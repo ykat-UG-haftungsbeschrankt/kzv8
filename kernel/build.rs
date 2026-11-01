@@ -48,12 +48,18 @@ fn main() {
     let (clang_target, sources, linker_script) = match target_arch.as_str() {
         "x86_64" => (
             "x86_64-none-elf",
-            vec![("arch/x86_64/boot.S", "boot.o")],
+            vec![
+                ("arch/x86_64/boot.S", "boot.o"),
+                ("arch/x86_64/smp_boot.S", "smp_boot.o"),
+            ],
             "linker/x86_64.ld",
         ),
         "aarch64" => (
             "aarch64-none-elf",
-            vec![("arch/aarch64/boot.S", "boot.o")],
+            vec![
+                ("arch/aarch64/boot.S", "boot.o"),
+                ("arch/aarch64/smp_boot.S", "smp_boot.o"),
+            ],
             "linker/aarch64.ld",
         ),
         _ => panic!("unsupported target architecture: {target_arch}"),
@@ -67,9 +73,9 @@ fn main() {
     println!("cargo:rerun-if-changed={}", linker_script.display());
     println!("cargo:rustc-link-arg=-T{}", linker_script.display());
 
-    for (source, object) in sources {
-        let source = package_dir.join(source);
-        let object = output_dir.join(object);
+    for (source_name, object_name) in sources {
+        let source = package_dir.join(source_name);
+        let object = output_dir.join(object_name);
         let status = Command::new(&clang)
             .arg(format!("--target={clang_target}"))
             .arg("-c")
@@ -83,9 +89,13 @@ fn main() {
             "Clang failed to assemble {}",
             source.display()
         );
-        if target_arch == "x86_64" {
+        if target_arch == "x86_64" && object_name == "boot.o" {
             let status = Command::new(&objcopy)
-                .arg("--globalize-symbol=pml4")
+                .args([
+                    "--globalize-symbol=pml4",
+                    "--globalize-symbol=stack_bottom",
+                    "--globalize-symbol=stack_top",
+                ])
                 .arg(&object)
                 .status()
                 .expect("failed to export the x86 PML4 symbol");
@@ -99,6 +109,9 @@ fn main() {
     let c_sources = [
         ("runtime/bridge/linux/stdio.c", "stdio.o"),
         ("runtime/bridge/linux/format.c", "format.o"),
+        ("runtime/bridge/linux/math.c", "math.o"),
+        ("runtime/bridge/linux/compat.c", "compat.o"),
+        ("runtime/bridge/linux/cxxabi.c", "cxxabi.o"),
         ("runtime/bridge/linux/string.c", "string.o"),
         ("runtime/bridge/linux/posix.c", "posix.o"),
         ("runtime/bridge/linux/stdio_smoke.c", "stdio_smoke.o"),

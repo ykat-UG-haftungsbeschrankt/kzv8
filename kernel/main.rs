@@ -126,6 +126,7 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         let _event = events.wait(now_ns);
     }
     let console_ready = console::initialize();
+    let online_cpus = arch::start_secondary_cpus();
     let future_smoke_started = task::spawn(futures_smoke()).is_ok();
     if future_smoke_started {
         task::run_until_stalled();
@@ -137,6 +138,9 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         #[cfg(target_arch = "aarch64")]
         let message = b"kz: aarch64 Rust kernel booted\n";
         if console::write(message) && console::write(b"kz: virtio-console transmit OK\n") {
+            if online_cpus > 1 {
+                let _smp_status = console::write(b"kz: SMP online\n");
+            }
             if future_smoke_started && FUTURE_SMOKE_DONE.load(Ordering::Acquire) {
                 let _future_status = console::write(b"kz: Rust futures smoke OK\n");
             }
@@ -180,6 +184,16 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
 async fn futures_smoke() {
     task::yield_now().await;
     FUTURE_SMOKE_DONE.store(true, Ordering::Release);
+}
+
+#[no_mangle]
+pub extern "C" fn kz_secondary_main(cpu_id: usize) -> ! {
+    if !arch::initialize_secondary_cpu(cpu_id) {
+        arch::halt();
+    }
+    arch::mark_cpu_online(cpu_id);
+    arch::interrupts::enable();
+    task::run_forever()
 }
 
 #[panic_handler]

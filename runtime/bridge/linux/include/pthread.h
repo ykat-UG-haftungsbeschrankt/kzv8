@@ -10,6 +10,7 @@ typedef unsigned int pthread_once_t;
 typedef struct {
     size_t stack_size;
     int detach_state;
+    void *stack_address;
 } pthread_attr_t;
 typedef struct {
     uintptr_t owner;
@@ -60,6 +61,10 @@ int pthread_attr_setdetachstate(pthread_attr_t *attributes, int detach_state);
 int pthread_attr_getdetachstate(const pthread_attr_t *attributes, int *detach_state);
 int pthread_attr_setstacksize(pthread_attr_t *attributes, size_t stack_size);
 int pthread_attr_getstacksize(const pthread_attr_t *attributes, size_t *stack_size);
+int pthread_attr_getstack(const pthread_attr_t *attributes, void **stack_address,
+                          size_t *stack_size);
+int pthread_getattr_np(pthread_t thread, pthread_attr_t *attributes);
+int pthread_kill(pthread_t thread, int signal_number);
 int pthread_create(pthread_t *thread, const pthread_attr_t *attributes,
                    void *(*start_routine)(void *), void *argument);
 int pthread_join(pthread_t thread, void **result);

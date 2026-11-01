@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 struct format_output {
@@ -259,4 +260,44 @@ int vfprintf(FILE* stream, const char* format, va_list arguments) {
     if (length < 0) return -1;
     const size_t count = (size_t)length < sizeof(buffer) ? (size_t)length : sizeof(buffer) - 1;
     return fwrite(buffer, 1, count, stream) == count ? (int)count : -1;
+}
+
+int __vfprintf_chk(FILE* stream, int flag, const char* format,
+                   va_list arguments) {
+    (void)flag;
+    return vfprintf(stream, format, arguments);
+}
+
+int __vprintf_chk(int flag, const char* format, va_list arguments) {
+    (void)flag;
+    return vfprintf(stdout, format, arguments);
+}
+
+int __vsnprintf_chk(char* buffer, size_t size, int flag, size_t object_size,
+                    const char* format, va_list arguments) {
+    (void)flag;
+    if (size > object_size) return -1;
+    return vsnprintf(buffer, size, format, arguments);
+}
+
+int vasprintf(char** output, const char* format, va_list arguments) {
+    if (output == NULL) return -1;
+    va_list sizing_arguments;
+    va_copy(sizing_arguments, arguments);
+    const int length = vsnprintf(NULL, 0, format, sizing_arguments);
+    va_end(sizing_arguments);
+    if (length < 0 || (size_t)length == SIZE_MAX) return -1;
+    char* buffer = (char*)malloc((size_t)length + 1);
+    if (buffer == NULL) return -1;
+    va_list writing_arguments;
+    va_copy(writing_arguments, arguments);
+    const int written = vsnprintf(buffer, (size_t)length + 1, format,
+                                  writing_arguments);
+    va_end(writing_arguments);
+    if (written != length) {
+        free(buffer);
+        return -1;
+    }
+    *output = buffer;
+    return length;
 }

@@ -217,10 +217,21 @@ pub(crate) fn initialize_controller() -> bool {
             core::ptr::write_volatile((GICD_BASE + 0x800 + interrupt) as *mut u8, 1);
         }
         core::ptr::write_volatile((GICD_BASE + 0x104) as *mut u32, u32::MAX);
+        core::ptr::write_volatile(GICD_BASE as *mut u32, 2);
+        core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
+    }
+    initialize_cpu_interface()
+}
+
+pub(crate) fn initialize_secondary_controller() -> bool {
+    initialize_cpu_interface()
+}
+
+fn initialize_cpu_interface() -> bool {
+    unsafe {
         core::ptr::write_volatile((GICC_BASE + 0x04) as *mut u32, 0xff);
         core::ptr::write_volatile((GICC_BASE + 0x08) as *mut u32, 0);
         core::ptr::write_volatile(GICC_BASE as *mut u32, 2);
-        core::ptr::write_volatile(GICD_BASE as *mut u32, 2);
         core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
     }
     true

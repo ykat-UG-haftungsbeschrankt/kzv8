@@ -109,6 +109,7 @@ unsafe extern "C" {
 }
 
 const VIRTIO_VECTOR: usize = 0x40;
+const EXECUTOR_IPI_VECTOR: usize = 0x41;
 const SPURIOUS_VECTOR: usize = 0xff;
 const LOCAL_APIC_BASE: usize = 0xfee0_0000;
 const IO_APIC_BASE: usize = 0xfec0_0000;
@@ -162,11 +163,22 @@ pub(crate) unsafe fn initialize() {
         .add(VIRTIO_VECTOR)
         .write(IdtEntry::interrupt(x86_irq_entry as *const () as usize));
     entries
+        .add(EXECUTOR_IPI_VECTOR)
+        .write(IdtEntry::interrupt(x86_irq_entry as *const () as usize));
+    entries
         .add(14)
         .write(IdtEntry::interrupt(x86_page_fault_entry as *const () as usize));
     entries
         .add(SPURIOUS_VECTOR)
         .write(IdtEntry::interrupt(x86_spurious_interrupt as *const () as usize));
+    load_idt();
+}
+
+pub(crate) unsafe fn initialize_secondary() {
+    load_idt();
+}
+
+unsafe fn load_idt() {
     let pointer = IdtPointer {
         limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
         base: addr_of!(IDT) as u64,
@@ -179,16 +191,11 @@ pub(crate) unsafe fn initialize() {
 }
 
 pub(crate) fn initialize_controller() -> bool {
-    let apic_base = read_msr(APIC_BASE_MSR);
-    if apic_base & X2APIC_ENABLE != 0 {
+    if !initialize_local_controller() {
         return false;
     }
-    write_msr(APIC_BASE_MSR, apic_base | APIC_ENABLE);
 
-    write_local_apic(0x80, 0);
-    write_local_apic(0xf0, (1 << 8) | SPURIOUS_VECTOR as u32);
     let apic_id = read_local_apic(0x20) & 0xff00_0000;
-
     let maximum_irq = (read_io_apic(1) >> 16) & 0xff;
     if maximum_irq < VIRTIO_GSI_BASE as u32 {
         return false;
@@ -209,10 +216,34 @@ pub(crate) fn initialize_controller() -> bool {
     true
 }
 
+pub(crate) fn initialize_local_controller() -> bool {
+    let apic_base = read_msr(APIC_BASE_MSR);
+    if apic_base & X2APIC_ENABLE != 0 {
+        return false;
+    }
+    write_msr(APIC_BASE_MSR, apic_base | APIC_ENABLE);
+
+    write_local_apic(0x80, 0);
+    write_local_apic(0xf0, (1 << 8) | SPURIOUS_VECTOR as u32);
+    true
+}
+
 #[no_mangle]
 pub extern "C" fn x86_irq_dispatch() {
-    crate::kz_handle_virtio_interrupt();
+    let in_service = read_local_apic(0x100 + (EXECUTOR_IPI_VECTOR / 32) * 0x10);
+    if in_service & (1 << (EXECUTOR_IPI_VECTOR % 32)) == 0 {
+        crate::kz_handle_virtio_interrupt();
+    }
     write_local_apic(0xb0, 0);
+}
+
+pub(crate) fn send_ipi(destination: u8, command: u32) {
+    write_local_apic(0x310, u32::from(destination) << 24);
+    write_local_apic(0x300, command);
+}
+
+pub(crate) fn ipi_pending() -> bool {
+    read_local_apic(0x300) & (1 << 12) != 0
 }
 
 fn read_msr(index: u32) -> u64 {

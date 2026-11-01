@@ -14,6 +14,7 @@ const EDEADLK: i32 = 35;
 const EINVAL: i32 = 22;
 const EPERM: i32 = 1;
 const ESRCH: i32 = 3;
+const ENOSYS: i32 = 38;
 
 const JOINABLE: i32 = 0;
 const DETACHED: i32 = 1;
@@ -24,6 +25,7 @@ type StartRoutine = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 struct ThreadAttributes {
     stack_size: usize,
     detach_state: i32,
+    stack_address: *mut c_void,
 }
 
 #[repr(C)]
@@ -98,6 +100,12 @@ static mut CURRENT_SLOT: usize = 0;
 static mut NEXT_THREAD_ID: usize = MAIN_THREAD_ID + 1;
 static mut INITIALIZED: bool = false;
 static mut FALLBACK_ERRNO: i32 = 0;
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    static stack_bottom: u8;
+    static stack_top: u8;
+}
 
 pub(crate) fn initialize() {
     let interrupt_state = crate::arch::interrupts::disable();
@@ -405,6 +413,7 @@ pub unsafe extern "C" fn pthread_attr_init(attributes: *mut c_void) -> i32 {
             .write(ThreadAttributes {
                 stack_size: 0,
                 detach_state: JOINABLE,
+                stack_address: core::ptr::null_mut(),
             });
     }
     0
@@ -421,6 +430,7 @@ pub unsafe extern "C" fn pthread_attr_destroy(attributes: *mut c_void) -> i32 {
             .write(ThreadAttributes {
                 stack_size: 0,
                 detach_state: JOINABLE,
+                stack_address: core::ptr::null_mut(),
             });
     }
     0
@@ -479,6 +489,81 @@ pub unsafe extern "C" fn pthread_attr_getstacksize(
         })
     };
     0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getstack(
+    attributes: *const c_void,
+    stack_address: *mut *mut c_void,
+    stack_size: *mut usize,
+) -> i32 {
+    if attributes.is_null() || stack_address.is_null() || stack_size.is_null() {
+        return EINVAL;
+    }
+    let attributes = unsafe { &*attributes.cast::<ThreadAttributes>() };
+    unsafe {
+        stack_address.write(attributes.stack_address);
+        stack_size.write(if attributes.stack_size == 0 {
+            STACK_SIZE
+        } else {
+            attributes.stack_size
+        });
+    }
+    0
+}
+
+fn thread_stack_bounds(slot: usize) -> (*mut c_void, usize) {
+    if slot == 0 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let start = core::ptr::addr_of!(stack_bottom) as usize;
+            let end = core::ptr::addr_of!(stack_top) as usize;
+            return (start as *mut c_void, end.saturating_sub(start));
+        }
+        #[cfg(target_arch = "aarch64")]
+        return (core::ptr::null_mut(), STACK_SIZE);
+    }
+
+    let stacks = addr_of_mut!(STACKS).cast::<ThreadStack>();
+    unsafe { (stacks.add(slot).cast::<c_void>(), STACK_SIZE) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_getattr_np(
+    thread_id: usize,
+    attributes: *mut c_void,
+) -> i32 {
+    if attributes.is_null() {
+        return EINVAL;
+    }
+    let interrupt_state = crate::arch::interrupts::disable();
+    let Some(slot) = (unsafe { find_thread(thread_id) }) else {
+        crate::arch::interrupts::restore(interrupt_state);
+        return ESRCH;
+    };
+    let threads = addr_of_mut!(THREADS).cast::<Thread>();
+    let thread = unsafe { *threads.add(slot) };
+    let (stack_address, stack_size) = thread_stack_bounds(slot);
+    unsafe {
+        attributes.cast::<ThreadAttributes>().write(ThreadAttributes {
+            stack_size,
+            detach_state: if thread.detached { DETACHED } else { JOINABLE },
+            stack_address,
+        });
+    }
+    crate::arch::interrupts::restore(interrupt_state);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_kill(thread_id: usize, signal_number: i32) -> i32 {
+    let interrupt_state = crate::arch::interrupts::disable();
+    let exists = unsafe { find_thread(thread_id) }.is_some();
+    crate::arch::interrupts::restore(interrupt_state);
+    if !exists {
+        return ESRCH;
+    }
+    if signal_number == 0 { 0 } else { ENOSYS }
 }
 
 #[no_mangle]

@@ -1,3 +1,24 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(target_arch = "aarch64")]
+#[path = "aarch64/smp.rs"]
+mod smp;
+#[cfg(target_arch = "x86_64")]
+#[path = "x86_64/smp.rs"]
+mod smp;
+
+pub(crate) const MAX_CPUS: usize = 8;
+pub(crate) const CPU_STACK_SIZE: usize = 16 * 1024;
+
+#[repr(C, align(16))]
+pub(crate) struct CpuStack([u8; CPU_STACK_SIZE]);
+
+#[no_mangle]
+pub(crate) static mut KZ_CPU_STACKS: [CpuStack; MAX_CPUS] =
+    [const { CpuStack([0; CPU_STACK_SIZE]) }; MAX_CPUS];
+
+static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(0);
+
 #[cfg(target_arch = "aarch64")]
 #[path = "aarch64/entry.rs"]
 mod entry;
@@ -60,6 +81,30 @@ pub(crate) fn initialize_interrupt_controller() -> bool {
     interrupts::initialize_controller()
 }
 
+pub(crate) fn start_secondary_cpus() -> usize {
+    ONLINE_CPUS.store(1, Ordering::Release);
+    smp::start_secondary_cpus();
+    online_cpu_count()
+}
+
+pub(crate) fn initialize_secondary_cpu(cpu_id: usize) -> bool {
+    smp::initialize_secondary_cpu(cpu_id)
+}
+
+pub(crate) fn mark_cpu_online(cpu_id: usize) {
+    if cpu_id < MAX_CPUS {
+        ONLINE_CPUS.fetch_or(1usize << cpu_id, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn cpu_is_online(cpu_id: usize) -> bool {
+    cpu_id < MAX_CPUS && ONLINE_CPUS.load(Ordering::Acquire) & (1usize << cpu_id) != 0
+}
+
+pub(crate) fn online_cpu_count() -> usize {
+    ONLINE_CPUS.load(Ordering::Acquire).count_ones() as usize
+}
+
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
     paging::set_page_permissions(address, length, permissions)
@@ -113,12 +158,11 @@ pub(crate) fn page_is_mapped(virtual_address: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         ram_map::page_is_mapped(virtual_address)
+    }
+}
 
 pub(crate) fn notify_executor() {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("sev");
-    }
+    smp::notify_executor();
 }
 
 pub(crate) fn wait_for_interrupt() {
@@ -129,7 +173,5 @@ pub(crate) fn wait_for_interrupt() {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("msr daifclr, #0xf", "wfe");
-    }
-}
     }
 }

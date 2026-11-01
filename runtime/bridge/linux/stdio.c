@@ -107,6 +107,15 @@ int fflush(FILE* stream) {
     return stream == NULL || stream == stdout || stream == stderr ? 0 : EOF;
 }
 
+int setvbuf(FILE* stream, char* buffer, int mode, size_t size) {
+    (void)buffer;
+    (void)size;
+    if (stream == NULL || (stream != stdin && stream != stdout && stream != stderr)) {
+        return EOF;
+    }
+    return mode == _IOFBF || mode == _IOLBF || mode == _IONBF ? 0 : EOF;
+}
+
 int fputc(int character, FILE* stream) {
     if (stream == NULL || (stream->descriptor != 1 && stream->descriptor != 2)) {
         return EOF;

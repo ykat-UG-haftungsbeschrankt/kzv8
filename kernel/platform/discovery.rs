@@ -23,6 +23,22 @@ static mut MEMORY_REGIONS: [MemoryRegion; MAX_MEMORY_REGIONS] =
     [MemoryRegion::EMPTY; MAX_MEMORY_REGIONS];
 static MEMORY_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(target_arch = "aarch64")]
+const MAX_CPU_IDS: usize = 8;
+#[cfg(target_arch = "aarch64")]
+static mut AARCH64_CPU_IDS: [u64; MAX_CPU_IDS] = [0; MAX_CPU_IDS];
+#[cfg(target_arch = "aarch64")]
+static AARCH64_CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "aarch64")]
+static PSCI_METHOD: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PsciConduit {
+    Smc,
+    Hvc,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VirtioWindow {
     pub(crate) start: usize,
@@ -38,6 +54,42 @@ fn reset_memory_regions() {
         }
     }
     MEMORY_REGION_COUNT.store(0, Ordering::Release);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn reset_cpu_info() {
+    let ids = addr_of_mut!(AARCH64_CPU_IDS).cast::<u64>();
+    for index in 0..MAX_CPU_IDS {
+        unsafe { ids.add(index).write(0) };
+    }
+    AARCH64_CPU_COUNT.store(0, Ordering::Release);
+    PSCI_METHOD.store(0, Ordering::Release);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn add_cpu_id(id: u64) -> bool {
+    let count = AARCH64_CPU_COUNT.load(Ordering::Relaxed);
+    if count == MAX_CPU_IDS {
+        return true;
+    }
+    unsafe { addr_of_mut!(AARCH64_CPU_IDS).cast::<u64>().add(count).write(id) };
+    AARCH64_CPU_COUNT.store(count + 1, Ordering::Release);
+    true
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn aarch64_cpu_ids() -> &'static [u64] {
+    let count = AARCH64_CPU_COUNT.load(Ordering::Acquire);
+    unsafe { core::slice::from_raw_parts(addr_of!(AARCH64_CPU_IDS).cast::<u64>(), count) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn psci_conduit() -> Option<PsciConduit> {
+    match PSCI_METHOD.load(Ordering::Acquire) {
+        1 => Some(PsciConduit::Smc),
+        2 => Some(PsciConduit::Hvc),
+        _ => None,
+    }
 }
 
 fn add_memory_region(start: u64, length: u64) -> bool {
@@ -156,6 +208,21 @@ fn fdt_string_matches(
 }
 
 #[cfg(target_arch = "aarch64")]
+fn fdt_value_matches(base: usize, total_size: usize, offset: usize, length: usize, value: &[u8]) -> bool {
+    let Some(end) = offset.checked_add(length) else {
+        return false;
+    };
+    if end > total_size || length != value.len() + 1 {
+        return false;
+    }
+    let Some(address) = base.checked_add(offset) else {
+        return false;
+    };
+    let actual = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
+    actual[..value.len()] == *value && actual[value.len()] == 0
+}
+
+#[cfg(target_arch = "aarch64")]
 fn fdt_cells(base: usize, total_size: usize, offset: usize, count: usize) -> Option<u64> {
     if count == 0 || count > 2 {
         return None;
@@ -208,10 +275,15 @@ pub(crate) fn initialize_aarch64(fdt: usize) -> bool {
     }
 
     reset_memory_regions();
+    reset_cpu_info();
     let mut address_cells = 2usize;
     let mut size_cells = 1usize;
+    let mut cpu_address_cells = 1usize;
     let mut node_depth = 0usize;
     let mut memory_nodes = [false; 32];
+    let mut cpus_nodes = [false; 32];
+    let mut cpu_nodes = [false; 32];
+    let mut psci_nodes = [false; 32];
     let mut cursor = structure_offset;
     while cursor < structure_end {
         let Some(token) = fdt_u32(fdt, structure_end, cursor) else {
@@ -242,6 +314,11 @@ pub(crate) fn initialize_aarch64(fdt: usize) -> bool {
                     unsafe { core::slice::from_raw_parts(name_address as *const u8, name_length) };
                 memory_nodes[node_depth] =
                     node_depth == 1 && (name == b"memory" || name.starts_with(b"memory@"));
+                cpus_nodes[node_depth] = node_depth == 1 && name == b"cpus";
+                cpu_nodes[node_depth] = node_depth == 2
+                    && cpus_nodes[node_depth - 1]
+                    && (name == b"cpu" || name.starts_with(b"cpu@"));
+                psci_nodes[node_depth] = node_depth == 1 && name == b"psci";
                 node_depth += 1;
                 let Some(next_cursor) =
                     cursor.checked_add(1).and_then(|value| value.checked_add(3))
@@ -295,6 +372,34 @@ pub(crate) fn initialize_aarch64(fdt: usize) -> bool {
                     size_cells = fdt_u32(fdt, structure_end, cursor)
                         .map(|value| value as usize)
                         .unwrap_or(0);
+                } else if node_depth == 2
+                    && cpus_nodes[node_depth - 1]
+                    && fdt_string_matches(
+                        fdt,
+                        strings_offset,
+                        strings_size,
+                        name_offset,
+                        b"#address-cells",
+                    )
+                {
+                    cpu_address_cells = fdt_u32(fdt, structure_end, cursor)
+                        .map(|value| value as usize)
+                        .unwrap_or(0);
+                } else if node_depth == 2
+                    && psci_nodes[node_depth - 1]
+                    && fdt_string_matches(
+                        fdt,
+                        strings_offset,
+                        strings_size,
+                        name_offset,
+                        b"method",
+                    )
+                {
+                    if fdt_value_matches(fdt, total_size, cursor, length, b"smc") {
+                        PSCI_METHOD.store(1, Ordering::Release);
+                    } else if fdt_value_matches(fdt, total_size, cursor, length, b"hvc") {
+                        PSCI_METHOD.store(2, Ordering::Release);
+                    }
                 } else if node_depth > 1
                     && fdt_string_matches(
                         fdt,
@@ -312,6 +417,20 @@ pub(crate) fn initialize_aarch64(fdt: usize) -> bool {
                             unsafe { core::slice::from_raw_parts(value_address as *const u8, 7) };
                         if value == b"memory\0" {
                             memory_nodes[node_depth - 1] = true;
+                        }
+                    }
+                } else if node_depth > 2
+                    && cpu_nodes[node_depth - 1]
+                    && fdt_string_matches(fdt, strings_offset, strings_size, name_offset, b"reg")
+                {
+                    if cpu_address_cells != 0
+                        && cpu_address_cells <= 2
+                        && length == cpu_address_cells * 4
+                    {
+                        if let Some(cpu_id) =
+                            fdt_cells(fdt, structure_end, cursor, cpu_address_cells)
+                        {
+                            let _ = add_cpu_id(cpu_id);
                         }
                     }
                 } else if node_depth > 1

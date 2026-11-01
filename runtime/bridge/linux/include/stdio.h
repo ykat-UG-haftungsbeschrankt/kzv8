@@ -9,6 +9,9 @@ extern "C" {
 #endif
 
 #define EOF (-1)
+#define _IOFBF 0
+#define _IOLBF 1
+#define _IONBF 2
 
 typedef struct kz_file {
 	int descriptor;
@@ -29,6 +32,12 @@ size_t fread(void* buffer, size_t size, size_t count, FILE* stream);
 size_t fwrite(const void* buffer, size_t size, size_t count, FILE* stream);
 int fileno(FILE* stream);
 int vfprintf(FILE* stream, const char* format, va_list arguments);
+int __vfprintf_chk(FILE* stream, int flag, const char* format,
+				   va_list arguments);
+int __vprintf_chk(int flag, const char* format, va_list arguments);
+int __vsnprintf_chk(char* buffer, size_t size, int flag, size_t object_size,
+					const char* format, va_list arguments);
+int setvbuf(FILE* stream, char* buffer, int mode, size_t size);
 int snprintf(char* buffer, size_t size, const char* format, ...);
 FILE* fopen64(const char* path, const char* mode);
 

@@ -11,6 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <sys/mman.h>
 
 #define SYS_GETPID 39
 #define SYS_SCHED_YIELD 24
@@ -34,6 +35,7 @@
 #define PR_GET_NAME 16
 #define PR_SET_VMA 0x53564d41
 #define PR_SET_VMA_ANON_NAME 0
+#define MREMAP_MAYMOVE 1
 
 extern int kz_host_console_write(const char* data, size_t length);
 extern uint64_t kz_host_time_ns(void);
@@ -539,6 +541,58 @@ const unsigned short int** __ctype_b_loc(void) {
     return &ctype_table_pointer;
 }
 
+void* mremap(void* old_address, size_t old_length, size_t new_length,
+             int flags, ...) {
+    if (old_address == NULL || old_length == 0 || new_length == 0 ||
+        (flags & ~MREMAP_MAYMOVE) != 0) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    if (old_length == new_length) return old_address;
+    void* replacement = mmap(NULL, new_length, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (replacement == MAP_FAILED) return MAP_FAILED;
+    const size_t copy_length = old_length < new_length ? old_length : new_length;
+    memcpy(replacement, old_address, copy_length);
+    if (munmap(old_address, old_length) != 0) {
+        munmap(replacement, new_length);
+        return MAP_FAILED;
+    }
+    return replacement;
+}
+
+double strtod_l(const char* text, char** end, void* locale) {
+    (void)locale;
+    return strtod(text, end);
+}
+
+float strtof_l(const char* text, char** end, void* locale) {
+    (void)locale;
+    return strtof(text, end);
+}
+
+long double strtold_l(const char* text, char** end, void* locale) {
+    (void)locale;
+    return (long double)strtod(text, end);
+}
+
+size_t __mbrlen(const char* text, size_t length, void* state) {
+    (void)state;
+    if (text == NULL) return 0;
+    if (length == 0) return (size_t)-2;
+    const unsigned char lead = (unsigned char)text[0];
+    if (lead < 0x80) return 1;
+    const size_t expected = (lead & 0xe0) == 0xc0 ? 2 :
+                            ((lead & 0xf0) == 0xe0 ? 3 :
+                             ((lead & 0xf8) == 0xf0 ? 4 : 0));
+    if (expected == 0) return (size_t)-1;
+    if (length < expected) return (size_t)-2;
+    for (size_t index = 1; index < expected; index++) {
+        if (((unsigned char)text[index] & 0xc0) != 0x80) return (size_t)-1;
+    }
+    return expected;
+}
+
 void abort(void) {
     __builtin_trap();
 }
@@ -570,4 +624,164 @@ void _Unwind_SetGR(_Unwind_Context* context, int register_number,
     (void)context;
     (void)register_number;
     (void)value;
+}
+
+int gettimeofday(void* value, void* timezone) {
+    (void)timezone;
+    if (value == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    struct kz_timeval {
+        long seconds;
+        long microseconds;
+    };
+    const int64_t milliseconds = kz_host_wall_time_ms();
+    struct kz_timeval* result = (struct kz_timeval*)value;
+    result->seconds = (long)(milliseconds / 1000);
+    result->microseconds = (long)(milliseconds % 1000) * 1000;
+    return 0;
+}
+
+time_t time(time_t* result) {
+    const time_t seconds = (time_t)(kz_host_wall_time_ms() / 1000);
+    if (result != NULL) *result = seconds;
+    return seconds;
+}
+
+char* strerror(int error) {
+    switch (error) {
+        case 0: return "success";
+        case EINVAL: return "invalid argument";
+        case ENOMEM: return "out of memory";
+        case EAGAIN: return "try again";
+        case EBUSY: return "resource busy";
+        case EIO: return "I/O error";
+        case EBADF: return "bad file descriptor";
+        case ENOSYS: return "function not implemented";
+        default: return "unknown error";
+    }
+}
+
+long __sysconf(int name) { return sysconf(name); }
+
+long __isoc23_strtol(const char* text, char** end, int base) {
+    return (long)parse_unsigned(text, end, base);
+}
+
+long long __isoc23_strtoll(const char* text, char** end, int base) {
+    return (long long)parse_unsigned(text, end, base);
+}
+
+int setpriority(int which, int who, int priority) {
+    (void)which;
+    (void)who;
+    (void)priority;
+    return 0;
+}
+
+int open64(const char* path, int flags, ...) {
+    (void)path;
+    (void)flags;
+    errno = ENOENT;
+    return -1;
+}
+
+int __open64_2(const char* path, int flags) {
+    return open64(path, flags);
+}
+
+int unlink(const char* path) {
+    (void)path;
+    errno = ENOENT;
+    return -1;
+}
+
+FILE* tmpfile64(void) {
+    errno = ENOSYS;
+    return NULL;
+}
+
+FILE* fdopen(int file_descriptor, const char* mode) {
+    (void)mode;
+    if (file_descriptor == 0) return stdin;
+    if (file_descriptor == 1) return stdout;
+    if (file_descriptor == 2) return stderr;
+    errno = EBADF;
+    return NULL;
+}
+
+ssize_t read(int file_descriptor, void* buffer, size_t length) {
+    if (buffer == NULL && length != 0) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (file_descriptor == 0) return 0;
+    errno = EBADF;
+    return -1;
+}
+
+int close(int file_descriptor) {
+    if (file_descriptor >= 0 && file_descriptor <= 2) return 0;
+    errno = EBADF;
+    return -1;
+}
+
+int sigemptyset(void* set) {
+    if (set == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    memset(set, 0, SIGSET_SIZE);
+    return 0;
+}
+
+int sigaction(int signal_number, const void* action, void* old_action) {
+    (void)action;
+    (void)old_action;
+    (void)signal_number;
+    errno = ENOSYS;
+    return -1;
+}
+
+int sigaltstack(const void* stack, void* old_stack) {
+    (void)stack;
+    (void)old_stack;
+    errno = ENOSYS;
+    return -1;
+}
+
+int feclearexcept(int exceptions) {
+    (void)exceptions;
+    return 0;
+}
+
+int feraiseexcept(int exceptions) {
+    (void)exceptions;
+    return 0;
+}
+
+struct kz_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+int uname(void* output) {
+    if (output == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    struct kz_utsname* name = (struct kz_utsname*)output;
+    memset(name, 0, sizeof(*name));
+    strncpy(name->sysname, "kz", sizeof(name->sysname) - 1);
+    strncpy(name->nodename, "localhost", sizeof(name->nodename) - 1);
+    strncpy(name->release, "0.1", sizeof(name->release) - 1);
+    strncpy(name->version, "freestanding", sizeof(name->version) - 1);
+    strncpy(name->machine, "x86_64", sizeof(name->machine) - 1);
+    strncpy(name->domainname, "local", sizeof(name->domainname) - 1);
+    return 0;
 }

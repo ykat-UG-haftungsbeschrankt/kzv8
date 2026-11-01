@@ -87,6 +87,16 @@ int strncmp(const char* left, const char* right, size_t count) {
     return 0;
 }
 
+char* strncpy(char* destination, const char* source, size_t count) {
+    size_t index = 0;
+    while (index < count && source[index] != '\0') {
+        destination[index] = source[index];
+        index++;
+    }
+    while (index < count) destination[index++] = '\0';
+    return destination;
+}
+
 char* strchr(const char* text, int character) {
     const char target = (char)character;
     while (*text != target) {
