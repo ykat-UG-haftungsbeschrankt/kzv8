@@ -1,0 +1,231 @@
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::virtio_transport::{Error, VirtioTransport};
+
+const DESC_NEXT: u16 = 1;
+const DESC_WRITE: u16 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Descriptor {
+    pub(crate) address: u64,
+    pub(crate) length: u32,
+    pub(crate) flags: u16,
+    pub(crate) next: u16,
+}
+
+impl Descriptor {
+    pub(crate) const fn new(address: u64, length: u32, device_writes: bool) -> Self {
+        Self {
+            address,
+            length,
+            flags: if device_writes { DESC_WRITE } else { 0 },
+            next: 0,
+        }
+    }
+}
+
+#[repr(C, align(4096))]
+struct DescriptorTable<const N: usize>([Descriptor; N]);
+
+#[repr(C, align(4096))]
+struct AvailableRing<const N: usize> {
+    flags: u16,
+    index: u16,
+    ring: [u16; N],
+    used_event: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct UsedElement {
+    pub(crate) id: u32,
+    pub(crate) length: u32,
+}
+
+#[repr(C, align(4096))]
+struct UsedRing<const N: usize> {
+    flags: u16,
+    index: u16,
+    ring: [UsedElement; N],
+    available_event: u16,
+}
+
+pub(crate) struct VirtQueue<const N: usize> {
+    descriptors: DescriptorTable<N>,
+    available: AvailableRing<N>,
+    used: UsedRing<N>,
+    next_descriptor: u16,
+    last_used: u16,
+    in_flight: bool,
+}
+
+impl<const N: usize> VirtQueue<N> {
+    pub(crate) const fn new() -> Self {
+        assert!(N > 0 && N <= u16::MAX as usize);
+        Self {
+            descriptors: DescriptorTable(
+                [Descriptor {
+                    address: 0,
+                    length: 0,
+                    flags: 0,
+                    next: 0,
+                }; N],
+            ),
+            available: AvailableRing {
+                flags: 0,
+                index: 0,
+                ring: [0; N],
+                used_event: 0,
+            },
+            used: UsedRing {
+                flags: 0,
+                index: 0,
+                ring: [UsedElement { id: 0, length: 0 }; N],
+                available_event: 0,
+            },
+            next_descriptor: 0,
+            last_used: 0,
+            in_flight: false,
+        }
+    }
+
+    pub(crate) fn configure(
+        &mut self,
+        transport: &VirtioTransport,
+        index: u32,
+    ) -> Result<(), Error> {
+        transport.configure_queue(
+            index,
+            N as u32,
+            core::ptr::addr_of_mut!(self.descriptors.0) as u64,
+            core::ptr::addr_of_mut!(self.available) as u64,
+            core::ptr::addr_of_mut!(self.used) as u64,
+        )
+    }
+
+    pub(crate) fn submit(&mut self, chain: &[Descriptor]) -> Option<u16> {
+        if self.in_flight || chain.is_empty() || chain.len() > N {
+            return None;
+        }
+        let head = self.next_descriptor;
+        for (offset, descriptor) in chain.iter().copied().enumerate() {
+            let slot = (usize::from(head) + offset) % N;
+            let mut descriptor = descriptor;
+            if offset + 1 < chain.len() {
+                descriptor.flags |= DESC_NEXT;
+                descriptor.next = ((slot + 1) % N) as u16;
+            } else {
+                descriptor.flags &= !DESC_NEXT;
+                descriptor.next = 0;
+            }
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!(self.descriptors.0[slot]),
+                    descriptor,
+                );
+            }
+        }
+        self.next_descriptor = ((usize::from(head) + chain.len()) % N) as u16;
+
+        let available_index =
+            unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.available.index)) };
+        let ring_slot = usize::from(available_index) % N;
+        unsafe {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!(self.available.ring[ring_slot]),
+                head,
+            );
+        }
+        crate::dma::sync_for_device();
+        unsafe {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!(self.available.index),
+                available_index.wrapping_add(1),
+            );
+        }
+        self.in_flight = true;
+        Some(head)
+    }
+
+    pub(crate) fn poll_used(&mut self) -> Option<UsedElement> {
+        let used_index = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.used.index)) };
+        if self.last_used == used_index {
+            return None;
+        }
+        crate::dma::sync_for_cpu();
+        let slot = usize::from(self.last_used) % N;
+        let element =
+            unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.used.ring[slot])) };
+        self.last_used = self.last_used.wrapping_add(1);
+        self.in_flight = false;
+        Some(element)
+    }
+
+    pub(crate) fn wait_used(&mut self, expected: u16, spins: usize) -> Option<UsedElement> {
+        for _ in 0..spins {
+            if let Some(element) = self.poll_used() {
+                return (element.id == u32::from(expected)).then_some(element);
+            }
+            core::hint::spin_loop();
+        }
+        None
+    }
+
+    pub(crate) const fn is_in_flight(&self) -> bool {
+        self.in_flight
+    }
+}
+
+pub(crate) struct QueueCell<const N: usize> {
+    locked: AtomicBool,
+    queue: UnsafeCell<VirtQueue<N>>,
+}
+
+unsafe impl<const N: usize> Sync for QueueCell<N> {}
+
+impl<const N: usize> QueueCell<N> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            queue: UnsafeCell::new(VirtQueue::new()),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> QueueGuard<'_, N> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        QueueGuard { cell: self }
+    }
+}
+
+pub(crate) struct QueueGuard<'a, const N: usize> {
+    cell: &'a QueueCell<N>,
+}
+
+impl<const N: usize> Deref for QueueGuard<'_, N> {
+    type Target = VirtQueue<N>;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.cell.queue.get() }
+    }
+}
+
+impl<const N: usize> DerefMut for QueueGuard<'_, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.cell.queue.get() }
+    }
+}
+
+impl<const N: usize> Drop for QueueGuard<'_, N> {
+    fn drop(&mut self) {
+        self.cell.locked.store(false, Ordering::Release);
+    }
+}
