@@ -3,7 +3,10 @@ use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
+use crate::event_loop::{EventFlags, EventLoop, EventSourceId, EventSourceToken};
 use crate::net_device::EthernetDevice;
+
+pub(crate) const NETWORK_EVENT_SOURCE: EventSourceId = EventSourceId::new(1);
 
 pub(crate) struct NetStack {
     pub(crate) interface: Interface,
@@ -38,16 +41,29 @@ impl NetStack {
         })
     }
 
-    pub(crate) fn poll(&mut self, now_ns: u64) -> bool {
+    pub(crate) fn poll<const N: usize>(
+        &mut self,
+        now_ns: u64,
+        events: &mut EventLoop<N>,
+        source: EventSourceToken,
+    ) -> bool {
         let now_ms = (now_ns / 1_000_000).min(i64::MAX as u64) as i64;
-        self.interface.poll(
+        let changed = self.interface.poll(
             Instant::from_millis(now_ms),
             &mut self.device,
             &mut self.sockets,
-        ) == smoltcp::iface::PollResult::SocketStateChanged
+        ) == smoltcp::iface::PollResult::SocketStateChanged;
+        if changed {
+            let _ = events.set_readiness(source, EventFlags::READABLE);
+        }
+        changed
     }
 
     pub(crate) fn device_mut(&mut self) -> &mut EthernetDevice {
         &mut self.device
+    }
+
+    pub(crate) fn interrupt_slot(&self) -> usize {
+        self.device.interrupt_slot()
     }
 }

@@ -8,15 +8,14 @@ const DEVICE_ID: u32 = 1;
 const QUEUE_SIZE: usize = 8;
 const HEADER_SIZE: usize = 10;
 pub(crate) const MTU: usize = 1500;
-const COMPLETION_SPINS: usize = 10_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
     Unavailable,
     FrameTooLarge,
     QueueBusy,
-    Timeout,
     BufferTooSmall,
+    CompletionMismatch,
 }
 
 #[repr(C)]
@@ -35,7 +34,9 @@ pub(crate) struct VirtioNet {
     receive_queue: Box<VirtQueue<QUEUE_SIZE>>,
     transmit_queue: Box<VirtQueue<QUEUE_SIZE>>,
     receive_buffer: DmaBuffer,
+    transmit_buffer: DmaBuffer,
     receive_head: Option<u16>,
+    transmit_head: Option<u16>,
     mac_address: [u8; 6],
 }
 
@@ -58,6 +59,7 @@ impl VirtioNet {
             return None;
         }
         let receive_buffer = dma::allocate(HEADER_SIZE + MTU, 16)?;
+        let transmit_buffer = dma::allocate(HEADER_SIZE + MTU, 16)?;
         let mac_low = transport.read_device_config(0);
         let mac_high = transport.read_device_config(4);
         let mac_address = [
@@ -73,7 +75,9 @@ impl VirtioNet {
             receive_queue,
             transmit_queue,
             receive_buffer,
+            transmit_buffer,
             receive_head: None,
+            transmit_head: None,
             mac_address,
         })
     }
@@ -82,25 +86,58 @@ impl VirtioNet {
         self.mac_address
     }
 
+    pub(crate) fn interrupt_slot(&self) -> usize {
+        self.transport.slot()
+    }
+
     pub(crate) fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
         if frame.len() > MTU {
             return Err(Error::FrameTooLarge);
         }
+        if self.transmit_head.is_some() && !self.poll_transmit()? {
+            return Err(Error::QueueBusy);
+        }
         let header = NetHeader::default();
+        let buffer = self.transmit_buffer.as_mut_slice();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &header as *const NetHeader as *const u8,
+                buffer.as_mut_ptr(),
+                HEADER_SIZE,
+            );
+        }
+        buffer[HEADER_SIZE..HEADER_SIZE + frame.len()].copy_from_slice(frame);
+        let base = self.transmit_buffer.bus_address();
         let descriptors = [
-            Descriptor::new(&header as *const _ as u64, HEADER_SIZE as u32, false),
-            Descriptor::new(frame.as_ptr() as u64, frame.len() as u32, false),
+            Descriptor::new(base, HEADER_SIZE as u32, false),
+            Descriptor::new(
+                base + HEADER_SIZE as u64,
+                frame.len() as u32,
+                false,
+            ),
         ];
         let head = self
             .transmit_queue
             .submit(&descriptors)
             .ok_or(Error::QueueBusy)?;
+        self.transmit_head = Some(head);
         dma::sync_for_device();
         self.transport.notify(1);
-        self.transmit_queue
-            .wait_used(head, COMPLETION_SPINS)
-            .ok_or(Error::Timeout)?;
         Ok(())
+    }
+
+    pub(crate) fn poll_transmit(&mut self) -> Result<bool, Error> {
+        let Some(expected) = self.transmit_head else {
+            return Ok(true);
+        };
+        let Some(used) = self.transmit_queue.poll_used() else {
+            return Ok(false);
+        };
+        self.transmit_head = None;
+        if used.id != u32::from(expected) {
+            return Err(Error::CompletionMismatch);
+        }
+        Ok(true)
     }
 
     pub(crate) fn poll_receive(&mut self, output: &mut [u8]) -> Result<Option<usize>, Error> {
@@ -125,10 +162,13 @@ impl VirtioNet {
         }
 
         let head = self.receive_head.unwrap();
-        let Some(used) = self.receive_queue.wait_used(head, 1) else {
+        let Some(used) = self.receive_queue.poll_used() else {
             return Ok(None);
         };
         self.receive_head = None;
+        if used.id != u32::from(head) {
+            return Err(Error::CompletionMismatch);
+        }
         let frame_length = (used.length as usize).saturating_sub(HEADER_SIZE);
         if frame_length > output.len() || frame_length > MTU {
             return Err(Error::BufferTooSmall);

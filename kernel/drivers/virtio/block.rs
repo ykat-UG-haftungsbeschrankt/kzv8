@@ -1,12 +1,13 @@
 use alloc::boxed::Box;
 
+use crate::dma::{self, DmaBuffer};
 use crate::virtio_queue::{Descriptor, VirtQueue};
 use crate::virtio_transport::VirtioTransport;
 
 const DEVICE_ID: u32 = 2;
 const QUEUE_SIZE: usize = 8;
 const SECTOR_SIZE: usize = 512;
-const COMPLETION_SPINS: usize = 10_000_000;
+const MAX_TRANSFER_SIZE: usize = 64 * 1024;
 
 #[repr(C)]
 struct RequestHeader {
@@ -20,14 +21,18 @@ pub(crate) enum Error {
     Unavailable,
     InvalidBuffer,
     QueueBusy,
-    Timeout,
     DeviceStatus(u8),
+    CompletionMismatch,
 }
 
 pub(crate) struct BlockDevice {
     transport: VirtioTransport,
     queue: Box<VirtQueue<QUEUE_SIZE>>,
     capacity_sectors: u64,
+    request_header: RequestHeader,
+    request_status: u8,
+    dma_buffer: DmaBuffer,
+    in_flight_head: Option<u16>,
 }
 
 impl BlockDevice {
@@ -39,12 +44,21 @@ impl BlockDevice {
         if !transport.activate() {
             return None;
         }
+        let dma_buffer = dma::allocate(MAX_TRANSFER_SIZE, 16)?;
         let capacity_sectors = u64::from(transport.read_device_config(0))
             | (u64::from(transport.read_device_config(4)) << 32);
         Some(Self {
             transport,
             queue,
             capacity_sectors,
+            request_header: RequestHeader {
+                request_type: 0,
+                reserved: 0,
+                sector: 0,
+            },
+            request_status: 0xff,
+            dma_buffer,
+            in_flight_head: None,
         })
     }
 
@@ -52,29 +66,26 @@ impl BlockDevice {
         self.capacity_sectors
     }
 
-    pub(crate) fn read_sectors(&mut self, sector: u64, output: &mut [u8]) -> Result<(), Error> {
-        if output.is_empty() || output.len() % SECTOR_SIZE != 0 {
-            return Err(Error::InvalidBuffer);
-        }
-        self.transfer(0, sector, output.as_mut_ptr(), output.len(), true)
-    }
-
-    pub(crate) fn write_sectors(&mut self, sector: u64, input: &[u8]) -> Result<(), Error> {
-        if input.is_empty() || input.len() % SECTOR_SIZE != 0 {
-            return Err(Error::InvalidBuffer);
-        }
-        self.transfer(1, sector, input.as_ptr() as *mut u8, input.len(), false)
-    }
-
-    fn transfer(
-        &mut self,
-        request_type: u32,
+    pub(crate) fn submit_read<'a>(
+        &'a mut self,
         sector: u64,
-        data: *mut u8,
-        length: usize,
-        device_writes: bool,
-    ) -> Result<(), Error> {
-        if length > u32::MAX as usize {
+        output: &'a mut [u8],
+    ) -> Result<BlockTransfer<'a>, Error> {
+        self.validate_request(sector, output.len())?;
+        self.submit(0, sector, output.len(), Some(output), None)
+    }
+
+    pub(crate) fn submit_write<'a>(
+        &'a mut self,
+        sector: u64,
+        input: &[u8],
+    ) -> Result<BlockTransfer<'a>, Error> {
+        self.validate_request(sector, input.len())?;
+        self.submit(1, sector, input.len(), None, Some(input))
+    }
+
+    fn validate_request(&self, sector: u64, length: usize) -> Result<(), Error> {
+        if length == 0 || length % SECTOR_SIZE != 0 || length > MAX_TRANSFER_SIZE {
             return Err(Error::InvalidBuffer);
         }
         if sector
@@ -83,31 +94,102 @@ impl BlockDevice {
         {
             return Err(Error::InvalidBuffer);
         }
-        let header = RequestHeader {
+        Ok(())
+    }
+
+    fn submit<'a>(
+        &'a mut self,
+        request_type: u32,
+        sector: u64,
+        length: usize,
+        output: Option<&'a mut [u8]>,
+        input: Option<&[u8]>,
+    ) -> Result<BlockTransfer<'a>, Error> {
+        self.reap_abandoned_request()?;
+        if let Some(input) = input {
+            self.dma_buffer.as_mut_slice()[..length].copy_from_slice(input);
+        }
+        self.request_header = RequestHeader {
             request_type,
             reserved: 0,
             sector,
         };
-        let mut status = 0xffu8;
+        self.request_status = 0xff;
         let descriptors = [
             Descriptor::new(
-                &header as *const _ as u64,
+                &self.request_header as *const _ as u64,
                 core::mem::size_of::<RequestHeader>() as u32,
                 false,
             ),
-            Descriptor::new(data as u64, length as u32, device_writes),
-            Descriptor::new(&mut status as *mut u8 as u64, 1, true),
+            Descriptor::new(
+                self.dma_buffer.bus_address(),
+                length as u32,
+                request_type == 0,
+            ),
+            Descriptor::new(&mut self.request_status as *mut u8 as u64, 1, true),
         ];
         let head = self.queue.submit(&descriptors).ok_or(Error::QueueBusy)?;
+        self.in_flight_head = Some(head);
         crate::dma::sync_for_device();
         self.transport.notify(0);
-        self.queue
-            .wait_used(head, COMPLETION_SPINS)
-            .ok_or(Error::Timeout)?;
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(Error::DeviceStatus(status))
+        Ok(BlockTransfer {
+            device: self,
+            output,
+            length,
+            head,
+            complete: false,
+        })
+    }
+
+    fn reap_abandoned_request(&mut self) -> Result<(), Error> {
+        let Some(expected) = self.in_flight_head else {
+            return Ok(());
+        };
+        let Some(used) = self.queue.poll_used() else {
+            return Err(Error::QueueBusy);
+        };
+        self.in_flight_head = None;
+        dma::sync_for_cpu();
+        if used.id != u32::from(expected) {
+            return Err(Error::CompletionMismatch);
         }
+        Ok(())
+    }
+
+    pub(crate) fn interrupt_slot(&self) -> usize {
+        self.transport.slot()
+    }
+}
+
+pub(crate) struct BlockTransfer<'a> {
+    device: &'a mut BlockDevice,
+    output: Option<&'a mut [u8]>,
+    length: usize,
+    head: u16,
+    complete: bool,
+}
+
+impl BlockTransfer<'_> {
+    pub(crate) fn poll(&mut self) -> Result<bool, Error> {
+        if self.complete {
+            return Ok(true);
+        }
+        let Some(used) = self.device.queue.poll_used() else {
+            return Ok(false);
+        };
+        self.device.in_flight_head = None;
+        dma::sync_for_cpu();
+        self.complete = true;
+        if used.id != u32::from(self.head) {
+            return Err(Error::CompletionMismatch);
+        }
+        if self.device.request_status != 0 {
+            return Err(Error::DeviceStatus(self.device.request_status));
+        }
+        if let Some(output) = self.output.as_mut() {
+            let source = &self.device.dma_buffer.as_mut_slice()[..self.length];
+            (**output).copy_from_slice(source);
+        }
+        Ok(true)
     }
 }

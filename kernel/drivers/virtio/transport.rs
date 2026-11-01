@@ -16,6 +16,8 @@ const REG_QUEUE_SIZE_MAX: usize = 0x34;
 const REG_QUEUE_SIZE: usize = 0x38;
 const REG_QUEUE_READY: usize = 0x44;
 const REG_QUEUE_NOTIFY: usize = 0x50;
+const REG_INTERRUPT_STATUS: usize = 0x60;
+const REG_INTERRUPT_ACK: usize = 0x64;
 const REG_STATUS: usize = 0x70;
 const REG_QUEUE_DESC: usize = 0x80;
 const REG_QUEUE_AVAIL: usize = 0x90;
@@ -136,6 +138,11 @@ impl VirtioTransport {
         unsafe { read_register(self.base, 0x100 + offset) }
     }
 
+    pub(crate) fn slot(&self) -> usize {
+        let window = platform::virtio_window();
+        (self.base - window.start) / window.stride
+    }
+
     pub(crate) fn base(&self) -> usize {
         self.base
     }
@@ -143,6 +150,26 @@ impl VirtioTransport {
     pub(crate) const fn net_mac_feature() -> u64 {
         FEATURE_NET_MAC
     }
+}
+
+pub(crate) fn dispatch_interrupts() -> u64 {
+    let window = platform::virtio_window();
+    let mut pending = 0u64;
+    for slot in 0..window.slots.min(64) {
+        let base = window.start + slot * window.stride;
+        let magic = unsafe { read_register(base, REG_MAGIC) };
+        let version = unsafe { read_register(base, REG_VERSION) };
+        let device_id = unsafe { read_register(base, REG_DEVICE_ID) };
+        if magic != MAGIC || version != VERSION_MODERN || device_id == 0 {
+            continue;
+        }
+        let status = unsafe { read_register(base, REG_INTERRUPT_STATUS) };
+        if status != 0 {
+            unsafe { write_register(base, REG_INTERRUPT_ACK, status) };
+            pending |= 1u64 << slot;
+        }
+    }
+    pending
 }
 
 unsafe fn read_register(base: usize, offset: usize) -> u32 {

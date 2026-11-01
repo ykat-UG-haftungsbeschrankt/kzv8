@@ -9,11 +9,113 @@ core::arch::global_asm!(
     "1:",
     "hlt",
     "jmp 1b",
+    ".global x86_irq_entry",
+    "x86_irq_entry:",
+    "cld",
+    "push rax",
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rbp",
+    "push rsi",
+    "push rdi",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov r12, rsp",
+    "sub rsp, 528",
+    "and rsp, -16",
+    "fxsave64 [rsp]",
+    "call x86_irq_dispatch",
+    "fxrstor64 [rsp]",
+    "mov rsp, r12",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rdi",
+    "pop rsi",
+    "pop rbp",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "iretq",
+    ".global x86_page_fault_entry",
+    "x86_page_fault_entry:",
+    "cld",
+    "push rax",
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rbp",
+    "push rsi",
+    "push rdi",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov r12, rsp",
+    "sub rsp, 528",
+    "and rsp, -16",
+    "fxsave64 [rsp]",
+    "mov rdi, cr2",
+    "mov rsi, [r12 + 120]",
+    "call x86_page_fault_dispatch",
+    "fxrstor64 [rsp]",
+    "mov rsp, r12",
+    "test rax, rax",
+    "jz x86_unhandled_interrupt",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rdi",
+    "pop rsi",
+    "pop rbp",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "add rsp, 8",
+    "iretq",
+    ".global x86_spurious_interrupt",
+    "x86_spurious_interrupt:",
+    "iretq",
 );
 
 unsafe extern "C" {
     fn x86_unhandled_interrupt();
+    fn x86_irq_entry();
+    fn x86_page_fault_entry();
+    fn x86_spurious_interrupt();
 }
+
+const VIRTIO_VECTOR: usize = 0x40;
+const SPURIOUS_VECTOR: usize = 0xff;
+const LOCAL_APIC_BASE: usize = 0xfee0_0000;
+const IO_APIC_BASE: usize = 0xfec0_0000;
+const APIC_BASE_MSR: u32 = 0x1b;
+const APIC_ENABLE: u64 = 1 << 11;
+const X2APIC_ENABLE: u64 = 1 << 10;
+const VIRTIO_GSI_BASE: usize = 5;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -51,11 +153,20 @@ struct IdtPointer {
 static mut IDT: [IdtEntry; 256] = [IdtEntry::interrupt(0); 256];
 
 pub(crate) unsafe fn initialize() {
-    let handler = x86_unhandled_interrupt as usize;
+    let handler = x86_unhandled_interrupt as *const () as usize;
     let entries = addr_of_mut!(IDT).cast::<IdtEntry>();
     for index in 0..256 {
         entries.add(index).write(IdtEntry::interrupt(handler));
     }
+    entries
+        .add(VIRTIO_VECTOR)
+        .write(IdtEntry::interrupt(x86_irq_entry as *const () as usize));
+    entries
+        .add(14)
+        .write(IdtEntry::interrupt(x86_page_fault_entry as *const () as usize));
+    entries
+        .add(SPURIOUS_VECTOR)
+        .write(IdtEntry::interrupt(x86_spurious_interrupt as *const () as usize));
     let pointer = IdtPointer {
         limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
         base: addr_of!(IDT) as u64,
@@ -65,6 +176,94 @@ pub(crate) unsafe fn initialize() {
         pointer = in(reg) &pointer,
         options(readonly, nostack, preserves_flags),
     );
+}
+
+pub(crate) fn initialize_controller() -> bool {
+    let apic_base = read_msr(APIC_BASE_MSR);
+    if apic_base & X2APIC_ENABLE != 0 {
+        return false;
+    }
+    write_msr(APIC_BASE_MSR, apic_base | APIC_ENABLE);
+
+    write_local_apic(0x80, 0);
+    write_local_apic(0xf0, (1 << 8) | SPURIOUS_VECTOR as u32);
+    let apic_id = read_local_apic(0x20) & 0xff00_0000;
+
+    let maximum_irq = (read_io_apic(1) >> 16) & 0xff;
+    if maximum_irq < VIRTIO_GSI_BASE as u32 {
+        return false;
+    }
+    for irq in 0..=maximum_irq as usize {
+        let redirection = 0x10 + (irq * 2) as u8;
+        write_io_apic(redirection + 1, apic_id);
+        write_io_apic(redirection, (1 << 16) | VIRTIO_VECTOR as u32);
+    }
+
+    let window = crate::platform::virtio_window();
+    let first_unrouted_irq = maximum_irq as usize + 1;
+    let last_virtio_irq = (VIRTIO_GSI_BASE + window.slots).min(first_unrouted_irq);
+    for irq in VIRTIO_GSI_BASE..last_virtio_irq {
+        let redirection = 0x10 + (irq * 2) as u8;
+        write_io_apic(redirection, (1 << 15) | VIRTIO_VECTOR as u32);
+    }
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn x86_irq_dispatch() {
+    crate::kz_handle_virtio_interrupt();
+    write_local_apic(0xb0, 0);
+}
+
+fn read_msr(index: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") index,
+            out("eax") low,
+            out("edx") high,
+            options(nostack, preserves_flags),
+        );
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+fn write_msr(index: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") index,
+            in("eax") low,
+            in("edx") high,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+fn read_local_apic(offset: usize) -> u32 {
+    unsafe { core::ptr::read_volatile((LOCAL_APIC_BASE + offset) as *const u32) }
+}
+
+fn write_local_apic(offset: usize, value: u32) {
+    unsafe { core::ptr::write_volatile((LOCAL_APIC_BASE + offset) as *mut u32, value) }
+}
+
+fn read_io_apic(index: u8) -> u32 {
+    unsafe {
+        core::ptr::write_volatile(IO_APIC_BASE as *mut u32, u32::from(index));
+        core::ptr::read_volatile((IO_APIC_BASE + 0x10) as *const u32)
+    }
+}
+
+fn write_io_apic(index: u8, value: u32) {
+    unsafe {
+        core::ptr::write_volatile(IO_APIC_BASE as *mut u32, u32::from(index));
+        core::ptr::write_volatile((IO_APIC_BASE + 0x10) as *mut u32, value);
+    }
 }
 
 pub(crate) fn disable() -> u64 {
@@ -106,4 +305,20 @@ pub(crate) fn enabled() -> bool {
         );
     }
     flags & (1 << 9) != 0
+}
+
+#[no_mangle]
+extern "C" fn x86_page_fault_dispatch(address: usize, error_code: u64) -> u64 {
+    const REJECTED_FAULT_BITS: u64 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6);
+    if error_code & REJECTED_FAULT_BITS != 0 {
+        return 0;
+    }
+    let access = if error_code & (1 << 4) != 0 {
+        crate::memory::FaultAccess::Execute
+    } else if error_code & (1 << 1) != 0 {
+        crate::memory::FaultAccess::Write
+    } else {
+        crate::memory::FaultAccess::Read
+    };
+    crate::memory::resolve_page_fault(address, access) as u64
 }

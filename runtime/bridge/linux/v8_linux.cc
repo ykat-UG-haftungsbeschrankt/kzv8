@@ -14,8 +14,10 @@ struct LinuxV8Runtime {
   bool platform_initialized = false;
   bool initialized = false;
 
-  LinuxV8Runtime() : platform(v8::platform::NewDefaultPlatform()) {
+  LinuxV8Runtime()
+      : platform(v8::platform::NewSingleThreadedDefaultPlatform()) {
     if (!platform) return;
+    v8::V8::SetFlagsFromString("--single-threaded");
     v8::V8::InitializePlatform(platform.get());
     platform_initialized = true;
     initialized = v8::V8::Initialize();

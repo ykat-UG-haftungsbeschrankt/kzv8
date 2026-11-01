@@ -1,7 +1,4 @@
-use core::cell::UnsafeCell;
-use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
-
+use crate::sync::{IrqSpinGuard, IrqSpinLock};
 use crate::virtio_transport::{Error, VirtioTransport};
 
 const DESC_NEXT: u16 = 1;
@@ -180,52 +177,17 @@ impl<const N: usize> VirtQueue<N> {
 }
 
 pub(crate) struct QueueCell<const N: usize> {
-    locked: AtomicBool,
-    queue: UnsafeCell<VirtQueue<N>>,
+    queue: IrqSpinLock<VirtQueue<N>>,
 }
-
-unsafe impl<const N: usize> Sync for QueueCell<N> {}
 
 impl<const N: usize> QueueCell<N> {
     pub(crate) const fn new() -> Self {
         Self {
-            locked: AtomicBool::new(false),
-            queue: UnsafeCell::new(VirtQueue::new()),
+            queue: IrqSpinLock::new(VirtQueue::new()),
         }
     }
 
-    pub(crate) fn lock(&self) -> QueueGuard<'_, N> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        QueueGuard { cell: self }
-    }
-}
-
-pub(crate) struct QueueGuard<'a, const N: usize> {
-    cell: &'a QueueCell<N>,
-}
-
-impl<const N: usize> Deref for QueueGuard<'_, N> {
-    type Target = VirtQueue<N>;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.cell.queue.get() }
-    }
-}
-
-impl<const N: usize> DerefMut for QueueGuard<'_, N> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.cell.queue.get() }
-    }
-}
-
-impl<const N: usize> Drop for QueueGuard<'_, N> {
-    fn drop(&mut self) {
-        self.cell.locked.store(false, Ordering::Release);
+    pub(crate) fn lock(&self) -> IrqSpinGuard<'_, VirtQueue<N>> {
+        self.queue.lock()
     }
 }

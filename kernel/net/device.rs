@@ -19,6 +19,10 @@ impl EthernetDevice {
     pub(crate) const fn mac_address(&self) -> [u8; 6] {
         self.device.mac_address()
     }
+
+    pub(crate) fn interrupt_slot(&self) -> usize {
+        self.device.interrupt_slot()
+    }
 }
 
 pub(crate) struct RxToken {

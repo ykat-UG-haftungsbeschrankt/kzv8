@@ -47,4 +47,18 @@ impl<T: Copy, const N: usize> CompletionQueue<T, N> {
     pub(crate) const fn is_empty(&self) -> bool {
         self.length == 0
     }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(T) -> bool) {
+        let mut entries = [None; N];
+        let mut length = 0;
+        while let Some(entry) = self.pop() {
+            if keep(entry) {
+                entries[length] = Some(entry);
+                length += 1;
+            }
+        }
+        self.entries = entries;
+        self.head = 0;
+        self.length = length;
+    }
 }

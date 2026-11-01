@@ -16,10 +16,17 @@ impl BlockDevice {
         self.device.capacity_sectors()
     }
 
-    pub(crate) fn submit(&mut self, request: Request<'_>) -> Result<(), virtio_block::Error> {
+    pub(crate) fn interrupt_slot(&self) -> usize {
+        self.device.interrupt_slot()
+    }
+
+    pub(crate) fn submit<'a>(
+        &'a mut self,
+        request: Request<'a>,
+    ) -> Result<virtio_block::BlockTransfer<'a>, virtio_block::Error> {
         match request.operation {
-            Operation::Read(output) => self.device.read_sectors(request.sector, output),
-            Operation::Write(input) => self.device.write_sectors(request.sector, input),
+            Operation::Read(output) => self.device.submit_read(request.sector, output),
+            Operation::Write(input) => self.device.submit_write(request.sector, input),
         }
     }
 }
