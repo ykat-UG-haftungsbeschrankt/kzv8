@@ -80,6 +80,57 @@ pub unsafe extern "C" fn mmap(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn mmap64(
+    address_hint: *mut c_void,
+    length: usize,
+    protection: i32,
+    flags: i32,
+    file_descriptor: i32,
+    offset: i64,
+) -> *mut c_void {
+    unsafe { mmap(address_hint, length, protection, flags, file_descriptor, offset) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mprotect(
+    address: *mut c_void,
+    length: usize,
+    protection: i32,
+) -> i32 {
+    if address.is_null() || address as usize % PAGE_SIZE != 0 || length == 0 {
+        set_errno(EINVAL);
+        return -1;
+    }
+    let Some(permissions) = page_permissions(protection) else {
+        set_errno(EINVAL);
+        return -1;
+    };
+    if !crate::arch::set_page_permissions(address as usize, length, permissions) {
+        set_errno(ENOMEM);
+        return -1;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn madvise(
+    address: *mut c_void,
+    length: usize,
+    advice: i32,
+) -> i32 {
+    if address.is_null()
+        || address as usize % PAGE_SIZE != 0
+        || length == 0
+        || rounded_length(length).is_none()
+        || !matches!(advice, MADV_WILLNEED | MADV_DONTNEED | MADV_FREE)
+    {
+        set_errno(EINVAL);
+        return -1;
+    }
+    0
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn munmap(address: *mut c_void, length: usize) -> i32 {
     let address = address as usize;
     if address == 0 || address % PAGE_SIZE != 0 || length == 0 {

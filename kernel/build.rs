@@ -98,7 +98,9 @@ fn main() {
     let include_dir = repository_dir.join("runtime/bridge/linux/include");
     let c_sources = [
         ("runtime/bridge/linux/stdio.c", "stdio.o"),
+        ("runtime/bridge/linux/format.c", "format.o"),
         ("runtime/bridge/linux/string.c", "string.o"),
+        ("runtime/bridge/linux/posix.c", "posix.o"),
         ("runtime/bridge/linux/stdio_smoke.c", "stdio_smoke.o"),
         ("runtime/bridge/linux/malloc_smoke.c", "malloc_smoke.o"),
         ("runtime/bridge/linux/mmap_smoke.c", "mmap_smoke.o"),
@@ -112,6 +114,9 @@ fn main() {
         "pthread.h",
         "errno.h",
         "sys/mman.h",
+        "time.h",
+        "unistd.h",
+        "sys/uio.h",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -197,6 +202,10 @@ fn main() {
                     "-DV8_HAVE_TARGET_OS",
                     "-DV8_TARGET_OS_LINUX",
                     "-DV8_TARGET_ARCH_X64",
+                    "-DV8_ENABLE_SANDBOX",
+                    "-DV8_COMPRESS_POINTERS",
+                    "-DV8_COMPRESS_POINTERS_IN_SHARED_CAGE",
+                    "-DV8_31BIT_SMIS_ON_64BIT_ARCH",
                 ])
                 .arg("-I")
                 .arg(v8_source.join("buildtools/third_party/libc++"))

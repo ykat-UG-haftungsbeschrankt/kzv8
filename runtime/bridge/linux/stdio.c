@@ -7,6 +7,13 @@
 
 #define OUTPUT_BUFFER_SIZE 512
 
+static FILE stdin_file = {0};
+static FILE stdout_file = {1};
+static FILE stderr_file = {2};
+FILE* stdin = &stdin_file;
+FILE* stdout = &stdout_file;
+FILE* stderr = &stderr_file;
+
 struct output_buffer {
     char bytes[OUTPUT_BUFFER_SIZE];
     size_t length;
@@ -90,6 +97,31 @@ static int emit_signed(struct output_buffer* output, long long value) {
 int putchar(int character) {
     const char byte = (char)(unsigned char)character;
     return kz_host_console_write(&byte, 1) == 1 ? (unsigned char)byte : EOF;
+}
+
+int fclose(FILE* stream) {
+    return stream == NULL ? EOF : 0;
+}
+
+int fflush(FILE* stream) {
+    return stream == NULL || stream == stdout || stream == stderr ? 0 : EOF;
+}
+
+int fputc(int character, FILE* stream) {
+    if (stream == NULL || (stream->descriptor != 1 && stream->descriptor != 2)) {
+        return EOF;
+    }
+    return putchar(character);
+}
+
+int fputs(const char* text, FILE* stream) {
+    if (text == NULL || stream == NULL ||
+        (stream->descriptor != 1 && stream->descriptor != 2)) {
+        return EOF;
+    }
+    size_t length = 0;
+    while (text[length] != '\0') length++;
+    return kz_host_console_write(text, length) == (int)length ? 0 : EOF;
 }
 
 int puts(const char* text) {

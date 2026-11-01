@@ -4,6 +4,7 @@ use core::slice::from_raw_parts_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_THREADS: usize = 8;
+const MAX_TLS_KEYS: usize = 64;
 const STACK_SIZE: usize = 16 * 1024;
 const MAIN_THREAD_ID: usize = 1;
 
@@ -35,6 +36,19 @@ struct PthreadCondition {
     generation: AtomicUsize,
 }
 
+#[derive(Clone, Copy)]
+struct TlsKey {
+    active: bool,
+    destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+impl TlsKey {
+    const EMPTY: Self = Self {
+        active: false,
+        destructor: None,
+    };
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ThreadState {
     Unused,
@@ -55,6 +69,7 @@ struct Thread {
     joiner: usize,
     detached: bool,
     errno: i32,
+    tls: [*mut c_void; MAX_TLS_KEYS],
 }
 
 impl Thread {
@@ -68,6 +83,7 @@ impl Thread {
         joiner: 0,
         detached: false,
         errno: 0,
+        tls: [core::ptr::null_mut(); MAX_TLS_KEYS],
     };
 }
 
@@ -76,6 +92,7 @@ impl Thread {
 struct ThreadStack([u8; STACK_SIZE]);
 
 static mut THREADS: [Thread; MAX_THREADS] = [Thread::EMPTY; MAX_THREADS];
+static mut TLS_KEYS: [TlsKey; MAX_TLS_KEYS] = [TlsKey::EMPTY; MAX_TLS_KEYS];
 static mut STACKS: [ThreadStack; MAX_THREADS] = [ThreadStack([0; STACK_SIZE]); MAX_THREADS];
 static mut CURRENT_SLOT: usize = 0;
 static mut NEXT_THREAD_ID: usize = MAIN_THREAD_ID + 1;
@@ -88,6 +105,10 @@ pub(crate) fn initialize() {
         let threads = addr_of_mut!(THREADS).cast::<Thread>();
         for index in 0..MAX_THREADS {
             threads.add(index).write(Thread::EMPTY);
+        }
+        let keys = addr_of_mut!(TLS_KEYS).cast::<TlsKey>();
+        for index in 0..MAX_TLS_KEYS {
+            keys.add(index).write(TlsKey::EMPTY);
         }
         threads.add(0).write(Thread {
             id: MAIN_THREAD_ID,
@@ -232,6 +253,145 @@ pub extern "C" fn pthread_self() -> usize {
 #[no_mangle]
 pub extern "C" fn pthread_equal(first: usize, second: usize) -> i32 {
     (first == second) as i32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_key_create(
+    key: *mut u32,
+    destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+) -> i32 {
+    if key.is_null() {
+        return EINVAL;
+    }
+    let interrupt_state = crate::arch::interrupts::disable();
+    let keys = addr_of_mut!(TLS_KEYS).cast::<TlsKey>();
+    for index in 0..MAX_TLS_KEYS {
+        let slot = unsafe { &mut *keys.add(index) };
+        if !slot.active {
+            *slot = TlsKey {
+                active: true,
+                destructor,
+            };
+            unsafe { key.write((index + 1) as u32) };
+            crate::arch::interrupts::restore(interrupt_state);
+            return 0;
+        }
+    }
+    crate::arch::interrupts::restore(interrupt_state);
+    EAGAIN
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_key_delete(key: u32) -> i32 {
+    if key == 0 || key as usize > MAX_TLS_KEYS {
+        return EINVAL;
+    }
+    let interrupt_state = crate::arch::interrupts::disable();
+    let index = key as usize - 1;
+    let keys = addr_of_mut!(TLS_KEYS).cast::<TlsKey>();
+    let slot = unsafe { &mut *keys.add(index) };
+    if !slot.active {
+        crate::arch::interrupts::restore(interrupt_state);
+        return EINVAL;
+    }
+    *slot = TlsKey::EMPTY;
+    let threads = addr_of_mut!(THREADS).cast::<Thread>();
+    for thread_index in 0..MAX_THREADS {
+        unsafe { (*threads.add(thread_index)).tls[index] = core::ptr::null_mut() };
+    }
+    crate::arch::interrupts::restore(interrupt_state);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_getspecific(key: u32) -> *mut c_void {
+    if key == 0 || key as usize > MAX_TLS_KEYS {
+        return core::ptr::null_mut();
+    }
+    let interrupt_state = crate::arch::interrupts::disable();
+    let index = key as usize - 1;
+    let value = unsafe {
+        let keys = addr_of_mut!(TLS_KEYS).cast::<TlsKey>();
+        let threads = addr_of_mut!(THREADS).cast::<Thread>();
+        if !INITIALIZED || !(*keys.add(index)).active {
+            core::ptr::null_mut()
+        } else {
+            (*threads.add(CURRENT_SLOT)).tls[index]
+        }
+    };
+    crate::arch::interrupts::restore(interrupt_state);
+    value
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setspecific(key: u32, value: *const c_void) -> i32 {
+    if key == 0 || key as usize > MAX_TLS_KEYS {
+        return EINVAL;
+    }
+    let interrupt_state = crate::arch::interrupts::disable();
+    let index = key as usize - 1;
+    let keys = addr_of_mut!(TLS_KEYS).cast::<TlsKey>();
+    if !INITIALIZED || !unsafe { (*keys.add(index)).active } {
+        crate::arch::interrupts::restore(interrupt_state);
+        return EINVAL;
+    }
+    let threads = addr_of_mut!(THREADS).cast::<Thread>();
+    unsafe { (*threads.add(CURRENT_SLOT)).tls[index] = value.cast_mut() };
+    crate::arch::interrupts::restore(interrupt_state);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_once(
+    once: *mut u32,
+    initializer: Option<unsafe extern "C" fn()>,
+) -> i32 {
+    if once.is_null() || initializer.is_none() {
+        return EINVAL;
+    }
+    let state = unsafe { &*once.cast::<core::sync::atomic::AtomicU32>() };
+    loop {
+        match state.load(Ordering::Acquire) {
+            2 => return 0,
+            0 => {
+                if state
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    unsafe { initializer.unwrap()() };
+                    state.store(2, Ordering::Release);
+                    return 0;
+                }
+            }
+            _ => {
+                if !switch_current(ThreadState::Ready) {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_getschedparam(
+    thread_id: usize,
+    policy: *mut i32,
+    parameters: *mut c_void,
+) -> i32 {
+    if policy.is_null() || parameters.is_null() {
+        return EINVAL;
+    }
+    let interrupt_state = crate::arch::interrupts::disable();
+    if unsafe { find_thread(thread_id) }.is_none() {
+        crate::arch::interrupts::restore(interrupt_state);
+        return ESRCH;
+    }
+    unsafe {
+        policy.write(0);
+        parameters.cast::<i32>().write(0);
+    }
+    crate::arch::interrupts::restore(interrupt_state);
+    0
 }
 
 #[no_mangle]

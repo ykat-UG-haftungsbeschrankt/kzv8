@@ -5,6 +5,8 @@
 #include <stdint.h>
 
 typedef uintptr_t pthread_t;
+typedef unsigned int pthread_key_t;
+typedef unsigned int pthread_once_t;
 typedef struct {
     size_t stack_size;
     int detach_state;
@@ -27,6 +29,7 @@ typedef struct {
 #define PTHREAD_STACK_MIN (16 * 1024)
 #define PTHREAD_MUTEX_INITIALIZER { 0 }
 #define PTHREAD_COND_INITIALIZER { 0 }
+#define PTHREAD_ONCE_INIT 0
 
 #ifndef EAGAIN
 #define EAGAIN 11
@@ -63,6 +66,12 @@ int pthread_join(pthread_t thread, void **result);
 int pthread_detach(pthread_t thread);
 pthread_t pthread_self(void);
 int pthread_equal(pthread_t first, pthread_t second);
+int pthread_key_create(pthread_key_t *key, void (*destructor)(void *));
+int pthread_key_delete(pthread_key_t key);
+void *pthread_getspecific(pthread_key_t key);
+int pthread_setspecific(pthread_key_t key, const void *value);
+int pthread_once(pthread_once_t *once, void (*initializer)(void));
+int pthread_getschedparam(pthread_t thread, int *policy, void *parameters);
 void pthread_exit(void *result) __attribute__((noreturn));
 int pthread_yield(void);
 int sched_yield(void);

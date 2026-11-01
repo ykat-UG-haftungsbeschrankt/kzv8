@@ -29,6 +29,7 @@ def check(architecture):
         errors = (timeout.stderr or b"").decode(errors="replace")
     expected = f"kz: {architecture} Rust kernel booted\n"
     expected += "kz: virtio-console transmit OK\n"
+    expected += "kz: Rust futures smoke OK\n"
     expected += "kz: C stdio printf 42 hello 0x2a\n"
     expected += "kz: C stdio puts works\n"
     expected += "!\n"

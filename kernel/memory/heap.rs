@@ -244,6 +244,42 @@ impl SlabAllocator {
             return;
         }
     }
+
+    unsafe fn allocation_capacity(&self, pointer: *const u8) -> Option<usize> {
+        if pointer.is_null() || !INITIALIZED.load(Ordering::Acquire) {
+            return None;
+        }
+        let address = pointer as usize;
+        let allocations = addr_of_mut!(LARGE_ALLOCATIONS).cast::<LargeAllocation>();
+        for index in 0..MAX_LARGE_ALLOCATIONS {
+            let allocation = unsafe { &*allocations.add(index) };
+            if allocation.active && allocation.address == address {
+                return Some(allocation.length);
+            }
+        }
+
+        let page = address & !(PAGE_SIZE - 1);
+        let slabs = addr_of_mut!(SLABS).cast::<Slab>();
+        for index in 0..MAX_SLABS {
+            let slab = unsafe { &*slabs.add(index) };
+            if !slab.active || slab.page != page {
+                continue;
+            }
+            let class_size = CLASS_SIZES[slab.class_index];
+            let offset = address - page;
+            if offset % class_size != 0 {
+                return None;
+            }
+            let slot = offset / class_size;
+            if slot >= PAGE_SIZE / class_size {
+                return None;
+            }
+            let mask = 1u64 << (slot % u64::BITS as usize);
+            return (slab.bitmap[slot / u64::BITS as usize] & mask != 0)
+                .then_some(class_size);
+        }
+        None
+    }
 }
 
 unsafe impl GlobalAlloc for SlabAllocator {
@@ -345,4 +381,58 @@ pub extern "C" fn free(pointer: *mut c_void) {
             GLOBAL_ALLOCATOR.dealloc(pointer.cast::<u8>(), Layout::new::<u8>());
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn malloc_usable_size(pointer: *mut c_void) -> usize {
+    let _guard = lock_heap();
+    unsafe {
+        GLOBAL_ALLOCATOR
+            .allocation_capacity(pointer.cast::<u8>())
+            .unwrap_or(0)
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
+    let Some(total) = count.checked_mul(size) else {
+        return null_mut();
+    };
+    let pointer = malloc(total);
+    if !pointer.is_null() {
+        unsafe { pointer.cast::<u8>().write_bytes(0, total) };
+    }
+    pointer
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn realloc(pointer: *mut c_void, size: usize) -> *mut c_void {
+    if pointer.is_null() {
+        return malloc(size);
+    }
+    if size == 0 {
+        free(pointer);
+        return null_mut();
+    }
+
+    let capacity = {
+        let _guard = lock_heap();
+        unsafe { GLOBAL_ALLOCATOR.allocation_capacity(pointer.cast::<u8>()) }
+    };
+    let Some(capacity) = capacity else {
+        return null_mut();
+    };
+    let replacement = malloc(size);
+    if replacement.is_null() {
+        return null_mut();
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            pointer.cast::<u8>(),
+            replacement.cast::<u8>(),
+            capacity.min(size),
+        );
+    }
+    free(pointer);
+    replacement
 }

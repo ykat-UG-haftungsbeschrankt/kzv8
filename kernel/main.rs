@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 extern crate alloc;
 
 mod arch;
@@ -43,6 +45,8 @@ mod runtime_ffi;
 #[path = "runtime/host.rs"]
 mod runtime_host;
 mod sync;
+#[path = "task.rs"]
+mod task;
 #[path = "drivers/virtio/block.rs"]
 mod virtio_block;
 #[path = "drivers/virtio/net.rs"]
@@ -60,6 +64,8 @@ extern "C" {
     fn kz_c_mmap_smoke() -> i32;
     fn kz_c_pthread_smoke() -> i32;
 }
+
+static FUTURE_SMOKE_DONE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_arch = "x86_64")]
 extern "C" {
@@ -120,6 +126,10 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         let _event = events.wait(now_ns);
     }
     let console_ready = console::initialize();
+    let future_smoke_started = task::spawn(futures_smoke()).is_ok();
+    if future_smoke_started {
+        task::run_until_stalled();
+    }
     arch::interrupts::enable();
     if console_ready {
         #[cfg(target_arch = "x86_64")]
@@ -127,6 +137,9 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         #[cfg(target_arch = "aarch64")]
         let message = b"kz: aarch64 Rust kernel booted\n";
         if console::write(message) && console::write(b"kz: virtio-console transmit OK\n") {
+            if future_smoke_started && FUTURE_SMOKE_DONE.load(Ordering::Acquire) {
+                let _future_status = console::write(b"kz: Rust futures smoke OK\n");
+            }
             let _stdio_status = unsafe { kz_c_stdio_smoke() };
             if physical::memory_bytes() > 128 * 1024 * 1024 {
                 let _memory_status = console::write(b"kz: RAM above 128 MiB detected\n");
@@ -161,7 +174,12 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
             let _v8_status = console::write(b"kz: V8 not integrated\n");
         }
     }
-    arch::halt()
+    task::run_forever()
+}
+
+async fn futures_smoke() {
+    task::yield_now().await;
+    FUTURE_SMOKE_DONE.store(true, Ordering::Release);
 }
 
 #[panic_handler]

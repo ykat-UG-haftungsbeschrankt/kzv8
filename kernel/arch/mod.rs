@@ -113,5 +113,23 @@ pub(crate) fn page_is_mapped(virtual_address: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         ram_map::page_is_mapped(virtual_address)
+
+pub(crate) fn notify_executor() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("sev");
+    }
+}
+
+pub(crate) fn wait_for_interrupt() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("sti", "hlt");
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("msr daifclr, #0xf", "wfe");
+    }
+}
     }
 }

@@ -86,3 +86,20 @@ int strncmp(const char* left, const char* right, size_t count) {
     }
     return 0;
 }
+
+char* strchr(const char* text, int character) {
+    const char target = (char)character;
+    while (*text != target) {
+        if (*text == '\0') return NULL;
+        text++;
+    }
+    return (char*)text;
+}
+
+void* __memcpy_chk(void* destination, const void* source, size_t count,
+                   size_t destination_size) {
+    if (count > destination_size) {
+        __builtin_trap();
+    }
+    return memcpy(destination, source, count);
+}
