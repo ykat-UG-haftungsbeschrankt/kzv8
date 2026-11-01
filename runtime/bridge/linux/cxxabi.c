@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <stdint.h>
 
 #define MAX_EXIT_HANDLERS 256
 
@@ -27,4 +28,38 @@ void __cxa_finalize(void* dso) {
         handler->active = 0;
         handler->destructor(handler->object);
     }
+}
+
+typedef int UnwindReasonCode;
+typedef uintptr_t UnwindWord;
+typedef struct UnwindContext UnwindContext;
+typedef struct UnwindException UnwindException;
+
+UnwindWord _Unwind_GetRegionStart(UnwindContext* context) {
+    (void)context;
+    return 0;
+}
+
+void* _Unwind_GetLanguageSpecificData(UnwindContext* context) {
+    (void)context;
+    return NULL;
+}
+
+void _Unwind_SetIP(UnwindContext* context, UnwindWord instruction_pointer) {
+    (void)context;
+    (void)instruction_pointer;
+}
+
+UnwindReasonCode _Unwind_RaiseException(UnwindException* exception) {
+    (void)exception;
+    return 3;
+}
+
+void _Unwind_Resume(UnwindException* exception) {
+    (void)exception;
+    __builtin_trap();
+}
+
+void _Unwind_DeleteException(UnwindException* exception) {
+    (void)exception;
 }

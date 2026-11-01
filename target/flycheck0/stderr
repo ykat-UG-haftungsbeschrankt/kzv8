@@ -444,7 +444,7 @@ Caused by:
   fatal error: too many errors emitted, stopping now [-ferror-limit=]
   1 warning and 20 errors generated.
 
-  thread 'main' (453767) panicked at kernel/build.rs:245:13:
+  thread 'main' (454537) panicked at kernel/build.rs:245:13:
   failed to compile /home/axu/kz/runtime/bridge/src/platform.cc
   stack backtrace:
      0: __rustc::rust_begin_unwind

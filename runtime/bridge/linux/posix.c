@@ -37,6 +37,7 @@
 #define PR_SET_VMA_ANON_NAME 0
 #define MREMAP_MAYMOVE 1
 
+extern void __cxa_finalize(void* dso);
 extern int kz_host_console_write(const char* data, size_t length);
 extern uint64_t kz_host_time_ns(void);
 extern int64_t kz_host_wall_time_ms(void);
@@ -380,6 +381,28 @@ int __xpg_strerror_r(int error, char* buffer, size_t length) {
     return text[index] == '\0' ? 0 : ERANGE;
 }
 
+int strerror_r(int error, char* buffer, size_t length) {
+    return __xpg_strerror_r(error, buffer, length);
+}
+
+void exit(int status) {
+    (void)status;
+    __cxa_finalize(NULL);
+    fflush(NULL);
+    _exit(status);
+}
+
+int getc(FILE* stream) {
+    (void)stream;
+    return EOF;
+}
+
+int ungetc(int character, FILE* stream) {
+    (void)character;
+    (void)stream;
+    return EOF;
+}
+
 char* getenv(const char* name) {
     (void)name;
     return NULL;
@@ -591,6 +614,14 @@ size_t __mbrlen(const char* text, size_t length, void* state) {
         if (((unsigned char)text[index] & 0xc0) != 0x80) return (size_t)-1;
     }
     return expected;
+}
+
+wchar_t* wmemchr(const wchar_t* memory, wchar_t value, size_t count) {
+    if (memory == NULL) return NULL;
+    for (size_t index = 0; index < count; index++) {
+        if (memory[index] == value) return (wchar_t*)(memory + index);
+    }
+    return NULL;
 }
 
 void abort(void) {

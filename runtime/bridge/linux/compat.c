@@ -23,6 +23,9 @@ static struct LocaleStub c_locale = {1};
 static int lower_table_initialized;
 static int lower_table_storage[384];
 static const int* lower_table = &lower_table_storage[128];
+static int upper_table_initialized;
+static int upper_table_storage[384];
+static const int* upper_table = &upper_table_storage[128];
 
 const int** __ctype_tolower_loc(void) {
     if (!lower_table_initialized) {
@@ -36,6 +39,17 @@ const int** __ctype_tolower_loc(void) {
 }
 
 size_t __ctype_get_mb_cur_max(void) { return 4; }
+
+const int** __ctype_toupper_loc(void) {
+    if (!upper_table_initialized) {
+        for (int value = 0; value < 256; value++) {
+            upper_table_storage[value + 128] =
+                value >= 'a' && value <= 'z' ? value - ('a' - 'A') : value;
+        }
+        upper_table_initialized = 1;
+    }
+    return &upper_table;
+}
 
 void* newlocale(int category_mask, const char* locale_name, void* base) {
     (void)category_mask;
