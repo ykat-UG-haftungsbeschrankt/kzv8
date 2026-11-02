@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::IrqSpinLock;
 
 const PAGE_SIZE: usize = 4096;
-const MAX_FRAMES: usize = crate::platform::MAX_PHYSICAL_ADDRESS / PAGE_SIZE;
+const MAX_FRAMES: usize = crate::memory_resources::MAX_PHYSICAL_ADDRESS / PAGE_SIZE;
 const BITMAP_WORDS: usize = MAX_FRAMES / u64::BITS as usize;
 
 static BITMAP: [AtomicU64; BITMAP_WORDS] = [const { AtomicU64::new(u64::MAX) }; BITMAP_WORDS];
@@ -49,7 +49,7 @@ pub(crate) fn initialize() -> bool {
     let mut frame_count = 0;
     let mut total_frames = 0;
     let mut next_hint = None;
-    for region in crate::platform::memory_regions() {
+    for region in crate::memory_resources::memory_regions() {
         let Some(region_end) = region.start.checked_add(region.length) else {
             continue;
         };
@@ -60,7 +60,7 @@ pub(crate) fn initialize() -> bool {
         else {
             continue;
         };
-        let end_address = region_end.min(crate::platform::MAX_PHYSICAL_ADDRESS) & !(PAGE_SIZE - 1);
+        let end_address = region_end.min(crate::memory_resources::MAX_PHYSICAL_ADDRESS) & !(PAGE_SIZE - 1);
         if start_address >= end_address {
             continue;
         }
@@ -241,7 +241,7 @@ pub(crate) fn deallocate_contiguous(address: usize, length: usize) -> bool {
 
 pub(crate) fn deallocate(frame: Frame) -> bool {
     let _guard = ALLOCATOR_LOCK.lock();
-    if frame.address % PAGE_SIZE != 0 || frame.address >= crate::platform::MAX_PHYSICAL_ADDRESS {
+    if frame.address % PAGE_SIZE != 0 || frame.address >= crate::memory_resources::MAX_PHYSICAL_ADDRESS {
         return false;
     }
     let index = frame.address / PAGE_SIZE;

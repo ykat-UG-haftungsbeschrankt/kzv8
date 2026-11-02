@@ -121,7 +121,7 @@ pub(crate) fn map_page(
     let Some(physical_end) = physical_address.checked_add(PAGE_SIZE) else {
         return false;
     };
-    if physical_end > crate::platform::MAX_PHYSICAL_ADDRESS
+    if physical_end > crate::memory_resources::MAX_PHYSICAL_ADDRESS
         || (matches!(permissions, 1 | 2) && !NX_ENABLED.load(Ordering::Acquire))
     {
         return false;

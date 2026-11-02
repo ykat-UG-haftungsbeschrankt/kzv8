@@ -29,8 +29,9 @@ This is not yet a JavaScript runtime or a complete operating system.
 - A bounded, cooperative pthread subset with fixed stacks, join/detach, mutexes,
   and condition variables.
 - A freestanding x86_64 V8 embedder with a cooperative task runner and kernel
-  page allocator; its smoke test evaluates `6 * 7`. V8 is not integrated on
-  AArch64.
+  page allocator. JavaScript can poll the kernel event loop through `kz.events`;
+  the smoke test verifies a timer event and evaluates `6 * 7`. Block and network
+  operations are not yet exposed to JavaScript. V8 is not integrated on AArch64.
 - QEMU smoke tests for both architectures. They verify interrupt-driven console
   completions, memory discovery, `mmap`, pthreads, C allocation, and stdio
   output; x86_64 also verifies lazy page faults and the V8 smoke test.
@@ -51,13 +52,13 @@ rustup target add x86_64-unknown-none aarch64-unknown-none
 make test
 ```
 
-The root Cargo workspace contains the freestanding kernel package.
+The root Cargo manifest defines the freestanding kernel package.
 `rust-toolchain.toml` selects stable Rust and the two targets. The kernel's
 build script assembles architecture entry code with Clang and applies the
 architecture-specific linker script. Make packages the resulting x86 ELF and
 AArch64 binary, then runs the QEMU smoke tests.
 
-The smoke runner captures each guest for up to five seconds and then stops it.
+The smoke runner captures each guest for up to ten seconds and then stops it.
 A healthy x86_64 guest emits:
 
 ```text
@@ -84,6 +85,7 @@ kz: V8 isolate created
 kz: V8 context created
 kz: V8 script compiled
 kz: V8 script ran
+kz: V8 event loop smoke OK
 kz: JS result: 42
 kz: V8 disposing isolate
 kz: V8 isolate disposed
@@ -95,6 +97,13 @@ kz: V8 evaluated 6 * 7 = 42
 
 The AArch64 guest prints `aarch64` instead of `x86_64`, has no lazy-fault or V8
 allocator diagnostic, omits the 4 GiB line, and ends with `kz: V8 not integrated`.
+
+The x86_64 V8 context exposes `kz.events.poll()`, `scheduleTimer(delayNs)`,
+`cancelTimer(id)`, `register(sourceId, flags, data)`, `modify(token, flags, data)`,
+`setReadiness(token, flags)`, `deregister(token)`, `complete(id, status)`, and
+`nextDeadline()`. Polling is nonblocking and returns `null` or one event with a
+kind, flags, id, status, and data. This API exposes the generic event loop; it
+does not yet connect JavaScript operations to the block or network drivers.
 
 ## Interactive runs
 

@@ -10,6 +10,7 @@ mod entry;
 pub(crate) mod interrupts;
 mod paging;
 mod ram_map;
+#[path = "../../../arch/aarch64/threads.rs"]
 mod threads;
 pub(crate) mod timer;
 mod virtio;
@@ -31,7 +32,7 @@ pub(crate) const fn virtio_window() -> crate::arch::VirtioWindow {
 pub(crate) fn initialize_mmu() {
     unsafe {
         paging::initialize();
-        ram_map::map_memory_regions(crate::platform::memory_regions());
+        ram_map::map_memory_regions(crate::memory_resources::memory_regions());
     }
 }
 
@@ -59,7 +60,7 @@ pub(crate) fn decommit_debug(_code: u8) {}
 
 pub(crate) fn is_identity_mapped(address: usize) -> bool {
     address < 0x4000_0000
-        || crate::platform::memory_regions().iter().any(|region| {
+        || crate::memory_resources::memory_regions().iter().any(|region| {
             region
                 .start
                 .checked_add(region.length)
@@ -87,7 +88,7 @@ pub(crate) fn v8_page_allocator_smoke() -> bool {
     false
 }
 
-pub(crate) fn run_v8_smoke() -> Option<i32> {
+pub(crate) fn run_v8_smoke(_events: &mut crate::event_loop::EventLoop<16>) -> Option<i32> {
     None
 }
 

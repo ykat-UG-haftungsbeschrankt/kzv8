@@ -154,7 +154,7 @@ pub(crate) fn initialize(fdt: usize) -> bool {
         return false;
     }
 
-    crate::platform::reset_memory_regions();
+    crate::memory_resources::reset_memory_regions();
     reset_cpu_info();
     let mut address_cells = 2usize;
     let mut size_cells = 1usize;
@@ -342,7 +342,7 @@ pub(crate) fn initialize(fdt: usize) -> bool {
                         let (Some(address), Some(size)) = (address, size) else {
                             return false;
                         };
-                        if !crate::platform::add_memory_region(address, size) {
+                        if !crate::memory_resources::add_memory_region(address, size) {
                             return false;
                         }
                         reg_offset += tuple_size;
@@ -358,5 +358,5 @@ pub(crate) fn initialize(fdt: usize) -> bool {
             _ => return false,
         }
     }
-    !crate::platform::memory_regions().is_empty()
+    !crate::memory_resources::memory_regions().is_empty()
 }

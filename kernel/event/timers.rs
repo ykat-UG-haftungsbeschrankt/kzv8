@@ -13,6 +13,19 @@ pub(crate) struct TimerId {
     generation: u64,
 }
 
+impl TimerId {
+    pub(crate) const fn raw(self) -> u64 {
+        (self.generation << 8) | self.index as u64
+    }
+
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self {
+            index: (raw & 0xff) as usize,
+            generation: raw >> 8,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Timer {
     id: TimerId,

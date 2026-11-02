@@ -31,8 +31,9 @@ mod event_timers;
 mod heap;
 #[path = "memory/mmap.rs"]
 mod kernel_mmap;
-#[path = "thread.rs"]
-mod kernel_thread;
+mod scheduler;
+pub(crate) use scheduler::sync;
+pub(crate) use scheduler::thread as kernel_thread;
 #[path = "memory/virtual.rs"]
 mod memory;
 #[path = "net/device.rs"]
@@ -43,15 +44,12 @@ mod net_stack;
 mod net_tcp;
 #[path = "memory/physical.rs"]
 mod physical;
-#[path = "platform/resources.rs"]
-mod platform;
+#[path = "memory/resources.rs"]
+mod memory_resources;
 #[path = "../runtime/ffi.rs"]
 mod runtime_ffi;
 #[path = "../runtime/libc/mod.rs"]
 mod runtime_libc;
-mod sync;
-#[path = "task.rs"]
-mod task;
 #[path = "drivers/virtio/block.rs"]
 mod virtio_block;
 #[path = "drivers/virtio/net.rs"]
@@ -125,9 +123,9 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         let _event = events.wait(now_ns);
     }
     let console_ready = console::initialize();
-    let future_smoke_started = task::spawn(futures_smoke()).is_ok();
+    let future_smoke_started = scheduler::task::spawn(futures_smoke()).is_ok();
     if future_smoke_started {
-        task::run_until_stalled();
+        scheduler::task::run_until_stalled();
     }
     arch::interrupts::enable();
     if console_ready {
@@ -154,7 +152,7 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
             if arch::v8_page_allocator_smoke() {
                 let _page_allocator = console::write(b"kz: V8 page allocator hooks OK\n");
             }
-            match arch::run_v8_smoke() {
+            match arch::run_v8_smoke(&mut events) {
                 Some(0) => {}
                 Some(_) => {
                     let _v8_error = console::write(b"kz: V8 smoke failed\n");
@@ -165,11 +163,11 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
             }
         }
     }
-    task::run_forever()
+    scheduler::task::run_forever()
 }
 
 async fn futures_smoke() {
-    task::yield_now().await;
+    scheduler::task::yield_now().await;
     FUTURE_SMOKE_DONE.store(true, Ordering::Release);
 }
 

@@ -1,5 +1,19 @@
+[package]
+name = "kz-kernel"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "kernel"
+path = "kernel/main.rs"
+test = false
+bench = false
+
+[dependencies]
+smoltcp = { version = "0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
+
 [workspace]
-members = ["kernel"]
 resolver = "2"
 
 [profile.dev]

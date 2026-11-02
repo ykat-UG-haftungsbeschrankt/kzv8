@@ -7,7 +7,35 @@
 
 use core::arch::x86_64::__cpuid;
 
-pub(crate) fn initialize() {}
+const TIMER_TICK_HZ: u64 = 100;
+const CALIBRATION_WINDOW_MS: u64 = 20;
+const FALLBACK_INITIAL_COUNT: u32 = 100_000;
+
+pub(crate) fn initialize() {
+    let initial_count = frequency_hz()
+        .and_then(|frequency| {
+            let calibration_cycles = frequency.saturating_mul(CALIBRATION_WINDOW_MS) / 1000;
+            if calibration_cycles == 0 {
+                return None;
+            }
+
+            crate::arch::interrupts::begin_timer_calibration();
+            let start = ticks();
+            while ticks().wrapping_sub(start) < calibration_cycles {
+                core::hint::spin_loop();
+            }
+
+            let elapsed_count = u64::from(
+                u32::MAX.wrapping_sub(crate::arch::interrupts::local_timer_current_count()),
+            );
+            let initial_count =
+                elapsed_count.saturating_mul(1000 / TIMER_TICK_HZ) / CALIBRATION_WINDOW_MS;
+            (initial_count > 0 && initial_count <= u64::from(u32::MAX))
+                .then_some(initial_count as u32)
+        })
+        .unwrap_or(FALLBACK_INITIAL_COUNT);
+    crate::arch::interrupts::initialize_timer(initial_count);
+}
 
 pub(crate) fn ticks() -> u64 {
     let low: u32;

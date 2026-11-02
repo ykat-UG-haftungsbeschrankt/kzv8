@@ -49,6 +49,7 @@ static mut SMOKE_MUTEX: PthreadMutex = PthreadMutex { owner: 0 };
 static mut SMOKE_CONDITION: PthreadCondition = PthreadCondition { generation: 0 };
 static SMOKE_READY: AtomicBool = AtomicBool::new(false);
 static SMOKE_FINISHED: AtomicUsize = AtomicUsize::new(0);
+static SMOKE_PREEMPTION_STAGE: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
@@ -220,6 +221,32 @@ unsafe extern "C" fn smoke_completion_worker(argument: *mut c_void) -> *mut c_vo
     argument
 }
 
+unsafe extern "C" fn smoke_preemption_worker(_argument: *mut c_void) -> *mut c_void {
+    SMOKE_PREEMPTION_STAGE.store(1, Ordering::Release);
+    while SMOKE_PREEMPTION_STAGE.load(Ordering::Acquire) < 2 {
+        core::hint::spin_loop();
+    }
+    SMOKE_PREEMPTION_STAGE.store(3, Ordering::Release);
+    core::ptr::null_mut()
+}
+
+fn wait_for_preemption_stage(stage: usize) -> bool {
+    let timeout_ticks = crate::arch::timer::frequency_hz().map(|frequency| frequency / 4);
+    let start_ticks = crate::arch::timer::ticks();
+    for _ in 0..50_000_000 {
+        if SMOKE_PREEMPTION_STAGE.load(Ordering::Acquire) >= stage {
+            return true;
+        }
+        if timeout_ticks.is_some_and(|timeout| {
+            crate::arch::timer::ticks().wrapping_sub(start_ticks) >= timeout
+        }) {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
     let mut attributes = PthreadAttributes {
@@ -232,6 +259,31 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
     {
         return -1;
     }
+    SMOKE_PREEMPTION_STAGE.store(0, Ordering::Release);
+    let mut preemption_thread = 0usize;
+    if unsafe {
+        pthread_create(
+            &mut preemption_thread,
+            &attributes,
+            Some(smoke_preemption_worker),
+            core::ptr::null_mut(),
+        )
+    } != 0
+        || !wait_for_preemption_stage(1)
+    {
+        return -1;
+    }
+    SMOKE_PREEMPTION_STAGE.store(2, Ordering::Release);
+    if !wait_for_preemption_stage(3) {
+        return -1;
+    }
+    let mut preemption_result = core::ptr::null_mut();
+    if unsafe { pthread_join(preemption_thread, &mut preemption_result) } != 0
+        || !preemption_result.is_null()
+    {
+        return -1;
+    }
+
     SMOKE_READY.store(false, Ordering::Release);
     let mut thread = 0usize;
     if unsafe {

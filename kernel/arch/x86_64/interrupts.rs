@@ -120,6 +120,7 @@ unsafe extern "C" {
 
 const VIRTIO_VECTOR: usize = 0x40;
 const EXECUTOR_IPI_VECTOR: usize = 0x41;
+const TIMER_VECTOR: usize = 0x42;
 const SPURIOUS_VECTOR: usize = 0xff;
 const LOCAL_APIC_BASE: usize = 0xfee0_0000;
 const IO_APIC_BASE: usize = 0xfec0_0000;
@@ -174,6 +175,9 @@ pub(crate) unsafe fn initialize() {
         .write(IdtEntry::interrupt(x86_irq_entry as *const () as usize));
     entries
         .add(EXECUTOR_IPI_VECTOR)
+        .write(IdtEntry::interrupt(x86_irq_entry as *const () as usize));
+    entries
+        .add(TIMER_VECTOR)
         .write(IdtEntry::interrupt(x86_irq_entry as *const () as usize));
     entries
         .add(14)
@@ -238,9 +242,30 @@ pub(crate) fn initialize_local_controller() -> bool {
     true
 }
 
+pub(crate) fn begin_timer_calibration() {
+    write_local_apic(0x3e0, 0x3);
+    write_local_apic(0x320, TIMER_VECTOR as u32 | (1 << 16));
+    write_local_apic(0x380, u32::MAX);
+}
+
+pub(crate) fn local_timer_current_count() -> u32 {
+    read_local_apic(0x390)
+}
+
+pub(crate) fn initialize_timer(initial_count: u32) {
+    write_local_apic(0x3e0, 0x3);
+    write_local_apic(0x320, TIMER_VECTOR as u32 | (1 << 17));
+    write_local_apic(0x380, initial_count);
+}
+
 #[no_mangle]
 pub extern "C" fn x86_irq_dispatch() {
     let in_service = read_local_apic(0x100 + (EXECUTOR_IPI_VECTOR / 32) * 0x10);
+    if in_service & (1 << (TIMER_VECTOR % 32)) != 0 {
+        write_local_apic(0xb0, 0);
+        crate::scheduler::thread::timer_tick();
+        return;
+    }
     if in_service & (1 << (EXECUTOR_IPI_VECTOR % 32)) == 0 {
         crate::kz_handle_virtio_interrupt();
     }

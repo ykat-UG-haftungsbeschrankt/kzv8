@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 static PAGE_ALLOCATOR_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
-    fn kz_v8_run_smoke() -> i32;
+    fn kz_v8_run_smoke(event_loop: *mut core::ffi::c_void) -> i32;
 }
 
 fn debugcon(message: &[u8]) {
@@ -115,8 +115,8 @@ pub extern "C" fn kz_host_v8_set_page_permissions(
     crate::memory::set_permissions(address as usize, length, permissions) as i32
 }
 
-pub(crate) fn run_smoke() -> i32 {
-    unsafe { kz_v8_run_smoke() }
+pub(crate) fn run_smoke(event_loop: &mut crate::event_loop::EventLoop<16>) -> i32 {
+    unsafe { kz_v8_run_smoke(event_loop as *mut _ as *mut core::ffi::c_void) }
 }
 
 pub(crate) fn page_allocator_smoke() -> bool {

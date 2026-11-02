@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-int kz_v8_run_smoke(void);
+int kz_v8_run_smoke(void* event_loop);
 
 #ifdef __cplusplus
 }

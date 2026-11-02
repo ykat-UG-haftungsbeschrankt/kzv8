@@ -30,6 +30,19 @@ pub(crate) struct EventSourceToken {
     generation: u64,
 }
 
+impl EventSourceToken {
+    pub(crate) const fn raw(self) -> u64 {
+        (self.generation << 8) | self.index as u64
+    }
+
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self {
+            index: (raw & 0xff) as usize,
+            generation: raw >> 8,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EventFlags(u8);
 
@@ -42,6 +55,14 @@ impl EventFlags {
 
     pub(crate) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
+    }
+
+    pub(crate) const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !0x0f == 0 {
+            Some(Self(bits as u8))
+        } else {
+            None
+        }
     }
 
     const fn intersection(self, other: Self) -> Self {
@@ -63,6 +84,17 @@ pub(crate) enum Event {
         data: u64,
     },
     DeviceInterrupt { slot: u8 },
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RawEvent {
+    pub(crate) kind: u32,
+    pub(crate) flags: u32,
+    pub(crate) id: u64,
+    pub(crate) status: i32,
+    pub(crate) reserved: u32,
+    pub(crate) data: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +255,38 @@ impl<const N: usize> EventLoop<N> {
             }
         }
         None
+    }
+
+    pub(crate) fn poll_raw(&mut self, now_ns: u64) -> Option<RawEvent> {
+        self.wait(now_ns).map(|event| match event {
+            Event::Timer(timer) => RawEvent {
+                kind: 1,
+                id: timer.raw(),
+                ..RawEvent::default()
+            },
+            Event::Completion(completion) => RawEvent {
+                kind: 2,
+                id: completion.id,
+                status: completion.status,
+                ..RawEvent::default()
+            },
+            Event::Readiness {
+                source,
+                flags,
+                data,
+            } => RawEvent {
+                kind: 3,
+                flags: u32::from(flags.0),
+                id: source.0,
+                data,
+                ..RawEvent::default()
+            },
+            Event::DeviceInterrupt { slot } => RawEvent {
+                kind: 4,
+                id: u64::from(slot),
+                ..RawEvent::default()
+            },
+        })
     }
 
     fn next_device_interrupt(&mut self) -> Option<Event> {

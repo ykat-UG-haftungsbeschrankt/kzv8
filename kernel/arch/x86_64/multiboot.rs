@@ -27,7 +27,7 @@ pub(crate) fn initialize(boot_info: usize, boot_magic: usize) -> bool {
         return false;
     }
 
-    crate::platform::reset_memory_regions();
+    crate::memory_resources::reset_memory_regions();
     let mut entry = map_start;
     while entry < map_end {
         if map_end - entry < 4 {
@@ -43,10 +43,10 @@ pub(crate) fn initialize(boot_info: usize, boot_magic: usize) -> bool {
         let start = unsafe { read_unaligned((entry + 4) as *const u64) };
         let length = unsafe { read_unaligned((entry + 12) as *const u64) };
         let kind = unsafe { read_unaligned((entry + 20) as *const u32) };
-        if kind == 1 && !crate::platform::add_memory_region(start, length) {
+        if kind == 1 && !crate::memory_resources::add_memory_region(start, length) {
             return false;
         }
         entry += entry_length;
     }
-    !crate::platform::memory_regions().is_empty()
+    !crate::memory_resources::memory_regions().is_empty()
 }

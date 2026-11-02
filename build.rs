@@ -27,7 +27,7 @@ fn collect_rlibs(directory: &Path, output: &mut Vec<PathBuf>) {
 
 fn main() {
     let package_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let repository_dir = package_dir.parent().unwrap();
+    let repository_dir = package_dir.clone();
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let clang = env::var_os("CLANG").unwrap_or_else(|| OsString::from("clang"));
@@ -56,16 +56,16 @@ fn main() {
         "x86_64" => (
             "x86_64-none-elf",
             vec![
-                ("arch/x86_64/boot.S", "boot.o"),
-                ("arch/x86_64/smp_boot.S", "smp_boot.o"),
+                ("kernel/arch/x86_64/boot.S", "boot.o"),
+                ("kernel/arch/x86_64/smp_boot.S", "smp_boot.o"),
             ],
             "linker/x86_64.ld",
         ),
         "aarch64" => (
             "aarch64-none-elf",
             vec![
-                ("arch/aarch64/boot.S", "boot.o"),
-                ("arch/aarch64/smp_boot.S", "smp_boot.o"),
+                ("kernel/arch/aarch64/boot.S", "boot.o"),
+                ("kernel/arch/aarch64/smp_boot.S", "smp_boot.o"),
             ],
             "linker/aarch64.ld",
         ),

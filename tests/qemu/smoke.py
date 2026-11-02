@@ -19,7 +19,7 @@ def check(architecture):
                    "-cpu", "cortex-a72", "-m", "2G",
                    "-kernel", "build/aarch64/kernel.bin"]
     try:
-        result = subprocess.run(command + common, capture_output=True, timeout=5)
+        result = subprocess.run(command + common, capture_output=True, timeout=10)
         output = result.stdout
         errors = result.stderr.decode(errors="replace")
         if result.returncode != 0:
@@ -54,6 +54,7 @@ def check(architecture):
         expected += "kz: V8 context created\n"
         expected += "kz: V8 script compiled\n"
         expected += "kz: V8 script ran\n"
+        expected += "kz: V8 event loop smoke OK\n"
         expected += "kz: JS result: 42\n"
         expected += "kz: V8 disposing isolate\n"
         expected += "kz: V8 isolate disposed\n"

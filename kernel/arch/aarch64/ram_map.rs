@@ -37,7 +37,7 @@ static mut PAGE_TABLES: [PageTable; PAGE_TABLE_COUNT] =
 static NEXT_PAGE_TABLE: AtomicUsize = AtomicUsize::new(0);
 static PAGE_TABLE_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 
-pub(crate) unsafe fn map_memory_regions(regions: &[crate::platform::MemoryRegion]) {
+pub(crate) unsafe fn map_memory_regions(regions: &[crate::memory_resources::MemoryRegion]) {
     let root: u64;
     unsafe {
         core::arch::asm!(
@@ -191,7 +191,7 @@ pub(crate) fn map_page(
     let Some(physical_end) = physical_address.checked_add(PAGE_SIZE) else {
         return false;
     };
-    if physical_end > crate::platform::MAX_PHYSICAL_ADDRESS {
+    if physical_end > crate::memory_resources::MAX_PHYSICAL_ADDRESS {
         return false;
     }
     let Some(attributes) = page_attributes(permissions) else {
@@ -259,7 +259,7 @@ pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i
         || address % PAGE_SIZE != 0
         || length % PAGE_SIZE != 0
         || address.checked_add(length).is_none()
-        || address.checked_add(length).unwrap() > crate::platform::MAX_PHYSICAL_ADDRESS
+        || address.checked_add(length).unwrap() > crate::memory_resources::MAX_PHYSICAL_ADDRESS
     {
         return false;
     }

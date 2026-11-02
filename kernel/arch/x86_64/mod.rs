@@ -70,7 +70,7 @@ pub(crate) fn decommit_debug(code: u8) {
 }
 
 pub(crate) fn is_identity_mapped(address: usize) -> bool {
-    address < crate::platform::MAX_PHYSICAL_ADDRESS
+    address < crate::memory_resources::MAX_PHYSICAL_ADDRESS
 }
 
 pub(crate) fn protect_kernel_image_pages(
@@ -115,8 +115,8 @@ pub(crate) fn v8_page_allocator_smoke() -> bool {
     v8::page_allocator_smoke()
 }
 
-pub(crate) fn run_v8_smoke() -> Option<i32> {
-    Some(v8::run_smoke())
+pub(crate) fn run_v8_smoke(events: &mut crate::event_loop::EventLoop<16>) -> Option<i32> {
+    Some(v8::run_smoke(events))
 }
 
 pub(crate) fn switch_thread(old_stack: &mut usize, new_stack: usize) {
