@@ -1,5 +1,6 @@
 #include "v8_engine.h"
 
+#include <cstdint>
 #include <memory>
 
 #include "os_platform.h"
@@ -18,6 +19,33 @@ void report(const char* message, size_t length) {
 	}
 #endif
 	kz_host_console_write(message, length);
+}
+
+void report_result(std::int32_t value) {
+	char message[32];
+	static constexpr char prefix[] = "kz: JS result: ";
+	size_t length = sizeof(prefix) - 1;
+	for (size_t index = 0; index < length; ++index) {
+		message[index] = prefix[index];
+	}
+	uint32_t magnitude;
+	if (value < 0) {
+		message[length++] = '-';
+		magnitude = static_cast<uint32_t>(-static_cast<int64_t>(value));
+	} else {
+		magnitude = static_cast<uint32_t>(value);
+	}
+	char digits[10];
+	size_t digit_count = 0;
+	do {
+		digits[digit_count++] = static_cast<char>('0' + magnitude % 10);
+		magnitude /= 10;
+	} while (magnitude != 0);
+	while (digit_count != 0) {
+		message[length++] = digits[--digit_count];
+	}
+	message[length++] = '\n';
+	report(message, length);
 }
 
 }  // namespace
@@ -64,6 +92,7 @@ extern "C" int kz_v8_run_smoke() {
 	report("kz: V8 isolate created\n", sizeof("kz: V8 isolate created\n") - 1);
 
 	bool succeeded = false;
+	std::int32_t script_result = -1;
 	{
 		v8::Isolate::Scope isolate_scope(isolate);
 		v8::HandleScope handle_scope(isolate);
@@ -79,7 +108,9 @@ extern "C" int kz_v8_run_smoke() {
 				v8::Local<v8::Value> result;
 				if (script->Run(context).ToLocal(&result)) {
 					report("kz: V8 script ran\n", sizeof("kz: V8 script ran\n") - 1);
-					succeeded = result->Int32Value(context).FromMaybe(-1) == 42;
+					script_result = result->Int32Value(context).FromMaybe(-1);
+					succeeded = script_result == 42;
+					report_result(script_result);
 				}
 			}
 		}

@@ -42,6 +42,8 @@ pub(crate) mod timer;
 #[path = "x86_64/timer.rs"]
 pub(crate) mod timer;
 
+pub(crate) const MAX_CPUS: usize = 8;
+
 pub(crate) fn initialize_mmu() {
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -57,6 +59,11 @@ pub(crate) fn initialize_mmu() {
 
 pub(crate) fn initialize_thread_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize {
     threads::initialize_stack(stack, entry)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
+    threads::initialize_thread_local_storage(cpu_id)
 }
 
 pub(crate) fn switch_thread(old_stack: &mut usize, new_stack: usize) {
@@ -120,6 +127,19 @@ pub(crate) fn page_is_mapped(virtual_address: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         ram_map::page_is_mapped(virtual_address)
+    }
+}
+
+pub(crate) fn page_has_backing(virtual_address: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        paging::page_has_backing(virtual_address)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        ram_map::page_is_mapped(virtual_address)
+    }
+}
 
 pub(crate) fn notify_executor() {
     #[cfg(target_arch = "aarch64")]
@@ -136,7 +156,5 @@ pub(crate) fn wait_for_interrupt() {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("msr daifclr, #0xf", "wfe");
-    }
-}
     }
 }

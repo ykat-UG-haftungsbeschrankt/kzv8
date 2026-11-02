@@ -49,6 +49,8 @@ mod physical;
 mod platform;
 #[path = "runtime/ffi.rs"]
 mod runtime_ffi;
+#[path = "runtime/libc/mod.rs"]
+mod runtime_libc;
 #[path = "runtime/host.rs"]
 mod runtime_host;
 mod sync;
@@ -109,6 +111,11 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
     );
     heap::initialize();
     kernel_thread::initialize();
+    #[cfg(target_arch = "x86_64")]
+    assert!(
+        arch::initialize_thread_local_storage(0),
+        "unable to initialize x86 thread-local storage"
+    );
     dma::initialize();
     assert!(
         arch::initialize_interrupt_controller(),
