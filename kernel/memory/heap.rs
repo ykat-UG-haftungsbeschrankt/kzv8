@@ -71,20 +71,17 @@ impl HeapState {
     }
 }
 
-static HEAP: IrqSpinLock<HeapState> = IrqSpinLock::new(HeapState::new());
-
-pub(crate) struct SlabAllocator;
+pub(crate) struct Heap;
 
 #[global_allocator]
-static GLOBAL_ALLOCATOR: SlabAllocator = SlabAllocator;
+static GLOBAL_ALLOCATOR: Heap = Heap;
 
-fn rounded_length(length: usize) -> Option<usize> {
-    length
-        .checked_add(PAGE_SIZE - 1)
-        .map(|value| value & !(PAGE_SIZE - 1))
-}
+impl Heap {
+    fn state() -> &'static IrqSpinLock<HeapState> {
+        static HEAP: IrqSpinLock<HeapState> = IrqSpinLock::new(HeapState::new());
+        &HEAP
+    }
 
-impl SlabAllocator {
     fn allocate(&self, heap: &mut HeapState, layout: Layout) -> *mut u8 {
         if !heap.initialized {
             return null_mut();
@@ -138,6 +135,12 @@ impl SlabAllocator {
         page as *mut u8
     }
 
+    fn rounded_length(length: usize) -> Option<usize> {
+        length
+            .checked_add(PAGE_SIZE - 1)
+            .map(|value| value & !(PAGE_SIZE - 1))
+    }
+
     fn allocate_large(&self, heap: &mut HeapState, size: usize, alignment: usize) -> *mut u8 {
         let Some(metadata_slot) = heap
             .large_allocations
@@ -146,7 +149,7 @@ impl SlabAllocator {
         else {
             return null_mut();
         };
-        let Some(length) = rounded_length(size) else {
+        let Some(length) = Self::rounded_length(size) else {
             return null_mut();
         };
         let alignment = alignment.max(PAGE_SIZE);
@@ -271,23 +274,23 @@ impl SlabAllocator {
         }
         total
     }
+
+    pub(crate) fn initialize() {
+        let mut heap = Self::state().lock();
+        heap.initialized = false;
+        heap.slabs.fill(Slab::EMPTY);
+        heap.class_heads.fill(NO_INDEX);
+        heap.large_allocations.fill(LargeAllocation::EMPTY);
+        heap.initialized = true;
+    }
 }
 
-unsafe impl GlobalAlloc for SlabAllocator {
+unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.allocate(&mut HEAP.lock(), layout)
+        self.allocate(&mut Self::state().lock(), layout)
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, _layout: Layout) {
-        self.deallocate(&mut HEAP.lock(), pointer)
+        self.deallocate(&mut Self::state().lock(), pointer)
     }
-}
-
-pub(crate) fn initialize() {
-    let mut heap = HEAP.lock();
-    heap.initialized = false;
-    heap.slabs.fill(Slab::EMPTY);
-    heap.class_heads.fill(NO_INDEX);
-    heap.large_allocations.fill(LargeAllocation::EMPTY);
-    heap.initialized = true;
 }

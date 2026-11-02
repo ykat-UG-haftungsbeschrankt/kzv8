@@ -5,16 +5,19 @@
  * free of charge, without warranty of any kind.
  */
 
-use core::ptr::addr_of_mut;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
 const DMA_ARENA_SIZE: usize = 512 * 1024;
 
 #[repr(C, align(4096))]
-pub(crate) struct DmaArena([u8; DMA_ARENA_SIZE]);
+pub(crate) struct DmaArena {
+    bytes: UnsafeCell<[u8; DMA_ARENA_SIZE]>,
+    next: AtomicUsize,
+}
 
-static mut ARENA: DmaArena = DmaArena([0; DMA_ARENA_SIZE]);
-static NEXT: AtomicUsize = AtomicUsize::new(0);
+// SAFETY: initialization runs before buffers are issued; `next` then reserves disjoint ranges.
+unsafe impl Sync for DmaArena {}
 
 pub(crate) struct DmaBuffer {
     pointer: *mut u8,
@@ -40,16 +43,29 @@ impl DmaBuffer {
 }
 
 impl DmaArena {
+    const fn new() -> Self {
+        Self {
+            bytes: UnsafeCell::new([0; DMA_ARENA_SIZE]),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn global() -> &'static Self {
+        static ARENA: DmaArena = DmaArena::new();
+        &ARENA
+    }
+
     pub(crate) fn initialize() {
-        NEXT.store(0, Ordering::Release);
+        Self::global().next.store(0, Ordering::Release);
     }
 
     pub(crate) fn allocate(length: usize, alignment: usize) -> Option<DmaBuffer> {
         if length == 0 || !alignment.is_power_of_two() {
             return None;
         }
-        let base = unsafe { addr_of_mut!(ARENA.0).cast::<u8>() as usize };
-        let mut current = NEXT.load(Ordering::Relaxed);
+        let arena = Self::global();
+        let base = arena.bytes.get().cast::<u8>() as usize;
+        let mut current = arena.next.load(Ordering::Relaxed);
         loop {
             let aligned = (base + current + alignment - 1) & !(alignment - 1);
             let end = aligned.checked_add(length)?;
@@ -57,7 +73,12 @@ impl DmaArena {
             if next > DMA_ARENA_SIZE {
                 return None;
             }
-            match NEXT.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
+            match arena.next.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => {
                     return Some(DmaBuffer {
                         pointer: aligned as *mut u8,

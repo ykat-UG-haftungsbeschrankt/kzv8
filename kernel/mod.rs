@@ -36,7 +36,7 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         memory::physical::PhysicalAllocator::initialize(),
         "unable to initialize physical memory"
     );
-    memory::heap::initialize();
+    memory::heap::Heap::initialize();
     scheduler::thread::initialize();
     assert!(
         arch::initialize_thread_local_storage(0),

@@ -373,7 +373,7 @@ pub unsafe extern "C" fn kz_host_tcp_connect(
     }
     let address = unsafe { slice::from_raw_parts(address, 4) };
     let address = Ipv4Address::new(address[0], address[1], address[2], address[3]);
-    let handle = match crate::kernel::net::tcp::connect(
+    let handle = match crate::kernel::net::tcp::Tcp::connect(
         unsafe { &mut *context.network_stack },
         address,
         remote_port as u16,
@@ -431,7 +431,7 @@ pub unsafe extern "C" fn kz_host_tcp_send(
             return -1;
         }
         if written < length && tcp_state(context, handle) == Some(TcpState::Established) {
-            let count = crate::kernel::net::tcp::send(
+            let count = crate::kernel::net::tcp::Tcp::send(
                 unsafe { &mut *context.network_stack },
                 handle,
                 &input[written..],
@@ -478,7 +478,7 @@ pub unsafe extern "C" fn kz_host_tcp_receive(
             Some(TcpState::Closed) | None => break,
             _ => {}
         }
-        let count = crate::kernel::net::tcp::receive(
+            let count = crate::kernel::net::tcp::Tcp::receive(
             unsafe { &mut *context.network_stack },
             handle,
             &mut output[received..],
