@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::{Event, EventFlags, EventLoop, EventSourceId, RegistrationError};
-    use crate::event_completion::Completion;
+    use crate::kernel::event::completion::Completion;
 
     #[test]
     fn readiness_is_filtered_and_level_triggered() {

@@ -98,7 +98,7 @@ unsafe extern "C" {
 }
 
 pub(crate) fn set_errno(error: i32) {
-    unsafe { crate::kernel_thread::__errno_location().write(error) };
+    unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
 }
 
 #[no_mangle]

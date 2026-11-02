@@ -24,7 +24,7 @@ unsafe extern "C" {
 
 pub(crate) fn start_secondary_cpus() {
     let cpu_count = detected_cpu_count().min(super::MAX_CPUS);
-    let _diagnostic = crate::console::write(if cpu_count == 1 {
+    let _diagnostic = crate::kernel::drivers::virtio::console::Console::write(if cpu_count == 1 {
         b"kz: smp detected 1 cpu\n"
     } else {
         b"kz: smp detected multiple cpus\n"
@@ -57,16 +57,16 @@ pub(crate) fn start_secondary_cpus() {
         fence(Ordering::SeqCst);
 
         let apic_id = slot as u8;
-        crate::arch::interrupts::send_ipi(apic_id, INIT_IPI);
+        crate::kernel::arch::interrupts::send_ipi(apic_id, INIT_IPI);
         wait_for_ipi_delivery();
         delay(10_000_000);
-        crate::arch::interrupts::send_ipi(
+        crate::kernel::arch::interrupts::send_ipi(
             apic_id,
             STARTUP_IPI_BASE | (AP_TRAMPOLINE_ADDRESS as u32 >> 12),
         );
         wait_for_ipi_delivery();
         delay(200_000);
-        crate::arch::interrupts::send_ipi(
+        crate::kernel::arch::interrupts::send_ipi(
             apic_id,
             STARTUP_IPI_BASE | (AP_TRAMPOLINE_ADDRESS as u32 >> 12),
         );
@@ -85,14 +85,14 @@ pub(crate) fn initialize_secondary_cpu(cpu_id: usize) -> bool {
     if cpu_id == 0 || cpu_id >= super::MAX_CPUS {
         return false;
     }
-    unsafe { crate::arch::interrupts::initialize_secondary() };
-    crate::arch::interrupts::initialize_local_controller()
+    unsafe { crate::kernel::arch::interrupts::initialize_secondary() };
+    crate::kernel::arch::interrupts::initialize_local_controller()
 }
 
 pub(crate) fn notify_executor() {
     for cpu_id in 0..super::MAX_CPUS {
         if super::cpu_is_online(cpu_id) {
-            crate::arch::interrupts::send_ipi(cpu_id as u8, u32::from(EXECUTOR_IPI_VECTOR));
+            crate::kernel::arch::interrupts::send_ipi(cpu_id as u8, u32::from(EXECUTOR_IPI_VECTOR));
         }
     }
 }
@@ -117,7 +117,7 @@ fn detected_cpu_count() -> usize {
 
 fn wait_for_ipi_delivery() {
     for _ in 0..1_000_000 {
-        if !crate::arch::interrupts::ipi_pending() {
+        if !crate::kernel::arch::interrupts::ipi_pending() {
             return;
         }
         core::hint::spin_loop();

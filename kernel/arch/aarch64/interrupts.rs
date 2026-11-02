@@ -229,14 +229,14 @@ pub(crate) fn initialize_controller() -> bool {
         core::ptr::write_volatile((GICD_BASE + 0xc0c) as *mut u32, 0);
         let timer_group = (GICD_BASE + 0x80) as *mut u32;
         let group = core::ptr::read_volatile(timer_group);
-        core::ptr::write_volatile(timer_group, group | (1 << crate::arch::timer::INTERRUPT_ID));
+        core::ptr::write_volatile(timer_group, group | (1 << crate::kernel::arch::timer::INTERRUPT_ID));
         core::ptr::write_volatile(
-            (GICD_BASE + 0x400 + crate::arch::timer::INTERRUPT_ID as usize) as *mut u8,
+            (GICD_BASE + 0x400 + crate::kernel::arch::timer::INTERRUPT_ID as usize) as *mut u8,
             0x80,
         );
         core::ptr::write_volatile(
             (GICD_BASE + 0x100) as *mut u32,
-            1 << crate::arch::timer::INTERRUPT_ID,
+            1 << crate::kernel::arch::timer::INTERRUPT_ID,
         );
         for interrupt in GIC_SPI_FIRST..GIC_SPI_END {
             core::ptr::write_volatile((GICD_BASE + 0x400 + interrupt) as *mut u8, 0x80);
@@ -270,13 +270,13 @@ pub extern "C" fn aarch64_irq_dispatch() {
     if interrupt_id >= 1020 {
         return;
     }
-    if interrupt_id == crate::arch::timer::INTERRUPT_ID {
-        crate::arch::timer::handle_interrupt();
+    if interrupt_id == crate::kernel::arch::timer::INTERRUPT_ID {
+        crate::kernel::arch::timer::handle_interrupt();
         unsafe {
             core::ptr::write_volatile((GICC_BASE + 0x10) as *mut u32, acknowledge);
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
-        crate::scheduler::thread::timer_tick();
+        crate::kernel::scheduler::thread::timer_tick();
         return;
     }
     crate::kz_handle_virtio_interrupt();
@@ -347,10 +347,10 @@ extern "C" fn aarch64_page_fault_dispatch() -> u64 {
         return 0;
     }
     let access = match exception_class {
-        0x21 => crate::memory::FaultAccess::Execute,
-        0x25 if syndrome & (1 << 6) != 0 => crate::memory::FaultAccess::Write,
-        0x25 => crate::memory::FaultAccess::Read,
+        0x21 => crate::kernel::memory::virtual_memory::FaultAccess::Execute,
+        0x25 if syndrome & (1 << 6) != 0 => crate::kernel::memory::virtual_memory::FaultAccess::Write,
+        0x25 => crate::kernel::memory::virtual_memory::FaultAccess::Read,
         _ => return 0,
     };
-    crate::memory::resolve_page_fault(address as usize, access) as u64
+    crate::kernel::memory::virtual_memory::resolve_page_fault(address as usize, access) as u64
 }

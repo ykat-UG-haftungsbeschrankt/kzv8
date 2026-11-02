@@ -61,33 +61,35 @@ struct TaskWaker {
     generation: usize,
 }
 
-impl Wake for TaskWaker {
-    fn wake(self: Arc<Self>) {
-        wake_task(self.slot, self.generation);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        wake_task(self.slot, self.generation);
+impl TaskWaker {
+    fn wake_task(&self) {
+        if let Some(task) = EXECUTOR.tasks.get(self.slot) {
+            let notify = {
+                let _waker = task.waker.lock();
+                if task.active.load(Ordering::Acquire)
+                    && task.wakeable.load(Ordering::Acquire)
+                    && task.generation.load(Ordering::Acquire) == self.generation
+                {
+                    task.ready.store(true, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            };
+            if notify {
+                crate::kernel::arch::notify_executor();
+            }
+        }
     }
 }
 
-fn wake_task(slot: usize, generation: usize) {
-    if let Some(task) = EXECUTOR.tasks.get(slot) {
-        let notify = {
-            let _waker = task.waker.lock();
-            if task.active.load(Ordering::Acquire)
-                && task.wakeable.load(Ordering::Acquire)
-                && task.generation.load(Ordering::Acquire) == generation
-            {
-                task.ready.store(true, Ordering::Release);
-                true
-            } else {
-                false
-            }
-        };
-        if notify {
-            crate::arch::notify_executor();
-        }
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_task();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wake_task();
     }
 }
 
@@ -122,7 +124,7 @@ where
             task.wakeable.store(true, Ordering::Release);
         }
         task.ready.store(true, Ordering::Release);
-        crate::arch::notify_executor();
+        crate::kernel::arch::notify_executor();
         return Ok(());
     }
     Err(SpawnError::Full)
@@ -200,12 +202,12 @@ pub(crate) fn run_until_stalled() {
 pub(crate) fn run_forever() -> ! {
     loop {
         run_until_stalled();
-        let interrupt_state = crate::arch::interrupts::disable();
+        let interrupt_state = crate::kernel::arch::interrupts::disable();
         if has_ready_tasks() {
-            crate::arch::interrupts::restore(interrupt_state);
+            crate::kernel::arch::interrupts::restore(interrupt_state);
             continue;
         }
-        crate::arch::wait_for_interrupt();
+        crate::kernel::arch::wait_for_interrupt();
     }
 }
 

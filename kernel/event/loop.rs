@@ -5,8 +5,8 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::event_completion::{Completion, CompletionQueue};
-use crate::event_timers::{TimerId, TimerQueue};
+use crate::kernel::event::completion::{Completion, CompletionQueue};
+use crate::kernel::event::timers::{TimerId, TimerQueue};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static PENDING_DEVICE_INTERRUPTS: AtomicU64 = AtomicU64::new(0);

@@ -183,7 +183,7 @@ pub unsafe extern "C" fn kz_c_mmap_smoke() -> i32 {
     if unsafe { munmap(memory, length) } != 0 {
         return -1;
     }
-    unsafe { crate::kernel_thread::__errno_location().write(0) };
+    unsafe { crate::kernel::scheduler::thread::__errno_location().write(0) };
     if unsafe {
         mmap(
             core::ptr::null_mut(),
@@ -194,7 +194,7 @@ pub unsafe extern "C" fn kz_c_mmap_smoke() -> i32 {
             0,
         )
     } != MAP_FAILED
-        || unsafe { crate::kernel_thread::__errno_location().read() } != EINVAL
+        || unsafe { crate::kernel::scheduler::thread::__errno_location().read() } != EINVAL
     {
         return -1;
     }
@@ -231,14 +231,14 @@ unsafe extern "C" fn smoke_preemption_worker(_argument: *mut c_void) -> *mut c_v
 }
 
 fn wait_for_preemption_stage(stage: usize) -> bool {
-    let timeout_ticks = crate::arch::timer::frequency_hz().map(|frequency| frequency / 4);
-    let start_ticks = crate::arch::timer::ticks();
+    let timeout_ticks = crate::kernel::arch::timer::frequency_hz().map(|frequency| frequency / 4);
+    let start_ticks = crate::kernel::arch::timer::ticks();
     for _ in 0..50_000_000 {
         if SMOKE_PREEMPTION_STAGE.load(Ordering::Acquire) >= stage {
             return true;
         }
         if timeout_ticks.is_some_and(|timeout| {
-            crate::arch::timer::ticks().wrapping_sub(start_ticks) >= timeout
+            crate::kernel::arch::timer::ticks().wrapping_sub(start_ticks) >= timeout
         }) {
             return false;
         }
@@ -545,9 +545,9 @@ pub unsafe extern "C" fn kz_c_filesystem_smoke() -> i32 {
     {
         return -1;
     }
-    unsafe { crate::kernel_thread::__errno_location().write(0) };
+    unsafe { crate::kernel::scheduler::thread::__errno_location().write(0) };
     let missing = unsafe { super::filesystem::kz_rust_open(path.as_ptr().cast(), O_RDONLY, 0) };
-    if missing != -1 || unsafe { crate::kernel_thread::__errno_location().read() } != ENOENT {
+    if missing != -1 || unsafe { crate::kernel::scheduler::thread::__errno_location().read() } != ENOENT {
         return -1;
     }
     0

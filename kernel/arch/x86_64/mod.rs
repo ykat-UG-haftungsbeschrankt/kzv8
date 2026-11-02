@@ -23,6 +23,8 @@ compile_error!("select one of fpu-x87, fpu-sse, or fpu-avx");
 
 pub(crate) use threads::FpuContext;
 
+pub(crate) struct MemoryArch;
+
 pub(crate) const MAX_CPUS: usize = 8;
 pub(crate) const VM_ARENA_SIZE: usize = 1 << 36;
 pub(crate) const VM_BASE: usize = 0x10_0000_0000;
@@ -42,13 +44,8 @@ pub(crate) unsafe fn initialize_boot_info(boot_info: usize, boot_magic: usize) -
     unsafe { multiboot::initialize(boot_info, boot_magic) }
 }
 
-pub(crate) const fn virtio_window() -> crate::arch::VirtioWindow {
+pub(crate) const fn virtio_window() -> crate::kernel::arch::VirtioWindow {
     virtio::virtio_window()
-}
-
-pub(crate) fn initialize_mmu() {
-    paging::initialize();
-    unsafe { ram_map::map_high_memory() };
 }
 
 pub(crate) fn initialize_thread_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize {
@@ -71,30 +68,6 @@ pub(crate) fn decommit_debug(code: u8) {
     debug::debugcon(&[code]);
 }
 
-pub(crate) fn is_identity_mapped(address: usize) -> bool {
-    address < crate::memory_resources::MAX_PHYSICAL_ADDRESS
-}
-
-pub(crate) fn protect_kernel_image_pages(
-    address: usize,
-    length: usize,
-    permissions: i32,
-) -> bool {
-    const PAGE_SIZE: usize = 4096;
-    if permissions != 1 || address % PAGE_SIZE != 0 || length % PAGE_SIZE != 0 {
-        return false;
-    }
-    let Some(end) = address.checked_add(length) else {
-        return false;
-    };
-    let (image_start, image_end) = unsafe {
-        (core::ptr::addr_of!(_start) as usize, core::ptr::addr_of!(__bss_end) as usize)
-    };
-    address >= image_start
-        && end <= image_end
-        && paging::set_page_permissions(address, length, permissions)
-}
-
 pub(crate) fn current_thread_stack_bounds(
     _stack_size: usize,
 ) -> (*mut core::ffi::c_void, usize) {
@@ -104,12 +77,16 @@ pub(crate) fn current_thread_stack_bounds(
 }
 
 pub(crate) fn high_memory_smoke() -> bool {
-    let Some(address) = crate::physical::allocate_contiguous(4096, 4 * 1024 * 1024 * 1024) else {
+    let Some(address) = crate::kernel::memory::physical::PhysicalAllocator::allocate_contiguous(
+        4096,
+        4 * 1024 * 1024 * 1024,
+    ) else {
         return false;
     };
     unsafe { core::ptr::write_volatile(address as *mut u8, 0xa5) };
     let mapped = unsafe { core::ptr::read_volatile(address as *const u8) == 0xa5 };
-    let released = crate::physical::deallocate_contiguous(address, 4096);
+    let released =
+        crate::kernel::memory::physical::PhysicalAllocator::deallocate_contiguous(address, 4096);
     mapped && released
 }
 
@@ -126,10 +103,6 @@ pub(crate) fn initialize_interrupt_controller() -> bool {
     interrupts::initialize_controller()
 }
 
-pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
-    paging::set_page_permissions(address, length, permissions)
-}
-
 pub(crate) fn halt() -> ! {
     loop {
         unsafe {
@@ -138,24 +111,59 @@ pub(crate) fn halt() -> ! {
     }
 }
 
-pub(crate) fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool {
-    paging::map_page(virtual_address, physical_address, permissions)
-}
-
-pub(crate) fn unmap_page(virtual_address: usize) -> Option<usize> {
-    paging::unmap_page(virtual_address)
-}
-
-pub(crate) fn page_is_mapped(virtual_address: usize) -> bool {
-    paging::page_is_mapped(virtual_address)
-}
-
-pub(crate) fn page_has_backing(virtual_address: usize) -> bool {
-    paging::page_has_backing(virtual_address)
-}
-
 pub(crate) fn notify_executor() {}
 
 pub(crate) fn wait_for_interrupt() {
     unsafe { core::arch::asm!("sti", "hlt") };
+}
+
+impl crate::kernel::arch::MemoryArchitecture for MemoryArch {
+    fn initialize_mmu() {
+        paging::initialize();
+        unsafe { ram_map::map_high_memory() };
+    }
+
+    fn is_identity_mapped(address: usize) -> bool {
+        address < crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS
+    }
+
+    fn protect_kernel_image_pages(
+        address: usize,
+        length: usize,
+        permissions: i32,
+    ) -> bool {
+        const PAGE_SIZE: usize = 4096;
+        if permissions != 1 || address % PAGE_SIZE != 0 || length % PAGE_SIZE != 0 {
+            return false;
+        }
+        let Some(end) = address.checked_add(length) else {
+            return false;
+        };
+        let (image_start, image_end) = unsafe {
+            (core::ptr::addr_of!(_start) as usize, core::ptr::addr_of!(__bss_end) as usize)
+        };
+        address >= image_start
+            && end <= image_end
+            && paging::set_page_permissions(address, length, permissions)
+    }
+
+    fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
+        paging::set_page_permissions(address, length, permissions)
+    }
+
+    fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool {
+        paging::map_page(virtual_address, physical_address, permissions)
+    }
+
+    fn unmap_page(virtual_address: usize) -> Option<usize> {
+        paging::unmap_page(virtual_address)
+    }
+
+    fn page_is_mapped(virtual_address: usize) -> bool {
+        paging::page_is_mapped(virtual_address)
+    }
+
+    fn page_has_backing(virtual_address: usize) -> bool {
+        paging::page_has_backing(virtual_address)
+    }
 }

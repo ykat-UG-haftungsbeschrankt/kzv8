@@ -10,8 +10,8 @@ use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
-use crate::event_loop::{EventFlags, EventLoop, EventSourceId, EventSourceToken};
-use crate::net_device::EthernetDevice;
+use crate::kernel::event::r#loop::{EventFlags, EventLoop, EventSourceId, EventSourceToken};
+use crate::kernel::net::device::EthernetDevice;
 
 pub(crate) const NETWORK_EVENT_SOURCE: EventSourceId = EventSourceId::new(1);
 

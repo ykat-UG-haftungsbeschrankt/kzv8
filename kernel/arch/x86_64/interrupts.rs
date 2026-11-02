@@ -272,7 +272,7 @@ pub(crate) fn initialize_controller() -> bool {
         write_io_apic(redirection, (1 << 16) | VIRTIO_VECTOR as u32);
     }
 
-    let window = crate::arch::virtio_window();
+    let window = crate::kernel::arch::virtio_window();
     let first_unrouted_irq = maximum_irq as usize + 1;
     let last_virtio_irq = (VIRTIO_GSI_BASE + window.slots).min(first_unrouted_irq);
     for irq in VIRTIO_GSI_BASE..last_virtio_irq {
@@ -315,7 +315,7 @@ pub extern "C" fn x86_irq_dispatch() {
     let in_service = read_local_apic(0x100 + (EXECUTOR_IPI_VECTOR / 32) * 0x10);
     if in_service & (1 << (TIMER_VECTOR % 32)) != 0 {
         write_local_apic(0xb0, 0);
-        crate::scheduler::thread::timer_tick();
+        crate::kernel::scheduler::thread::timer_tick();
         return;
     }
     if in_service & (1 << (EXECUTOR_IPI_VECTOR % 32)) == 0 {
@@ -432,20 +432,20 @@ extern "C" fn x86_page_fault_dispatch(address: usize, error_code: u64) -> u64 {
         return 0;
     }
     let access = if error_code & (1 << 4) != 0 {
-        crate::memory::FaultAccess::Execute
+        crate::kernel::memory::virtual_memory::FaultAccess::Execute
     } else if error_code & (1 << 1) != 0 {
-        crate::memory::FaultAccess::Write
+        crate::kernel::memory::virtual_memory::FaultAccess::Write
     } else {
-        crate::memory::FaultAccess::Read
+        crate::kernel::memory::virtual_memory::FaultAccess::Read
     };
-    let resolved = crate::memory::resolve_page_fault(address, access);
+    let resolved = crate::kernel::memory::virtual_memory::resolve_page_fault(address, access);
     if !PAGE_FAULT_DIAGNOSTIC.swap(true, Ordering::AcqRel) {
         let message = if resolved {
             b"kz: first lazy page fault resolved\n" as &[u8]
         } else {
             b"kz: first lazy page fault rejected\n" as &[u8]
         };
-        let _written = crate::console::write(message);
+        let _written = crate::kernel::drivers::virtio::console::Console::write(message);
     }
     resolved as u64
 }

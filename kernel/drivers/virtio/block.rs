@@ -5,9 +5,9 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::dma::{self, DmaBuffer};
-use crate::virtio_queue::{Descriptor, DmaQueue};
-use crate::virtio_transport::VirtioTransport;
+use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
+use crate::kernel::drivers::virtio::queue::{Descriptor, DmaQueue};
+use crate::kernel::drivers::virtio::transport::VirtioTransport;
 
 const DEVICE_ID: u32 = 2;
 const QUEUE_SIZE: usize = 8;
@@ -49,7 +49,7 @@ impl BlockDevice {
         if !transport.activate() {
             return None;
         }
-        let dma_buffer = dma::allocate(MAX_TRANSFER_SIZE, 16)?;
+        let dma_buffer = DmaArena::allocate(MAX_TRANSFER_SIZE, 16)?;
         let capacity_sectors = u64::from(transport.read_device_config(0)?)
             | (u64::from(transport.read_device_config(4)?) << 32);
         Some(Self {
@@ -135,7 +135,7 @@ impl BlockDevice {
         ];
         let head = self.queue.submit(&descriptors).ok_or(Error::QueueBusy)?;
         self.in_flight_head = Some(head);
-        crate::dma::sync_for_device();
+        crate::kernel::memory::dma::sync_for_device();
         self.transport.notify(0);
         Ok(BlockTransfer {
             device: self,

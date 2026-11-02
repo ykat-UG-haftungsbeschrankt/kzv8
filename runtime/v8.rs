@@ -16,7 +16,7 @@ unsafe extern "C" {
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_v8_debug_stage(stage: u8) {
-    crate::arch::debug::debugcon(&[stage]);
+    crate::kernel::arch::debug::debugcon(&[stage]);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -31,27 +31,27 @@ pub extern "C" fn kz_host_v8_allocate_pages(
     let permissions = if permissions == 5 { 0 } else { permissions };
     let trace = PAGE_ALLOCATOR_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 32;
     if trace {
-        crate::arch::debug::debugcon(b"A");
+        crate::kernel::arch::debug::debugcon(b"A");
     }
-    if let Some(address) = crate::memory::reserve_with_hint(hint, length, alignment, permissions) {
+    if let Some(address) = crate::kernel::memory::virtual_memory::reserve_with_hint(hint, length, alignment, permissions) {
         if trace {
-            crate::arch::debug::debugcon(b"H\n");
+            crate::kernel::arch::debug::debugcon(b"H\n");
         }
         return address as *mut u8;
     }
     if hint.is_some() {
         if trace {
-            crate::arch::debug::debugcon(b"F");
+            crate::kernel::arch::debug::debugcon(b"F");
         }
-        if let Some(address) = crate::memory::reserve(length, alignment, permissions) {
+        if let Some(address) = crate::kernel::memory::virtual_memory::reserve(length, alignment, permissions) {
             if trace {
-                crate::arch::debug::debugcon(b"S\n");
+                crate::kernel::arch::debug::debugcon(b"S\n");
             }
             return address as *mut u8;
         }
     }
     if trace {
-        crate::arch::debug::debugcon(b"X\n");
+        crate::kernel::arch::debug::debugcon(b"X\n");
     }
     core::ptr::null_mut()
 }
@@ -59,7 +59,7 @@ pub extern "C" fn kz_host_v8_allocate_pages(
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_host_v8_random_mmap_addr() -> *mut u8 {
-    crate::memory::allocator_base() as *mut u8
+    crate::kernel::memory::virtual_memory::allocator_base() as *mut u8
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -68,7 +68,7 @@ pub extern "C" fn kz_host_v8_free_pages(address: *mut u8, length: usize) -> i32 
     if address.is_null() {
         return 0;
     }
-    crate::memory::release(address as usize, length) as i32
+    crate::kernel::memory::virtual_memory::release(address as usize, length) as i32
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -81,7 +81,7 @@ pub extern "C" fn kz_host_v8_release_pages(
     if address.is_null() || new_length > length || new_length % 4096 != 0 {
         return 0;
     }
-    crate::memory::release_suffix(address as usize, length, new_length) as i32
+    crate::kernel::memory::virtual_memory::release_suffix(address as usize, length, new_length) as i32
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -90,7 +90,7 @@ pub extern "C" fn kz_host_v8_decommit_pages(address: *mut u8, length: usize) -> 
     if address.is_null() {
         return 0;
     }
-    crate::memory::decommit(address as usize, length) as i32
+    crate::kernel::memory::virtual_memory::decommit(address as usize, length) as i32
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -104,12 +104,12 @@ pub extern "C" fn kz_host_v8_set_page_permissions(
         return 0;
     }
     let permissions = if permissions == 5 { 0 } else { permissions };
-    crate::memory::set_permissions(address as usize, length, permissions) as i32
+    crate::kernel::memory::virtual_memory::set_permissions(address as usize, length, permissions) as i32
 }
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn run_smoke(
-    event_loop: &mut crate::event_loop::EventLoop<16>,
+    event_loop: &mut crate::kernel::event::r#loop::EventLoop<16>,
     block_device: *mut core::ffi::c_void,
     tcp_context: *mut core::ffi::c_void,
 ) -> Option<i32> {
@@ -124,7 +124,7 @@ pub(crate) fn run_smoke(
 
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn run_smoke(
-    _event_loop: &mut crate::event_loop::EventLoop<16>,
+    _event_loop: &mut crate::kernel::event::r#loop::EventLoop<16>,
     _block_device: *mut core::ffi::c_void,
     _tcp_context: *mut core::ffi::c_void,
 ) -> Option<i32> {
@@ -135,7 +135,7 @@ pub(crate) fn run_smoke(
 pub(crate) fn page_allocator_smoke() -> bool {
     let page_size = 4096;
     let length = page_size * 2;
-    let out_of_arena_hint = crate::memory::allocator_base().saturating_sub(page_size) as *mut u8;
+    let out_of_arena_hint = crate::kernel::memory::virtual_memory::allocator_base().saturating_sub(page_size) as *mut u8;
     let memory = kz_host_v8_allocate_pages(out_of_arena_hint, length, page_size, 2);
     if memory.is_null() {
         return false;

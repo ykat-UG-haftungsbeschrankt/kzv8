@@ -51,7 +51,7 @@ pub unsafe extern "C" fn newlocale(
     {
         core::ptr::addr_of_mut!(C_LOCALE).cast()
     } else {
-        crate::runtime::runtime_libc::posix::set_errno(EINVAL);
+        crate::kernel::runtime::runtime_libc::posix::set_errno(EINVAL);
         core::ptr::null_mut()
     }
 }

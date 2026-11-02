@@ -41,8 +41,8 @@ impl FpuContext {
 
 const TLS_BLOCK_SIZE: usize = 4096;
 
-static mut TLS_BLOCKS: [[u8; TLS_BLOCK_SIZE]; crate::arch::MAX_CPUS] =
-    [[0; TLS_BLOCK_SIZE]; crate::arch::MAX_CPUS];
+static mut TLS_BLOCKS: [[u8; TLS_BLOCK_SIZE]; crate::kernel::arch::MAX_CPUS] =
+    [[0; TLS_BLOCK_SIZE]; crate::kernel::arch::MAX_CPUS];
 
 unsafe extern "C" {
     static __tls_start: u8;
@@ -111,7 +111,7 @@ unsafe extern "C" {
 }
 
 pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
-    if cpu_id >= crate::arch::MAX_CPUS {
+    if cpu_id >= crate::kernel::arch::MAX_CPUS {
         return false;
     }
 

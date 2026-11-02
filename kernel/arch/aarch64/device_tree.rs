@@ -5,7 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::sync::IrqSpinLock;
+use crate::kernel::scheduler::sync::IrqSpinLock;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_CPU_IDS: usize = 8;
@@ -174,7 +174,7 @@ pub(crate) unsafe fn initialize(fdt_address: usize) -> bool {
         return false;
     }
 
-    crate::memory_resources::reset_memory_regions();
+    crate::kernel::memory::resources::MemoryRegionRegistry::reset_memory_regions();
     reset_cpu_info();
     let mut address_cells = 2usize;
     let mut size_cells = 1usize;
@@ -344,7 +344,7 @@ pub(crate) unsafe fn initialize(fdt_address: usize) -> bool {
                         let (Some(address), Some(size)) = (address, size) else {
                             return false;
                         };
-                        if !crate::memory_resources::add_memory_region(address, size) {
+                        if !crate::kernel::memory::resources::MemoryRegionRegistry::add_memory_region(address, size) {
                             return false;
                         }
                         reg_offset += tuple_size;
@@ -360,5 +360,5 @@ pub(crate) unsafe fn initialize(fdt_address: usize) -> bool {
             _ => return false,
         }
     }
-    !crate::memory_resources::memory_regions().is_empty()
+    !crate::kernel::memory::resources::MemoryRegionRegistry::memory_regions().is_empty()
 }

@@ -69,9 +69,9 @@ struct Thread {
     errno: i32,
     tls: [*mut c_void; MAX_TLS_KEYS],
     #[cfg(target_arch = "x86_64")]
-    fpu_context: crate::arch::FpuContext,
+    fpu_context: crate::kernel::arch::FpuContext,
     #[cfg(target_arch = "aarch64")]
-    fpu_context: crate::arch::FpuContext,
+    fpu_context: crate::kernel::arch::FpuContext,
 }
 
 impl Thread {
@@ -87,15 +87,37 @@ impl Thread {
         errno: 0,
         tls: [core::ptr::null_mut(); MAX_TLS_KEYS],
         #[cfg(target_arch = "x86_64")]
-        fpu_context: crate::arch::FpuContext::INITIAL,
+        fpu_context: crate::kernel::arch::FpuContext::INITIAL,
         #[cfg(target_arch = "aarch64")]
-        fpu_context: crate::arch::FpuContext::INITIAL,
+        fpu_context: crate::kernel::arch::FpuContext::INITIAL,
     };
 }
 
 #[derive(Clone, Copy)]
 #[repr(align(16))]
-struct ThreadStack([u8; STACK_SIZE]);
+pub(crate) struct ThreadStack([u8; STACK_SIZE]);
+
+impl ThreadStack {
+    /// # Safety
+    /// `index` must be valid, and the caller must ensure exclusive access to that stack.
+    pub(crate) unsafe fn slice_at(index: usize) -> &'static mut [u8] {
+        let stacks = addr_of_mut!(STACKS).cast::<ThreadStack>();
+        let stack = unsafe { stacks.add(index) };
+        unsafe { from_raw_parts_mut(addr_of_mut!((*stack).0).cast::<u8>(), STACK_SIZE) }
+    }
+
+    pub(crate) fn bounds(index: usize) -> (*mut c_void, usize) {
+        if index == 0 {
+            return crate::kernel::arch::current_thread_stack_bounds(STACK_SIZE);
+        }
+        if index >= MAX_THREADS {
+            return (core::ptr::null_mut(), 0);
+        }
+
+        let stacks = addr_of_mut!(STACKS).cast::<ThreadStack>();
+        unsafe { (stacks.add(index).cast::<c_void>(), STACK_SIZE) }
+    }
+}
 
 static mut THREADS: [Thread; MAX_THREADS] = [Thread::EMPTY; MAX_THREADS];
 static mut TLS_KEYS: [TlsKey; MAX_TLS_KEYS] = [TlsKey::EMPTY; MAX_TLS_KEYS];
@@ -106,7 +128,7 @@ static mut INITIALIZED: bool = false;
 static mut FALLBACK_ERRNO: i32 = 0;
 
 pub(crate) fn initialize() {
-    let interrupt_state = crate::arch::interrupts::disable();
+    let interrupt_state = crate::kernel::arch::interrupts::disable();
     unsafe {
         let threads = addr_of_mut!(THREADS).cast::<Thread>();
         for index in 0..MAX_THREADS {
@@ -125,7 +147,7 @@ pub(crate) fn initialize() {
         NEXT_THREAD_ID = MAIN_THREAD_ID + 1;
         INITIALIZED = true;
     }
-    crate::arch::interrupts::restore(interrupt_state);
+    crate::kernel::arch::interrupts::restore(interrupt_state);
 }
 
 #[no_mangle]
@@ -163,18 +185,12 @@ unsafe fn find_ready(current: usize) -> Option<usize> {
     None
 }
 
-unsafe fn stack_slice(index: usize) -> &'static mut [u8] {
-    let stacks = addr_of_mut!(STACKS).cast::<ThreadStack>();
-    let stack = stacks.add(index);
-    unsafe { from_raw_parts_mut(addr_of_mut!((*stack).0).cast::<u8>(), STACK_SIZE) }
-}
-
 fn switch_current(next_state: ThreadState) -> bool {
-    let interrupt_state = crate::arch::interrupts::disable();
+    let interrupt_state = crate::kernel::arch::interrupts::disable();
     let current = unsafe { CURRENT_SLOT };
     let next = unsafe { find_ready(current) };
     let Some(next) = next else {
-        crate::arch::interrupts::restore(interrupt_state);
+        crate::kernel::arch::interrupts::restore(interrupt_state);
         return false;
     };
 
@@ -186,21 +202,21 @@ fn switch_current(next_state: ThreadState) -> bool {
         let old_stack = addr_of_mut!((*threads.add(current)).stack_pointer);
         let new_stack = (*threads.add(next)).stack_pointer;
         #[cfg(target_arch = "x86_64")]
-        crate::arch::switch_thread(
+        crate::kernel::arch::switch_thread(
             &mut *old_stack,
             new_stack,
             &mut (*threads.add(current)).fpu_context,
             &(*threads.add(next)).fpu_context,
         );
         #[cfg(target_arch = "aarch64")]
-        crate::arch::switch_thread(
+        crate::kernel::arch::switch_thread(
             &mut *old_stack,
             new_stack,
             &mut (*threads.add(current)).fpu_context,
             &(*threads.add(next)).fpu_context,
         );
     }
-    crate::arch::interrupts::restore(interrupt_state);
+    crate::kernel::arch::interrupts::restore(interrupt_state);
     true
 }
 
@@ -209,7 +225,7 @@ pub(crate) fn timer_tick() {
 }
 
 pub(crate) fn current_thread_id() -> usize {
-    let interrupt_state = crate::arch::interrupts::disable();
+    let interrupt_state = crate::kernel::arch::interrupts::disable();
     let id = unsafe {
         if INITIALIZED {
             let threads = addr_of_mut!(THREADS).cast::<Thread>();
@@ -218,12 +234,12 @@ pub(crate) fn current_thread_id() -> usize {
             0
         }
     };
-    crate::arch::interrupts::restore(interrupt_state);
+    crate::kernel::arch::interrupts::restore(interrupt_state);
     id
 }
 
 pub(crate) fn exit_current(result: *mut c_void) -> ! {
-    let _interrupt_state = crate::arch::interrupts::disable();
+    let _interrupt_state = crate::kernel::arch::interrupts::disable();
     unsafe {
         let threads = addr_of_mut!(THREADS).cast::<Thread>();
         let current = CURRENT_SLOT;
@@ -246,14 +262,14 @@ pub(crate) fn exit_current(result: *mut c_void) -> ! {
             let old_stack = addr_of_mut!((*threads.add(current)).stack_pointer);
             let new_stack = (*threads.add(next)).stack_pointer;
             #[cfg(target_arch = "x86_64")]
-            crate::arch::switch_thread(
+            crate::kernel::arch::switch_thread(
                 &mut *old_stack,
                 new_stack,
                 &mut (*threads.add(current)).fpu_context,
                 &(*threads.add(next)).fpu_context,
             );
             #[cfg(target_arch = "aarch64")]
-            crate::arch::switch_thread(
+            crate::kernel::arch::switch_thread(
                 &mut *old_stack,
                 new_stack,
                 &mut (*threads.add(current)).fpu_context,
@@ -261,19 +277,19 @@ pub(crate) fn exit_current(result: *mut c_void) -> ! {
             );
         }
     }
-    crate::arch::halt()
+    crate::kernel::arch::halt()
 }
 
 extern "C" fn thread_trampoline() -> ! {
-    let interrupt_state = crate::arch::interrupts::disable();
+    let interrupt_state = crate::kernel::arch::interrupts::disable();
     let current = unsafe { CURRENT_SLOT };
     let (start_routine, argument) = unsafe {
         let threads = addr_of_mut!(THREADS).cast::<Thread>();
         let thread = threads.add(current);
         ((*thread).start_routine, (*thread).argument)
     };
-    crate::arch::interrupts::restore(interrupt_state);
-    crate::arch::interrupts::enable();
+    crate::kernel::arch::interrupts::restore(interrupt_state);
+    crate::kernel::arch::interrupts::enable();
 
     if let Some(start_routine) = start_routine {
         let result = unsafe { start_routine(argument) };

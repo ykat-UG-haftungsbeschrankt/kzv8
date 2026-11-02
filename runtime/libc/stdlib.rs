@@ -6,7 +6,7 @@ const EINVAL: i32 = 22;
 const ENOMEM: i32 = 12;
 
 fn set_errno(error: i32) {
-    unsafe { crate::kernel_thread::__errno_location().write(error) };
+    unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
 }
 
 pub(crate) fn remaining() -> usize {
@@ -32,7 +32,7 @@ pub(crate) fn c_allocation_capacity(pointer: *const u8) -> Option<usize> {
 
 #[no_mangle]
 pub extern "C" fn malloc(size: usize) -> *mut c_void {
-    let pointer = crate::heap::allocate_c_layout(size, align_of::<u128>());
+    let pointer = crate::kernel::memory::heap::allocate_c_layout(size, align_of::<u128>());
     if pointer.is_null() {
         set_errno(ENOMEM);
     }
@@ -45,7 +45,7 @@ pub extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
         set_errno(EINVAL);
         return null_mut();
     }
-    let pointer = crate::heap::allocate_c_layout(size, alignment);
+    let pointer = crate::kernel::memory::heap::allocate_c_layout(size, alignment);
     if pointer.is_null() {
         set_errno(ENOMEM);
     }
@@ -65,7 +65,7 @@ pub unsafe extern "C" fn posix_memalign(
     {
         return EINVAL;
     }
-    let pointer = crate::heap::allocate_c_layout(size, alignment);
+    let pointer = crate::kernel::memory::heap::allocate_c_layout(size, alignment);
     if pointer.is_null() {
         return ENOMEM;
     }
@@ -75,12 +75,12 @@ pub unsafe extern "C" fn posix_memalign(
 
 #[no_mangle]
 pub extern "C" fn free(pointer: *mut c_void) {
-    crate::heap::deallocate_c_pointer(pointer);
+    crate::kernel::memory::heap::deallocate_c_pointer(pointer);
 }
 
 #[no_mangle]
 pub extern "C" fn malloc_usable_size(pointer: *mut c_void) -> usize {
-    crate::heap::c_allocation_capacity(pointer.cast::<u8>()).unwrap_or(0)
+    crate::kernel::memory::heap::c_allocation_capacity(pointer.cast::<u8>()).unwrap_or(0)
 }
 
 #[no_mangle]
@@ -105,7 +105,7 @@ pub unsafe extern "C" fn realloc(pointer: *mut c_void, size: usize) -> *mut c_vo
         return null_mut();
     }
 
-    let Some(capacity) = crate::heap::c_allocation_capacity(pointer.cast::<u8>()) else {
+    let Some(capacity) = crate::kernel::memory::heap::c_allocation_capacity(pointer.cast::<u8>()) else {
         return null_mut();
     };
     let replacement = malloc(size);

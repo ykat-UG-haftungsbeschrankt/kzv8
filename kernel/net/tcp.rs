@@ -10,7 +10,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
-use crate::net_stack::NetStack;
+use crate::kernel::net::stack::NetStack;
 
 const DEFAULT_RX_CAPACITY: usize = 4096;
 const DEFAULT_TX_CAPACITY: usize = 4096;

@@ -5,7 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::sync::IrqSpinLock;
+use crate::kernel::scheduler::sync::IrqSpinLock;
 
 pub(crate) const MAX_PHYSICAL_ADDRESS: usize = 64 * 1024 * 1024 * 1024;
 const MAX_MEMORY_REGIONS: usize = 32;
@@ -50,36 +50,40 @@ impl MemoryRegions {
 
 static MEMORY_REGIONS: IrqSpinLock<MemoryRegions> = IrqSpinLock::new(MemoryRegions::EMPTY);
 
-pub(crate) fn reset_memory_regions() {
-    *MEMORY_REGIONS.lock() = MemoryRegions::EMPTY;
-}
+pub(crate) struct MemoryRegionRegistry;
 
-pub(crate) fn add_memory_region(start: u64, length: u64) -> bool {
-    if length == 0 {
-        return true;
+impl MemoryRegionRegistry {
+    pub(crate) fn reset_memory_regions() {
+        *MEMORY_REGIONS.lock() = MemoryRegions::EMPTY;
     }
-    let Some(end) = start.checked_add(length) else {
-        return false;
-    };
-    let maximum = MAX_PHYSICAL_ADDRESS as u64;
-    if start >= maximum {
-        return true;
-    }
-    let clipped_end = end.min(maximum);
-    let region = MemoryRegion {
-        start: start as usize,
-        length: (clipped_end - start) as usize,
-    };
-    let mut regions = MEMORY_REGIONS.lock();
-    if regions.count == MAX_MEMORY_REGIONS {
-        return false;
-    }
-    let index = regions.count;
-    regions.regions[index] = region;
-    regions.count = index + 1;
-    true
-}
 
-pub(crate) fn memory_regions() -> MemoryRegions {
-    *MEMORY_REGIONS.lock()
+    pub(crate) fn add_memory_region(start: u64, length: u64) -> bool {
+        if length == 0 {
+            return true;
+        }
+        let Some(end) = start.checked_add(length) else {
+            return false;
+        };
+        let maximum = MAX_PHYSICAL_ADDRESS as u64;
+        if start >= maximum {
+            return true;
+        }
+        let clipped_end = end.min(maximum);
+        let region = MemoryRegion {
+            start: start as usize,
+            length: (clipped_end - start) as usize,
+        };
+        let mut regions = MEMORY_REGIONS.lock();
+        if regions.count == MAX_MEMORY_REGIONS {
+            return false;
+        }
+        let index = regions.count;
+        regions.regions[index] = region;
+        regions.count = index + 1;
+        true
+    }
+
+    pub(crate) fn memory_regions() -> MemoryRegions {
+        *MEMORY_REGIONS.lock()
+    }
 }

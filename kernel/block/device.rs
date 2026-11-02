@@ -5,8 +5,8 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::block_request::{Operation, Request};
-use crate::virtio_block;
+use crate::kernel::block::request::{Operation, Request};
+use crate::kernel::drivers::virtio::block;
 
 pub(crate) struct BlockDevice {
     device: virtio_block::BlockDevice,

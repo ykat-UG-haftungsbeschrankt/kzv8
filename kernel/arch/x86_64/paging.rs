@@ -8,7 +8,7 @@
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::sync::IrqSpinLock;
+use crate::kernel::scheduler::sync::IrqSpinLock;
 
 const PAGE_SIZE: usize = 4096;
 const PAGE_TABLE_ENTRIES: usize = 512;
@@ -121,7 +121,7 @@ pub(crate) fn map_page(
     let Some(physical_end) = physical_address.checked_add(PAGE_SIZE) else {
         return false;
     };
-    if physical_end > crate::memory_resources::MAX_PHYSICAL_ADDRESS
+    if physical_end > crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS
         || (matches!(permissions, 1 | 2) && !NX_ENABLED.load(Ordering::Acquire))
     {
         return false;

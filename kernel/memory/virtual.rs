@@ -7,17 +7,19 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use crate::sync::IrqSpinLock;
+use crate::kernel::arch::{ActiveMemoryArch, MemoryArchitecture as _};
+use crate::kernel::memory::physical::PhysicalAllocator;
+use crate::kernel::scheduler::sync::IrqSpinLock;
 
 pub(crate) const PAGE_SIZE: usize = 4096;
 
-const VM_ARENA_SIZE: usize = crate::arch::VM_ARENA_SIZE;
+const VM_ARENA_SIZE: usize = crate::kernel::arch::VM_ARENA_SIZE;
 const MAX_VM_PAGES: usize = VM_ARENA_SIZE / PAGE_SIZE;
 const MAX_VM_AREAS: usize = 16384;
 const VM_RESERVED: u8 = 1 << 7;
 const VM_PERMISSION_MASK: u8 = 0x07;
 
-const VM_BASE: usize = crate::arch::VM_BASE;
+const VM_BASE: usize = crate::kernel::arch::VM_BASE;
 
 static PAGE_STATE: [AtomicU8; MAX_VM_PAGES] = [const { AtomicU8::new(0) }; MAX_VM_PAGES];
 static MMU_READY: AtomicBool = AtomicBool::new(false);
@@ -48,7 +50,7 @@ pub(crate) enum FaultAccess {
 }
 
 pub(super) fn initialize() {
-    crate::arch::initialize_mmu();
+    ActiveMemoryArch::initialize_mmu();
     MMU_READY.store(true, Ordering::Release);
 }
 
@@ -264,7 +266,7 @@ pub(crate) fn release_range(address: usize, length: usize) -> bool {
 }
 
 fn decommit_debug(code: u8) {
-    crate::arch::decommit_debug(code);
+    crate::kernel::arch::decommit_debug(code);
 }
 
 pub(crate) fn decommit(address: usize, length: usize) -> bool {
@@ -310,8 +312,8 @@ pub(crate) fn decommit(address: usize, length: usize) -> bool {
     let mut decommitted = true;
     for page in start_page..end_page {
         let virtual_address = VM_BASE + page * PAGE_SIZE;
-        if let Some(physical_address) = crate::arch::unmap_page(virtual_address) {
-            if !crate::physical::deallocate_contiguous(physical_address, PAGE_SIZE) {
+        if let Some(physical_address) = ActiveMemoryArch::unmap_page(virtual_address) {
+            if !PhysicalAllocator::deallocate_contiguous(physical_address, PAGE_SIZE) {
                 decommitted = false;
                 decommit_debug(b'g');
             }
@@ -419,8 +421,8 @@ pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -
             return false;
         }
         let virtual_address = VM_BASE + page * PAGE_SIZE;
-        if crate::arch::page_has_backing(virtual_address)
-            && !crate::arch::set_page_permissions(virtual_address, PAGE_SIZE, permissions)
+        if ActiveMemoryArch::page_has_backing(virtual_address)
+            && !ActiveMemoryArch::set_page_permissions(virtual_address, PAGE_SIZE, permissions)
         {
             return false;
         }
@@ -433,8 +435,8 @@ fn release_pages(start_page: usize, end_page: usize) -> bool {
     let mut released = true;
     for page in start_page..end_page {
         let virtual_address = VM_BASE + page * PAGE_SIZE;
-        if let Some(physical_address) = crate::arch::unmap_page(virtual_address) {
-            if !crate::physical::deallocate_contiguous(physical_address, PAGE_SIZE) {
+        if let Some(physical_address) = ActiveMemoryArch::unmap_page(virtual_address) {
+            if !PhysicalAllocator::deallocate_contiguous(physical_address, PAGE_SIZE) {
                 released = false;
             }
         }
@@ -467,28 +469,28 @@ pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
     if !access_allowed {
         return false;
     }
-    if crate::arch::page_is_mapped(page_address) {
+    if ActiveMemoryArch::page_is_mapped(page_address) {
         return true;
     }
 
-    let Some(frame) = crate::physical::allocate() else {
+    let Some(frame) = PhysicalAllocator::allocate() else {
         return false;
     };
     let physical_address = frame.address();
-    if !crate::arch::set_page_permissions(physical_address, PAGE_SIZE, 2) {
-        let _released = crate::physical::deallocate(frame);
+    if !ActiveMemoryArch::set_page_permissions(physical_address, PAGE_SIZE, 2) {
+        let _released = PhysicalAllocator::deallocate(frame);
         return false;
     }
     unsafe { core::ptr::write_bytes(physical_address as *mut u8, 0, PAGE_SIZE) };
-    if crate::arch::map_page(page_address, physical_address, permissions) {
+    if ActiveMemoryArch::map_page(page_address, physical_address, permissions) {
         return true;
     }
-    let _released = crate::physical::deallocate(frame);
+    let _released = PhysicalAllocator::deallocate(frame);
     false
 }
 
 pub(crate) fn is_identity_mapped(address: usize) -> bool {
-    crate::arch::is_identity_mapped(address)
+    ActiveMemoryArch::is_identity_mapped(address)
 }
 
 pub(crate) fn translate(address: usize) -> Option<usize> {

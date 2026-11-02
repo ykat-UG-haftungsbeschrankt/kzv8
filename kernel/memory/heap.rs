@@ -9,9 +9,9 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 use core::ptr::null_mut;
 
-use crate::sync::IrqSpinLock;
+use crate::kernel::scheduler::sync::IrqSpinLock;
 
-const PAGE_SIZE: usize = crate::memory::PAGE_SIZE;
+const PAGE_SIZE: usize = crate::kernel::memory::virtual_memory::PAGE_SIZE;
 const CLASS_SIZES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
 const MAX_SLABS: usize = 8192;
 const MAX_LARGE_ALLOCATIONS: usize = 512;
@@ -122,7 +122,7 @@ impl SlabAllocator {
         let Some(metadata_slot) = heap.slabs.iter().position(|slab| !slab.active) else {
             return null_mut();
         };
-        let Some(page) = crate::memory::reserve(PAGE_SIZE, PAGE_SIZE, 2) else {
+        let Some(page) = crate::kernel::memory::virtual_memory::reserve(PAGE_SIZE, PAGE_SIZE, 2) else {
             return null_mut();
         };
         let head = heap.class_heads[class_index];
@@ -150,7 +150,7 @@ impl SlabAllocator {
             return null_mut();
         };
         let alignment = alignment.max(PAGE_SIZE);
-        let Some(address) = crate::memory::reserve(length, alignment, 2) else {
+        let Some(address) = crate::kernel::memory::virtual_memory::reserve(length, alignment, 2) else {
             return null_mut();
         };
         heap.large_allocations[metadata_slot] = LargeAllocation {
@@ -172,7 +172,7 @@ impl SlabAllocator {
             .position(|allocation| allocation.active && allocation.address == address)
         {
             let allocation = heap.large_allocations[index];
-            if crate::memory::release(allocation.address, allocation.length) {
+            if crate::kernel::memory::virtual_memory::release(allocation.address, allocation.length) {
                 heap.large_allocations[index] = LargeAllocation::EMPTY;
             }
             return;
@@ -209,7 +209,7 @@ impl SlabAllocator {
             slab.used -= 1;
             slab.used == 0
         };
-        if unused && crate::memory::release(page, PAGE_SIZE) {
+        if unused && crate::kernel::memory::virtual_memory::release(page, PAGE_SIZE) {
             let mut previous = NO_INDEX;
             let mut current = heap.class_heads[class_index];
             while current != NO_INDEX {

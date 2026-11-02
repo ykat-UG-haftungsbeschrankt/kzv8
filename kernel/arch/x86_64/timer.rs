@@ -19,14 +19,14 @@ pub(crate) fn initialize() {
                 return None;
             }
 
-            crate::arch::interrupts::begin_timer_calibration();
+            crate::kernel::arch::interrupts::begin_timer_calibration();
             let start = ticks();
             while ticks().wrapping_sub(start) < calibration_cycles {
                 core::hint::spin_loop();
             }
 
             let elapsed_count = u64::from(
-                u32::MAX.wrapping_sub(crate::arch::interrupts::local_timer_current_count()),
+                u32::MAX.wrapping_sub(crate::kernel::arch::interrupts::local_timer_current_count()),
             );
             let initial_count =
                 elapsed_count.saturating_mul(1000 / TIMER_TICK_HZ) / CALIBRATION_WINDOW_MS;
@@ -34,7 +34,7 @@ pub(crate) fn initialize() {
                 .then_some(initial_count as u32)
         })
         .unwrap_or(FALLBACK_INITIAL_COUNT);
-    crate::arch::interrupts::initialize_timer(initial_count);
+    crate::kernel::arch::interrupts::initialize_timer(initial_count);
 }
 
 pub(crate) fn ticks() -> u64 {

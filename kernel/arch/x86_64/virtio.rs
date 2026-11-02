@@ -5,7 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::arch::VirtioWindow;
+use crate::kernel::arch::VirtioWindow;
 
 pub(crate) const fn virtio_window() -> VirtioWindow {
     VirtioWindow {

@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use core::ffi::{c_char, c_void};
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::sync::IrqSpinLock;
+use crate::kernel::scheduler::sync::IrqSpinLock;
 
 const EBADF: i32 = 9;
 const EBUSY: i32 = 16;
@@ -467,7 +467,7 @@ impl FileSystem {
 static FILESYSTEM: IrqSpinLock<FileSystem> = IrqSpinLock::new(FileSystem::new());
 
 fn set_errno(error: i32) {
-    unsafe { crate::kernel_thread::__errno_location().write(error) };
+    unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
 }
 
 fn fail(error: i32) -> i32 {
@@ -589,7 +589,7 @@ pub unsafe extern "C" fn write(
         while written < length {
             let chunk = (length - written).min(512);
             let result = unsafe {
-                crate::runtime::runtime_ffi::kz_host_console_write(
+                crate::kernel::runtime::runtime_ffi::kz_host_console_write(
                     buffer.cast::<u8>().add(written),
                     chunk,
                 )

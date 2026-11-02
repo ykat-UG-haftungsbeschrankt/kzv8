@@ -42,7 +42,7 @@ pub(crate) unsafe fn initialize(boot_info: usize, boot_magic: usize) -> bool {
     }
     let map = unsafe { core::slice::from_raw_parts(map_start as *const u8, map_length) };
 
-    crate::memory_resources::reset_memory_regions();
+    crate::kernel::memory::resources::MemoryRegionRegistry::reset_memory_regions();
     let mut entry = 0;
     while entry < map.len() {
         let remaining = map.len() - entry;
@@ -65,10 +65,14 @@ pub(crate) unsafe fn initialize(boot_info: usize, boot_magic: usize) -> bool {
         ) else {
             return false;
         };
-        if kind == 1 && !crate::memory_resources::add_memory_region(start, length) {
+        if kind == 1
+            && !crate::kernel::memory::resources::MemoryRegionRegistry::add_memory_region(
+                start, length,
+            )
+        {
             return false;
         }
         entry += entry_length;
     }
-    !crate::memory_resources::memory_regions().is_empty()
+    !crate::kernel::memory::resources::MemoryRegionRegistry::memory_regions().is_empty()
 }

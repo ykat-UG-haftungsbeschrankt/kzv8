@@ -7,7 +7,7 @@
 
 use core::ffi::c_void;
 
-use crate::sync::IrqSpinLock;
+use crate::kernel::scheduler::sync::IrqSpinLock;
 
 const MAX_EXIT_HANDLERS: usize = 256;
 

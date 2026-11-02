@@ -5,9 +5,9 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::dma::{self, DmaBuffer};
-use crate::sync::{IrqSpinGuard, IrqSpinLock};
-use crate::virtio_transport::{Error, VirtioTransport};
+use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
+use crate::kernel::scheduler::sync::{IrqSpinGuard, IrqSpinLock};
+use crate::kernel::drivers::virtio::transport::{Error, VirtioTransport};
 
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
@@ -144,7 +144,7 @@ impl<const N: usize> VirtQueue<N> {
                 head,
             );
         }
-        crate::dma::sync_for_device();
+        crate::kernel::memory::dma::sync_for_device();
         unsafe {
             core::ptr::write_volatile(
                 core::ptr::addr_of_mut!(self.available.index),
@@ -160,7 +160,7 @@ impl<const N: usize> VirtQueue<N> {
         if self.last_used == used_index {
             return None;
         }
-        crate::dma::sync_for_cpu();
+        crate::kernel::memory::dma::sync_for_cpu();
         let slot = usize::from(self.last_used) % N;
         let element =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.used.ring[slot])) };
@@ -190,7 +190,7 @@ pub(crate) struct DmaQueue<const N: usize> {
 
 impl<const N: usize> DmaQueue<N> {
     pub(crate) fn new() -> Option<Self> {
-        let mut storage = dma::allocate(
+        let mut storage = DmaArena::allocate(
             core::mem::size_of::<VirtQueue<N>>(),
             core::mem::align_of::<VirtQueue<N>>(),
         )?;

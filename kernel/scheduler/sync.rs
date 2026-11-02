@@ -28,7 +28,7 @@ impl<T> IrqSpinLock<T> {
     }
 
     pub(crate) fn lock(&self) -> IrqSpinGuard<'_, T> {
-        let interrupt_state = crate::arch::interrupts::disable();
+        let interrupt_state = crate::kernel::arch::interrupts::disable();
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -69,6 +69,6 @@ impl<T> DerefMut for IrqSpinGuard<'_, T> {
 impl<T> Drop for IrqSpinGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
-        crate::arch::interrupts::restore(self.interrupt_state);
+        crate::kernel::arch::interrupts::restore(self.interrupt_state);
     }
 }

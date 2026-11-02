@@ -47,10 +47,10 @@ pub(crate) struct VirtioTransport {
 
 impl VirtioTransport {
     pub(crate) fn from_base(base: usize) -> Option<Self> {
-        if !crate::memory::mmu_ready() {
+        if !crate::kernel::memory::virtual_memory::mmu_ready() {
             return None;
         }
-        let window = crate::arch::virtio_window();
+        let window = crate::kernel::arch::virtio_window();
         let offset = base.checked_sub(window.start)?;
         if window.stride == 0
             || offset % window.stride != 0
@@ -62,10 +62,10 @@ impl VirtioTransport {
     }
 
     pub(crate) fn find(device_id: u32) -> Option<Self> {
-        if !crate::memory::mmu_ready() {
+        if !crate::kernel::memory::virtual_memory::mmu_ready() {
             return None;
         }
-        let window = crate::arch::virtio_window();
+        let window = crate::kernel::arch::virtio_window();
         for slot in 0..window.slots {
             let base = window.start.checked_add(slot.checked_mul(window.stride)?)?;
             let magic = unsafe { read_register(base, REG_MAGIC) };
@@ -87,7 +87,7 @@ impl VirtioTransport {
         device_id: u32,
         requested_features: u64,
     ) -> Result<Self, Error> {
-        if !crate::memory::mmu_ready() {
+        if !crate::kernel::memory::virtual_memory::mmu_ready() {
             return Err(Error::InvalidDevice);
         }
         let base = self.base;
@@ -151,7 +151,7 @@ impl VirtioTransport {
             write_address(self.base, REG_QUEUE_DESC, descriptors);
             write_address(self.base, REG_QUEUE_AVAIL, available);
             write_address(self.base, REG_QUEUE_USED, used);
-            crate::dma::sync_for_device();
+            crate::kernel::memory::dma::sync_for_device();
             write_register(self.base, REG_QUEUE_READY, 1);
         }
         Ok(())
@@ -171,7 +171,7 @@ impl VirtioTransport {
     }
 
     pub(crate) fn read_device_config(&self, offset: usize) -> Option<u32> {
-        let window = crate::arch::virtio_window();
+        let window = crate::kernel::arch::virtio_window();
         let config_offset = 0x100usize.checked_add(offset)?;
         if offset % core::mem::size_of::<u32>() != 0
             || config_offset.checked_add(core::mem::size_of::<u32>())? > window.stride
@@ -182,7 +182,7 @@ impl VirtioTransport {
     }
 
     pub(crate) fn slot(&self) -> usize {
-        let window = crate::arch::virtio_window();
+        let window = crate::kernel::arch::virtio_window();
         (self.base - window.start) / window.stride
     }
 
@@ -196,10 +196,10 @@ impl VirtioTransport {
 }
 
 pub(crate) fn dispatch_interrupts() -> u64 {
-    if !crate::memory::mmu_ready() {
+    if !crate::kernel::memory::virtual_memory::mmu_ready() {
         return 0;
     }
-    let window = crate::arch::virtio_window();
+    let window = crate::kernel::arch::virtio_window();
     let mut pending = 0u64;
     for slot in 0..window.slots.min(64) {
         let base = window.start + slot * window.stride;

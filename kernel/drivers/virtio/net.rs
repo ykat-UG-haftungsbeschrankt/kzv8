@@ -5,9 +5,9 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::dma::{self, DmaBuffer};
-use crate::virtio_queue::{Descriptor, DmaQueue};
-use crate::virtio_transport::VirtioTransport;
+use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
+use crate::kernel::drivers::virtio::queue::{Descriptor, DmaQueue};
+use crate::kernel::drivers::virtio::transport::VirtioTransport;
 
 const DEVICE_ID: u32 = 1;
 const QUEUE_SIZE: usize = 8;
@@ -51,8 +51,8 @@ impl VirtioNet {
         if !transport.activate() {
             return None;
         }
-        let receive_buffer = dma::allocate(HEADER_SIZE + MTU, 16)?;
-        let transmit_buffer = dma::allocate(HEADER_SIZE + MTU, 16)?;
+        let receive_buffer = DmaArena::allocate(HEADER_SIZE + MTU, 16)?;
+        let transmit_buffer = DmaArena::allocate(HEADER_SIZE + MTU, 16)?;
         let mac_low = transport.read_device_config(0)?;
         let mac_high = transport.read_device_config(4)?;
         let mac_address = [
