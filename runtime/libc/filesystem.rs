@@ -589,7 +589,7 @@ pub unsafe extern "C" fn write(
         while written < length {
             let chunk = (length - written).min(512);
             let result = unsafe {
-                crate::runtime_ffi::kz_host_console_write(
+                crate::runtime::runtime_ffi::kz_host_console_write(
                     buffer.cast::<u8>().add(written),
                     chunk,
                 )
