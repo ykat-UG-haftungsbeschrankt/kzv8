@@ -27,8 +27,8 @@ impl Frame {
 }
 
 pub(crate) struct PhysicalAllocator {
-    bitmap: [AtomicU64; BITMAP_WORDS],
-    usable: [AtomicU64; BITMAP_WORDS],
+    bitmap: [AtomicU64; PhysicalAllocator::BITMAP_WORDS],
+    usable: [AtomicU64; PhysicalAllocator::BITMAP_WORDS],
     initialized: AtomicBool,
     frame_count: AtomicUsize,
     next_hint: AtomicUsize,
@@ -43,8 +43,8 @@ impl PhysicalAllocator {
 
     const fn new() -> Self {
         Self {
-            bitmap: [const { AtomicU64::new(u64::MAX) }; BITMAP_WORDS],
-            usable: [const { AtomicU64::new(0) }; BITMAP_WORDS],
+            bitmap: [const { AtomicU64::new(u64::MAX) }; Self::BITMAP_WORDS],
+            usable: [const { AtomicU64::new(0) }; Self::BITMAP_WORDS],
             initialized: AtomicBool::new(false),
             frame_count: AtomicUsize::new(0),
             next_hint: AtomicUsize::new(0),

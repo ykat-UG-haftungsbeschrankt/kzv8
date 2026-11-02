@@ -8,7 +8,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
-const DMA_ARENA_SIZE: usize = 512 * 1024;
+
 
 #[repr(C, align(4096))]
 pub(crate) struct DmaArena {
@@ -43,9 +43,10 @@ impl DmaBuffer {
 }
 
 impl DmaArena {
+    const DMA_ARENA_SIZE: usize = 512 * 1024;
     const fn new() -> Self {
         Self {
-            bytes: UnsafeCell::new([0; DMA_ARENA_SIZE]),
+            bytes: UnsafeCell::new([0; Self::DMA_ARENA_SIZE]),
             next: AtomicUsize::new(0),
         }
     }
@@ -70,7 +71,7 @@ impl DmaArena {
             let aligned = (base + current + alignment - 1) & !(alignment - 1);
             let end = aligned.checked_add(length)?;
             let next = end.checked_sub(base)?;
-            if next > DMA_ARENA_SIZE {
+            if next > Self::DMA_ARENA_SIZE {
                 return None;
             }
             match arena.next.compare_exchange_weak(
@@ -89,14 +90,15 @@ impl DmaArena {
             }
         }
     }
-}
 
-pub(crate) fn sync_for_device() {
-    fence(Ordering::SeqCst);
-    crate::kernel::arch::dma_sync_for_device();
-}
+    pub(crate) fn sync_for_device() {
+        fence(Ordering::SeqCst);
+        crate::kernel::arch::dma_sync_for_device();
+    }
 
-pub(crate) fn sync_for_cpu() {
-    fence(Ordering::SeqCst);
-    crate::kernel::arch::dma_sync_for_cpu();
+    pub(crate) fn sync_for_cpu() {
+        fence(Ordering::SeqCst);
+        crate::kernel::arch::dma_sync_for_cpu();
+    }
+
 }

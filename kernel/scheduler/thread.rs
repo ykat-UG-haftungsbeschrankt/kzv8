@@ -10,11 +10,6 @@ use core::ptr::addr_of_mut;
 use core::slice::from_raw_parts_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const MAX_THREADS: usize = 8;
-const MAX_TLS_KEYS: usize = 64;
-const STACK_SIZE: usize = 16 * 1024;
-const MAIN_THREAD_ID: usize = 1;
-
 type StartRoutine = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 
 #[repr(C)]
@@ -95,21 +90,22 @@ impl Thread {
 
 #[derive(Clone, Copy)]
 #[repr(align(16))]
-pub(crate) struct ThreadStack([u8; STACK_SIZE]);
+pub(crate) struct ThreadStack([u8; Self::STACK_SIZE]);
 
 impl ThreadStack {
+    const STACK_SIZE: usize = 16 * 1024;
     /// # Safety
     /// `index` must be valid, and the caller must ensure exclusive access to that stack.
     pub(crate) unsafe fn slice_at(index: usize) -> &'static mut [u8] {
         let manager = ThreadManager::get_instance();
         let stacks = unsafe { addr_of_mut!((*manager).stacks).cast::<ThreadStack>() };
         let stack = unsafe { stacks.add(index) };
-        unsafe { from_raw_parts_mut(addr_of_mut!((*stack).0).cast::<u8>(), STACK_SIZE) }
+        unsafe { from_raw_parts_mut(addr_of_mut!((*stack).0).cast::<u8>(), Self::STACK_SIZE) }
     }
 
     pub(crate) fn bounds(index: usize) -> (*mut c_void, usize) {
         if index == 0 {
-            return crate::kernel::arch::current_thread_stack_bounds(STACK_SIZE);
+            return crate::kernel::arch::current_thread_stack_bounds(Self::STACK_SIZE);
         }
         if index >= MAX_THREADS {
             return (core::ptr::null_mut(), 0);
@@ -117,14 +113,14 @@ impl ThreadStack {
 
         let manager = ThreadManager::get_instance();
         let stacks = unsafe { addr_of_mut!((*manager).stacks).cast::<ThreadStack>() };
-        unsafe { (stacks.add(index).cast::<c_void>(), STACK_SIZE) }
+        unsafe { (stacks.add(index).cast::<c_void>(), Self::STACK_SIZE) }
     }
 }
 
 pub(crate) struct ThreadManager {
-    threads: [Thread; MAX_THREADS],
-    tls_keys: [TlsKey; MAX_TLS_KEYS],
-    stacks: [ThreadStack; MAX_THREADS],
+    threads: [Thread; Self::MAX_THREADS],
+    tls_keys: [TlsKey; Self::MAX_TLS_KEYS],
+    stacks: [ThreadStack; Self::MAX_THREADS],
     current_slot: usize,
     next_thread_id: usize,
     initialized: bool,
@@ -132,11 +128,15 @@ pub(crate) struct ThreadManager {
 }
 
 impl ThreadManager {
+    const MAX_THREADS: usize = 8;
+    const MAX_TLS_KEYS: usize = 64;
+    const MAIN_THREAD_ID: usize = 1;
+
     const fn new() -> Self {
         Self {
-            threads: [Thread::EMPTY; MAX_THREADS],
-            tls_keys: [TlsKey::EMPTY; MAX_TLS_KEYS],
-            stacks: [ThreadStack([0; STACK_SIZE]); MAX_THREADS],
+            threads: [Thread::EMPTY; Self::MAX_THREADS],
+            tls_keys: [TlsKey::EMPTY; Self::MAX_TLS_KEYS],
+            stacks: [ThreadStack([0; ThreadStack::STACK_SIZE]); Self::MAX_THREADS],
             current_slot: 0,
             next_thread_id: MAIN_THREAD_ID + 1,
             initialized: false,
@@ -154,11 +154,11 @@ impl ThreadManager {
         let manager = Self::get_instance();
         unsafe {
             let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-            for index in 0..MAX_THREADS {
+            for index in 0..Self::MAX_THREADS {
                 threads.add(index).write(Thread::EMPTY);
             }
             let keys = addr_of_mut!((*manager).tls_keys).cast::<TlsKey>();
-            for index in 0..MAX_TLS_KEYS {
+            for index in 0..Self::MAX_TLS_KEYS {
                 keys.add(index).write(TlsKey::EMPTY);
             }
             threads.add(0).write(Thread {
@@ -189,7 +189,7 @@ impl ThreadManager {
     unsafe fn find_thread(id: usize) -> Option<usize> {
         let manager = Self::get_instance();
         let threads = unsafe { addr_of_mut!((*manager).threads).cast::<Thread>() };
-        for index in 0..MAX_THREADS {
+        for index in 0..Self::MAX_THREADS {
             let thread = unsafe { threads.add(index) };
             if unsafe { (*thread).state != ThreadState::Unused && (*thread).id == id } {
                 return Some(index);
@@ -201,8 +201,8 @@ impl ThreadManager {
     unsafe fn find_ready(current: usize) -> Option<usize> {
         let manager = Self::get_instance();
         let threads = unsafe { addr_of_mut!((*manager).threads).cast::<Thread>() };
-        for distance in 1..=MAX_THREADS {
-            let index = (current + distance) % MAX_THREADS;
+        for distance in 1..=Self::MAX_THREADS {
+            let index = (current + distance) % Self::MAX_THREADS;
             if unsafe { (*threads.add(index)).state == ThreadState::Ready } {
                 return Some(index);
             }
@@ -326,17 +326,4 @@ impl ThreadManager {
         }
         Self::exit_current(core::ptr::null_mut())
     }
-}
-
-#[no_mangle]
-pub extern "C" fn __errno_location() -> *mut i32 {
-    ThreadManager::errno_location()
-}
-
-pub(crate) fn current_thread_id() -> usize {
-    ThreadManager::current_thread_id()
-}
-
-pub(crate) fn exit_current(result: *mut c_void) -> ! {
-    ThreadManager::exit_current(result)
 }

@@ -17,8 +17,6 @@ use crate::kernel::error::Error;
 
 use super::sync::IrqSpinLock;
 
-const MAX_TASKS: usize = 16;
-
 type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct Task {
@@ -44,13 +42,14 @@ impl Task {
 }
 
 struct Executor {
-    tasks: [Task; MAX_TASKS],
+    tasks: [Task; Self::MAX_TASKS],
 }
 
 impl Executor {
+    const MAX_TASKS: usize = 16;
     const fn new() -> Self {
         Self {
-            tasks: [const { Task::new() }; MAX_TASKS],
+            tasks: [const { Task::new() }; Self::MAX_TASKS],
         }
     }
 }

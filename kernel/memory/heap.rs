@@ -11,12 +11,6 @@ use core::ptr::null_mut;
 
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
-const PAGE_SIZE: usize = crate::kernel::memory::virtual_memory::PAGE_SIZE;
-const CLASS_SIZES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
-const MAX_SLABS: usize = 8192;
-const MAX_LARGE_ALLOCATIONS: usize = 512;
-const NO_INDEX: usize = usize::MAX;
-
 #[derive(Clone, Copy)]
 struct Slab {
     page: usize,
@@ -32,7 +26,7 @@ impl Slab {
         page: 0,
         class_index: 0,
         used: 0,
-        next: NO_INDEX,
+        next: Heap::NO_INDEX,
         bitmap: [0; 4],
         active: false,
     };
@@ -55,18 +49,18 @@ impl LargeAllocation {
 
 struct HeapState {
     initialized: bool,
-    slabs: [Slab; MAX_SLABS],
-    class_heads: [usize; CLASS_SIZES.len()],
-    large_allocations: [LargeAllocation; MAX_LARGE_ALLOCATIONS],
+    slabs: [Slab; Heap::MAX_SLABS],
+    class_heads: [usize; Heap::CLASS_SIZES.len()],
+    large_allocations: [LargeAllocation; Heap::MAX_LARGE_ALLOCATIONS],
 }
 
 impl HeapState {
     const fn new() -> Self {
         Self {
             initialized: false,
-            slabs: [Slab::EMPTY; MAX_SLABS],
-            class_heads: [NO_INDEX; CLASS_SIZES.len()],
-            large_allocations: [LargeAllocation::EMPTY; MAX_LARGE_ALLOCATIONS],
+            slabs: [Slab::EMPTY; Heap::MAX_SLABS],
+            class_heads: [Heap::NO_INDEX; Heap::CLASS_SIZES.len()],
+            large_allocations: [LargeAllocation::EMPTY; Heap::MAX_LARGE_ALLOCATIONS],
         }
     }
 }
@@ -79,6 +73,12 @@ pub(crate) struct Heap {
 static GLOBAL_ALLOCATOR: Heap = Heap::new();
 
 impl Heap {
+    const PAGE_SIZE: usize = crate::kernel::memory::virtual_memory::PAGE_SIZE;
+    const CLASS_SIZES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
+    const MAX_SLABS: usize = 8192;
+    const MAX_LARGE_ALLOCATIONS: usize = 512;
+    const NO_INDEX: usize = usize::MAX;
+
     const fn new() -> Self {
         Self {
             state: IrqSpinLock::new(HeapState::new()),
@@ -95,18 +95,21 @@ impl Heap {
         }
         let size = layout.size().max(1);
         let required = size.max(layout.align());
-        if let Some(class_index) = CLASS_SIZES.iter().position(|class| required <= *class) {
+        if let Some(class_index) = Self::CLASS_SIZES
+            .iter()
+            .position(|class| required <= *class)
+        {
             return self.allocate_small(heap, class_index);
         }
         self.allocate_large(heap, size, layout.align())
     }
 
     fn allocate_small(&self, heap: &mut HeapState, class_index: usize) -> *mut u8 {
-        let class_size = CLASS_SIZES[class_index];
-        let slot_count = PAGE_SIZE / class_size;
+        let class_size = Self::CLASS_SIZES[class_index];
+        let slot_count = Self::PAGE_SIZE / class_size;
         let mut slab_index = heap.class_heads[class_index];
 
-        while slab_index != NO_INDEX {
+        while slab_index != Self::NO_INDEX {
             if heap.slabs[slab_index].used < slot_count {
                 for slot in 0..slot_count {
                     let word = slot / u64::BITS as usize;
@@ -126,7 +129,11 @@ impl Heap {
         let Some(metadata_slot) = heap.slabs.iter().position(|slab| !slab.active) else {
             return null_mut();
         };
-        let Some(page) = crate::kernel::memory::virtual_memory::reserve(PAGE_SIZE, PAGE_SIZE, 2)
+        let Some(page) = crate::kernel::memory::virtual_memory::reserve(
+            Self::PAGE_SIZE,
+            Self::PAGE_SIZE,
+            2,
+        )
         else {
             return null_mut();
         };
@@ -145,8 +152,8 @@ impl Heap {
 
     fn rounded_length(length: usize) -> Option<usize> {
         length
-            .checked_add(PAGE_SIZE - 1)
-            .map(|value| value & !(PAGE_SIZE - 1))
+            .checked_add(Self::PAGE_SIZE - 1)
+            .map(|value| value & !(Self::PAGE_SIZE - 1))
     }
 
     fn allocate_large(&self, heap: &mut HeapState, size: usize, alignment: usize) -> *mut u8 {
@@ -160,7 +167,7 @@ impl Heap {
         let Some(length) = Self::rounded_length(size) else {
             return null_mut();
         };
-        let alignment = alignment.max(PAGE_SIZE);
+        let alignment = alignment.max(Self::PAGE_SIZE);
         let Some(address) = crate::kernel::memory::virtual_memory::reserve(length, alignment, 2)
         else {
             return null_mut();
@@ -191,7 +198,7 @@ impl Heap {
             return;
         }
 
-        let page = address & !(PAGE_SIZE - 1);
+        let page = address & !(Self::PAGE_SIZE - 1);
         let Some(index) = heap
             .slabs
             .iter()
@@ -200,13 +207,13 @@ impl Heap {
             return;
         };
         let slab = heap.slabs[index];
-        let class_size = CLASS_SIZES[slab.class_index];
+        let class_size = Self::CLASS_SIZES[slab.class_index];
         let offset = address - page;
         if offset % class_size != 0 {
             return;
         }
         let slot = offset / class_size;
-        let slot_count = PAGE_SIZE / class_size;
+        let slot_count = Self::PAGE_SIZE / class_size;
         if slot >= slot_count {
             return;
         }
@@ -222,13 +229,13 @@ impl Heap {
             slab.used -= 1;
             slab.used == 0
         };
-        if unused && crate::kernel::memory::virtual_memory::release(page, PAGE_SIZE) {
-            let mut previous = NO_INDEX;
+        if unused && crate::kernel::memory::virtual_memory::release(page, Self::PAGE_SIZE) {
+            let mut previous = Self::NO_INDEX;
             let mut current = heap.class_heads[class_index];
-            while current != NO_INDEX {
+            while current != Self::NO_INDEX {
                 let next = heap.slabs[current].next;
                 if current == index {
-                    if previous == NO_INDEX {
+                    if previous == Self::NO_INDEX {
                         heap.class_heads[class_index] = next;
                     } else {
                         heap.slabs[previous].next = next;
@@ -255,18 +262,18 @@ impl Heap {
             return Some(allocation.length);
         }
 
-        let page = address & !(PAGE_SIZE - 1);
+        let page = address & !(Self::PAGE_SIZE - 1);
         let slab = heap
             .slabs
             .iter()
             .find(|slab| slab.active && slab.page == page)?;
-        let class_size = CLASS_SIZES[slab.class_index];
+        let class_size = Self::CLASS_SIZES[slab.class_index];
         let offset = address - page;
         if offset % class_size != 0 {
             return None;
         }
         let slot = offset / class_size;
-        if slot >= PAGE_SIZE / class_size {
+        if slot >= Self::PAGE_SIZE / class_size {
             return None;
         }
         let mask = 1u64 << (slot % u64::BITS as usize);
@@ -277,8 +284,8 @@ impl Heap {
         let mut total = 0usize;
         for slab in &heap.slabs {
             if slab.active {
-                let class_size = CLASS_SIZES[slab.class_index];
-                let slots = PAGE_SIZE / class_size;
+                let class_size = Self::CLASS_SIZES[slab.class_index];
+                let slots = Self::PAGE_SIZE / class_size;
                 total = total.saturating_add((slots - slab.used) * class_size);
             }
         }
@@ -289,7 +296,7 @@ impl Heap {
         let mut heap = Self::get_instance().state.lock();
         heap.initialized = false;
         heap.slabs.fill(Slab::EMPTY);
-        heap.class_heads.fill(NO_INDEX);
+        heap.class_heads.fill(Self::NO_INDEX);
         heap.large_allocations.fill(LargeAllocation::EMPTY);
         heap.initialized = true;
     }

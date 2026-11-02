@@ -13,12 +13,12 @@ use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 use crate::kernel::error::Error;
 use crate::kernel::net::stack::NetStack;
 
-const DEFAULT_RX_CAPACITY: usize = 4096;
-const DEFAULT_TX_CAPACITY: usize = 4096;
-
 pub(crate) struct Tcp;
 
 impl Tcp {
+    const DEFAULT_RX_CAPACITY: usize = 4096;
+    const DEFAULT_TX_CAPACITY: usize = 4096;
+
     pub(crate) fn open_socket(
         rx_capacity: usize,
         tx_capacity: usize,
@@ -38,7 +38,7 @@ impl Tcp {
         remote_port: u16,
         local_port: u16,
     ) -> Result<SocketHandle, Error> {
-        let mut socket = Self::open_socket(DEFAULT_RX_CAPACITY, DEFAULT_TX_CAPACITY)?;
+        let mut socket = Self::open_socket(Self::DEFAULT_RX_CAPACITY, Self::DEFAULT_TX_CAPACITY)?;
         socket
             .connect(
                 stack.interface.context(),
@@ -50,7 +50,7 @@ impl Tcp {
     }
 
     pub(crate) fn listen(stack: &mut NetStack, local_port: u16) -> Result<SocketHandle, Error> {
-        let mut socket = Self::open_socket(DEFAULT_RX_CAPACITY, DEFAULT_TX_CAPACITY)?;
+        let mut socket = Self::open_socket(Self::DEFAULT_RX_CAPACITY, Self::DEFAULT_TX_CAPACITY)?;
         socket.listen(local_port).map_err(|_| Error::Io)?;
         Ok(stack.sockets.add(socket))
     }
