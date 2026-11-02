@@ -28,13 +28,17 @@ This is not yet a JavaScript runtime or a complete operating system.
 - An anonymous Linux-shaped `mmap`/`munmap` subset backed by physical frames.
 - A bounded, cooperative pthread subset with fixed stacks, join/detach, mutexes,
   and condition variables.
+- A freestanding x86_64 V8 embedder with a cooperative task runner and kernel
+  page allocator; its smoke test evaluates `6 * 7`. V8 is not integrated on
+  AArch64.
 - QEMU smoke tests for both architectures. They verify interrupt-driven console
-  completions, memory discovery, `mmap`, pthreads, C allocation, and stdio output.
+  completions, memory discovery, `mmap`, pthreads, C allocation, and stdio
+  output; x86_64 also verifies lazy page faults and the V8 smoke test.
 
 There is no kernel-side ELF loader, filesystem, or full libc. Kernel threads
-are cooperatively scheduled on the single configured CPU. Boot assembly,
-paging and interrupt vectors are architecture-specific; the VirtIO transport
-and drivers are shared. Only the VirtIO console is used for kernel output.
+are cooperatively scheduled. Boot assembly, paging and interrupt vectors are
+architecture-specific; the VirtIO transport and drivers are shared. Only the
+VirtIO console is used for kernel output.
 
 ## Build and test
 
@@ -53,12 +57,14 @@ build script assembles architecture entry code with Clang and applies the
 architecture-specific linker script. Make packages the resulting x86 ELF and
 AArch64 binary, then runs the QEMU smoke tests.
 
-The test runs each guest for up to five seconds and then stops it. A healthy
-x86_64 guest emits:
+The smoke runner captures each guest for up to five seconds and then stops it.
+A healthy x86_64 guest emits:
 
 ```text
+kz: first lazy page fault resolved
 kz: x86_64 Rust kernel booted
 kz: virtio-console transmit OK
+kz: Rust futures smoke OK
 kz: C stdio printf 42 hello 0x2a
 kz: C stdio puts works
 !
@@ -68,11 +74,27 @@ kz: malloc/free smoke OK
 kz: RAM above 4 GiB mapped
 kz: pthreads smoke OK
 kz: V8 page allocator hooks OK
-kz: V8 not integrated
+kz: V8 smoke entered
+kz: V8 flags set
+kz: V8 platform created
+kz: V8 platform initialized
+kz: V8 initialized
+kz: V8 allocator ready
+kz: V8 isolate created
+kz: V8 context created
+kz: V8 script compiled
+kz: V8 script ran
+kz: JS result: 42
+kz: V8 disposing isolate
+kz: V8 isolate disposed
+kz: V8 disposing runtime
+kz: V8 runtime disposed
+kz: V8 platform disposed
+kz: V8 evaluated 6 * 7 = 42
 ```
 
-The ARM guest prints `aarch64` instead of `x86_64`, omits the 4 GiB and V8 page
-allocator lines, and reports its own memory, mmap, malloc, and pthread smoke results.
+The AArch64 guest prints `aarch64` instead of `x86_64`, has no lazy-fault or V8
+allocator diagnostic, omits the 4 GiB line, and ends with `kz: V8 not integrated`.
 
 ## Interactive runs
 
@@ -83,6 +105,9 @@ make run-aarch64
 
 Run one command at a time. Press Ctrl-A then X to leave QEMU's stdio console.
 Both machines use software emulation, so KVM privileges are unnecessary.
+The x86 target uses `microvm,acpi=off`: its interrupt routing currently assumes
+the first IO-APIC and fixed VirtIO GSI assignments. QEMU's ACPI-enabled microvm
+can add a second IO-APIC with a different VirtIO GSI base.
 
 The x86 build is linked as ELF64 and converted to an ELF32 container for
 QEMU's Multiboot loader. It still executes 64-bit Rust after the boot
@@ -91,19 +116,21 @@ applications inside the running kernel.
 
 ## Limitations and next milestones
 
-This supports only the single-CPU QEMU configurations in the Makefile. RAM
-regions are discovered from Multiboot or FDT and managed up to the 64 GiB
-physical-address ceiling. VirtIO-MMIO windows remain fixed; there is no general
-ACPI/device-tree device discovery. The frame allocator reserves memory through
-`__bss_end`. The 256 KiB heap reclaims and coalesces freed blocks; the DMA arena
-remains a bounded bump allocator. DMA addresses equal physical addresses.
+The smoke tests use one vCPU; interactive targets request two, but scheduling
+is cooperative and does not provide general SMP or preemption. RAM regions are
+discovered from Multiboot or FDT and managed up to the 64 GiB physical-address
+ceiling. VirtIO-MMIO windows and interrupt routing remain QEMU-specific; there
+is no general ACPI/device-tree device discovery or dynamic interrupt routing.
+The frame allocator reserves memory through `__bss_end`. The 256 KiB heap
+reclaims and coalesces freed blocks; the DMA arena remains a bounded bump
+allocator. DMA addresses equal physical addresses.
 The drivers poll and allow one outstanding queue request; the default smoke
 tests do not attach block, network, or RNG devices. The network stack uses a
 static `10.0.2.15/24` address and the QEMU user-network gateway. There is no
-interrupt-controller setup, address-space manager, filesystem, exception
-recovery, memory isolation, or production safety. The pthread subset has eight
-fixed thread slots, 16 KiB stacks, and no preemption, SMP, cancellation, or
-thread-local storage; it is not a complete POSIX threads implementation.
+per-process address space, filesystem, exception recovery, memory isolation,
+or production safety. The pthread subset has eight fixed thread slots, 16 KiB
+stacks, and no cancellation or thread-local storage; it is not a complete POSIX
+threads implementation.
 Thread attributes accept only the default or fixed stack size. Contended
 mutex, condition, and join operations yield cooperatively and may return
 `EDEADLK` when no runnable thread can make progress.
@@ -111,10 +138,11 @@ The `mmap` subset supports anonymous private/shared mappings in the shared
 kernel identity map only. It has no file mappings, `MAP_FIXED`, partial
 `munmap`, or per-process address spaces, and is not a Linux `mmap(2)` syscall.
 
-V8 is not linked into, initialized in, or simulated by the kernel. No
-JavaScript has been executed in the kernel. V8 15.9.62 is pinned in
-`runtime/v8/version.txt` and checked out at `runtime/v8/src`. The x64 Linux
-host build produces a monolithic static archive at
+V8 15.9.62 is pinned in `runtime/v8/version.txt` and checked out at
+`runtime/v8/src`. The x86_64 kernel links a freestanding monolithic build and
+uses it to evaluate a single JavaScript expression; this smoke does not verify
+general runtime bindings or JIT execution. AArch64 does not link V8. The
+separate x64 Linux host build produces a monolithic static archive at
 `runtime/v8/src/out.gn/x64.release/obj/libv8_monolith.a`; its JIT is enabled
 with Sparkplug, Maglev and TurboFan, and JITless mode is disabled. Rebuild it
 from the repository root with:
@@ -134,8 +162,8 @@ make v8-host-test
 This builds and runs V8's `v8_hello_world` embedder sample, then verifies an
 optimized JavaScript function in `d8`. The JIT smoke uses V8's internal test
 intrinsics and status bits, so it is intentionally tied to the pinned version.
-These are hosted x64 checks; V8 is not linked into the kernel, and this is not
-a freestanding build. The bare-metal V8 port remains the major unresolved work:
+These are hosted x64 checks and are separate from the freestanding kernel build.
+The kernel V8 integration remains experimental; major next steps include:
 
 1. Port the required C/C++ runtime and V8 platform services; provide safe
   executable-memory support before enabling JIT in the kernel.

@@ -287,14 +287,32 @@ pub(crate) fn release_range(address: usize, length: usize) -> bool {
     released
 }
 
+#[cfg(target_arch = "x86_64")]
+fn decommit_debug(code: u8) {
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0xe9u16,
+            in("al") code,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn decommit_debug(_code: u8) {}
+
 pub(crate) fn decommit(address: usize, length: usize) -> bool {
     if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 {
+        decommit_debug(b'a');
         return false;
     }
     let Some(length) = rounded_length(length) else {
+        decommit_debug(b'b');
         return false;
     };
     let Some(offset) = address.checked_sub(VM_BASE) else {
+        decommit_debug(b'c');
         return false;
     };
     let start_page = offset / PAGE_SIZE;
@@ -303,6 +321,7 @@ pub(crate) fn decommit(address: usize, length: usize) -> bool {
         return false;
     };
     if end_page > MAX_VM_PAGES {
+        decommit_debug(b'd');
         return false;
     }
 
@@ -314,10 +333,14 @@ pub(crate) fn decommit(address: usize, length: usize) -> bool {
             && start_page >= area.start_page
             && end_page <= area.start_page.saturating_add(area.page_count)
     });
-    if !range_reserved
-        || (start_page..end_page)
-            .any(|page| PAGE_STATE[page].load(Ordering::Acquire) & VM_RESERVED == 0)
+    if !range_reserved {
+        decommit_debug(b'e');
+        return false;
+    }
+    if (start_page..end_page)
+        .any(|page| PAGE_STATE[page].load(Ordering::Acquire) & VM_RESERVED == 0)
     {
+        decommit_debug(b'f');
         return false;
     }
 
@@ -327,9 +350,13 @@ pub(crate) fn decommit(address: usize, length: usize) -> bool {
         if let Some(physical_address) = crate::arch::unmap_page(virtual_address) {
             if !crate::physical::deallocate_contiguous(physical_address, PAGE_SIZE) {
                 decommitted = false;
+                decommit_debug(b'g');
             }
         }
         PAGE_STATE[page].store(VM_RESERVED, Ordering::Release);
+    }
+    if decommitted {
+        decommit_debug(b'.');
     }
     decommitted
 }

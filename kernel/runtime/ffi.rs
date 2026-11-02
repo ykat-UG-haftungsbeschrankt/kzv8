@@ -132,6 +132,15 @@ pub extern "C" fn kz_host_v8_release_pages(
 
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
+pub extern "C" fn kz_host_v8_decommit_pages(address: *mut u8, length: usize) -> i32 {
+    if address.is_null() {
+        return 0;
+    }
+    crate::memory::decommit(address as usize, length) as i32
+}
+
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
 pub extern "C" fn kz_host_v8_set_page_permissions(
     address: *mut u8,
     length: usize,
@@ -140,6 +149,7 @@ pub extern "C" fn kz_host_v8_set_page_permissions(
     if address.is_null() {
         return 0;
     }
+    let permissions = if permissions == 5 { 0 } else { permissions };
     crate::memory::set_permissions(address as usize, length, permissions) as i32
 }
 

@@ -17,6 +17,7 @@ void* kz_host_v8_allocate_pages(void* hint, size_t length, size_t alignment,
 																int permissions);
 int kz_host_v8_free_pages(void* address, size_t length);
 int kz_host_v8_release_pages(void* address, size_t length, size_t new_length);
+int kz_host_v8_decommit_pages(void* address, size_t length);
 int kz_host_v8_set_page_permissions(void* address, size_t length,
 																		int permissions);
 #endif
@@ -75,7 +76,9 @@ class KernelPageAllocator final : public v8::PageAllocator {
 							 address, length, static_cast<int>(permissions)) != 0;
 	}
 
-	bool DecommitPages(void*, size_t) override { return false; }
+	bool DecommitPages(void* address, size_t length) override {
+		return kz_host_v8_decommit_pages(address, length) != 0;
+	}
 };
 #endif
 

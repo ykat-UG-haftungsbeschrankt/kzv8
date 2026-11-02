@@ -126,6 +126,7 @@ const IO_APIC_BASE: usize = 0xfec0_0000;
 const APIC_BASE_MSR: u32 = 0x1b;
 const APIC_ENABLE: u64 = 1 << 11;
 const X2APIC_ENABLE: u64 = 1 << 10;
+const IO_APIC_LEVEL_TRIGGERED: u32 = 1 << 15;
 const VIRTIO_GSI_BASE: usize = 5;
 
 #[repr(C, packed)]
@@ -221,7 +222,7 @@ pub(crate) fn initialize_controller() -> bool {
     let last_virtio_irq = (VIRTIO_GSI_BASE + window.slots).min(first_unrouted_irq);
     for irq in VIRTIO_GSI_BASE..last_virtio_irq {
         let redirection = 0x10 + (irq * 2) as u8;
-        write_io_apic(redirection, (1 << 15) | VIRTIO_VECTOR as u32);
+        write_io_apic(redirection, IO_APIC_LEVEL_TRIGGERED | VIRTIO_VECTOR as u32);
     }
     true
 }

@@ -12,7 +12,7 @@ def check(architecture):
         "-device", "virtconsole,chardev=console",
     ]
     if architecture == "x86_64":
-        command = ["qemu-system-x86_64", "-machine", "microvm", "-m", "5G",
+        command = ["qemu-system-x86_64", "-machine", "microvm,acpi=off", "-m", "5G",
                    "-kernel", "build/x86_64/kernel.elf"]
     else:
         command = ["qemu-system-aarch64", "-machine", "virt,gic-version=2",
@@ -27,7 +27,10 @@ def check(architecture):
     except subprocess.TimeoutExpired as timeout:
         output = timeout.stdout or b""
         errors = (timeout.stderr or b"").decode(errors="replace")
-    expected = f"kz: {architecture} Rust kernel booted\n"
+    expected = ""
+    if architecture == "x86_64":
+        expected += "kz: first lazy page fault resolved\n"
+    expected += f"kz: {architecture} Rust kernel booted\n"
     expected += "kz: virtio-console transmit OK\n"
     expected += "kz: Rust futures smoke OK\n"
     expected += "kz: C stdio printf 42 hello 0x2a\n"
@@ -41,7 +44,25 @@ def check(architecture):
     expected += "kz: pthreads smoke OK\n"
     if architecture == "x86_64":
         expected += "kz: V8 page allocator hooks OK\n"
-    expected += "kz: V8 not integrated\n"
+        expected += "kz: V8 smoke entered\n"
+        expected += "kz: V8 flags set\n"
+        expected += "kz: V8 platform created\n"
+        expected += "kz: V8 platform initialized\n"
+        expected += "kz: V8 initialized\n"
+        expected += "kz: V8 allocator ready\n"
+        expected += "kz: V8 isolate created\n"
+        expected += "kz: V8 context created\n"
+        expected += "kz: V8 script compiled\n"
+        expected += "kz: V8 script ran\n"
+        expected += "kz: JS result: 42\n"
+        expected += "kz: V8 disposing isolate\n"
+        expected += "kz: V8 isolate disposed\n"
+        expected += "kz: V8 disposing runtime\n"
+        expected += "kz: V8 runtime disposed\n"
+        expected += "kz: V8 platform disposed\n"
+        expected += "kz: V8 evaluated 6 * 7 = 42\n"
+    else:
+        expected += "kz: V8 not integrated\n"
     expected = expected.encode()
     if output != expected:
         raise RuntimeError(f"{architecture}: unexpected output {output!r}\n{errors}")
