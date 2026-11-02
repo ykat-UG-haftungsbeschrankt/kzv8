@@ -1,5 +1,4 @@
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -8,72 +7,6 @@ from pathlib import Path
 
 
 TCP_TEST_PORT = 17777
-
-
-def summarize_pcap(path):
-    try:
-        data = Path(path).read_bytes()
-    except OSError:
-        return {"error": "capture unavailable"}
-    if len(data) < 24:
-        return {"error": "capture is empty"}
-    if data[:4] == b"\xd4\xc3\xb2\xa1":
-        byte_order = "<"
-    elif data[:4] == b"\xa1\xb2\xc3\xd4":
-        byte_order = ">"
-    else:
-        return {"error": "unknown pcap format"}
-    link_type = struct.unpack_from(f"{byte_order}I", data, 20)[0]
-    if link_type != 1:
-        return {"link_type": link_type}
-
-    summary = {
-        "frames": 0,
-        "arp": 0,
-        "ipv4": 0,
-        "ether_types": [],
-        "samples": [],
-        "tcp": [],
-    }
-    offset = 24
-    while offset + 16 <= len(data):
-        frame_length = struct.unpack_from(f"{byte_order}I", data, offset + 8)[0]
-        frame_start = offset + 16
-        frame_end = frame_start + frame_length
-        if frame_end > len(data):
-            break
-        frame = data[frame_start:frame_end]
-        summary["frames"] += 1
-        offset = frame_end
-        if len(frame) < 14:
-            summary["samples"].append(frame[:64].hex())
-            continue
-        ether_type = int.from_bytes(frame[12:14], "big")
-        if ether_type not in summary["ether_types"]:
-            summary["ether_types"].append(hex(ether_type))
-        if len(summary["samples"]) < 5:
-            summary["samples"].append(frame[:64].hex())
-        if ether_type == 0x0806:
-            summary["arp"] += 1
-            continue
-        if ether_type != 0x0800 or len(frame) < 34:
-            continue
-        summary["ipv4"] += 1
-        ip_start = 14
-        ip_header_length = (frame[ip_start] & 0x0F) * 4
-        tcp_start = ip_start + ip_header_length
-        if frame[ip_start + 9] != 6 or tcp_start + 20 > len(frame):
-            continue
-        flags = frame[tcp_start + 13]
-        summary["tcp"].append({
-            "source": ".".join(str(byte) for byte in frame[ip_start + 12:ip_start + 16]),
-            "destination": ".".join(str(byte) for byte in frame[ip_start + 16:ip_start + 20]),
-            "source_port": int.from_bytes(frame[tcp_start:tcp_start + 2], "big"),
-            "destination_port": int.from_bytes(frame[tcp_start + 2:tcp_start + 4], "big"),
-            "syn": bool(flags & 0x02),
-            "ack": bool(flags & 0x10),
-        })
-    return summary
 
 
 def serve_echo_once(listener, state):
@@ -115,13 +48,10 @@ def check(architecture):
     temporary_directory = None
     echo_listener = None
     echo_thread = None
-    capture_path = None
-    capture_summary = None
     echo_state = {"accepted": False, "received": None, "error": None}
     if architecture == "x86_64":
         temporary_directory = tempfile.TemporaryDirectory()
         disk_path = Path(temporary_directory.name) / "smoke.raw"
-        capture_path = Path(temporary_directory.name) / "network.pcap"
         with disk_path.open("wb") as disk:
             disk.truncate(16 * 1024 * 1024)
             disk.seek(8 * 512)
@@ -140,7 +70,6 @@ def check(architecture):
             "-device", "virtio-blk-device,drive=smoke-disk",
             "-netdev", "user,id=smoke-net",
             "-device", "virtio-net-device,netdev=smoke-net",
-            "-object", f"filter-dump,id=smoke-capture,netdev=smoke-net,file={capture_path}",
         ]
     try:
         try:
@@ -154,8 +83,6 @@ def check(architecture):
         except subprocess.TimeoutExpired as timeout:
             output = timeout.stdout or b""
             errors = (timeout.stderr or b"").decode(errors="replace")
-        if capture_path is not None:
-            capture_summary = summarize_pcap(capture_path)
     finally:
         if echo_listener is not None:
             echo_listener.close()
@@ -209,7 +136,6 @@ def check(architecture):
         raise RuntimeError(
             f"{architecture}: unexpected output {output!r}\n{errors}"
             + (f"\nTCP echo server: {echo_state!r}" if echo_listener else "")
-            + (f"\nQEMU network capture: {capture_summary!r}" if capture_path else "")
         )
     print(output.decode(), end="")
     print(f"PASS: {architecture}")
