@@ -315,7 +315,7 @@ pub extern "C" fn x86_irq_dispatch() {
     let in_service = read_local_apic(0x100 + (EXECUTOR_IPI_VECTOR / 32) * 0x10);
     if in_service & (1 << (TIMER_VECTOR % 32)) != 0 {
         write_local_apic(0xb0, 0);
-        crate::kernel::scheduler::thread::timer_tick();
+        crate::kernel::scheduler::thread::ThreadManager::timer_tick();
         return;
     }
     if in_service & (1 << (EXECUTOR_IPI_VECTOR % 32)) == 0 {

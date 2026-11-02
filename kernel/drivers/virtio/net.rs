@@ -7,6 +7,7 @@
 
 use crate::kernel::drivers::virtio::queue::{Descriptor, DmaQueue};
 use crate::kernel::drivers::virtio::transport::VirtioTransport;
+use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
 
 const DEVICE_ID: u32 = 1;
@@ -14,15 +15,6 @@ const QUEUE_SIZE: usize = 8;
 const HEADER_SIZE: usize = 12;
 const FEATURE_MRG_RXBUF: u64 = 1 << 15;
 pub(crate) const MTU: usize = 1500;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Error {
-    Unavailable,
-    FrameTooLarge,
-    QueueBusy,
-    BufferTooSmall,
-    CompletionMismatch,
-}
 
 pub(crate) struct VirtioNet {
     transport: VirtioTransport,
@@ -85,10 +77,10 @@ impl VirtioNet {
 
     pub(crate) fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
         if frame.len() > MTU {
-            return Err(Error::FrameTooLarge);
+            return Err(Error::MsgSize);
         }
         if self.transmit_head.is_some() && !self.poll_transmit()? {
-            return Err(Error::QueueBusy);
+            return Err(Error::Busy);
         }
         let buffer = self.transmit_buffer.as_mut_slice();
         buffer[..HEADER_SIZE].fill(0);
@@ -101,7 +93,7 @@ impl VirtioNet {
         let head = self
             .transmit_queue
             .submit(&descriptors)
-            .ok_or(Error::QueueBusy)?;
+            .ok_or(Error::Busy)?;
         self.transmit_head = Some(head);
         dma::sync_for_device();
         self.transport.notify(1);
@@ -117,14 +109,14 @@ impl VirtioNet {
         };
         self.transmit_head = None;
         if used.id != u32::from(expected) {
-            return Err(Error::CompletionMismatch);
+            return Err(Error::Proto);
         }
         Ok(true)
     }
 
     pub(crate) fn poll_receive(&mut self, output: &mut [u8]) -> Result<Option<usize>, Error> {
         if output.is_empty() {
-            return Err(Error::BufferTooSmall);
+            return Err(Error::MsgSize);
         }
         if self.receive_head.is_none() {
             let buffer = self.receive_buffer.as_mut_slice();
@@ -134,10 +126,7 @@ impl VirtioNet {
                 Descriptor::new(base, HEADER_SIZE as u32, true),
                 Descriptor::new(base + HEADER_SIZE as u64, MTU as u32, true),
             ];
-            let head = self
-                .receive_queue
-                .submit(&descriptors)
-                .ok_or(Error::QueueBusy)?;
+            let head = self.receive_queue.submit(&descriptors).ok_or(Error::Busy)?;
             dma::sync_for_device();
             self.transport.notify(0);
             self.receive_head = Some(head);
@@ -149,11 +138,11 @@ impl VirtioNet {
         };
         self.receive_head = None;
         if used.id != u32::from(head) {
-            return Err(Error::CompletionMismatch);
+            return Err(Error::Proto);
         }
         let frame_length = (used.length as usize).saturating_sub(HEADER_SIZE);
         if frame_length > output.len() || frame_length > MTU {
-            return Err(Error::BufferTooSmall);
+            return Err(Error::MsgSize);
         }
         let buffer = self.receive_buffer.as_mut_slice();
         output[..frame_length].copy_from_slice(&buffer[HEADER_SIZE..HEADER_SIZE + frame_length]);

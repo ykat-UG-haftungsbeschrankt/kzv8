@@ -13,6 +13,8 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use crate::kernel::error::Error;
+
 use super::sync::IrqSpinLock;
 
 const MAX_TASKS: usize = 16;
@@ -93,12 +95,7 @@ impl Wake for TaskWaker {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SpawnError {
-    Full,
-}
-
-pub(crate) fn spawn<F>(future: F) -> Result<(), SpawnError>
+pub(crate) fn spawn<F>(future: F) -> Result<(), Error>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -127,7 +124,7 @@ where
         crate::kernel::arch::notify_executor();
         return Ok(());
     }
-    Err(SpawnError::Full)
+    Err(Error::Again)
 }
 
 fn poll_ready() {

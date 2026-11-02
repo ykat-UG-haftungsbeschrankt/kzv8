@@ -7,17 +7,12 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const QUEUE_SIZE: usize = 8;
-const OUTPUT_CAPACITY: usize = 16 * 1024;
-const MAX_CHUNK_SIZE: usize = 512;
-const VIRTIO_CONSOLE_DEVICE_ID: u32 = 3;
-
 use crate::kernel::drivers::virtio::queue::{Descriptor, QueueCell};
 use crate::kernel::drivers::virtio::transport::VirtioTransport;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 struct OutputQueue {
-    bytes: [u8; OUTPUT_CAPACITY],
+    bytes: [u8; Console::OUTPUT_CAPACITY],
     head: usize,
     length: usize,
     active_length: usize,
@@ -26,7 +21,7 @@ struct OutputQueue {
 
 impl OutputQueue {
     const EMPTY: Self = Self {
-        bytes: [0; OUTPUT_CAPACITY],
+        bytes: [0; Console::OUTPUT_CAPACITY],
         head: 0,
         length: 0,
         active_length: 0,
@@ -35,13 +30,18 @@ impl OutputQueue {
 }
 
 pub(crate) struct Console {
-    queue: QueueCell<QUEUE_SIZE>,
+    queue: QueueCell<Console::QUEUE_SIZE>,
     base: AtomicUsize,
     slot: AtomicUsize,
     output: IrqSpinLock<OutputQueue>,
 }
 
 impl Console {
+    const QUEUE_SIZE: usize = 8;
+    const OUTPUT_CAPACITY: usize = 16 * 1024;
+    const MAX_CHUNK_SIZE: usize = 512;
+    const VIRTIO_CONSOLE_DEVICE_ID: u32 = 3;
+
     const fn new() -> Self {
         Self {
             queue: QueueCell::new(),
@@ -58,10 +58,10 @@ impl Console {
 
     pub(crate) fn initialize() -> bool {
         let console = Self::get_instance();
-        let Some(candidate) = VirtioTransport::find(VIRTIO_CONSOLE_DEVICE_ID) else {
+        let Some(candidate) = VirtioTransport::find(Console::VIRTIO_CONSOLE_DEVICE_ID) else {
             return false;
         };
-        let Ok(transport) = candidate.initialize(VIRTIO_CONSOLE_DEVICE_ID) else {
+        let Ok(transport) = candidate.initialize(Console::VIRTIO_CONSOLE_DEVICE_ID) else {
             return false;
         };
         let base = transport.base();
@@ -75,7 +75,7 @@ impl Console {
 
     pub(crate) fn write(message: &[u8]) -> bool {
         let console = Self::get_instance();
-        if message.len() > MAX_CHUNK_SIZE {
+        if message.len() > Console::MAX_CHUNK_SIZE {
             return false;
         }
         if message.is_empty() {
@@ -86,11 +86,11 @@ impl Console {
             return false;
         }
         let mut output = console.output.lock();
-        if message.len() > OUTPUT_CAPACITY - output.length {
+        if message.len() > Console::OUTPUT_CAPACITY - output.length {
             return false;
         }
-        let tail = (output.head + output.length) % OUTPUT_CAPACITY;
-        let first_length = message.len().min(OUTPUT_CAPACITY - tail);
+        let tail = (output.head + output.length) % Console::OUTPUT_CAPACITY;
+        let first_length = message.len().min(Console::OUTPUT_CAPACITY - tail);
         output.bytes[tail..tail + first_length].copy_from_slice(&message[..first_length]);
         output.bytes[..message.len() - first_length].copy_from_slice(&message[first_length..]);
         output.length += message.len();
@@ -121,7 +121,7 @@ impl Console {
         if used.id != u32::from(expected) {
             return;
         }
-        output.head = (output.head + output.active_length) % OUTPUT_CAPACITY;
+        output.head = (output.head + output.active_length) % Console::OUTPUT_CAPACITY;
         output.length -= output.active_length;
         output.active_length = 0;
         output.active_head = None;
@@ -140,8 +140,8 @@ impl Console {
         }
         let length = output
             .length
-            .min(MAX_CHUNK_SIZE)
-            .min(OUTPUT_CAPACITY - output.head);
+            .min(Console::MAX_CHUNK_SIZE)
+            .min(Console::OUTPUT_CAPACITY - output.head);
         let descriptor = Descriptor::new(
             output.bytes[output.head..output.head + length].as_ptr() as u64,
             length as u32,

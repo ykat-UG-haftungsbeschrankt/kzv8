@@ -1,5 +1,8 @@
 When working on files under `runtime/`, do not modify files under `kernel/`. If a runtime task appears to require a kernel change, explain why and ask for approval before editing `kernel/`.
 
+## Kernel Errors
+- Define all kernel error codes in `kernel/error.rs`; do not define kernel error codes elsewhere.
+
 ## Rust Safety
 - Prefer safe Rust and avoid `unsafe` whenever a safe API can express the operation.
 - When `unsafe` is necessary, keep the block minimal and document its safety invariants.

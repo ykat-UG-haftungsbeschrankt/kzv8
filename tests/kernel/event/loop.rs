@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use super::{Event, EventFlags, EventLoop, EventSourceId, RegistrationError};
+    use super::{Event, EventFlags, EventLoop, EventSourceId};
+    use crate::kernel::error::Error;
     use crate::kernel::event::completion::Completion;
 
     #[test]
@@ -28,17 +29,11 @@ mod tests {
         let source = EventSourceId::new(8);
         let mut events = EventLoop::<1>::new();
         let token = events.register(source, EventFlags::READABLE, 1).unwrap();
-        events
-            .set_readiness(token, EventFlags::READABLE)
-            .unwrap();
-        events
-            .modify(token, EventFlags::WRITABLE, 2)
-            .unwrap();
+        events.set_readiness(token, EventFlags::READABLE).unwrap();
+        events.modify(token, EventFlags::WRITABLE, 2).unwrap();
         assert_eq!(events.wait(0), None);
 
-        events
-            .set_readiness(token, EventFlags::WRITABLE)
-            .unwrap();
+        events.set_readiness(token, EventFlags::WRITABLE).unwrap();
         assert_eq!(
             events.wait(0),
             Some(Event::Readiness {
@@ -50,11 +45,9 @@ mod tests {
         events.deregister(token).unwrap();
         assert_eq!(
             events.set_readiness(token, EventFlags::READABLE),
-            Err(RegistrationError::NotRegistered)
+            Err(Error::NoEnt)
         );
-        let replacement = events
-            .register(source, EventFlags::READABLE, 3)
-            .unwrap();
+        let replacement = events.register(source, EventFlags::READABLE, 3).unwrap();
         assert_ne!(token, replacement);
     }
 
@@ -71,7 +64,7 @@ mod tests {
             .is_ok());
         assert_eq!(
             events.register(EventSourceId::new(1), EventFlags::NONE, 0),
-            Err(RegistrationError::AlreadyRegistered)
+            Err(Error::Exist)
         );
     }
 

@@ -7,6 +7,7 @@
 
 use crate::kernel::drivers::virtio::queue::{Descriptor, DmaQueue};
 use crate::kernel::drivers::virtio::transport::VirtioTransport;
+use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
 
 const DEVICE_ID: u32 = 2;
@@ -19,15 +20,6 @@ struct RequestHeader {
     request_type: u32,
     reserved: u32,
     sector: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Error {
-    Unavailable,
-    InvalidBuffer,
-    QueueBusy,
-    DeviceStatus(u8),
-    CompletionMismatch,
 }
 
 pub(crate) struct BlockDevice {
@@ -91,13 +83,13 @@ impl BlockDevice {
 
     fn validate_request(&self, sector: u64, length: usize) -> Result<(), Error> {
         if length == 0 || length % SECTOR_SIZE != 0 || length > MAX_TRANSFER_SIZE {
-            return Err(Error::InvalidBuffer);
+            return Err(Error::Inval);
         }
         if sector
             .checked_add((length / SECTOR_SIZE) as u64)
             .is_none_or(|end| end > self.capacity_sectors)
         {
-            return Err(Error::InvalidBuffer);
+            return Err(Error::Inval);
         }
         Ok(())
     }
@@ -133,7 +125,7 @@ impl BlockDevice {
             ),
             Descriptor::new(&mut self.request_status as *mut u8 as u64, 1, true),
         ];
-        let head = self.queue.submit(&descriptors).ok_or(Error::QueueBusy)?;
+        let head = self.queue.submit(&descriptors).ok_or(Error::Busy)?;
         self.in_flight_head = Some(head);
         crate::kernel::memory::dma::sync_for_device();
         self.transport.notify(0);
@@ -151,12 +143,12 @@ impl BlockDevice {
             return Ok(());
         };
         let Some(used) = self.queue.poll_used() else {
-            return Err(Error::QueueBusy);
+            return Err(Error::Busy);
         };
         self.in_flight_head = None;
         dma::sync_for_cpu();
         if used.id != u32::from(expected) {
-            return Err(Error::CompletionMismatch);
+            return Err(Error::Proto);
         }
         Ok(())
     }
@@ -186,10 +178,13 @@ impl BlockTransfer<'_> {
         dma::sync_for_cpu();
         self.complete = true;
         if used.id != u32::from(self.head) {
-            return Err(Error::CompletionMismatch);
+            return Err(Error::Proto);
         }
-        if self.device.request_status != 0 {
-            return Err(Error::DeviceStatus(self.device.request_status));
+        match self.device.request_status {
+            0 => {}
+            1 => return Err(Error::Io),
+            2 => return Err(Error::OpNotSupp),
+            _ => return Err(Error::Proto),
         }
         if let Some(output) = self.output.as_mut() {
             let source = &self.device.dma_buffer.as_mut_slice()[..self.length];

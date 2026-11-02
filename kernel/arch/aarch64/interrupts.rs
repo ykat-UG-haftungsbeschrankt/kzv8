@@ -279,7 +279,7 @@ pub extern "C" fn aarch64_irq_dispatch() {
             core::ptr::write_volatile((GICC_BASE + 0x10) as *mut u32, acknowledge);
             core::arch::asm!("dsb sy", options(nostack, preserves_flags));
         }
-        crate::kernel::scheduler::thread::timer_tick();
+        crate::kernel::scheduler::thread::ThreadManager::timer_tick();
         return;
     }
     crate::kz_handle_virtio_interrupt();

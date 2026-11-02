@@ -10,19 +10,11 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
+use crate::kernel::error::Error;
 use crate::kernel::net::stack::NetStack;
 
 const DEFAULT_RX_CAPACITY: usize = 4096;
 const DEFAULT_TX_CAPACITY: usize = 4096;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Error {
-    InvalidBufferSize,
-    Connect,
-    Listen,
-    Send,
-    Receive,
-}
 
 pub(crate) struct Tcp;
 
@@ -32,7 +24,7 @@ impl Tcp {
         tx_capacity: usize,
     ) -> Result<TcpSocket<'static>, Error> {
         if rx_capacity == 0 || tx_capacity == 0 {
-            return Err(Error::InvalidBufferSize);
+            return Err(Error::Inval);
         }
         Ok(TcpSocket::new(
             SocketBuffer::new(vec![0; rx_capacity]),
@@ -53,13 +45,13 @@ impl Tcp {
                 IpEndpoint::new(IpAddress::Ipv4(address), remote_port),
                 local_port,
             )
-            .map_err(|_| Error::Connect)?;
+            .map_err(|_| Error::Io)?;
         Ok(stack.sockets.add(socket))
     }
 
     pub(crate) fn listen(stack: &mut NetStack, local_port: u16) -> Result<SocketHandle, Error> {
         let mut socket = Self::open_socket(DEFAULT_RX_CAPACITY, DEFAULT_TX_CAPACITY)?;
-        socket.listen(local_port).map_err(|_| Error::Listen)?;
+        socket.listen(local_port).map_err(|_| Error::Io)?;
         Ok(stack.sockets.add(socket))
     }
 
@@ -72,7 +64,7 @@ impl Tcp {
             .sockets
             .get_mut::<TcpSocket>(handle)
             .send_slice(bytes)
-            .map_err(|_| Error::Send)
+            .map_err(|_| Error::Io)
     }
 
     pub(crate) fn receive(
@@ -84,6 +76,6 @@ impl Tcp {
             .sockets
             .get_mut::<TcpSocket>(handle)
             .recv_slice(output)
-            .map_err(|_| Error::Receive)
+            .map_err(|_| Error::Io)
     }
 }

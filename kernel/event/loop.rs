@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+use crate::kernel::error::Error;
 use crate::kernel::event::completion::{Completion, CompletionQueue};
 use crate::kernel::event::timers::{TimerId, TimerQueue};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -93,13 +94,6 @@ pub(crate) struct RawEvent {
     pub(crate) data: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegistrationError {
-    AlreadyRegistered,
-    NotRegistered,
-    Full,
-}
-
 #[derive(Clone, Copy)]
 struct SourceWatch {
     source: EventSourceId,
@@ -166,20 +160,20 @@ impl<const N: usize> EventLoop<N> {
         source: EventSourceId,
         interest: EventFlags,
         data: u64,
-    ) -> Result<EventSourceToken, RegistrationError> {
+    ) -> Result<EventSourceToken, Error> {
         if self
             .sources
             .iter()
             .any(|watch| watch.active && watch.source == source)
         {
-            return Err(RegistrationError::AlreadyRegistered);
+            return Err(Error::Exist);
         }
         let Some(index) = self
             .sources
             .iter()
             .position(|watch| !watch.active && !watch.queued)
         else {
-            return Err(RegistrationError::Full);
+            return Err(Error::NoBufs);
         };
         let generation = self.sources[index].generation.wrapping_add(1).max(1);
         self.sources[index] = SourceWatch {
@@ -199,7 +193,7 @@ impl<const N: usize> EventLoop<N> {
         token: EventSourceToken,
         interest: EventFlags,
         data: u64,
-    ) -> Result<(), RegistrationError> {
+    ) -> Result<(), Error> {
         let index = self.source_index(token)?;
         self.sources[index].interest = interest;
         self.sources[index].data = data;
@@ -207,7 +201,7 @@ impl<const N: usize> EventLoop<N> {
         Ok(())
     }
 
-    pub(crate) fn deregister(&mut self, token: EventSourceToken) -> Result<(), RegistrationError> {
+    pub(crate) fn deregister(&mut self, token: EventSourceToken) -> Result<(), Error> {
         let index = self.source_index(token)?;
         self.ready_sources
             .retain(|ready_index| ready_index != index);
@@ -223,7 +217,7 @@ impl<const N: usize> EventLoop<N> {
         &mut self,
         token: EventSourceToken,
         readiness: EventFlags,
-    ) -> Result<(), RegistrationError> {
+    ) -> Result<(), Error> {
         let index = self.source_index(token)?;
         self.sources[index].readiness = readiness;
         self.queue_ready(index);
@@ -305,12 +299,12 @@ impl<const N: usize> EventLoop<N> {
         Some(Event::DeviceInterrupt { slot: slot as u8 })
     }
 
-    fn source_index(&self, token: EventSourceToken) -> Result<usize, RegistrationError> {
+    fn source_index(&self, token: EventSourceToken) -> Result<usize, Error> {
         let Some(watch) = self.sources.get(token.index) else {
-            return Err(RegistrationError::NotRegistered);
+            return Err(Error::NoEnt);
         };
         if !watch.active || watch.generation != token.generation {
-            return Err(RegistrationError::NotRegistered);
+            return Err(Error::NoEnt);
         }
         Ok(token.index)
     }
