@@ -15,6 +15,8 @@ pub(crate) struct IrqSpinLock<T> {
     data: UnsafeCell<T>,
 }
 
+// SAFETY: all access to data is serialized by locked; lock() also masks local
+// interrupts, and T: Send permits ownership to move between CPUs.
 unsafe impl<T: Send> Sync for IrqSpinLock<T> {}
 
 impl<T> IrqSpinLock<T> {
@@ -52,12 +54,14 @@ impl<T> Deref for IrqSpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: this guard keeps the lock held for the returned borrow.
         unsafe { &*self.lock.data.get() }
     }
 }
 
 impl<T> DerefMut for IrqSpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: this is the unique mutable guard while the lock is held.
         unsafe { &mut *self.lock.data.get() }
     }
 }

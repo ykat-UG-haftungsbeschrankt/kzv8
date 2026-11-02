@@ -36,8 +36,10 @@ unsafe extern "C" {
     static stack_top: u8;
 }
 
-pub(crate) fn initialize_boot_info(boot_info: usize, boot_magic: usize) -> bool {
-    multiboot::initialize(boot_info, boot_magic)
+/// # Safety
+/// `boot_info` must point to the Multiboot structure supplied by the bootloader.
+pub(crate) unsafe fn initialize_boot_info(boot_info: usize, boot_magic: usize) -> bool {
+    unsafe { multiboot::initialize(boot_info, boot_magic) }
 }
 
 pub(crate) const fn virtio_window() -> crate::arch::VirtioWindow {

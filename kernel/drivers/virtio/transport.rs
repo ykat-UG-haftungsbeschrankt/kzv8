@@ -46,68 +46,89 @@ pub(crate) struct VirtioTransport {
 }
 
 impl VirtioTransport {
-    pub(crate) const fn from_base(base: usize) -> Self {
-        Self { base }
+    pub(crate) fn from_base(base: usize) -> Option<Self> {
+        if !crate::memory::mmu_ready() {
+            return None;
+        }
+        let window = crate::arch::virtio_window();
+        let offset = base.checked_sub(window.start)?;
+        if window.stride == 0
+            || offset % window.stride != 0
+            || offset / window.stride >= window.slots
+        {
+            return None;
+        }
+        Some(Self { base })
     }
 
-    pub(crate) unsafe fn find(device_id: u32) -> Option<Self> {
+    pub(crate) fn find(device_id: u32) -> Option<Self> {
+        if !crate::memory::mmu_ready() {
+            return None;
+        }
         let window = crate::arch::virtio_window();
         for slot in 0..window.slots {
-            let base = window.start + slot * window.stride;
+            let base = window.start.checked_add(slot.checked_mul(window.stride)?)?;
             let magic = unsafe { read_register(base, REG_MAGIC) };
             let version = unsafe { read_register(base, REG_VERSION) };
             let id = unsafe { read_register(base, REG_DEVICE_ID) };
             if magic == MAGIC && version == VERSION_MODERN && id == device_id {
-                return Some(Self::from_base(base));
+                return Some(Self { base });
             }
         }
         None
     }
 
-    pub(crate) unsafe fn initialize(base: usize, device_id: u32) -> Result<Self, Error> {
-        Self::initialize_with_features(base, device_id, 0)
+    pub(crate) fn initialize(self, device_id: u32) -> Result<Self, Error> {
+        self.initialize_with_features(device_id, 0)
     }
 
-    pub(crate) unsafe fn initialize_with_features(
-        base: usize,
+    pub(crate) fn initialize_with_features(
+        self,
         device_id: u32,
         requested_features: u64,
     ) -> Result<Self, Error> {
-        if read_register(base, REG_MAGIC) != MAGIC
-            || read_register(base, REG_VERSION) != VERSION_MODERN
-            || read_register(base, REG_DEVICE_ID) != device_id
-        {
+        if !crate::memory::mmu_ready() {
             return Err(Error::InvalidDevice);
         }
+        let base = self.base;
+        // SAFETY: this handle is restricted to the mapped VirtIO window, and MMU readiness is checked above.
+        unsafe {
+            if read_register(base, REG_MAGIC) != MAGIC
+                || read_register(base, REG_VERSION) != VERSION_MODERN
+                || read_register(base, REG_DEVICE_ID) != device_id
+            {
+                return Err(Error::InvalidDevice);
+            }
 
-        write_register(base, REG_STATUS, 0);
-        write_register(base, REG_STATUS, 1);
-        write_register(base, REG_STATUS, 3);
+            write_register(base, REG_STATUS, 0);
+            write_register(base, REG_STATUS, 1);
+            write_register(base, REG_STATUS, 3);
 
-        write_register(base, REG_DEVICE_FEATURES_SELECT, 0);
-        let offered_low = read_register(base, REG_DEVICE_FEATURES);
-        write_register(base, REG_DEVICE_FEATURES_SELECT, 1);
-        let offered_high = read_register(base, REG_DEVICE_FEATURES);
-        if offered_high & FEATURE_VERSION_1 == 0 {
-            write_register(base, REG_STATUS, 0x80);
-            return Err(Error::MissingVersionFeature);
+            write_register(base, REG_DEVICE_FEATURES_SELECT, 0);
+            let offered_low = read_register(base, REG_DEVICE_FEATURES);
+            write_register(base, REG_DEVICE_FEATURES_SELECT, 1);
+            let offered_high = read_register(base, REG_DEVICE_FEATURES);
+            if offered_high & FEATURE_VERSION_1 == 0 {
+                write_register(base, REG_STATUS, 0x80);
+                return Err(Error::MissingVersionFeature);
+            }
+            let requested_low = requested_features as u32;
+            let requested_high = (requested_features >> 32) as u32 | FEATURE_VERSION_1;
+            if requested_low & !offered_low != 0 || requested_high & !offered_high != 0 {
+                write_register(base, REG_STATUS, 0x80);
+                return Err(Error::UnsupportedFeature);
+            }
+            write_register(base, REG_DRIVER_FEATURES_SELECT, 0);
+            write_register(base, REG_DRIVER_FEATURES, requested_low);
+            write_register(base, REG_DRIVER_FEATURES_SELECT, 1);
+            write_register(base, REG_DRIVER_FEATURES, requested_high);
+            write_register(base, REG_STATUS, 11);
+            if read_register(base, REG_STATUS) & 8 == 0 {
+                write_register(base, REG_STATUS, 0x80);
+                return Err(Error::FeatureNegotiation);
+            }
         }
-        let requested_low = requested_features as u32;
-        let requested_high = (requested_features >> 32) as u32 | FEATURE_VERSION_1;
-        if requested_low & !offered_low != 0 || requested_high & !offered_high != 0 {
-            write_register(base, REG_STATUS, 0x80);
-            return Err(Error::UnsupportedFeature);
-        }
-        write_register(base, REG_DRIVER_FEATURES_SELECT, 0);
-        write_register(base, REG_DRIVER_FEATURES, requested_low);
-        write_register(base, REG_DRIVER_FEATURES_SELECT, 1);
-        write_register(base, REG_DRIVER_FEATURES, requested_high);
-        write_register(base, REG_STATUS, 11);
-        if read_register(base, REG_STATUS) & 8 == 0 {
-            write_register(base, REG_STATUS, 0x80);
-            return Err(Error::FeatureNegotiation);
-        }
-        Ok(Self { base })
+        Ok(self)
     }
 
     pub(crate) fn configure_queue(
@@ -149,8 +170,15 @@ impl VirtioTransport {
         }
     }
 
-    pub(crate) fn read_device_config(&self, offset: usize) -> u32 {
-        unsafe { read_register(self.base, 0x100 + offset) }
+    pub(crate) fn read_device_config(&self, offset: usize) -> Option<u32> {
+        let window = crate::arch::virtio_window();
+        let config_offset = 0x100usize.checked_add(offset)?;
+        if offset % core::mem::size_of::<u32>() != 0
+            || config_offset.checked_add(core::mem::size_of::<u32>())? > window.stride
+        {
+            return None;
+        }
+        Some(unsafe { read_register(self.base, config_offset) })
     }
 
     pub(crate) fn slot(&self) -> usize {
@@ -168,6 +196,9 @@ impl VirtioTransport {
 }
 
 pub(crate) fn dispatch_interrupts() -> u64 {
+    if !crate::memory::mmu_ready() {
+        return 0;
+    }
     let window = crate::arch::virtio_window();
     let mut pending = 0u64;
     for slot in 0..window.slots.min(64) {

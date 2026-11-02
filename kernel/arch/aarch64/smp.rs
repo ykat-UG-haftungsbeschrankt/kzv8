@@ -20,7 +20,8 @@ pub(crate) fn start_secondary_cpus() {
     };
     let boot_cpu = current_mpidr() & MPIDR_AFFINITY_MASK;
     let mut slot = 1usize;
-    for target in crate::arch::device_tree::aarch64_cpu_ids() {
+    let (cpu_ids, cpu_count) = crate::arch::device_tree::aarch64_cpu_ids();
+    for target in cpu_ids.iter().take(cpu_count) {
         if target & MPIDR_AFFINITY_MASK == boot_cpu {
             continue;
         }

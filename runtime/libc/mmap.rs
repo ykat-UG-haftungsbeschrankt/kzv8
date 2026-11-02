@@ -106,15 +106,20 @@ pub unsafe extern "C" fn mmap64(
     file_descriptor: i32,
     offset: i64,
 ) -> *mut c_void {
-    unsafe { mmap(address_hint, length, protection, flags, file_descriptor, offset) }
+    unsafe {
+        mmap(
+            address_hint,
+            length,
+            protection,
+            flags,
+            file_descriptor,
+            offset,
+        )
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mprotect(
-    address: *mut c_void,
-    length: usize,
-    protection: i32,
-) -> i32 {
+pub unsafe extern "C" fn mprotect(address: *mut c_void, length: usize, protection: i32) -> i32 {
     if address.is_null() || address as usize % PAGE_SIZE != 0 || length == 0 {
         set_errno(EINVAL);
         return -1;
@@ -135,11 +140,7 @@ pub unsafe extern "C" fn mprotect(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn madvise(
-    address: *mut c_void,
-    length: usize,
-    advice: i32,
-) -> i32 {
+pub unsafe extern "C" fn madvise(address: *mut c_void, length: usize, advice: i32) -> i32 {
     if address.is_null()
         || address as usize % PAGE_SIZE != 0
         || length == 0

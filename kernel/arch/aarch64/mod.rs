@@ -22,8 +22,10 @@ pub(crate) const VM_BASE: usize = 511usize << 30;
 pub(crate) const BOOT_MESSAGE: &[u8] = b"kz: aarch64 Rust kernel booted\n";
 pub(crate) const BOOT_INFO_ERROR: &str = "unable to read the device-tree memory map";
 
-pub(crate) fn initialize_boot_info(boot_info: usize, _boot_magic: usize) -> bool {
-    device_tree::initialize(boot_info)
+/// # Safety
+/// `boot_info` must point to the mapped FDT blob supplied by the boot firmware.
+pub(crate) unsafe fn initialize_boot_info(boot_info: usize, _boot_magic: usize) -> bool {
+    unsafe { device_tree::initialize(boot_info) }
 }
 
 pub(crate) const fn virtio_window() -> crate::arch::VirtioWindow {
@@ -31,9 +33,10 @@ pub(crate) const fn virtio_window() -> crate::arch::VirtioWindow {
 }
 
 pub(crate) fn initialize_mmu() {
+    let memory_regions = crate::memory_resources::memory_regions();
     unsafe {
         paging::initialize();
-        ram_map::map_memory_regions(crate::memory_resources::memory_regions());
+        ram_map::map_memory_regions(memory_regions.as_slice());
     }
 }
 
@@ -60,8 +63,9 @@ pub(crate) fn dma_sync_for_cpu() {
 pub(crate) fn decommit_debug(_code: u8) {}
 
 pub(crate) fn is_identity_mapped(address: usize) -> bool {
+    let memory_regions = crate::memory_resources::memory_regions();
     address < 0x4000_0000
-        || crate::memory_resources::memory_regions().iter().any(|region| {
+        || memory_regions.iter().any(|region| {
             region
                 .start
                 .checked_add(region.length)

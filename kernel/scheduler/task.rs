@@ -6,20 +6,26 @@
  */
 
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
+use alloc::sync::Arc;
+use alloc::task::Wake;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::task::{Context, Poll, Waker};
+
+use super::sync::IrqSpinLock;
 
 const MAX_TASKS: usize = 16;
 
-type TaskFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
+type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct Task {
     active: AtomicBool,
     ready: AtomicBool,
-    future: UnsafeCell<Option<TaskFuture>>,
+    wakeable: AtomicBool,
+    generation: AtomicUsize,
+    future: IrqSpinLock<Option<TaskFuture>>,
+    waker: IrqSpinLock<Option<Waker>>,
 }
 
 impl Task {
@@ -27,7 +33,10 @@ impl Task {
         Self {
             active: AtomicBool::new(false),
             ready: AtomicBool::new(false),
-            future: UnsafeCell::new(None),
+            wakeable: AtomicBool::new(false),
+            generation: AtomicUsize::new(0),
+            future: IrqSpinLock::new(None),
+            waker: IrqSpinLock::new(None),
         }
     }
 }
@@ -44,10 +53,43 @@ impl Executor {
     }
 }
 
-unsafe impl Sync for Executor {}
-
 static EXECUTOR: Executor = Executor::new();
 static POLLING: AtomicBool = AtomicBool::new(false);
+
+struct TaskWaker {
+    slot: usize,
+    generation: usize,
+}
+
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        wake_task(self.slot, self.generation);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        wake_task(self.slot, self.generation);
+    }
+}
+
+fn wake_task(slot: usize, generation: usize) {
+    if let Some(task) = EXECUTOR.tasks.get(slot) {
+        let notify = {
+            let _waker = task.waker.lock();
+            if task.active.load(Ordering::Acquire)
+                && task.wakeable.load(Ordering::Acquire)
+                && task.generation.load(Ordering::Acquire) == generation
+            {
+                task.ready.store(true, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        };
+        if notify {
+            crate::arch::notify_executor();
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SpawnError {
@@ -56,10 +98,10 @@ pub(crate) enum SpawnError {
 
 pub(crate) fn spawn<F>(future: F) -> Result<(), SpawnError>
 where
-    F: Future<Output = ()> + 'static,
+    F: Future<Output = ()> + Send + 'static,
 {
     let future: TaskFuture = Box::pin(future);
-    for task in &EXECUTOR.tasks {
+    for (slot, task) in EXECUTOR.tasks.iter().enumerate() {
         if task
             .active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -67,7 +109,18 @@ where
         {
             continue;
         }
-        unsafe { *task.future.get() = Some(future) };
+        task.ready.store(false, Ordering::Relaxed);
+        task.wakeable.store(false, Ordering::Release);
+        let generation = task
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        *task.future.lock() = Some(future);
+        {
+            let mut waker_slot = task.waker.lock();
+            *waker_slot = Some(Waker::from(Arc::new(TaskWaker { slot, generation })));
+            task.wakeable.store(true, Ordering::Release);
+        }
         task.ready.store(true, Ordering::Release);
         crate::arch::notify_executor();
         return Ok(());
@@ -82,32 +135,37 @@ fn poll_ready() {
     let _polling = PollingGuard;
 
     for task in &EXECUTOR.tasks {
-        if !task.active.load(Ordering::Acquire)
-            || !task.ready.swap(false, Ordering::AcqRel)
-        {
+        if !task.active.load(Ordering::Acquire) || !task.ready.swap(false, Ordering::AcqRel) {
             continue;
         }
 
-        let waker = unsafe {
-            Waker::from_raw(RawWaker::new(
-                task as *const Task as *const (),
-                &TASK_WAKER_VTABLE,
-            ))
-        };
-        let mut context = Context::from_waker(&waker);
-        let poll_result = {
-            let future_slot = unsafe { &mut *task.future.get() };
-            let Some(future) = future_slot.as_mut() else {
+        let future = {
+            let mut future_slot = task.future.lock();
+            let Some(future) = future_slot.take() else {
                 task.active.store(false, Ordering::Release);
                 continue;
             };
-            future.as_mut().poll(&mut context)
+            future
         };
+        let Some(waker) = task.waker.lock().as_ref().cloned() else {
+            *task.future.lock() = Some(future);
+            task.ready.store(true, Ordering::Release);
+            continue;
+        };
+        let mut context = Context::from_waker(&waker);
+        let mut future = future;
+        let poll_result = future.as_mut().poll(&mut context);
 
         if poll_result.is_ready() {
-            unsafe { *task.future.get() = None };
+            {
+                let mut waker_slot = task.waker.lock();
+                task.wakeable.store(false, Ordering::Release);
+                waker_slot.take();
+            }
             task.ready.store(false, Ordering::Relaxed);
             task.active.store(false, Ordering::Release);
+        } else {
+            *task.future.lock() = Some(future);
         }
     }
 }
@@ -150,29 +208,6 @@ pub(crate) fn run_forever() -> ! {
         crate::arch::wait_for_interrupt();
     }
 }
-
-unsafe fn clone_task_waker(data: *const ()) -> RawWaker {
-    RawWaker::new(data, &TASK_WAKER_VTABLE)
-}
-
-unsafe fn wake_task(data: *const ()) {
-    let task = unsafe { &*data.cast::<Task>() };
-    task.ready.store(true, Ordering::Release);
-    crate::arch::notify_executor();
-}
-
-unsafe fn wake_task_by_ref(data: *const ()) {
-    unsafe { wake_task(data) };
-}
-
-unsafe fn drop_task_waker(_data: *const ()) {}
-
-static TASK_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_task_waker,
-    wake_task,
-    wake_task_by_ref,
-    drop_task_waker,
-);
 
 pub(crate) struct YieldNow {
     yielded: bool,

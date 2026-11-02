@@ -29,8 +29,6 @@ mod event_loop;
 mod event_timers;
 #[path = "memory/heap.rs"]
 mod heap;
-#[path = "memory/mmap.rs"]
-mod kernel_mmap;
 mod scheduler;
 pub(crate) use scheduler::sync;
 pub(crate) use scheduler::thread as kernel_thread;
@@ -79,8 +77,9 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
     unsafe {
         arch::interrupts::initialize();
     }
+    // SAFETY: the bootloader supplies the architecture-specific boot-info pointer.
     assert!(
-        arch::initialize_boot_info(boot_info, boot_magic),
+        unsafe { arch::initialize_boot_info(boot_info, boot_magic) },
         "{}",
         arch::BOOT_INFO_ERROR
     );

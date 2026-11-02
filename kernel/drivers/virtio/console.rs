@@ -40,14 +40,13 @@ impl OutputQueue {
 }
 
 pub(crate) fn initialize() -> bool {
-    let Some(candidate) = (unsafe { VirtioTransport::find(VIRTIO_CONSOLE_DEVICE_ID) }) else {
+    let Some(candidate) = VirtioTransport::find(VIRTIO_CONSOLE_DEVICE_ID) else {
         return false;
     };
-    let base = candidate.base();
-    let Ok(transport) = (unsafe { VirtioTransport::initialize(base, VIRTIO_CONSOLE_DEVICE_ID) })
-    else {
+    let Ok(transport) = candidate.initialize(VIRTIO_CONSOLE_DEVICE_ID) else {
         return false;
     };
+    let base = transport.base();
     if QUEUE.lock().configure(&transport, 1).is_err() || !transport.activate() {
         return false;
     }
@@ -79,7 +78,9 @@ pub(crate) fn write(message: &[u8]) -> bool {
     let notify = submit_next(&mut output);
     drop(output);
     if notify {
-        VirtioTransport::from_base(base).notify(1);
+        if let Some(transport) = VirtioTransport::from_base(base) {
+            transport.notify(1);
+        }
     }
     true
 }
@@ -107,7 +108,9 @@ pub(crate) fn handle_interrupt(pending: u64) {
     let notify = submit_next(&mut output);
     drop(output);
     if notify {
-        VirtioTransport::from_base(base).notify(1);
+        if let Some(transport) = VirtioTransport::from_base(base) {
+            transport.notify(1);
+        }
     }
 }
 
@@ -120,7 +123,7 @@ fn submit_next(output: &mut OutputQueue) -> bool {
         .min(MAX_CHUNK_SIZE)
         .min(OUTPUT_CAPACITY - output.head);
     let descriptor = Descriptor::new(
-        unsafe { output.bytes.as_ptr().add(output.head) } as u64,
+        output.bytes[output.head..output.head + length].as_ptr() as u64,
         length as u32,
         false,
     );

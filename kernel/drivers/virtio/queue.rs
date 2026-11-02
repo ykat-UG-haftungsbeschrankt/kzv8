@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+use crate::dma::{self, DmaBuffer};
 use crate::sync::{IrqSpinGuard, IrqSpinLock};
 use crate::virtio_transport::{Error, VirtioTransport};
 
@@ -180,6 +181,49 @@ impl<const N: usize> VirtQueue<N> {
 
     pub(crate) const fn is_in_flight(&self) -> bool {
         self.in_flight
+    }
+}
+
+pub(crate) struct DmaQueue<const N: usize> {
+    storage: DmaBuffer,
+}
+
+impl<const N: usize> DmaQueue<N> {
+    pub(crate) fn new() -> Option<Self> {
+        let mut storage = dma::allocate(
+            core::mem::size_of::<VirtQueue<N>>(),
+            core::mem::align_of::<VirtQueue<N>>(),
+        )?;
+        let queue = storage.as_mut_slice().as_mut_ptr().cast::<VirtQueue<N>>();
+        // SAFETY: storage has the size and alignment of VirtQueue<N> and is exclusively owned.
+        unsafe { queue.write(VirtQueue::new()) };
+        Some(Self { storage })
+    }
+
+    fn with_queue<R>(&mut self, operation: impl for<'a> FnOnce(&'a mut VirtQueue<N>) -> R) -> R {
+        let queue = self
+            .storage
+            .as_mut_slice()
+            .as_mut_ptr()
+            .cast::<VirtQueue<N>>();
+        // SAFETY: new initialized this uniquely owned DMA allocation as VirtQueue<N>.
+        unsafe { operation(&mut *queue) }
+    }
+
+    pub(crate) fn configure(
+        &mut self,
+        transport: &VirtioTransport,
+        index: u32,
+    ) -> Result<(), Error> {
+        self.with_queue(|queue| queue.configure(transport, index))
+    }
+
+    pub(crate) fn submit(&mut self, chain: &[Descriptor]) -> Option<u16> {
+        self.with_queue(|queue| queue.submit(chain))
+    }
+
+    pub(crate) fn poll_used(&mut self) -> Option<UsedElement> {
+        self.with_queue(VirtQueue::poll_used)
     }
 }
 

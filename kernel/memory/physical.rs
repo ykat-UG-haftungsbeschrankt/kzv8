@@ -49,7 +49,8 @@ pub(crate) fn initialize() -> bool {
     let mut frame_count = 0;
     let mut total_frames = 0;
     let mut next_hint = None;
-    for region in crate::memory_resources::memory_regions() {
+    let memory_regions = crate::memory_resources::memory_regions();
+    for region in memory_regions.iter() {
         let Some(region_end) = region.start.checked_add(region.length) else {
             continue;
         };

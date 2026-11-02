@@ -5,8 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::IrqSpinLock;
 
 pub(crate) const MAX_PHYSICAL_ADDRESS: usize = 64 * 1024 * 1024 * 1024;
 const MAX_MEMORY_REGIONS: usize = 32;
@@ -24,18 +23,35 @@ impl MemoryRegion {
     };
 }
 
-static mut MEMORY_REGIONS: [MemoryRegion; MAX_MEMORY_REGIONS] =
-    [MemoryRegion::EMPTY; MAX_MEMORY_REGIONS];
-static MEMORY_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryRegions {
+    regions: [MemoryRegion; MAX_MEMORY_REGIONS],
+    count: usize,
+}
+
+impl MemoryRegions {
+    const EMPTY: Self = Self {
+        regions: [MemoryRegion::EMPTY; MAX_MEMORY_REGIONS],
+        count: 0,
+    };
+
+    pub(crate) fn as_slice(&self) -> &[MemoryRegion] {
+        &self.regions[..self.count]
+    }
+
+    pub(crate) fn iter(&self) -> core::slice::Iter<'_, MemoryRegion> {
+        self.as_slice().iter()
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+static MEMORY_REGIONS: IrqSpinLock<MemoryRegions> = IrqSpinLock::new(MemoryRegions::EMPTY);
 
 pub(crate) fn reset_memory_regions() {
-    unsafe {
-        let regions = addr_of_mut!(MEMORY_REGIONS).cast::<MemoryRegion>();
-        for index in 0..MAX_MEMORY_REGIONS {
-            regions.add(index).write(MemoryRegion::EMPTY);
-        }
-    }
-    MEMORY_REGION_COUNT.store(0, Ordering::Release);
+    *MEMORY_REGIONS.lock() = MemoryRegions::EMPTY;
 }
 
 pub(crate) fn add_memory_region(start: u64, length: u64) -> bool {
@@ -54,21 +70,16 @@ pub(crate) fn add_memory_region(start: u64, length: u64) -> bool {
         start: start as usize,
         length: (clipped_end - start) as usize,
     };
-    let count = MEMORY_REGION_COUNT.load(Ordering::Relaxed);
-    if count == MAX_MEMORY_REGIONS {
+    let mut regions = MEMORY_REGIONS.lock();
+    if regions.count == MAX_MEMORY_REGIONS {
         return false;
     }
-    unsafe {
-        addr_of_mut!(MEMORY_REGIONS)
-            .cast::<MemoryRegion>()
-            .add(count)
-            .write(region);
-    }
-    MEMORY_REGION_COUNT.store(count + 1, Ordering::Release);
+    let index = regions.count;
+    regions.regions[index] = region;
+    regions.count = index + 1;
     true
 }
 
-pub(crate) fn memory_regions() -> &'static [MemoryRegion] {
-    let count = MEMORY_REGION_COUNT.load(Ordering::Acquire);
-    unsafe { core::slice::from_raw_parts(addr_of!(MEMORY_REGIONS).cast::<MemoryRegion>(), count) }
+pub(crate) fn memory_regions() -> MemoryRegions {
+    *MEMORY_REGIONS.lock()
 }

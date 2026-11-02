@@ -219,7 +219,7 @@ pub(crate) fn timer_tick() {
     let _ = switch_current(ThreadState::Ready);
 }
 
-fn current_thread_id() -> usize {
+pub(crate) fn current_thread_id() -> usize {
     let interrupt_state = crate::arch::interrupts::disable();
     let id = unsafe {
         if INITIALIZED {
@@ -233,7 +233,7 @@ fn current_thread_id() -> usize {
     id
 }
 
-fn exit_current(result: *mut c_void) -> ! {
+pub(crate) fn exit_current(result: *mut c_void) -> ! {
     let _interrupt_state = crate::arch::interrupts::disable();
     unsafe {
         let threads = addr_of_mut!(THREADS).cast::<Thread>();
@@ -293,18 +293,7 @@ extern "C" fn thread_trampoline() -> ! {
     exit_current(core::ptr::null_mut())
 }
 
-#[no_mangle]
-pub extern "C" fn pthread_self() -> usize {
-    current_thread_id()
-}
-
-#[no_mangle]
-pub extern "C" fn pthread_equal(first: usize, second: usize) -> i32 {
-    (first == second) as i32
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pthread_key_create(
+pub(crate) unsafe fn pthread_key_create(
     key: *mut u32,
     destructor: Option<unsafe extern "C" fn(*mut c_void)>,
 ) -> i32 {
@@ -329,8 +318,7 @@ pub unsafe extern "C" fn pthread_key_create(
     EAGAIN
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_key_delete(key: u32) -> i32 {
+pub(crate) unsafe fn pthread_key_delete(key: u32) -> i32 {
     if key == 0 || key as usize > MAX_TLS_KEYS {
         return EINVAL;
     }
@@ -351,8 +339,7 @@ pub unsafe extern "C" fn pthread_key_delete(key: u32) -> i32 {
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_getspecific(key: u32) -> *mut c_void {
+pub(crate) unsafe fn pthread_getspecific(key: u32) -> *mut c_void {
     if key == 0 || key as usize > MAX_TLS_KEYS {
         return core::ptr::null_mut();
     }
@@ -371,8 +358,7 @@ pub unsafe extern "C" fn pthread_getspecific(key: u32) -> *mut c_void {
     value
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_setspecific(key: u32, value: *const c_void) -> i32 {
+pub(crate) unsafe fn pthread_setspecific(key: u32, value: *const c_void) -> i32 {
     if key == 0 || key as usize > MAX_TLS_KEYS {
         return EINVAL;
     }
@@ -389,8 +375,7 @@ pub unsafe extern "C" fn pthread_setspecific(key: u32, value: *const c_void) -> 
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_once(
+pub(crate) unsafe fn pthread_once(
     once: *mut u32,
     initializer: Option<unsafe extern "C" fn()>,
 ) -> i32 {
@@ -420,8 +405,7 @@ pub unsafe extern "C" fn pthread_once(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_getschedparam(
+pub(crate) unsafe fn pthread_getschedparam(
     thread_id: usize,
     policy: *mut i32,
     parameters: *mut c_void,
@@ -442,8 +426,7 @@ pub unsafe extern "C" fn pthread_getschedparam(
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_init(attributes: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_attr_init(attributes: *mut c_void) -> i32 {
     if attributes.is_null() {
         return EINVAL;
     }
@@ -459,8 +442,7 @@ pub unsafe extern "C" fn pthread_attr_init(attributes: *mut c_void) -> i32 {
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_destroy(attributes: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_attr_destroy(attributes: *mut c_void) -> i32 {
     if attributes.is_null() {
         return EINVAL;
     }
@@ -476,8 +458,7 @@ pub unsafe extern "C" fn pthread_attr_destroy(attributes: *mut c_void) -> i32 {
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_setdetachstate(
+pub(crate) unsafe fn pthread_attr_setdetachstate(
     attributes: *mut c_void,
     detach_state: i32,
 ) -> i32 {
@@ -488,8 +469,7 @@ pub unsafe extern "C" fn pthread_attr_setdetachstate(
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_getdetachstate(
+pub(crate) unsafe fn pthread_attr_getdetachstate(
     attributes: *const c_void,
     detach_state: *mut i32,
 ) -> i32 {
@@ -500,11 +480,7 @@ pub unsafe extern "C" fn pthread_attr_getdetachstate(
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_setstacksize(
-    attributes: *mut c_void,
-    stack_size: usize,
-) -> i32 {
+pub(crate) unsafe fn pthread_attr_setstacksize(attributes: *mut c_void, stack_size: usize) -> i32 {
     if attributes.is_null() || stack_size != STACK_SIZE {
         return EINVAL;
     }
@@ -512,8 +488,7 @@ pub unsafe extern "C" fn pthread_attr_setstacksize(
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_getstacksize(
+pub(crate) unsafe fn pthread_attr_getstacksize(
     attributes: *const c_void,
     stack_size: *mut usize,
 ) -> i32 {
@@ -531,8 +506,7 @@ pub unsafe extern "C" fn pthread_attr_getstacksize(
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_getstack(
+pub(crate) unsafe fn pthread_attr_getstack(
     attributes: *const c_void,
     stack_address: *mut *mut c_void,
     stack_size: *mut usize,
@@ -561,11 +535,7 @@ fn thread_stack_bounds(slot: usize) -> (*mut c_void, usize) {
     unsafe { (stacks.add(slot).cast::<c_void>(), STACK_SIZE) }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_getattr_np(
-    thread_id: usize,
-    attributes: *mut c_void,
-) -> i32 {
+pub(crate) unsafe fn pthread_getattr_np(thread_id: usize, attributes: *mut c_void) -> i32 {
     if attributes.is_null() {
         return EINVAL;
     }
@@ -578,29 +548,33 @@ pub unsafe extern "C" fn pthread_getattr_np(
     let thread = unsafe { *threads.add(slot) };
     let (stack_address, stack_size) = thread_stack_bounds(slot);
     unsafe {
-        attributes.cast::<ThreadAttributes>().write(ThreadAttributes {
-            stack_size,
-            detach_state: if thread.detached { DETACHED } else { JOINABLE },
-            stack_address,
-        });
+        attributes
+            .cast::<ThreadAttributes>()
+            .write(ThreadAttributes {
+                stack_size,
+                detach_state: if thread.detached { DETACHED } else { JOINABLE },
+                stack_address,
+            });
     }
     crate::arch::interrupts::restore(interrupt_state);
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_kill(thread_id: usize, signal_number: i32) -> i32 {
+pub(crate) unsafe fn pthread_kill(thread_id: usize, signal_number: i32) -> i32 {
     let interrupt_state = crate::arch::interrupts::disable();
     let exists = unsafe { find_thread(thread_id) }.is_some();
     crate::arch::interrupts::restore(interrupt_state);
     if !exists {
         return ESRCH;
     }
-    if signal_number == 0 { 0 } else { ENOSYS }
+    if signal_number == 0 {
+        0
+    } else {
+        ENOSYS
+    }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_create(
+pub(crate) unsafe fn pthread_create(
     thread_id: *mut usize,
     attributes: *const c_void,
     start_routine: Option<StartRoutine>,
@@ -662,8 +636,7 @@ pub unsafe extern "C" fn pthread_create(
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_join(thread_id: usize, result: *mut *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_join(thread_id: usize, result: *mut *mut c_void) -> i32 {
     let interrupt_state = crate::arch::interrupts::disable();
     let (current_id, target_slot, target_state) = unsafe {
         if !INITIALIZED {
@@ -744,8 +717,7 @@ pub unsafe extern "C" fn pthread_join(thread_id: usize, result: *mut *mut c_void
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_detach(thread_id: usize) -> i32 {
+pub(crate) unsafe fn pthread_detach(thread_id: usize) -> i32 {
     let interrupt_state = crate::arch::interrupts::disable();
     let result = unsafe {
         let Some(slot) = find_thread(thread_id) else {
@@ -769,24 +741,12 @@ pub unsafe extern "C" fn pthread_detach(thread_id: usize) -> i32 {
     result
 }
 
-#[no_mangle]
-pub extern "C" fn sched_yield() -> i32 {
+pub(crate) fn yield_current() -> i32 {
     let _ = switch_current(ThreadState::Ready);
     0
 }
 
-#[no_mangle]
-pub extern "C" fn pthread_yield() -> i32 {
-    sched_yield()
-}
-
-#[no_mangle]
-pub extern "C" fn pthread_exit(result: *mut c_void) -> ! {
-    exit_current(result)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pthread_mutex_init(mutex: *mut c_void, attributes: *const c_void) -> i32 {
+pub(crate) unsafe fn pthread_mutex_init(mutex: *mut c_void, attributes: *const c_void) -> i32 {
     if mutex.is_null() || !attributes.is_null() {
         return EINVAL;
     }
@@ -798,8 +758,7 @@ pub unsafe extern "C" fn pthread_mutex_init(mutex: *mut c_void, attributes: *con
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_mutex_destroy(mutex: *mut c_void) -> i32 {
     if mutex.is_null() {
         return EINVAL;
     }
@@ -815,8 +774,7 @@ pub unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut c_void) -> i32 {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_mutex_lock(mutex: *mut c_void) -> i32 {
     if mutex.is_null() {
         return EINVAL;
     }
@@ -835,8 +793,7 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> i32 {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_mutex_trylock(mutex: *mut c_void) -> i32 {
     if mutex.is_null() {
         return EINVAL;
     }
@@ -851,8 +808,7 @@ pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut c_void) -> i32 {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_mutex_unlock(mutex: *mut c_void) -> i32 {
     if mutex.is_null() {
         return EINVAL;
     }
@@ -867,11 +823,7 @@ pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut c_void) -> i32 {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_cond_init(
-    condition: *mut c_void,
-    attributes: *const c_void,
-) -> i32 {
+pub(crate) unsafe fn pthread_cond_init(condition: *mut c_void, attributes: *const c_void) -> i32 {
     if condition.is_null() || !attributes.is_null() {
         return EINVAL;
     }
@@ -883,8 +835,7 @@ pub unsafe extern "C" fn pthread_cond_init(
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_cond_destroy(condition: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_cond_destroy(condition: *mut c_void) -> i32 {
     if condition.is_null() {
         EINVAL
     } else {
@@ -892,8 +843,7 @@ pub unsafe extern "C" fn pthread_cond_destroy(condition: *mut c_void) -> i32 {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_cond_wait(condition: *mut c_void, mutex: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_cond_wait(condition: *mut c_void, mutex: *mut c_void) -> i32 {
     if condition.is_null() || mutex.is_null() {
         return EINVAL;
     }
@@ -921,8 +871,7 @@ pub unsafe extern "C" fn pthread_cond_wait(condition: *mut c_void, mutex: *mut c
     unsafe { pthread_mutex_lock(mutex) }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_cond_signal(condition: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_cond_signal(condition: *mut c_void) -> i32 {
     if condition.is_null() {
         return EINVAL;
     }
@@ -934,7 +883,6 @@ pub unsafe extern "C" fn pthread_cond_signal(condition: *mut c_void) -> i32 {
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_cond_broadcast(condition: *mut c_void) -> i32 {
+pub(crate) unsafe fn pthread_cond_broadcast(condition: *mut c_void) -> i32 {
     unsafe { pthread_cond_signal(condition) }
 }
