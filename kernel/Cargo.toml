@@ -1,0 +1,19 @@
+# Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+#
+# Permission for non-commercial use is hereby granted,
+# free of charge, without warranty of any kind.
+
+[package]
+name = "kz-kernel"
+version = "0.1.0"
+edition = "2021"
+build = "../build.rs"
+
+[[bin]]
+name = "kernel"
+path = "main.rs"
+test = false
+bench = false
+
+[dependencies]
+smoltcp = { version = "0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
