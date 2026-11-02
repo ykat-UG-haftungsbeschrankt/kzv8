@@ -50,20 +50,20 @@ impl DmaArena {
         }
     }
 
-    fn global() -> &'static Self {
+    fn get_instance() -> &'static Self {
         static ARENA: DmaArena = DmaArena::new();
         &ARENA
     }
 
     pub(crate) fn initialize() {
-        Self::global().next.store(0, Ordering::Release);
+        Self::get_instance().next.store(0, Ordering::Release);
     }
 
     pub(crate) fn allocate(length: usize, alignment: usize) -> Option<DmaBuffer> {
         if length == 0 || !alignment.is_power_of_two() {
             return None;
         }
-        let arena = Self::global();
+        let arena = Self::get_instance();
         let base = arena.bytes.get().cast::<u8>() as usize;
         let mut current = arena.next.load(Ordering::Relaxed);
         loop {

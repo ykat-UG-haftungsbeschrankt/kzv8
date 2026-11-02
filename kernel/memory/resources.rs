@@ -59,13 +59,13 @@ impl MemoryRegionRegistry {
         }
     }
 
-    fn global() -> &'static Self {
+    fn get_instance() -> &'static Self {
         static REGISTRY: MemoryRegionRegistry = MemoryRegionRegistry::new();
         &REGISTRY
     }
 
     pub(crate) fn reset_memory_regions() {
-        *Self::global().regions.lock() = MemoryRegions::EMPTY;
+        *Self::get_instance().regions.lock() = MemoryRegions::EMPTY;
     }
 
     pub(crate) fn add_memory_region(start: u64, length: u64) -> bool {
@@ -84,7 +84,7 @@ impl MemoryRegionRegistry {
             start: start as usize,
             length: (clipped_end - start) as usize,
         };
-        let mut regions = Self::global().regions.lock();
+        let mut regions = Self::get_instance().regions.lock();
         if regions.count == MAX_MEMORY_REGIONS {
             return false;
         }
@@ -95,6 +95,6 @@ impl MemoryRegionRegistry {
     }
 
     pub(crate) fn memory_regions() -> MemoryRegions {
-        *Self::global().regions.lock()
+        *Self::get_instance().regions.lock()
     }
 }

@@ -75,10 +75,8 @@ pub(crate) struct Heap {
     state: IrqSpinLock<HeapState>,
 }
 
-struct GlobalHeap;
-
 #[global_allocator]
-static GLOBAL_ALLOCATOR: GlobalHeap = GlobalHeap;
+static GLOBAL_ALLOCATOR: Heap = Heap::new();
 
 impl Heap {
     const fn new() -> Self {
@@ -87,9 +85,8 @@ impl Heap {
         }
     }
 
-    fn global() -> &'static Self {
-        static HEAP: Heap = Heap::new();
-        &HEAP
+    fn get_instance() -> &'static Self {
+        &GLOBAL_ALLOCATOR
     }
 
     fn allocate(&self, heap: &mut HeapState, layout: Layout) -> *mut u8 {
@@ -289,7 +286,7 @@ impl Heap {
     }
 
     pub(crate) fn initialize() {
-        let mut heap = Self::global().state.lock();
+        let mut heap = Self::get_instance().state.lock();
         heap.initialized = false;
         heap.slabs.fill(Slab::EMPTY);
         heap.class_heads.fill(NO_INDEX);
@@ -298,14 +295,12 @@ impl Heap {
     }
 }
 
-unsafe impl GlobalAlloc for GlobalHeap {
+unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let heap = Heap::global();
-        heap.allocate(&mut heap.state.lock(), layout)
+        self.allocate(&mut self.state.lock(), layout)
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, _layout: Layout) {
-        let heap = Heap::global();
-        heap.deallocate(&mut heap.state.lock(), pointer)
+        self.deallocate(&mut self.state.lock(), pointer)
     }
 }

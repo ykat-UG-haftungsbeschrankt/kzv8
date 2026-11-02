@@ -51,13 +51,13 @@ impl Console {
         }
     }
 
-    fn global() -> &'static Self {
+    fn get_instance() -> &'static Self {
         static CONSOLE: Console = Console::new();
         &CONSOLE
     }
 
     pub(crate) fn initialize() -> bool {
-        let console = Self::global();
+        let console = Self::get_instance();
         let Some(candidate) = VirtioTransport::find(VIRTIO_CONSOLE_DEVICE_ID) else {
             return false;
         };
@@ -74,7 +74,7 @@ impl Console {
     }
 
     pub(crate) fn write(message: &[u8]) -> bool {
-        let console = Self::global();
+        let console = Self::get_instance();
         if message.len() > MAX_CHUNK_SIZE {
             return false;
         }
@@ -105,7 +105,7 @@ impl Console {
     }
 
     pub(crate) fn handle_interrupt(pending: u64) {
-        let console = Self::global();
+        let console = Self::get_instance();
         let slot = console.slot.load(Ordering::Acquire);
         if slot >= 64 || pending & (1u64 << slot) == 0 {
             return;
