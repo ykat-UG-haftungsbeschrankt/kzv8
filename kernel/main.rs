@@ -46,12 +46,8 @@ mod net_tcp;
 mod physical;
 #[path = "memory/resources.rs"]
 mod memory_resources;
-#[path = "../runtime/ffi.rs"]
-mod runtime_ffi;
-#[path = "../runtime/v8.rs"]
-mod runtime_v8;
-#[path = "../runtime/libc/mod.rs"]
-mod runtime_libc;
+#[path = "../runtime/run.rs"]
+mod runtime;
 #[path = "drivers/virtio/block.rs"]
 mod virtio_block;
 #[path = "drivers/virtio/net.rs"]
@@ -151,18 +147,7 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
             if unsafe { kz_c_pthread_smoke() } == 0 {
                 let _thread_status = console::write(b"kz: pthreads smoke OK\n");
             }
-            if runtime_v8::page_allocator_smoke() {
-                let _page_allocator = console::write(b"kz: V8 page allocator hooks OK\n");
-            }
-            match runtime_v8::run_smoke(&mut events) {
-                Some(0) => {}
-                Some(_) => {
-                    let _v8_error = console::write(b"kz: V8 smoke failed\n");
-                }
-                None => {
-                    let _v8_status = console::write(b"kz: V8 not integrated\n");
-                }
-            }
+            runtime::run(&mut events);
         }
     }
     scheduler::task::run_forever()
