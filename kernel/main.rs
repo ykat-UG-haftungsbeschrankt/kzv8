@@ -48,6 +48,8 @@ mod physical;
 mod memory_resources;
 #[path = "../runtime/ffi.rs"]
 mod runtime_ffi;
+#[path = "../runtime/v8.rs"]
+mod runtime_v8;
 #[path = "../runtime/libc/mod.rs"]
 mod runtime_libc;
 #[path = "drivers/virtio/block.rs"]
@@ -149,10 +151,10 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
             if unsafe { kz_c_pthread_smoke() } == 0 {
                 let _thread_status = console::write(b"kz: pthreads smoke OK\n");
             }
-            if arch::v8_page_allocator_smoke() {
+            if runtime_v8::page_allocator_smoke() {
                 let _page_allocator = console::write(b"kz: V8 page allocator hooks OK\n");
             }
-            match arch::run_v8_smoke(&mut events) {
+            match runtime_v8::run_smoke(&mut events) {
                 Some(0) => {}
                 Some(_) => {
                     let _v8_error = console::write(b"kz: V8 smoke failed\n");

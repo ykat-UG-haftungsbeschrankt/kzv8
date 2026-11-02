@@ -10,7 +10,6 @@ mod entry;
 pub(crate) mod interrupts;
 mod paging;
 mod ram_map;
-#[path = "../../../arch/aarch64/threads.rs"]
 mod threads;
 pub(crate) mod timer;
 mod virtio;
@@ -82,14 +81,6 @@ pub(crate) fn current_thread_stack_bounds(stack_size: usize) -> (*mut core::ffi:
 
 pub(crate) fn high_memory_smoke() -> bool {
     false
-}
-
-pub(crate) fn v8_page_allocator_smoke() -> bool {
-    false
-}
-
-pub(crate) fn run_v8_smoke(_events: &mut crate::event_loop::EventLoop<16>) -> Option<i32> {
-    None
 }
 
 pub(crate) fn switch_thread(old_stack: &mut usize, new_stack: usize) {

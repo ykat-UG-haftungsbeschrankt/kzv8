@@ -1,36 +1,21 @@
-/*
- * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
- *
- * Permission for non-commercial use is hereby granted,
- * free of charge, without warranty of any kind.
- */
-
+#[cfg(target_arch = "x86_64")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(target_arch = "x86_64")]
 static PAGE_ALLOCATOR_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
     fn kz_v8_run_smoke(event_loop: *mut core::ffi::c_void) -> i32;
 }
 
-fn debugcon(message: &[u8]) {
-    for byte in message {
-        unsafe {
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") 0xe9u16,
-                in("al") *byte,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-    }
-}
-
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_v8_debug_stage(stage: u8) {
-    debugcon(&[stage]);
+    crate::arch::debug::debugcon(&[stage]);
 }
 
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_host_v8_allocate_pages(
     address_hint: *mut u8,
@@ -42,38 +27,38 @@ pub extern "C" fn kz_host_v8_allocate_pages(
     let permissions = if permissions == 5 { 0 } else { permissions };
     let trace = PAGE_ALLOCATOR_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 32;
     if trace {
-        debugcon(b"A");
+        crate::arch::debug::debugcon(b"A");
     }
-    if let Some(address) =
-        crate::memory::reserve_with_hint(hint, length, alignment, permissions)
-    {
+    if let Some(address) = crate::memory::reserve_with_hint(hint, length, alignment, permissions) {
         if trace {
-            debugcon(b"H\n");
+            crate::arch::debug::debugcon(b"H\n");
         }
         return address as *mut u8;
     }
     if hint.is_some() {
         if trace {
-            debugcon(b"F");
+            crate::arch::debug::debugcon(b"F");
         }
         if let Some(address) = crate::memory::reserve(length, alignment, permissions) {
             if trace {
-                debugcon(b"S\n");
+                crate::arch::debug::debugcon(b"S\n");
             }
             return address as *mut u8;
         }
     }
     if trace {
-        debugcon(b"X\n");
+        crate::arch::debug::debugcon(b"X\n");
     }
     core::ptr::null_mut()
 }
 
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_host_v8_random_mmap_addr() -> *mut u8 {
     crate::memory::allocator_base() as *mut u8
 }
 
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_host_v8_free_pages(address: *mut u8, length: usize) -> i32 {
     if address.is_null() {
@@ -82,6 +67,7 @@ pub extern "C" fn kz_host_v8_free_pages(address: *mut u8, length: usize) -> i32 
     crate::memory::release(address as usize, length) as i32
 }
 
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_host_v8_release_pages(
     address: *mut u8,
@@ -94,6 +80,7 @@ pub extern "C" fn kz_host_v8_release_pages(
     crate::memory::release_suffix(address as usize, length, new_length) as i32
 }
 
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_host_v8_decommit_pages(address: *mut u8, length: usize) -> i32 {
     if address.is_null() {
@@ -102,6 +89,7 @@ pub extern "C" fn kz_host_v8_decommit_pages(address: *mut u8, length: usize) -> 
     crate::memory::decommit(address as usize, length) as i32
 }
 
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_host_v8_set_page_permissions(
     address: *mut u8,
@@ -115,15 +103,21 @@ pub extern "C" fn kz_host_v8_set_page_permissions(
     crate::memory::set_permissions(address as usize, length, permissions) as i32
 }
 
-pub(crate) fn run_smoke(event_loop: &mut crate::event_loop::EventLoop<16>) -> i32 {
-    unsafe { kz_v8_run_smoke(event_loop as *mut _ as *mut core::ffi::c_void) }
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn run_smoke(event_loop: &mut crate::event_loop::EventLoop<16>) -> Option<i32> {
+    Some(unsafe { kz_v8_run_smoke(event_loop as *mut _ as *mut core::ffi::c_void) })
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn run_smoke(_event_loop: &mut crate::event_loop::EventLoop<16>) -> Option<i32> {
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn page_allocator_smoke() -> bool {
     let page_size = 4096;
     let length = page_size * 2;
-    let out_of_arena_hint =
-        crate::memory::allocator_base().saturating_sub(page_size) as *mut u8;
+    let out_of_arena_hint = crate::memory::allocator_base().saturating_sub(page_size) as *mut u8;
     let memory = kz_host_v8_allocate_pages(out_of_arena_hint, length, page_size, 2);
     if memory.is_null() {
         return false;
@@ -141,4 +135,9 @@ pub(crate) fn page_allocator_smoke() -> bool {
     };
     let released = kz_host_v8_free_pages(memory, length) != 0;
     inaccessible && writable && contents_match && released
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn page_allocator_smoke() -> bool {
+    false
 }

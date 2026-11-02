@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+pub(crate) mod debug;
 mod entry;
 pub(crate) mod interrupts;
 mod multiboot;
@@ -14,7 +15,6 @@ mod ram_map;
 mod threads;
 pub(crate) mod timer;
 mod virtio;
-mod v8;
 
 pub(crate) const MAX_CPUS: usize = 8;
 pub(crate) const VM_ARENA_SIZE: usize = 1 << 36;
@@ -59,14 +59,7 @@ pub(crate) fn dma_sync_for_device() {}
 pub(crate) fn dma_sync_for_cpu() {}
 
 pub(crate) fn decommit_debug(code: u8) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") 0xe9u16,
-            in("al") code,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
+    debug::debugcon(&[code]);
 }
 
 pub(crate) fn is_identity_mapped(address: usize) -> bool {
@@ -109,14 +102,6 @@ pub(crate) fn high_memory_smoke() -> bool {
     let mapped = unsafe { core::ptr::read_volatile(address as *const u8) == 0xa5 };
     let released = crate::physical::deallocate_contiguous(address, 4096);
     mapped && released
-}
-
-pub(crate) fn v8_page_allocator_smoke() -> bool {
-    v8::page_allocator_smoke()
-}
-
-pub(crate) fn run_v8_smoke(events: &mut crate::event_loop::EventLoop<16>) -> Option<i32> {
-    Some(v8::run_smoke(events))
 }
 
 pub(crate) fn switch_thread(old_stack: &mut usize, new_stack: usize) {
