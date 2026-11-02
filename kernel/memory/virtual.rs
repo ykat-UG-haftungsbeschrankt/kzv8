@@ -12,19 +12,13 @@ use crate::sync::IrqSpinLock;
 
 pub(crate) const PAGE_SIZE: usize = 4096;
 
-#[cfg(target_arch = "x86_64")]
-const VM_ARENA_SIZE: usize = 1 << 36;
-#[cfg(target_arch = "aarch64")]
-const VM_ARENA_SIZE: usize = 1 << 30;
+const VM_ARENA_SIZE: usize = crate::arch::VM_ARENA_SIZE;
 const MAX_VM_PAGES: usize = VM_ARENA_SIZE / PAGE_SIZE;
 const MAX_VM_AREAS: usize = 16384;
 const VM_RESERVED: u8 = 1 << 7;
 const VM_PERMISSION_MASK: u8 = 0x07;
 
-#[cfg(target_arch = "x86_64")]
-const VM_BASE: usize = 0x10_0000_0000;
-#[cfg(target_arch = "aarch64")]
-const VM_BASE: usize = 511usize << 30;
+const VM_BASE: usize = crate::arch::VM_BASE;
 
 static PAGE_STATE: [AtomicU8; MAX_VM_PAGES] = [const { AtomicU8::new(0) }; MAX_VM_PAGES];
 static VM_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
@@ -287,20 +281,9 @@ pub(crate) fn release_range(address: usize, length: usize) -> bool {
     released
 }
 
-#[cfg(target_arch = "x86_64")]
 fn decommit_debug(code: u8) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") 0xe9u16,
-            in("al") code,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
+    crate::arch::decommit_debug(code);
 }
-
-#[cfg(target_arch = "aarch64")]
-fn decommit_debug(_code: u8) {}
 
 pub(crate) fn decommit(address: usize, length: usize) -> bool {
     if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 {
@@ -533,20 +516,7 @@ pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
 }
 
 pub(crate) fn is_identity_mapped(address: usize) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        address < crate::platform::MAX_PHYSICAL_ADDRESS
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        address < 0x4000_0000
-            || crate::platform::memory_regions().iter().any(|region| {
-                region
-                    .start
-                    .checked_add(region.length)
-                    .is_some_and(|end| (region.start..end).contains(&address))
-            })
-    }
+    crate::arch::is_identity_mapped(address)
 }
 
 pub(crate) fn translate(address: usize) -> Option<usize> {

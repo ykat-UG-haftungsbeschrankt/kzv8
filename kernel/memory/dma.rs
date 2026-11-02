@@ -70,16 +70,10 @@ pub(crate) fn allocate(length: usize, alignment: usize) -> Option<DmaBuffer> {
 
 pub(crate) fn sync_for_device() {
     fence(Ordering::SeqCst);
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-    }
+    crate::arch::dma_sync_for_device();
 }
 
 pub(crate) fn sync_for_cpu() {
     fence(Ordering::SeqCst);
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-    }
+    crate::arch::dma_sync_for_cpu();
 }

@@ -6,7 +6,6 @@
  */
 
 use core::ffi::c_void;
-use core::ptr::addr_of;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -29,12 +28,6 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
 const MAP_FIXED: i32 = 0x10;
-
-#[cfg(target_arch = "x86_64")]
-extern "C" {
-    static _start: u8;
-    static __bss_end: u8;
-}
 
 fn set_errno(error: i32) {
     unsafe { crate::kernel_thread::__errno_location().write(error) };
@@ -134,24 +127,8 @@ pub unsafe extern "C" fn mprotect(
     if crate::memory::set_permissions(address, length, permissions) {
         return 0;
     }
-    #[cfg(target_arch = "x86_64")]
-    if permissions == PROT_READ
-        && address % PAGE_SIZE == 0
-        && length % PAGE_SIZE == 0
-    {
-        let Some(end) = address.checked_add(length) else {
-            set_errno(ENOMEM);
-            return -1;
-        };
-        let (image_start, image_end) = unsafe {
-            (addr_of!(_start) as usize, addr_of!(__bss_end) as usize)
-        };
-        if address >= image_start
-            && end <= image_end
-            && crate::arch::set_page_permissions(address, length, permissions)
-        {
-            return 0;
-        }
+    if crate::arch::protect_kernel_image_pages(address, length, permissions) {
+        return 0;
     }
     set_errno(ENOMEM);
     -1

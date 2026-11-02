@@ -108,12 +108,6 @@ static mut NEXT_THREAD_ID: usize = MAIN_THREAD_ID + 1;
 static mut INITIALIZED: bool = false;
 static mut FALLBACK_ERRNO: i32 = 0;
 
-#[cfg(target_arch = "x86_64")]
-unsafe extern "C" {
-    static stack_bottom: u8;
-    static stack_top: u8;
-}
-
 pub(crate) fn initialize() {
     let interrupt_state = crate::arch::interrupts::disable();
     unsafe {
@@ -521,14 +515,7 @@ pub unsafe extern "C" fn pthread_attr_getstack(
 
 fn thread_stack_bounds(slot: usize) -> (*mut c_void, usize) {
     if slot == 0 {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let start = core::ptr::addr_of!(stack_bottom) as usize;
-            let end = core::ptr::addr_of!(stack_top) as usize;
-            return (start as *mut c_void, end.saturating_sub(start));
-        }
-        #[cfg(target_arch = "aarch64")]
-        return (core::ptr::null_mut(), STACK_SIZE);
+        return crate::arch::current_thread_stack_bounds(STACK_SIZE);
     }
 
     let stacks = addr_of_mut!(STACKS).cast::<ThreadStack>();

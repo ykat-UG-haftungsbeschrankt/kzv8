@@ -15,12 +15,12 @@ unsafe extern "C" {
 }
 
 pub(crate) fn start_secondary_cpus() {
-    let Some(conduit) = crate::platform::psci_conduit() else {
+    let Some(conduit) = crate::arch::device_tree::psci_conduit() else {
         return;
     };
     let boot_cpu = current_mpidr() & MPIDR_AFFINITY_MASK;
     let mut slot = 1usize;
-    for target in crate::platform::aarch64_cpu_ids() {
+    for target in crate::arch::device_tree::aarch64_cpu_ids() {
         if target & MPIDR_AFFINITY_MASK == boot_cpu {
             continue;
         }
@@ -55,12 +55,12 @@ pub(crate) fn notify_executor() {
     unsafe { asm!("sev", options(nostack, preserves_flags)) };
 }
 
-fn psci_cpu_on(conduit: crate::platform::PsciConduit, target: u64, slot: usize) -> i64 {
+fn psci_cpu_on(conduit: crate::arch::device_tree::PsciConduit, target: u64, slot: usize) -> i64 {
     let entry = aarch64_secondary_entry as *const () as u64;
     let result: u64;
     unsafe {
         match conduit {
-            crate::platform::PsciConduit::Smc => asm!(
+            crate::arch::device_tree::PsciConduit::Smc => asm!(
                 "smc #0",
                 inout("x0") PSCI_CPU_ON_64 => result,
                 inlateout("x1") target => _,
@@ -82,7 +82,7 @@ fn psci_cpu_on(conduit: crate::platform::PsciConduit, target: u64, slot: usize) 
                 lateout("x17") _,
                 options(nostack),
             ),
-            crate::platform::PsciConduit::Hvc => asm!(
+            crate::arch::device_tree::PsciConduit::Hvc => asm!(
                 "hvc #0",
                 inout("x0") PSCI_CPU_ON_64 => result,
                 inlateout("x1") target => _,

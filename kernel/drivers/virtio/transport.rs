@@ -5,8 +5,6 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::platform;
-
 const MAGIC: u32 = 0x7472_6976;
 const VERSION_MODERN: u32 = 2;
 const FEATURE_VERSION_1: u32 = 1;
@@ -53,7 +51,17 @@ impl VirtioTransport {
     }
 
     pub(crate) unsafe fn find(device_id: u32) -> Option<Self> {
-        platform::find_virtio_device(device_id).map(Self::from_base)
+        let window = crate::arch::virtio_window();
+        for slot in 0..window.slots {
+            let base = window.start + slot * window.stride;
+            let magic = unsafe { read_register(base, REG_MAGIC) };
+            let version = unsafe { read_register(base, REG_VERSION) };
+            let id = unsafe { read_register(base, REG_DEVICE_ID) };
+            if magic == MAGIC && version == VERSION_MODERN && id == device_id {
+                return Some(Self::from_base(base));
+            }
+        }
+        None
     }
 
     pub(crate) unsafe fn initialize(base: usize, device_id: u32) -> Result<Self, Error> {
@@ -146,7 +154,7 @@ impl VirtioTransport {
     }
 
     pub(crate) fn slot(&self) -> usize {
-        let window = platform::virtio_window();
+        let window = crate::arch::virtio_window();
         (self.base - window.start) / window.stride
     }
 
@@ -160,7 +168,7 @@ impl VirtioTransport {
 }
 
 pub(crate) fn dispatch_interrupts() -> u64 {
-    let window = platform::virtio_window();
+    let window = crate::arch::virtio_window();
     let mut pending = 0u64;
     for slot in 0..window.slots.min(64) {
         let base = window.start + slot * window.stride;

@@ -41,18 +41,14 @@ mod net_device;
 mod net_stack;
 #[path = "net/tcp.rs"]
 mod net_tcp;
-#[path = "platform/pci.rs"]
-mod pci;
 #[path = "memory/physical.rs"]
 mod physical;
-#[path = "platform/discovery.rs"]
+#[path = "platform/resources.rs"]
 mod platform;
-#[path = "runtime/ffi.rs"]
+#[path = "../runtime/ffi.rs"]
 mod runtime_ffi;
-#[path = "runtime/libc/mod.rs"]
+#[path = "../runtime/libc/mod.rs"]
 mod runtime_libc;
-#[path = "runtime/host.rs"]
-mod runtime_host;
 mod sync;
 #[path = "task.rs"]
 mod task;
@@ -76,11 +72,6 @@ extern "C" {
 
 static FUTURE_SMOKE_DONE: AtomicBool = AtomicBool::new(false);
 
-#[cfg(target_arch = "x86_64")]
-extern "C" {
-    fn kz_v8_run_smoke() -> i32;
-}
-
 #[no_mangle]
 pub extern "C" fn kz_handle_virtio_interrupt() {
     let pending = virtio_transport::dispatch_interrupts();
@@ -94,15 +85,10 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
     unsafe {
         arch::interrupts::initialize();
     }
-    #[cfg(target_arch = "x86_64")]
     assert!(
-        platform::initialize_x86(boot_info, boot_magic),
-        "unable to read the Multiboot memory map"
-    );
-    #[cfg(target_arch = "aarch64")]
-    assert!(
-        platform::initialize_aarch64(boot_info),
-        "unable to read the device-tree memory map"
+        arch::initialize_boot_info(boot_info, boot_magic),
+        "{}",
+        arch::BOOT_INFO_ERROR
     );
     memory::initialize();
     assert!(
@@ -111,10 +97,9 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
     );
     heap::initialize();
     kernel_thread::initialize();
-    #[cfg(target_arch = "x86_64")]
     assert!(
         arch::initialize_thread_local_storage(0),
-        "unable to initialize x86 thread-local storage"
+        "unable to initialize thread-local storage"
     );
     dma::initialize();
     assert!(
@@ -146,11 +131,7 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
     }
     arch::interrupts::enable();
     if console_ready {
-        #[cfg(target_arch = "x86_64")]
-        let message = b"kz: x86_64 Rust kernel booted\n";
-        #[cfg(target_arch = "aarch64")]
-        let message = b"kz: aarch64 Rust kernel booted\n";
-        if console::write(message) && console::write(b"kz: virtio-console transmit OK\n") {
+        if console::write(arch::BOOT_MESSAGE) && console::write(b"kz: virtio-console transmit OK\n") {
             if future_smoke_started && FUTURE_SMOKE_DONE.load(Ordering::Acquire) {
                 let _future_status = console::write(b"kz: Rust futures smoke OK\n");
             }
@@ -164,28 +145,24 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
             if unsafe { kz_c_malloc_smoke() } == 0 {
                 let _malloc_status = console::write(b"kz: malloc/free smoke OK\n");
             }
-            #[cfg(target_arch = "x86_64")]
-            if let Some(address) = physical::allocate_contiguous(4096, 4 * 1024 * 1024 * 1024) {
-                unsafe { core::ptr::write_volatile(address as *mut u8, 0xa5) };
-                let mapped = unsafe { core::ptr::read_volatile(address as *const u8) == 0xa5 };
-                let released = physical::deallocate_contiguous(address, 4096);
-                if mapped && released {
-                    let _high_memory_status = console::write(b"kz: RAM above 4 GiB mapped\n");
-                }
+            if arch::high_memory_smoke() {
+                let _high_memory_status = console::write(b"kz: RAM above 4 GiB mapped\n");
             }
             if unsafe { kz_c_pthread_smoke() } == 0 {
                 let _thread_status = console::write(b"kz: pthreads smoke OK\n");
             }
-            #[cfg(target_arch = "x86_64")]
-            if runtime_ffi::v8_page_allocator_smoke() {
+            if arch::v8_page_allocator_smoke() {
                 let _page_allocator = console::write(b"kz: V8 page allocator hooks OK\n");
             }
-            #[cfg(target_arch = "x86_64")]
-            if unsafe { kz_v8_run_smoke() } != 0 {
-                let _v8_error = console::write(b"kz: V8 smoke failed\n");
+            match arch::run_v8_smoke() {
+                Some(0) => {}
+                Some(_) => {
+                    let _v8_error = console::write(b"kz: V8 smoke failed\n");
+                }
+                None => {
+                    let _v8_status = console::write(b"kz: V8 not integrated\n");
+                }
             }
-            #[cfg(target_arch = "aarch64")]
-            let _v8_status = console::write(b"kz: V8 not integrated\n");
         }
     }
     task::run_forever()
