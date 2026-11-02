@@ -9,6 +9,27 @@ fn set_errno(error: i32) {
     unsafe { crate::kernel_thread::__errno_location().write(error) };
 }
 
+pub(crate) fn remaining() -> usize {
+    GLOBAL_ALLOCATOR.remaining(&HEAP.lock())
+}
+
+pub(crate) fn allocate_c_layout(size: usize, alignment: usize) -> *mut c_void {
+    let Ok(layout) = Layout::from_size_align(size.max(1), alignment) else {
+        return null_mut();
+    };
+    unsafe { GLOBAL_ALLOCATOR.alloc(layout).cast::<c_void>() }
+}
+
+pub(crate) fn deallocate_c_pointer(pointer: *mut c_void) {
+    if !pointer.is_null() {
+        GLOBAL_ALLOCATOR.deallocate(&mut HEAP.lock(), pointer.cast::<u8>());
+    }
+}
+
+pub(crate) fn c_allocation_capacity(pointer: *const u8) -> Option<usize> {
+    GLOBAL_ALLOCATOR.allocation_capacity(&HEAP.lock(), pointer)
+}
+
 #[no_mangle]
 pub extern "C" fn malloc(size: usize) -> *mut c_void {
     let pointer = crate::heap::allocate_c_layout(size, align_of::<u128>());
