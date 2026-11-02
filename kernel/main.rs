@@ -116,26 +116,8 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
     }
     arch::interrupts::enable();
     if console_ready {
-        if console::write(arch::BOOT_MESSAGE) && console::write(b"kz: virtio-console transmit OK\n") {
-            if future_smoke_started && FUTURE_SMOKE_DONE.load(Ordering::Acquire) {
-                let _future_status = console::write(b"kz: Rust futures smoke OK\n");
-            }
-            let _stdio_status = unsafe { kz_c_stdio_smoke() };
-            if physical::memory_bytes() > 128 * 1024 * 1024 {
-                let _memory_status = console::write(b"kz: RAM above 128 MiB detected\n");
-            }
-            if unsafe { kz_c_mmap_smoke() } == 0 {
-                let _mmap_status = console::write(b"kz: mmap smoke OK\n");
-            }
-            if unsafe { kz_c_malloc_smoke() } == 0 {
-                let _malloc_status = console::write(b"kz: malloc/free smoke OK\n");
-            }
-            if arch::high_memory_smoke() {
-                let _high_memory_status = console::write(b"kz: RAM above 4 GiB mapped\n");
-            }
-            if unsafe { kz_c_pthread_smoke() } == 0 {
-                let _thread_status = console::write(b"kz: pthreads smoke OK\n");
-            }
+        if console::write(arch::BOOT_MESSAGE)
+        && console::write(b"kz: virtio-console transmit OK\n") {
             runtime::run(
                 &mut events,
                 block_device.as_mut(),
