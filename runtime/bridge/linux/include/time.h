@@ -23,6 +23,7 @@ struct tm {
 
 #define CLOCK_REALTIME 0
 #define CLOCK_MONOTONIC 1
+#define CLOCK_MONOTONIC_RAW 4
 
 #ifdef __cplusplus
 extern "C" {

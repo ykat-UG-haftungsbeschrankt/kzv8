@@ -16,3 +16,4 @@ v8_enable_pointer_compression_shared_cage = true
 use_sysroot = false
 use_glib = false
 use_allocator_shim = false
+v8_kz_freestanding = true

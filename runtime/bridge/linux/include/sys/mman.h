@@ -3,8 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
-typedef int64_t off_t;
+#include <sys/types.h>
 
 #define PROT_NONE 0x0
 #define PROT_READ 0x1

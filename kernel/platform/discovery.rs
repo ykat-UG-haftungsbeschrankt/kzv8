@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #[cfg(target_arch = "x86_64")]
 use core::ptr::read_unaligned;
 use core::ptr::{addr_of, addr_of_mut};

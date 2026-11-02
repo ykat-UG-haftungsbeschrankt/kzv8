@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #![no_std]
 #![no_main]
 
@@ -126,47 +133,17 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         let _event = events.wait(now_ns);
     }
     let console_ready = console::initialize();
-    #[cfg(target_arch = "x86_64")]
-    let v8_smoke_status = if console_ready {
-        unsafe { kz_v8_run_smoke() }
-    } else {
-        -1
-    };
-    #[cfg(target_arch = "x86_64")]
-    if console_ready {
-        let _phase = console::write(b"kz: debug console ready\n");
-    }
-    let online_cpus = arch::start_secondary_cpus();
-    #[cfg(target_arch = "x86_64")]
-    if console_ready {
-        let _phase = console::write(b"kz: debug smp returned\n");
-    }
     let future_smoke_started = task::spawn(futures_smoke()).is_ok();
-    #[cfg(target_arch = "x86_64")]
-    if console_ready {
-        let _phase = console::write(b"kz: debug task spawned\n");
-    }
     if future_smoke_started {
         task::run_until_stalled();
     }
-    #[cfg(target_arch = "x86_64")]
-    if console_ready {
-        let _phase = console::write(b"kz: debug executor stalled\n");
-    }
     arch::interrupts::enable();
-    #[cfg(target_arch = "x86_64")]
-    if console_ready {
-        let _phase = console::write(b"kz: debug interrupts enabled\n");
-    }
     if console_ready {
         #[cfg(target_arch = "x86_64")]
         let message = b"kz: x86_64 Rust kernel booted\n";
         #[cfg(target_arch = "aarch64")]
         let message = b"kz: aarch64 Rust kernel booted\n";
         if console::write(message) && console::write(b"kz: virtio-console transmit OK\n") {
-            if online_cpus > 1 {
-                let _smp_status = console::write(b"kz: SMP online\n");
-            }
             if future_smoke_started && FUTURE_SMOKE_DONE.load(Ordering::Acquire) {
                 let _future_status = console::write(b"kz: Rust futures smoke OK\n");
             }
@@ -197,7 +174,7 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
                 let _page_allocator = console::write(b"kz: V8 page allocator hooks OK\n");
             }
             #[cfg(target_arch = "x86_64")]
-            if v8_smoke_status != 0 {
+            if unsafe { kz_v8_run_smoke() } != 0 {
                 let _v8_error = console::write(b"kz: V8 smoke failed\n");
             }
             #[cfg(target_arch = "aarch64")]
@@ -210,16 +187,6 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
 async fn futures_smoke() {
     task::yield_now().await;
     FUTURE_SMOKE_DONE.store(true, Ordering::Release);
-}
-
-#[no_mangle]
-pub extern "C" fn kz_secondary_main(cpu_id: usize) -> ! {
-    if !arch::initialize_secondary_cpu(cpu_id) {
-        arch::halt();
-    }
-    arch::mark_cpu_online(cpu_id);
-    arch::interrupts::enable();
-    task::run_forever()
 }
 
 #[panic_handler]

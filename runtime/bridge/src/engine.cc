@@ -87,10 +87,15 @@ extern "C" int kz_v8_run_smoke() {
 
 	for (size_t count = 0; count < 128 && kz_os_platform_pump_one(platform); count++) {
 	}
+	report("kz: V8 disposing isolate\n", sizeof("kz: V8 disposing isolate\n") - 1);
 	isolate->Dispose();
+	report("kz: V8 isolate disposed\n", sizeof("kz: V8 isolate disposed\n") - 1);
 	delete allocator;
+	report("kz: V8 disposing runtime\n", sizeof("kz: V8 disposing runtime\n") - 1);
 	v8::V8::Dispose();
+	report("kz: V8 runtime disposed\n", sizeof("kz: V8 runtime disposed\n") - 1);
 	v8::V8::DisposePlatform();
+	report("kz: V8 platform disposed\n", sizeof("kz: V8 platform disposed\n") - 1);
 	kz_os_platform_destroy(platform);
 
 	if (!succeeded) return -5;

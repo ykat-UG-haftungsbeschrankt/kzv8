@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(target_arch = "x86_64")]
@@ -42,10 +49,15 @@ pub unsafe extern "C" fn kz_host_console_write(data: *const u8, length: usize) -
 
 #[no_mangle]
 pub extern "C" fn kz_host_time_ns() -> u64 {
-    crate::runtime_host::monotonic_time_ns().unwrap_or(0)
+    match crate::runtime_host::monotonic_time_ns() {
+        Some(now_ns) if now_ns != 0 => now_ns,
+        #[cfg(target_arch = "x86_64")]
+        _ => crate::arch::timer::ticks(),
+        #[cfg(target_arch = "aarch64")]
+        _ => 0,
+    }
 }
 
-#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kz_host_wall_time_ms() -> i64 {
     0

@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -6,7 +13,7 @@ use crate::sync::IrqSpinLock;
 pub(crate) const PAGE_SIZE: usize = 4096;
 
 #[cfg(target_arch = "x86_64")]
-const VM_ARENA_SIZE: usize = 1 << 35;
+const VM_ARENA_SIZE: usize = 1 << 36;
 #[cfg(target_arch = "aarch64")]
 const VM_ARENA_SIZE: usize = 1 << 30;
 const MAX_VM_PAGES: usize = VM_ARENA_SIZE / PAGE_SIZE;
@@ -189,6 +196,142 @@ pub(crate) fn release(address: usize, length: usize) -> bool {
     let released = release_pages(start_page, end_page);
     unsafe { areas.add(area_slot).write(VmArea::EMPTY) };
     released
+}
+
+pub(crate) fn release_range(address: usize, length: usize) -> bool {
+    if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 {
+        return false;
+    }
+    let Some(length) = rounded_length(length) else {
+        return false;
+    };
+    let Some(offset) = address.checked_sub(VM_BASE) else {
+        return false;
+    };
+    let start_page = offset / PAGE_SIZE;
+    let page_count = length / PAGE_SIZE;
+    let Some(end_page) = start_page.checked_add(page_count) else {
+        return false;
+    };
+    if end_page > MAX_VM_PAGES {
+        return false;
+    }
+
+    let _guard = VM_LOCK.lock();
+    let areas = addr_of_mut!(VM_AREAS).cast::<VmArea>();
+    let mut area_slot = None;
+    for index in 0..MAX_VM_AREAS {
+        let area = unsafe { &*areas.add(index) };
+        if area.active
+            && start_page >= area.start_page
+            && end_page <= area.start_page.saturating_add(area.page_count)
+        {
+            area_slot = Some(index);
+            break;
+        }
+    }
+    let Some(area_slot) = area_slot else {
+        return false;
+    };
+    let area = unsafe { *areas.add(area_slot) };
+    if (start_page..end_page)
+        .any(|page| PAGE_STATE[page].load(Ordering::Acquire) & VM_RESERVED == 0)
+    {
+        return false;
+    }
+
+    let area_end = area.start_page + area.page_count;
+    let prefix_page_count = start_page - area.start_page;
+    let suffix_page_count = area_end - end_page;
+    let mut split_slot = None;
+    if prefix_page_count != 0 && suffix_page_count != 0 {
+        for index in 0..MAX_VM_AREAS {
+            if !unsafe { (*areas.add(index)).active } {
+                split_slot = Some(index);
+                break;
+            }
+        }
+        if split_slot.is_none() {
+            return false;
+        }
+    }
+
+    let released = release_pages(start_page, end_page);
+    unsafe {
+        match (prefix_page_count, suffix_page_count) {
+            (0, 0) => areas.add(area_slot).write(VmArea::EMPTY),
+            (0, suffix_page_count) => areas.add(area_slot).write(VmArea {
+                start_page: end_page,
+                page_count: suffix_page_count,
+                active: true,
+            }),
+            (prefix_page_count, 0) => areas.add(area_slot).write(VmArea {
+                start_page: area.start_page,
+                page_count: prefix_page_count,
+                active: true,
+            }),
+            (prefix_page_count, suffix_page_count) => {
+                areas.add(area_slot).write(VmArea {
+                    start_page: area.start_page,
+                    page_count: prefix_page_count,
+                    active: true,
+                });
+                areas.add(split_slot.unwrap()).write(VmArea {
+                    start_page: end_page,
+                    page_count: suffix_page_count,
+                    active: true,
+                });
+            }
+        }
+    }
+    released
+}
+
+pub(crate) fn decommit(address: usize, length: usize) -> bool {
+    if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 {
+        return false;
+    }
+    let Some(length) = rounded_length(length) else {
+        return false;
+    };
+    let Some(offset) = address.checked_sub(VM_BASE) else {
+        return false;
+    };
+    let start_page = offset / PAGE_SIZE;
+    let page_count = length / PAGE_SIZE;
+    let Some(end_page) = start_page.checked_add(page_count) else {
+        return false;
+    };
+    if end_page > MAX_VM_PAGES {
+        return false;
+    }
+
+    let _guard = VM_LOCK.lock();
+    let areas = addr_of_mut!(VM_AREAS).cast::<VmArea>();
+    let range_reserved = (0..MAX_VM_AREAS).any(|index| {
+        let area = unsafe { &*areas.add(index) };
+        area.active
+            && start_page >= area.start_page
+            && end_page <= area.start_page.saturating_add(area.page_count)
+    });
+    if !range_reserved
+        || (start_page..end_page)
+            .any(|page| PAGE_STATE[page].load(Ordering::Acquire) & VM_RESERVED == 0)
+    {
+        return false;
+    }
+
+    let mut decommitted = true;
+    for page in start_page..end_page {
+        let virtual_address = VM_BASE + page * PAGE_SIZE;
+        if let Some(physical_address) = crate::arch::unmap_page(virtual_address) {
+            if !crate::physical::deallocate_contiguous(physical_address, PAGE_SIZE) {
+                decommitted = false;
+            }
+        }
+        PAGE_STATE[page].store(VM_RESERVED, Ordering::Release);
+    }
+    decommitted
 }
 
 pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -> bool {

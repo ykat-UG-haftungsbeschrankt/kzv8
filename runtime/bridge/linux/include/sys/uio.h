@@ -2,9 +2,7 @@
 #define KZ_RUNTIME_BRIDGE_LINUX_INCLUDE_SYS_UIO_H_
 
 #include <stddef.h>
-#include <stdint.h>
-
-typedef intptr_t ssize_t;
+#include <sys/types.h>
 
 struct iovec {
     void* iov_base;

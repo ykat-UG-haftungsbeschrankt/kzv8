@@ -2,6 +2,7 @@
 #define KZ_RUNTIME_BRIDGE_LINUX_INCLUDE_STDIO_H_
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdarg.h>
 
 #ifdef __cplusplus
@@ -15,17 +16,23 @@ extern "C" {
 
 typedef struct kz_file {
 	int descriptor;
+	int pushback;
+	int has_pushback;
 } FILE;
 extern FILE *stdin;
 extern FILE *stdout;
 extern FILE *stderr;
 
 int putchar(int character);
+int getchar(void);
 int puts(const char* text);
 int printf(const char* format, ...);
 int snprintf(char* buffer, size_t size, const char* format, ...);
 int fclose(FILE* stream);
 int fflush(FILE* stream);
+int fgetc(FILE* stream);
+int getc(FILE* stream);
+int ungetc(int character, FILE* stream);
 int fputc(int character, FILE* stream);
 int fputs(const char* text, FILE* stream);
 size_t fread(void* buffer, size_t size, size_t count, FILE* stream);
@@ -38,8 +45,15 @@ int __vprintf_chk(int flag, const char* format, va_list arguments);
 int __vsnprintf_chk(char* buffer, size_t size, int flag, size_t object_size,
 					const char* format, va_list arguments);
 int setvbuf(FILE* stream, char* buffer, int mode, size_t size);
+int fseek(FILE* stream, long offset, int origin);
+int fseeko64(FILE* stream, int64_t offset, int origin);
+int64_t ftello64(FILE* stream);
 int snprintf(char* buffer, size_t size, const char* format, ...);
+FILE* fopen(const char* path, const char* mode);
 FILE* fopen64(const char* path, const char* mode);
+FILE* fdopen(int file_descriptor, const char* mode);
+FILE* tmpfile(void);
+FILE* tmpfile64(void);
 
 #ifdef __cplusplus
 }

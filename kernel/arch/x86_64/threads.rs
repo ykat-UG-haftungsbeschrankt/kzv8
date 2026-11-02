@@ -1,4 +1,23 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::mem::size_of;
+use core::ptr::{addr_of, addr_of_mut, copy_nonoverlapping, write_bytes};
+
+const TLS_BLOCK_SIZE: usize = 4096;
+
+static mut TLS_BLOCKS: [[u8; TLS_BLOCK_SIZE]; crate::arch::MAX_CPUS] =
+    [[0; TLS_BLOCK_SIZE]; crate::arch::MAX_CPUS];
+
+unsafe extern "C" {
+    static __tls_start: u8;
+    static __tls_data_end: u8;
+    static __tls_end: u8;
+}
 
 core::arch::global_asm!(
     ".section .text",
@@ -25,6 +44,46 @@ core::arch::global_asm!(
 
 unsafe extern "C" {
     fn kz_x86_64_context_switch(old_stack: *mut usize, new_stack: usize);
+}
+
+pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
+    if cpu_id >= crate::arch::MAX_CPUS {
+        return false;
+    }
+
+    unsafe {
+        let tls_start = addr_of!(__tls_start) as usize;
+        let tls_data_end = addr_of!(__tls_data_end) as usize;
+        let tls_end = addr_of!(__tls_end) as usize;
+        let Some(tls_size) = tls_end.checked_sub(tls_start) else {
+            return false;
+        };
+        let Some(tls_data_size) = tls_data_end.checked_sub(tls_start) else {
+            return false;
+        };
+        if tls_data_size > tls_size || tls_size > TLS_BLOCK_SIZE - 2 * size_of::<usize>() {
+            return false;
+        }
+
+        let blocks = addr_of_mut!(TLS_BLOCKS).cast::<u8>();
+        let tls_block = blocks.add(cpu_id * TLS_BLOCK_SIZE);
+        write_bytes(tls_block, 0, TLS_BLOCK_SIZE);
+        copy_nonoverlapping(tls_start as *const u8, tls_block, tls_data_size);
+
+        let thread_pointer = tls_block.add(tls_size) as usize;
+        (thread_pointer as *mut usize).write(thread_pointer);
+        ((thread_pointer + size_of::<usize>()) as *mut usize).write(0);
+
+        let thread_pointer = thread_pointer as u64;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xc000_0100u32,
+            in("eax") thread_pointer as u32,
+            in("edx") (thread_pointer >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+    true
 }
 
 pub(crate) fn initialize_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize {

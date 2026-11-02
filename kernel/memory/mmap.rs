@@ -1,4 +1,12 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::ffi::c_void;
+use core::ptr::addr_of;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -19,6 +27,14 @@ const PROT_READ_WRITE_EXEC: i32 = PROT_READ | PROT_WRITE | PROT_EXEC;
 const MAP_SHARED: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MAP_ANONYMOUS: i32 = 0x20;
+const MAP_NORESERVE: i32 = 0x4000;
+const MAP_FIXED: i32 = 0x10;
+
+#[cfg(target_arch = "x86_64")]
+extern "C" {
+    static _start: u8;
+    static __bss_end: u8;
+}
 
 fn set_errno(error: i32) {
     unsafe { crate::kernel_thread::__errno_location().write(error) };
@@ -48,7 +64,7 @@ fn page_permissions(protection: i32) -> Option<i32> {
 
 #[no_mangle]
 pub unsafe extern "C" fn mmap(
-    _address_hint: *mut c_void,
+    address_hint: *mut c_void,
     length: usize,
     protection: i32,
     flags: i32,
@@ -56,7 +72,7 @@ pub unsafe extern "C" fn mmap(
     offset: i64,
 ) -> *mut c_void {
     let sharing = flags & (MAP_PRIVATE | MAP_SHARED);
-    let supported_flags = MAP_PRIVATE | MAP_SHARED | MAP_ANONYMOUS;
+    let supported_flags = MAP_PRIVATE | MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED;
     if length == 0
         || protection & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0
         || flags & !supported_flags != 0
@@ -73,6 +89,15 @@ pub unsafe extern "C" fn mmap(
     let Some(length) = rounded_length(length) else {
         return fail(ENOMEM);
     };
+    if flags & MAP_FIXED != 0 {
+        if address_hint.is_null() || permissions != 0 {
+            return fail(EINVAL);
+        }
+        if !crate::memory::decommit(address_hint as usize, length) {
+            return fail(ENOMEM);
+        }
+        return address_hint;
+    }
     let Some(address) = crate::memory::reserve(length, PAGE_SIZE, permissions) else {
         return fail(ENOMEM);
     };
@@ -105,11 +130,31 @@ pub unsafe extern "C" fn mprotect(
         set_errno(EINVAL);
         return -1;
     };
-    if !crate::memory::set_permissions(address as usize, length, permissions) {
-        set_errno(ENOMEM);
-        return -1;
+    let address = address as usize;
+    if crate::memory::set_permissions(address, length, permissions) {
+        return 0;
     }
-    0
+    #[cfg(target_arch = "x86_64")]
+    if permissions == PROT_READ
+        && address % PAGE_SIZE == 0
+        && length % PAGE_SIZE == 0
+    {
+        let Some(end) = address.checked_add(length) else {
+            set_errno(ENOMEM);
+            return -1;
+        };
+        let (image_start, image_end) = unsafe {
+            (addr_of!(_start) as usize, addr_of!(__bss_end) as usize)
+        };
+        if address >= image_start
+            && end <= image_end
+            && crate::arch::set_page_permissions(address, length, permissions)
+        {
+            return 0;
+        }
+    }
+    set_errno(ENOMEM);
+    -1
 }
 
 #[no_mangle]
@@ -141,7 +186,7 @@ pub unsafe extern "C" fn munmap(address: *mut c_void, length: usize) -> i32 {
         set_errno(EINVAL);
         return -1;
     };
-    if !crate::memory::release(address, length) {
+    if !crate::memory::release_range(address, length) {
         set_errno(EINVAL);
         return -1;
     }

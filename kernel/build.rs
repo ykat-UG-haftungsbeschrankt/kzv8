@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use std::fs;
 use std::env;
 use std::ffi::OsString;
@@ -107,17 +114,7 @@ fn main() {
 
     let include_dir = repository_dir.join("runtime/bridge/linux/include");
     let c_sources = [
-        ("runtime/bridge/linux/stdio.c", "stdio.o"),
-        ("runtime/bridge/linux/format.c", "format.o"),
-        ("runtime/bridge/linux/math.c", "math.o"),
-        ("runtime/bridge/linux/compat.c", "compat.o"),
-        ("runtime/bridge/linux/cxxabi.c", "cxxabi.o"),
-        ("runtime/bridge/linux/string.c", "string.o"),
-        ("runtime/bridge/linux/posix.c", "posix.o"),
-        ("runtime/bridge/linux/stdio_smoke.c", "stdio_smoke.o"),
-        ("runtime/bridge/linux/malloc_smoke.c", "malloc_smoke.o"),
-        ("runtime/bridge/linux/mmap_smoke.c", "mmap_smoke.o"),
-        ("runtime/bridge/linux/pthread_smoke.c", "pthread_smoke.o"),
+        ("runtime/bridge/linux/variadic.c", "variadic.o"),
     ];
 
     for header in [
@@ -126,6 +123,9 @@ fn main() {
         "stdlib.h",
         "pthread.h",
         "errno.h",
+        "fcntl.h",
+        "sys/types.h",
+        "sys/stat.h",
         "sys/mman.h",
         "time.h",
         "unistd.h",
@@ -220,7 +220,6 @@ fn main() {
                     "-DV8_ENABLE_SANDBOX",
                     "-DV8_COMPRESS_POINTERS",
                     "-DV8_COMPRESS_POINTERS_IN_SHARED_CAGE",
-                    "-DV8_31BIT_SMIS_ON_64BIT_ARCH",
                 ])
                 .arg("-I")
                 .arg(v8_source.join("buildtools/third_party/libc++"))

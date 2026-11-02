@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
@@ -7,12 +14,11 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 const MAX_TASKS: usize = 16;
 
-type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type TaskFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
 struct Task {
     active: AtomicBool,
     ready: AtomicBool,
-    polling: AtomicBool,
     future: UnsafeCell<Option<TaskFuture>>,
 }
 
@@ -21,7 +27,6 @@ impl Task {
         Self {
             active: AtomicBool::new(false),
             ready: AtomicBool::new(false),
-            polling: AtomicBool::new(false),
             future: UnsafeCell::new(None),
         }
     }
@@ -42,6 +47,7 @@ impl Executor {
 unsafe impl Sync for Executor {}
 
 static EXECUTOR: Executor = Executor::new();
+static POLLING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SpawnError {
@@ -50,7 +56,7 @@ pub(crate) enum SpawnError {
 
 pub(crate) fn spawn<F>(future: F) -> Result<(), SpawnError>
 where
-    F: Future<Output = ()> + Send + 'static,
+    F: Future<Output = ()> + 'static,
 {
     let future: TaskFuture = Box::pin(future);
     for task in &EXECUTOR.tasks {
@@ -70,16 +76,15 @@ where
 }
 
 fn poll_ready() {
+    if POLLING.swap(true, Ordering::Acquire) {
+        return;
+    }
+    let _polling = PollingGuard;
+
     for task in &EXECUTOR.tasks {
-        if task
-            .polling
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+        if !task.active.load(Ordering::Acquire)
+            || !task.ready.swap(false, Ordering::AcqRel)
         {
-            continue;
-        }
-        if !task.active.load(Ordering::Acquire) || !task.ready.swap(false, Ordering::AcqRel) {
-            task.polling.store(false, Ordering::Release);
             continue;
         }
 
@@ -94,7 +99,6 @@ fn poll_ready() {
             let future_slot = unsafe { &mut *task.future.get() };
             let Some(future) = future_slot.as_mut() else {
                 task.active.store(false, Ordering::Release);
-                task.polling.store(false, Ordering::Release);
                 continue;
             };
             future.as_mut().poll(&mut context)
@@ -105,7 +109,14 @@ fn poll_ready() {
             task.ready.store(false, Ordering::Relaxed);
             task.active.store(false, Ordering::Release);
         }
-        task.polling.store(false, Ordering::Release);
+    }
+}
+
+struct PollingGuard;
+
+impl Drop for PollingGuard {
+    fn drop(&mut self) {
+        POLLING.store(false, Ordering::Release);
     }
 }
 
@@ -117,6 +128,9 @@ fn has_ready_tasks() -> bool {
 }
 
 pub(crate) fn run_until_stalled() {
+    if POLLING.load(Ordering::Acquire) {
+        return;
+    }
     loop {
         poll_ready();
         if !has_ready_tasks() {
