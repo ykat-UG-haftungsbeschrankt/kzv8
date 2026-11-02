@@ -1,5 +1,8 @@
 use core::ffi::c_void;
 
+const JOINABLE: i32 = 0;
+const DETACHED: i32 = 1;
+
 #[no_mangle]
 pub extern "C" fn pthread_self() -> usize {
     crate::kernel_thread::current_thread_id()

@@ -15,17 +15,6 @@ const MAX_TLS_KEYS: usize = 64;
 const STACK_SIZE: usize = 16 * 1024;
 const MAIN_THREAD_ID: usize = 1;
 
-const EAGAIN: i32 = 11;
-const EBUSY: i32 = 16;
-const EDEADLK: i32 = 35;
-const EINVAL: i32 = 22;
-const EPERM: i32 = 1;
-const ESRCH: i32 = 3;
-const ENOSYS: i32 = 38;
-
-const JOINABLE: i32 = 0;
-const DETACHED: i32 = 1;
-
 type StartRoutine = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 
 #[repr(C)]
