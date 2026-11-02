@@ -55,13 +55,6 @@ mod virtio_queue;
 #[path = "drivers/virtio/transport.rs"]
 mod virtio_transport;
 
-extern "C" {
-    fn kz_c_stdio_smoke() -> i32;
-    fn kz_c_malloc_smoke() -> i32;
-    fn kz_c_mmap_smoke() -> i32;
-    fn kz_c_pthread_smoke() -> i32;
-}
-
 static FUTURE_SMOKE_DONE: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
