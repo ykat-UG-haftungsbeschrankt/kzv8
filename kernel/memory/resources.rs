@@ -48,13 +48,24 @@ impl MemoryRegions {
     }
 }
 
-static MEMORY_REGIONS: IrqSpinLock<MemoryRegions> = IrqSpinLock::new(MemoryRegions::EMPTY);
-
-pub(crate) struct MemoryRegionRegistry;
+pub(crate) struct MemoryRegionRegistry {
+    regions: IrqSpinLock<MemoryRegions>,
+}
 
 impl MemoryRegionRegistry {
+    const fn new() -> Self {
+        Self {
+            regions: IrqSpinLock::new(MemoryRegions::EMPTY),
+        }
+    }
+
+    fn global() -> &'static Self {
+        static REGISTRY: MemoryRegionRegistry = MemoryRegionRegistry::new();
+        &REGISTRY
+    }
+
     pub(crate) fn reset_memory_regions() {
-        *MEMORY_REGIONS.lock() = MemoryRegions::EMPTY;
+        *Self::global().regions.lock() = MemoryRegions::EMPTY;
     }
 
     pub(crate) fn add_memory_region(start: u64, length: u64) -> bool {
@@ -73,7 +84,7 @@ impl MemoryRegionRegistry {
             start: start as usize,
             length: (clipped_end - start) as usize,
         };
-        let mut regions = MEMORY_REGIONS.lock();
+        let mut regions = Self::global().regions.lock();
         if regions.count == MAX_MEMORY_REGIONS {
             return false;
         }
@@ -84,6 +95,6 @@ impl MemoryRegionRegistry {
     }
 
     pub(crate) fn memory_regions() -> MemoryRegions {
-        *MEMORY_REGIONS.lock()
+        *Self::global().regions.lock()
     }
 }

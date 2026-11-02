@@ -71,14 +71,24 @@ impl HeapState {
     }
 }
 
-pub(crate) struct Heap;
+pub(crate) struct Heap {
+    state: IrqSpinLock<HeapState>,
+}
+
+struct GlobalHeap;
 
 #[global_allocator]
-static GLOBAL_ALLOCATOR: Heap = Heap;
+static GLOBAL_ALLOCATOR: GlobalHeap = GlobalHeap;
 
 impl Heap {
-    fn state() -> &'static IrqSpinLock<HeapState> {
-        static HEAP: IrqSpinLock<HeapState> = IrqSpinLock::new(HeapState::new());
+    const fn new() -> Self {
+        Self {
+            state: IrqSpinLock::new(HeapState::new()),
+        }
+    }
+
+    fn global() -> &'static Self {
+        static HEAP: Heap = Heap::new();
         &HEAP
     }
 
@@ -119,7 +129,8 @@ impl Heap {
         let Some(metadata_slot) = heap.slabs.iter().position(|slab| !slab.active) else {
             return null_mut();
         };
-        let Some(page) = crate::kernel::memory::virtual_memory::reserve(PAGE_SIZE, PAGE_SIZE, 2) else {
+        let Some(page) = crate::kernel::memory::virtual_memory::reserve(PAGE_SIZE, PAGE_SIZE, 2)
+        else {
             return null_mut();
         };
         let head = heap.class_heads[class_index];
@@ -153,7 +164,8 @@ impl Heap {
             return null_mut();
         };
         let alignment = alignment.max(PAGE_SIZE);
-        let Some(address) = crate::kernel::memory::virtual_memory::reserve(length, alignment, 2) else {
+        let Some(address) = crate::kernel::memory::virtual_memory::reserve(length, alignment, 2)
+        else {
             return null_mut();
         };
         heap.large_allocations[metadata_slot] = LargeAllocation {
@@ -175,7 +187,8 @@ impl Heap {
             .position(|allocation| allocation.active && allocation.address == address)
         {
             let allocation = heap.large_allocations[index];
-            if crate::kernel::memory::virtual_memory::release(allocation.address, allocation.length) {
+            if crate::kernel::memory::virtual_memory::release(allocation.address, allocation.length)
+            {
                 heap.large_allocations[index] = LargeAllocation::EMPTY;
             }
             return;
@@ -276,7 +289,7 @@ impl Heap {
     }
 
     pub(crate) fn initialize() {
-        let mut heap = Self::state().lock();
+        let mut heap = Self::global().state.lock();
         heap.initialized = false;
         heap.slabs.fill(Slab::EMPTY);
         heap.class_heads.fill(NO_INDEX);
@@ -285,12 +298,14 @@ impl Heap {
     }
 }
 
-unsafe impl GlobalAlloc for Heap {
+unsafe impl GlobalAlloc for GlobalHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.allocate(&mut Self::state().lock(), layout)
+        let heap = Heap::global();
+        heap.allocate(&mut heap.state.lock(), layout)
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, _layout: Layout) {
-        self.deallocate(&mut Self::state().lock(), pointer)
+        let heap = Heap::global();
+        heap.deallocate(&mut heap.state.lock(), pointer)
     }
 }

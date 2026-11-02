@@ -52,11 +52,14 @@ impl PhysicalAllocator {
     }
 }
 
-static PHYSICAL_ALLOCATOR: PhysicalAllocator = PhysicalAllocator::new();
-
 impl PhysicalAllocator {
+    fn global() -> &'static Self {
+        static ALLOCATOR: PhysicalAllocator = PhysicalAllocator::new();
+        &ALLOCATOR
+    }
+
     pub(crate) fn initialize() -> bool {
-        let allocator = &PHYSICAL_ALLOCATOR;
+        let allocator = Self::global();
         let _guard = allocator.lock.lock();
         let image_end = core::ptr::addr_of!(__bss_end) as usize;
         for word in &allocator.bitmap {
@@ -119,7 +122,7 @@ impl PhysicalAllocator {
     }
 
     pub(crate) fn allocate() -> Option<Frame> {
-        let allocator = &PHYSICAL_ALLOCATOR;
+        let allocator = Self::global();
         let _guard = allocator.lock.lock();
         if !allocator.initialized.load(Ordering::Acquire) {
             return None;
@@ -162,7 +165,7 @@ impl PhysicalAllocator {
     }
 
     pub(crate) fn allocate_contiguous(length: usize, alignment: usize) -> Option<usize> {
-        let allocator = &PHYSICAL_ALLOCATOR;
+        let allocator = Self::global();
         let _guard = allocator.lock.lock();
         if !allocator.initialized.load(Ordering::Acquire)
             || length == 0
@@ -238,7 +241,7 @@ impl PhysicalAllocator {
     }
 
     pub(crate) fn deallocate_contiguous(address: usize, length: usize) -> bool {
-        let allocator = &PHYSICAL_ALLOCATOR;
+        let allocator = Self::global();
         let _guard = allocator.lock.lock();
         if length == 0 || length % PAGE_SIZE != 0 || address % PAGE_SIZE != 0 {
             return false;
@@ -273,7 +276,7 @@ impl PhysicalAllocator {
     }
 
     pub(crate) fn deallocate(frame: Frame) -> bool {
-        let allocator = &PHYSICAL_ALLOCATOR;
+        let allocator = Self::global();
         let _guard = allocator.lock.lock();
         if frame.address % PAGE_SIZE != 0
             || frame.address >= crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS
@@ -295,7 +298,7 @@ impl PhysicalAllocator {
     }
 
     pub(crate) fn free_frames() -> usize {
-        let allocator = &PHYSICAL_ALLOCATOR;
+        let allocator = Self::global();
         let _guard = allocator.lock.lock();
         let count = allocator.frame_count.load(Ordering::Relaxed);
         (0..count)
@@ -308,7 +311,7 @@ impl PhysicalAllocator {
     }
 
     pub(crate) fn memory_bytes() -> usize {
-        let allocator = &PHYSICAL_ALLOCATOR;
+        let allocator = Self::global();
         allocator.memory_bytes.load(Ordering::Acquire)
     }
 }
