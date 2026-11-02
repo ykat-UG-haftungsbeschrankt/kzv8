@@ -115,11 +115,7 @@ impl crate::kernel::arch::MemoryArchitecture for MemoryArch {
             })
     }
 
-    fn protect_kernel_image_pages(
-        _address: usize,
-        _length: usize,
-        _permissions: i32,
-    ) -> bool {
+    fn protect_kernel_image_pages(_address: usize, _length: usize, _permissions: i32) -> bool {
         false
     }
 

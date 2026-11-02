@@ -33,7 +33,12 @@ pub extern "C" fn kz_host_v8_allocate_pages(
     if trace {
         crate::kernel::arch::debug::debugcon(b"A");
     }
-    if let Some(address) = crate::kernel::memory::virtual_memory::reserve_with_hint(hint, length, alignment, permissions) {
+    if let Some(address) = crate::kernel::memory::virtual_memory::reserve_with_hint(
+        hint,
+        length,
+        alignment,
+        permissions,
+    ) {
         if trace {
             crate::kernel::arch::debug::debugcon(b"H\n");
         }
@@ -43,7 +48,9 @@ pub extern "C" fn kz_host_v8_allocate_pages(
         if trace {
             crate::kernel::arch::debug::debugcon(b"F");
         }
-        if let Some(address) = crate::kernel::memory::virtual_memory::reserve(length, alignment, permissions) {
+        if let Some(address) =
+            crate::kernel::memory::virtual_memory::reserve(length, alignment, permissions)
+        {
             if trace {
                 crate::kernel::arch::debug::debugcon(b"S\n");
             }
@@ -81,7 +88,8 @@ pub extern "C" fn kz_host_v8_release_pages(
     if address.is_null() || new_length > length || new_length % 4096 != 0 {
         return 0;
     }
-    crate::kernel::memory::virtual_memory::release_suffix(address as usize, length, new_length) as i32
+    crate::kernel::memory::virtual_memory::release_suffix(address as usize, length, new_length)
+        as i32
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -104,7 +112,8 @@ pub extern "C" fn kz_host_v8_set_page_permissions(
         return 0;
     }
     let permissions = if permissions == 5 { 0 } else { permissions };
-    crate::kernel::memory::virtual_memory::set_permissions(address as usize, length, permissions) as i32
+    crate::kernel::memory::virtual_memory::set_permissions(address as usize, length, permissions)
+        as i32
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -135,7 +144,8 @@ pub(crate) fn run_smoke(
 pub(crate) fn page_allocator_smoke() -> bool {
     let page_size = 4096;
     let length = page_size * 2;
-    let out_of_arena_hint = crate::kernel::memory::virtual_memory::allocator_base().saturating_sub(page_size) as *mut u8;
+    let out_of_arena_hint = crate::kernel::memory::virtual_memory::allocator_base()
+        .saturating_sub(page_size) as *mut u8;
     let memory = kz_host_v8_allocate_pages(out_of_arena_hint, length, page_size, 2);
     if memory.is_null() {
         return false;

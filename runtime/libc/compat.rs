@@ -191,20 +191,12 @@ pub unsafe extern "C" fn mbrtowc(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mbrlen(
-    input: *const c_char,
-    length: usize,
-    state: *mut c_void,
-) -> usize {
+pub unsafe extern "C" fn mbrlen(input: *const c_char, length: usize, state: *mut c_void) -> usize {
     unsafe { mbrtowc(core::ptr::null_mut(), input, length, state) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mbtowc(
-    output: *mut i32,
-    input: *const c_char,
-    length: usize,
-) -> i32 {
+pub unsafe extern "C" fn mbtowc(output: *mut i32, input: *const c_char, length: usize) -> i32 {
     let result = unsafe { mbrtowc(output, input, length, core::ptr::null_mut()) };
     if result == usize::MAX || result == usize::MAX - 1 {
         -1
@@ -219,11 +211,7 @@ pub unsafe extern "C" fn mblen(input: *const c_char, length: usize) -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wcrtomb(
-    output: *mut c_char,
-    input: i32,
-    _state: *mut c_void,
-) -> usize {
+pub unsafe extern "C" fn wcrtomb(output: *mut c_char, input: i32, _state: *mut c_void) -> usize {
     if output.is_null() {
         return 1;
     }
@@ -404,7 +392,9 @@ pub extern "C" fn ungetwc(_character: i32, _stream: *mut c_void) -> u32 {
 pub unsafe extern "C" fn fputwc(character: i32, stream: *mut c_void) -> u32 {
     let mut encoded = [0i8; 4];
     let length = unsafe { wcrtomb(encoded.as_mut_ptr(), character, core::ptr::null_mut()) };
-    if length == usize::MAX || unsafe { fwrite(encoded.as_ptr().cast(), 1, length, stream) } != length {
+    if length == usize::MAX
+        || unsafe { fwrite(encoded.as_ptr().cast(), 1, length, stream) } != length
+    {
         return WEOF;
     }
     character as u32
@@ -469,11 +459,7 @@ pub unsafe extern "C" fn __mbrlen(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wmemchr(
-    memory: *const i32,
-    value: i32,
-    count: usize,
-) -> *mut i32 {
+pub unsafe extern "C" fn wmemchr(memory: *const i32, value: i32, count: usize) -> *mut i32 {
     if memory.is_null() {
         return core::ptr::null_mut();
     }

@@ -137,12 +137,7 @@ pub extern "C" fn _Unwind_GetIP(_context: *mut c_void) -> usize {
 }
 
 #[no_mangle]
-pub extern "C" fn _Unwind_SetGR(
-    _context: *mut c_void,
-    _register_number: i32,
-    _value: usize,
-) {
-}
+pub extern "C" fn _Unwind_SetGR(_context: *mut c_void, _register_number: i32, _value: usize) {}
 
 #[cold]
 fn trap() -> ! {

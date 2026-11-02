@@ -11,7 +11,9 @@ use core::slice;
 use crate::kernel::block::device::BlockDevice;
 use crate::kernel::block::request::Request;
 use crate::kernel::event::completion::Completion;
-use crate::kernel::event::r#loop::{EventFlags, EventLoop, EventSourceId, EventSourceToken, RawEvent};
+use crate::kernel::event::r#loop::{
+    EventFlags, EventLoop, EventSourceId, EventSourceToken, RawEvent,
+};
 use crate::kernel::event::timers::TimerId;
 use crate::kernel::net::stack::NetStack;
 use smoltcp::iface::SocketHandle;
@@ -45,7 +47,9 @@ pub unsafe extern "C" fn kz_host_tcp_available(context: *mut c_void) -> i32 {
     if context.is_null() {
         return 0;
     }
-    (!unsafe { &*context.cast::<TcpContext>() }.network_stack.is_null()) as i32
+    (!unsafe { &*context.cast::<TcpContext>() }
+        .network_stack
+        .is_null()) as i32
 }
 
 #[no_mangle]
@@ -87,7 +91,8 @@ pub unsafe extern "C" fn kz_host_event_loop_poll(
         return 0;
     }
     let events = unsafe { &mut *context.cast::<EventLoop<16>>() };
-    let now_ns = crate::kernel::arch::timer::now_ns().unwrap_or_else(crate::kernel::arch::fallback_time_ns);
+    let now_ns =
+        crate::kernel::arch::timer::now_ns().unwrap_or_else(crate::kernel::arch::fallback_time_ns);
     let Some(event) = events.poll_raw(now_ns) else {
         return 0;
     };
@@ -105,7 +110,8 @@ pub unsafe extern "C" fn kz_host_event_loop_schedule_timer(
         return 0;
     }
     let events = unsafe { &mut *context.cast::<EventLoop<16>>() };
-    let now_ns = crate::kernel::arch::timer::now_ns().unwrap_or_else(crate::kernel::arch::fallback_time_ns);
+    let now_ns =
+        crate::kernel::arch::timer::now_ns().unwrap_or_else(crate::kernel::arch::fallback_time_ns);
     let Some(deadline_ns) = now_ns.checked_add(delay_ns) else {
         return 0;
     };
@@ -164,7 +170,9 @@ pub unsafe extern "C" fn kz_host_event_loop_modify(
         return 0;
     };
     let events = unsafe { &mut *context.cast::<EventLoop<16>>() };
-    events.modify(EventSourceToken::from_raw(token), interest, data).is_ok() as i32
+    events
+        .modify(EventSourceToken::from_raw(token), interest, data)
+        .is_ok() as i32
 }
 
 #[no_mangle]
@@ -186,10 +194,7 @@ pub unsafe extern "C" fn kz_host_event_loop_set_readiness(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn kz_host_event_loop_deregister(
-    context: *mut c_void,
-    token: u64,
-) -> i32 {
+pub unsafe extern "C" fn kz_host_event_loop_deregister(context: *mut c_void, token: u64) -> i32 {
     if context.is_null() {
         return 0;
     }
@@ -248,11 +253,7 @@ pub unsafe extern "C" fn kz_host_block_read(
     output: *mut u8,
     length: usize,
 ) -> i32 {
-    if device.is_null()
-        || output.is_null()
-        || length == 0
-        || length > MAX_BLOCK_TRANSFER_SIZE
-    {
+    if device.is_null() || output.is_null() || length == 0 || length > MAX_BLOCK_TRANSFER_SIZE {
         return -1;
     }
     let output = unsafe { slice::from_raw_parts_mut(output, length) };
@@ -284,11 +285,7 @@ pub unsafe extern "C" fn kz_host_block_write(
     input: *const u8,
     length: usize,
 ) -> i32 {
-    if device.is_null()
-        || input.is_null()
-        || length == 0
-        || length > MAX_BLOCK_TRANSFER_SIZE
-    {
+    if device.is_null() || input.is_null() || length == 0 || length > MAX_BLOCK_TRANSFER_SIZE {
         return -1;
     }
     let input = unsafe { slice::from_raw_parts(input, length) };
@@ -328,11 +325,7 @@ fn poll_tcp_context(context: &mut TcpContext) -> bool {
     }
     let source = EventSourceToken::from_raw(context.network_registration.unwrap_or(0));
     unsafe {
-        (&mut *context.network_stack).poll(
-            host_time_ns(),
-            &mut *context.event_loop,
-            source,
-        );
+        (&mut *context.network_stack).poll(host_time_ns(), &mut *context.event_loop, source);
     }
     true
 }
@@ -341,15 +334,19 @@ fn tcp_state(context: &mut TcpContext, handle: SocketHandle) -> Option<TcpState>
     if context.network_stack.is_null() {
         return None;
     }
-    Some(unsafe { &mut *context.network_stack }
-        .sockets
-        .get::<TcpSocket>(handle)
-        .state())
+    Some(
+        unsafe { &mut *context.network_stack }
+            .sockets
+            .get::<TcpSocket>(handle)
+            .state(),
+    )
 }
 
 fn remove_tcp_socket(context: &mut TcpContext, handle: SocketHandle) {
     if !context.network_stack.is_null() {
-        let _socket = unsafe { &mut *context.network_stack }.sockets.remove(handle);
+        let _socket = unsafe { &mut *context.network_stack }
+            .sockets
+            .remove(handle);
     }
     context.socket_handle = None;
 }
@@ -360,8 +357,7 @@ pub unsafe extern "C" fn kz_host_tcp_connect(
     address: *const u8,
     remote_port: u32,
 ) -> i32 {
-    if context.is_null() || address.is_null() || remote_port == 0 || remote_port > u16::MAX as u32
-    {
+    if context.is_null() || address.is_null() || remote_port == 0 || remote_port > u16::MAX as u32 {
         return -1;
     }
     let context = unsafe { &mut *context.cast::<TcpContext>() };
@@ -413,10 +409,7 @@ pub unsafe extern "C" fn kz_host_tcp_send(
     input: *const u8,
     length: usize,
 ) -> i32 {
-    if context.is_null()
-        || (input.is_null() && length != 0)
-        || length > MAX_TCP_TRANSFER_SIZE
-    {
+    if context.is_null() || (input.is_null() && length != 0) || length > MAX_TCP_TRANSFER_SIZE {
         return -1;
     }
     let context = unsafe { &mut *context.cast::<TcpContext>() };
@@ -456,11 +449,7 @@ pub unsafe extern "C" fn kz_host_tcp_receive(
     output: *mut u8,
     length: usize,
 ) -> i32 {
-    if context.is_null()
-        || output.is_null()
-        || length == 0
-        || length > MAX_TCP_TRANSFER_SIZE
-    {
+    if context.is_null() || output.is_null() || length == 0 || length > MAX_TCP_TRANSFER_SIZE {
         return -1;
     }
     let context = unsafe { &mut *context.cast::<TcpContext>() };
@@ -478,7 +467,7 @@ pub unsafe extern "C" fn kz_host_tcp_receive(
             Some(TcpState::Closed) | None => break,
             _ => {}
         }
-            let count = crate::kernel::net::tcp::Tcp::receive(
+        let count = crate::kernel::net::tcp::Tcp::receive(
             unsafe { &mut *context.network_stack },
             handle,
             &mut output[received..],

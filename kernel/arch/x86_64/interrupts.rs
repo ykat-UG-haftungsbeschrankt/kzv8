@@ -231,12 +231,12 @@ pub(crate) unsafe fn initialize() {
     entries
         .add(TIMER_VECTOR)
         .write(IdtEntry::interrupt(x86_irq_entry as *const () as usize));
-    entries
-        .add(14)
-        .write(IdtEntry::interrupt(x86_page_fault_entry as *const () as usize));
-    entries
-        .add(SPURIOUS_VECTOR)
-        .write(IdtEntry::interrupt(x86_spurious_interrupt as *const () as usize));
+    entries.add(14).write(IdtEntry::interrupt(
+        x86_page_fault_entry as *const () as usize,
+    ));
+    entries.add(SPURIOUS_VECTOR).write(IdtEntry::interrupt(
+        x86_spurious_interrupt as *const () as usize,
+    ));
     load_idt();
 }
 

@@ -42,7 +42,10 @@ pub unsafe extern "C" fn modf(value: f64, integral_part: *mut f64) -> f64 {
     if integral_part.is_null() {
         return value;
     }
-    if value != value || value >= 9_223_372_036_854_775_808.0 || value < -9_223_372_036_854_775_808.0 {
+    if value != value
+        || value >= 9_223_372_036_854_775_808.0
+        || value < -9_223_372_036_854_775_808.0
+    {
         unsafe { integral_part.write(value) };
         return 0.0;
     }

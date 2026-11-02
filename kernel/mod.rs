@@ -3,19 +3,20 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub(crate) mod arch;
 pub(crate) mod block;
 pub(crate) mod drivers;
+pub(crate) mod error;
 pub(crate) mod event;
 pub(crate) mod memory;
 pub(crate) mod net;
-pub(crate) mod scheduler;
 #[path = "../runtime/run.rs"]
 pub(crate) mod runtime;
+pub(crate) mod scheduler;
 
 static FUTURE_SMOKE_DONE: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
 pub extern "C" fn kz_handle_virtio_interrupt() {
     let pending = drivers::virtio::transport::dispatch_interrupts();
-    event::r#loop::record_device_interrupts(pending);
+    event::r#loop::EventLoop::<16>::record_device_interrupts(pending);
     drivers::virtio::console::Console::handle_interrupt(pending);
 }
 

@@ -5,8 +5,6 @@
  * free of charge, without warranty of any kind.
  */
 
-const NO_INDEX: usize = usize::MAX;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TimerId {
     index: usize,
@@ -14,6 +12,7 @@ pub(crate) struct TimerId {
 }
 
 impl TimerId {
+    const NO_INDEX: usize = usize::MAX;
     pub(crate) const fn raw(self) -> u64 {
         (self.generation << 8) | self.index as u64
     }
@@ -37,12 +36,12 @@ struct Timer {
 impl Timer {
     const EMPTY: Self = Self {
         id: TimerId {
-            index: NO_INDEX,
+            index: TimerId::NO_INDEX,
             generation: 0,
         },
         deadline_ns: 0,
-        heap_index: NO_INDEX,
-        next_free: NO_INDEX,
+        heap_index: TimerId::NO_INDEX,
+        next_free: TimerId::NO_INDEX,
     };
 }
 
@@ -59,7 +58,7 @@ impl<const N: usize> TimerQueue<N> {
         let mut timers = [Timer::EMPTY; N];
         let mut index = 0;
         while index < N {
-            timers[index].next_free = if index + 1 < N { index + 1 } else { NO_INDEX };
+            timers[index].next_free = if index + 1 < N { index + 1 } else { TimerId::NO_INDEX };
             index += 1;
         }
         Self {
@@ -72,7 +71,7 @@ impl<const N: usize> TimerQueue<N> {
 
     pub(crate) fn schedule(&mut self, deadline_ns: u64) -> Option<TimerId> {
         let index = self.free_head;
-        if index == NO_INDEX {
+        if index == TimerId::NO_INDEX {
             return None;
         }
         self.free_head = self.timers[index].next_free;
@@ -83,7 +82,7 @@ impl<const N: usize> TimerQueue<N> {
             id,
             deadline_ns,
             heap_index: self.heap_len,
-            next_free: NO_INDEX,
+            next_free: TimerId::NO_INDEX,
         };
         self.heap[self.heap_len] = index;
         self.heap_len += 1;
@@ -95,7 +94,7 @@ impl<const N: usize> TimerQueue<N> {
         let Some(timer) = self.timers.get(id.index) else {
             return false;
         };
-        if timer.id != id || timer.heap_index == NO_INDEX {
+        if timer.id != id || timer.heap_index == TimerId::NO_INDEX {
             return false;
         }
 
@@ -125,7 +124,7 @@ impl<const N: usize> TimerQueue<N> {
     }
 
     fn release(&mut self, index: usize) {
-        self.timers[index].heap_index = NO_INDEX;
+        self.timers[index].heap_index = TimerId::NO_INDEX;
         self.timers[index].next_free = self.free_head;
         self.free_head = index;
     }
@@ -139,7 +138,7 @@ impl<const N: usize> TimerQueue<N> {
             self.timers[replacement].heap_index = index;
         }
         self.heap_len = last_index;
-        self.timers[removed_slot].heap_index = NO_INDEX;
+        self.timers[removed_slot].heap_index = TimerId::NO_INDEX;
 
         if index < self.heap_len {
             let parent = index.saturating_sub(1) / 2;
@@ -173,8 +172,7 @@ impl<const N: usize> TimerQueue<N> {
                 break;
             }
             let right = left + 1;
-            let child = if right < self.heap_len
-                && self.precedes(self.heap[right], self.heap[left])
+            let child = if right < self.heap_len && self.precedes(self.heap[right], self.heap[left])
             {
                 right
             } else {

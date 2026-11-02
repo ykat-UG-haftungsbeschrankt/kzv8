@@ -105,7 +105,8 @@ pub unsafe extern "C" fn realloc(pointer: *mut c_void, size: usize) -> *mut c_vo
         return null_mut();
     }
 
-    let Some(capacity) = crate::kernel::memory::heap::c_allocation_capacity(pointer.cast::<u8>()) else {
+    let Some(capacity) = crate::kernel::memory::heap::c_allocation_capacity(pointer.cast::<u8>())
+    else {
         return null_mut();
     };
     let replacement = malloc(size);

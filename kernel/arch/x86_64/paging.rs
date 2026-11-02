@@ -110,11 +110,7 @@ pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i
     true
 }
 
-pub(crate) fn map_page(
-    virtual_address: usize,
-    physical_address: usize,
-    permissions: i32,
-) -> bool {
+pub(crate) fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool {
     if virtual_address % PAGE_SIZE != 0 || physical_address % PAGE_SIZE != 0 {
         return false;
     }

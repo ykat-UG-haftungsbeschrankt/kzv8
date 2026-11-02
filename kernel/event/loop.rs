@@ -9,12 +9,6 @@ use crate::kernel::event::completion::{Completion, CompletionQueue};
 use crate::kernel::event::timers::{TimerId, TimerQueue};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-static PENDING_DEVICE_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn record_device_interrupts(interrupts: u64) {
-    PENDING_DEVICE_INTERRUPTS.fetch_or(interrupts, Ordering::Release);
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EventSourceId(u64);
 
@@ -83,7 +77,9 @@ pub(crate) enum Event {
         flags: EventFlags,
         data: u64,
     },
-    DeviceInterrupt { slot: u8 },
+    DeviceInterrupt {
+        slot: u8,
+    },
 }
 
 #[repr(C)]
@@ -137,6 +133,15 @@ pub(crate) struct EventLoop<const N: usize> {
 }
 
 impl<const N: usize> EventLoop<N> {
+    fn pending_interrupt_source() -> &'static AtomicU64 {
+        static PENDING_DEVICE_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+        &PENDING_DEVICE_INTERRUPTS
+    }
+
+    pub(crate) fn record_device_interrupts(interrupts: u64) {
+        Self::pending_interrupt_source().fetch_or(interrupts, Ordering::Release);
+    }
+
     pub(crate) const fn new() -> Self {
         Self {
             timers: TimerQueue::new(),
@@ -204,7 +209,8 @@ impl<const N: usize> EventLoop<N> {
 
     pub(crate) fn deregister(&mut self, token: EventSourceToken) -> Result<(), RegistrationError> {
         let index = self.source_index(token)?;
-        self.ready_sources.retain(|ready_index| ready_index != index);
+        self.ready_sources
+            .retain(|ready_index| ready_index != index);
         let generation = self.sources[index].generation;
         self.sources[index] = SourceWatch {
             generation,
@@ -241,7 +247,8 @@ impl<const N: usize> EventLoop<N> {
 
     pub(crate) fn wait(&mut self, now_ns: u64) -> Option<Event> {
         self.queue_expired_timers(now_ns);
-        self.pending_device_interrupts |= PENDING_DEVICE_INTERRUPTS.swap(0, Ordering::AcqRel);
+        self.pending_device_interrupts |=
+            Self::pending_interrupt_source().swap(0, Ordering::AcqRel);
         for _ in 0..3 {
             let queue = self.next_queue;
             self.next_queue = (self.next_queue + 1) % 3;
@@ -321,9 +328,7 @@ impl<const N: usize> EventLoop<N> {
 
     fn queue_ready(&mut self, index: usize) {
         let watch = self.sources[index];
-        if !watch.active
-            || watch.queued
-            || watch.readiness.intersection(watch.interest).is_empty()
+        if !watch.active || watch.queued || watch.readiness.intersection(watch.interest).is_empty()
         {
             return;
         }

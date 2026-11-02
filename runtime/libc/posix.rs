@@ -114,10 +114,7 @@ pub unsafe extern "C" fn clock_gettime(clock_id: i32, output: *mut Timespec) -> 
         }
         CLOCK_REALTIME => {
             let milliseconds = unsafe { kz_host_wall_time_ms() }.max(0) as u64;
-            (
-                milliseconds / 1000,
-                milliseconds % 1000 * 1_000_000,
-            )
+            (milliseconds / 1000, milliseconds % 1000 * 1_000_000)
         }
         _ => {
             set_errno(EINVAL);
@@ -301,11 +298,7 @@ pub extern "C" fn _exit(_status: i32) -> ! {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sem_init(
-    semaphore: *mut c_void,
-    process_shared: i32,
-    value: u32,
-) -> i32 {
+pub unsafe extern "C" fn sem_init(semaphore: *mut c_void, process_shared: i32, value: u32) -> i32 {
     if semaphore.is_null() || process_shared != 0 || value > 0x7fff_ffff {
         return EINVAL;
     }
@@ -315,7 +308,11 @@ pub unsafe extern "C" fn sem_init(
 
 #[no_mangle]
 pub unsafe extern "C" fn sem_destroy(semaphore: *mut c_void) -> i32 {
-    if semaphore.is_null() { EINVAL } else { 0 }
+    if semaphore.is_null() {
+        EINVAL
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -351,12 +348,7 @@ pub unsafe extern "C" fn sem_wait(semaphore: *mut c_void) -> i32 {
         let mut current = count.load(Ordering::Acquire);
         if current != 0
             && count
-                .compare_exchange_weak(
-                    current,
-                    current - 1,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(current, current - 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
         {
             return 0;
@@ -424,17 +416,19 @@ pub unsafe extern "C" fn kz_rust_syscall(number: i64, arguments: *mut c_void) ->
         }
         SYS_FUTEX => {
             let address = unsafe { variadic::next(arguments, VA_POINTER) as *const u32 };
-            let operation = unsafe { variadic::next(arguments, VA_INT) } as i32
-                & !FUTEX_PRIVATE_FLAG;
+            let operation =
+                unsafe { variadic::next(arguments, VA_INT) } as i32 & !FUTEX_PRIVATE_FLAG;
             let expected = unsafe { variadic::next(arguments, VA_UINT) } as u32;
             if address.is_null() {
                 set_errno(EFAULT);
                 -1
             } else if operation == FUTEX_WAKE {
-                if expected == 0 { 0 } else { 1 }
-            } else if operation == FUTEX_WAIT
-                && unsafe { read_volatile(address) } != expected
-            {
+                if expected == 0 {
+                    0
+                } else {
+                    1
+                }
+            } else if operation == FUTEX_WAIT && unsafe { read_volatile(address) } != expected {
                 set_errno(EAGAIN);
                 -1
             } else {
@@ -449,11 +443,7 @@ pub unsafe extern "C" fn kz_rust_syscall(number: i64, arguments: *mut c_void) ->
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn __xpg_strerror_r(
-    error: i32,
-    buffer: *mut c_char,
-    length: usize,
-) -> i32 {
+pub unsafe extern "C" fn __xpg_strerror_r(error: i32, buffer: *mut c_char, length: usize) -> i32 {
     if buffer.is_null() || length == 0 {
         return ERANGE;
     }
@@ -464,15 +454,15 @@ pub unsafe extern "C" fn __xpg_strerror_r(
         unsafe { buffer.add(index).write(text[index] as c_char) };
     }
     unsafe { buffer.add(copied).write(0) };
-    if copied == text_length { 0 } else { ERANGE }
+    if copied == text_length {
+        0
+    } else {
+        ERANGE
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn strerror_r(
-    error: i32,
-    buffer: *mut c_char,
-    length: usize,
-) -> i32 {
+pub unsafe extern "C" fn strerror_r(error: i32, buffer: *mut c_char, length: usize) -> i32 {
     unsafe { __xpg_strerror_r(error, buffer, length) }
 }
 
@@ -510,14 +500,13 @@ pub extern "C" fn getenv(_name: *const c_char) -> *mut c_char {
     core::ptr::null_mut()
 }
 
-unsafe fn parse_unsigned(
-    input: *const c_char,
-    end: *mut *mut c_char,
-    base: i32,
-) -> u64 {
+unsafe fn parse_unsigned(input: *const c_char, end: *mut *mut c_char, base: i32) -> u64 {
     let start = input;
     let mut cursor = input;
-    while matches!(unsafe { read_volatile(cursor.cast::<u8>()) }, b' ' | b'\t'..=b'\r') {
+    while matches!(
+        unsafe { read_volatile(cursor.cast::<u8>()) },
+        b' ' | b'\t'..=b'\r'
+    ) {
         cursor = unsafe { cursor.add(1) };
     }
     let negative = unsafe { read_volatile(cursor) } == b'-' as c_char;
@@ -527,12 +516,19 @@ unsafe fn parse_unsigned(
     let mut radix = base;
     if (radix == 0 || radix == 16)
         && unsafe { read_volatile(cursor.cast::<u8>()) } == b'0'
-        && matches!(unsafe { read_volatile(cursor.add(1).cast::<u8>()) }, b'x' | b'X')
+        && matches!(
+            unsafe { read_volatile(cursor.add(1).cast::<u8>()) },
+            b'x' | b'X'
+        )
     {
         radix = 16;
         cursor = unsafe { cursor.add(2) };
     } else if radix == 0 {
-        radix = if unsafe { read_volatile(cursor.cast::<u8>()) } == b'0' { 8 } else { 10 };
+        radix = if unsafe { read_volatile(cursor.cast::<u8>()) } == b'0' {
+            8
+        } else {
+            10
+        };
     }
     if !(2..=36).contains(&radix) {
         set_errno(EINVAL);
@@ -575,24 +571,20 @@ unsafe fn parse_unsigned(
     if overflow {
         set_errno(ERANGE);
     }
-    if negative { 0u64.wrapping_sub(value) } else { value }
+    if negative {
+        0u64.wrapping_sub(value)
+    } else {
+        value
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn strtoull(
-    input: *const c_char,
-    end: *mut *mut c_char,
-    base: i32,
-) -> u64 {
+pub unsafe extern "C" fn strtoull(input: *const c_char, end: *mut *mut c_char, base: i32) -> u64 {
     unsafe { parse_unsigned(input, end, base) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn strtoul(
-    input: *const c_char,
-    end: *mut *mut c_char,
-    base: i32,
-) -> usize {
+pub unsafe extern "C" fn strtoul(input: *const c_char, end: *mut *mut c_char, base: i32) -> usize {
     let value = unsafe { parse_unsigned(input, end, base) };
     if value > usize::MAX as u64 {
         set_errno(ERANGE);
@@ -642,7 +634,10 @@ pub unsafe extern "C" fn __isoc23_strtoll(
 pub unsafe extern "C" fn strtod(input: *const c_char, end: *mut *mut c_char) -> f64 {
     let start = input;
     let mut cursor = input;
-    while matches!(unsafe { read_volatile(cursor.cast::<u8>()) }, b' ' | b'\t'..=b'\r') {
+    while matches!(
+        unsafe { read_volatile(cursor.cast::<u8>()) },
+        b' ' | b'\t'..=b'\r'
+    ) {
         cursor = unsafe { cursor.add(1) };
     }
     let negative = unsafe { read_volatile(cursor) } == b'-' as c_char;
@@ -703,14 +698,22 @@ pub unsafe extern "C" fn strtod(input: *const c_char, end: *mut *mut c_char) -> 
             cursor = exponent_start;
         } else {
             for _ in 0..exponent {
-                value = if exponent_negative { value / 10.0 } else { value * 10.0 };
+                value = if exponent_negative {
+                    value / 10.0
+                } else {
+                    value * 10.0
+                };
             }
         }
     }
     if !end.is_null() {
         unsafe { end.write(cursor.cast_mut()) };
     }
-    if negative { -value } else { value }
+    if negative {
+        -value
+    } else {
+        value
+    }
 }
 
 #[no_mangle]
@@ -733,26 +736,38 @@ pub extern "C" fn __ctype_b_loc() -> *mut *const u16 {
             let table = core::ptr::addr_of_mut!(CTYPE_B_TABLE).cast::<u16>();
             for value in 0..256usize {
                 let mut flags = 0u16;
-                if value < 32 || value == 127 { flags |= 0x0002; }
+                if value < 32 || value == 127 {
+                    flags |= 0x0002;
+                }
                 if value == b' ' as usize || (b'\t' as usize..=b'\r' as usize).contains(&value) {
                     flags |= 0x2001;
                 }
-                if (b'0' as usize..=b'9' as usize).contains(&value) { flags |= 0x0808; }
+                if (b'0' as usize..=b'9' as usize).contains(&value) {
+                    flags |= 0x0808;
+                }
                 if (b'a' as usize..=b'z' as usize).contains(&value)
                     || (b'A' as usize..=b'Z' as usize).contains(&value)
                 {
                     flags |= 0x0408;
                 }
-                if (b'a' as usize..=b'z' as usize).contains(&value) { flags |= 0x0200; }
-                if (b'A' as usize..=b'Z' as usize).contains(&value) { flags |= 0x0100; }
+                if (b'a' as usize..=b'z' as usize).contains(&value) {
+                    flags |= 0x0200;
+                }
+                if (b'A' as usize..=b'Z' as usize).contains(&value) {
+                    flags |= 0x0100;
+                }
                 if (b'0' as usize..=b'9' as usize).contains(&value)
                     || (b'a' as usize..=b'f' as usize).contains(&value)
                     || (b'A' as usize..=b'F' as usize).contains(&value)
                 {
                     flags |= 0x1000;
                 }
-                if (32..127).contains(&value) { flags |= 0x4000; }
-                if (33..127).contains(&value) { flags |= 0x8000; }
+                if (32..127).contains(&value) {
+                    flags |= 0x4000;
+                }
+                if (33..127).contains(&value) {
+                    flags |= 0x8000;
+                }
                 if (33..127).contains(&value)
                     && !(b'0' as usize..=b'9' as usize).contains(&value)
                     && !(b'a' as usize..=b'z' as usize).contains(&value)
@@ -798,11 +813,7 @@ pub unsafe extern "C" fn kz_rust_mremap(
     const PROT_READ_WRITE: i32 = 3;
     const MAP_PRIVATE_ANONYMOUS: i32 = 0x22;
     const MREMAP_MAYMOVE: i32 = 1;
-    if old_address.is_null()
-        || old_length == 0
-        || new_length == 0
-        || flags & !MREMAP_MAYMOVE != 0
-    {
+    if old_address.is_null() || old_length == 0 || new_length == 0 || flags & !MREMAP_MAYMOVE != 0 {
         set_errno(EINVAL);
         return MAP_FAILED;
     }

@@ -49,15 +49,13 @@ pub(crate) fn run(
         let _thread_status = Console::write(b"kz: pthreads smoke OK\n");
     }
 
-
     if runtime_v8::page_allocator_smoke() {
         let _page_allocator = Console::write(b"kz: V8 page allocator hooks OK\n");
     }
     let block_device = block_device
         .map(|device| device as *mut _ as *mut core::ffi::c_void)
         .unwrap_or(core::ptr::null_mut());
-    let mut tcp_context =
-        runtime_ffi::TcpContext::new(events, network_stack, network_registration);
+    let mut tcp_context = runtime_ffi::TcpContext::new(events, network_stack, network_registration);
     match runtime_v8::run_smoke(
         events,
         block_device,

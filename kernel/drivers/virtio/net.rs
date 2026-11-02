@@ -5,9 +5,9 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
 use crate::kernel::drivers::virtio::queue::{Descriptor, DmaQueue};
 use crate::kernel::drivers::virtio::transport::VirtioTransport;
+use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
 
 const DEVICE_ID: u32 = 1;
 const QUEUE_SIZE: usize = 8;

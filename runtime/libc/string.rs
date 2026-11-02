@@ -55,11 +55,7 @@ pub unsafe extern "C" fn memmove(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn memset(
-    destination: *mut c_void,
-    value: i32,
-    count: usize,
-) -> *mut c_void {
+pub unsafe extern "C" fn memset(destination: *mut c_void, value: i32, count: usize) -> *mut c_void {
     let destination = destination.cast::<u8>();
     for index in 0..count {
         unsafe { write_volatile(destination.add(index), value as u8) };
@@ -68,11 +64,7 @@ pub unsafe extern "C" fn memset(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn memcmp(
-    left: *const c_void,
-    right: *const c_void,
-    count: usize,
-) -> i32 {
+pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count: usize) -> i32 {
     let left = left.cast::<u8>();
     let right = right.cast::<u8>();
     for index in 0..count {
@@ -86,20 +78,12 @@ pub unsafe extern "C" fn memcmp(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn bcmp(
-    left: *const c_void,
-    right: *const c_void,
-    count: usize,
-) -> i32 {
+pub unsafe extern "C" fn bcmp(left: *const c_void, right: *const c_void, count: usize) -> i32 {
     unsafe { memcmp(left, right, count) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn memchr(
-    memory: *const c_void,
-    value: i32,
-    count: usize,
-) -> *mut c_void {
+pub unsafe extern "C" fn memchr(memory: *const c_void, value: i32, count: usize) -> *mut c_void {
     let bytes = memory.cast::<u8>();
     for index in 0..count {
         if unsafe { read_volatile(bytes.add(index)) } == value as u8 {
@@ -135,11 +119,7 @@ pub unsafe extern "C" fn strcmp(left: *const i8, right: *const i8) -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn strncmp(
-    left: *const i8,
-    right: *const i8,
-    count: usize,
-) -> i32 {
+pub unsafe extern "C" fn strncmp(left: *const i8, right: *const i8, count: usize) -> i32 {
     let left = left.cast::<u8>();
     let right = right.cast::<u8>();
     for index in 0..count {
@@ -153,11 +133,7 @@ pub unsafe extern "C" fn strncmp(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn strncpy(
-    destination: *mut i8,
-    source: *const i8,
-    count: usize,
-) -> *mut i8 {
+pub unsafe extern "C" fn strncpy(destination: *mut i8, source: *const i8, count: usize) -> *mut i8 {
     let destination_bytes = destination.cast::<u8>();
     let source_bytes = source.cast::<u8>();
     let mut index = 0;

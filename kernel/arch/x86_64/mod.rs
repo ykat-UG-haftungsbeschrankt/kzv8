@@ -68,9 +68,7 @@ pub(crate) fn decommit_debug(code: u8) {
     debug::debugcon(&[code]);
 }
 
-pub(crate) fn current_thread_stack_bounds(
-    _stack_size: usize,
-) -> (*mut core::ffi::c_void, usize) {
+pub(crate) fn current_thread_stack_bounds(_stack_size: usize) -> (*mut core::ffi::c_void, usize) {
     let start = core::ptr::addr_of!(stack_bottom) as usize;
     let end = core::ptr::addr_of!(stack_top) as usize;
     (start as *mut core::ffi::c_void, end.saturating_sub(start))
@@ -127,11 +125,7 @@ impl crate::kernel::arch::MemoryArchitecture for MemoryArch {
         address < crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS
     }
 
-    fn protect_kernel_image_pages(
-        address: usize,
-        length: usize,
-        permissions: i32,
-    ) -> bool {
+    fn protect_kernel_image_pages(address: usize, length: usize, permissions: i32) -> bool {
         const PAGE_SIZE: usize = 4096;
         if permissions != 1 || address % PAGE_SIZE != 0 || length % PAGE_SIZE != 0 {
             return false;
@@ -140,7 +134,10 @@ impl crate::kernel::arch::MemoryArchitecture for MemoryArch {
             return false;
         };
         let (image_start, image_end) = unsafe {
-            (core::ptr::addr_of!(_start) as usize, core::ptr::addr_of!(__bss_end) as usize)
+            (
+                core::ptr::addr_of!(_start) as usize,
+                core::ptr::addr_of!(__bss_end) as usize,
+            )
         };
         address >= image_start
             && end <= image_end

@@ -14,7 +14,7 @@ pub(crate) mod mmap;
 pub(crate) mod posix;
 pub(crate) mod pthread;
 pub(crate) mod smoke;
-pub(crate) mod stdlib;
 pub(crate) mod stdio;
+pub(crate) mod stdlib;
 pub(crate) mod string;
 pub(crate) mod variadic;

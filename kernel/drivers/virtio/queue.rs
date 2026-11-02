@@ -5,9 +5,10 @@
  * free of charge, without warranty of any kind.
  */
 
+use crate::kernel::drivers::virtio::transport::VirtioTransport;
+use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
 use crate::kernel::scheduler::sync::{IrqSpinGuard, IrqSpinLock};
-use crate::kernel::drivers::virtio::transport::{Error, VirtioTransport};
 
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;

@@ -163,7 +163,11 @@ impl FileSystem {
 
     fn parent_is_directory(&self, path: &[u8]) -> Result<(), i32> {
         let slash = path.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
-        let parent = if slash == 0 { b"/".as_slice() } else { &path[..slash] };
+        let parent = if slash == 0 {
+            b"/".as_slice()
+        } else {
+            &path[..slash]
+        };
         let Some(index) = self.find_node(parent) else {
             return Err(ENOENT);
         };
@@ -258,12 +262,7 @@ impl FileSystem {
         Ok(slot as i32 + FIRST_DESCRIPTOR)
     }
 
-    fn read(
-        &mut self,
-        file_descriptor: i32,
-        buffer: *mut u8,
-        length: usize,
-    ) -> Result<usize, i32> {
+    fn read(&mut self, file_descriptor: i32, buffer: *mut u8, length: usize) -> Result<usize, i32> {
         let slot = self.descriptor_slot(file_descriptor)?;
         let mut descriptor = self.descriptors[slot].ok_or(EBADF)?;
         if !descriptor.readable {
@@ -348,7 +347,10 @@ impl FileSystem {
         if position < 0 {
             return Err(EINVAL);
         }
-        self.descriptors[slot] = Some(Descriptor { offset: position, ..descriptor });
+        self.descriptors[slot] = Some(Descriptor {
+            offset: position,
+            ..descriptor
+        });
         Ok(position)
     }
 
@@ -456,9 +458,18 @@ impl FileSystem {
             size: size as i64,
             block_size: 4096,
             blocks: (size / 512 + if size % 512 != 0 { 1 } else { 0 }) as i64,
-            accessed: Timespec { seconds: 0, nanoseconds: 0 },
-            modified: Timespec { seconds: 0, nanoseconds: 0 },
-            changed: Timespec { seconds: 0, nanoseconds: 0 },
+            accessed: Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            modified: Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            changed: Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            },
             reserved: [0; 3],
         })
     }
@@ -529,20 +540,12 @@ fn with_path(path: *const c_char, operation: impl FnOnce(Vec<u8>) -> Result<i32,
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn kz_rust_open(
-    path: *const c_char,
-    flags: i32,
-    mode: u32,
-) -> i32 {
+pub unsafe extern "C" fn kz_rust_open(path: *const c_char, flags: i32, mode: u32) -> i32 {
     with_path(path, |path| FILESYSTEM.lock().open(path, flags, mode))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn read(
-    file_descriptor: i32,
-    buffer: *mut c_void,
-    length: usize,
-) -> isize {
+pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length: usize) -> isize {
     if buffer.is_null() && length != 0 {
         set_errno(EFAULT);
         return -1;
@@ -657,9 +660,7 @@ pub unsafe extern "C" fn unlink(path: *const c_char) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn mkdir(path: *const c_char, mode: u32) -> i32 {
-    with_path(path, |path| {
-        FILESYSTEM.lock().mkdir(path, mode).map(|()| 0)
-    })
+    with_path(path, |path| FILESYSTEM.lock().mkdir(path, mode).map(|()| 0))
 }
 
 #[no_mangle]
@@ -696,9 +697,18 @@ pub unsafe extern "C" fn fstat(file_descriptor: i32, output: *mut c_void) -> i32
             size: 0,
             block_size: 4096,
             blocks: 0,
-            accessed: Timespec { seconds: 0, nanoseconds: 0 },
-            modified: Timespec { seconds: 0, nanoseconds: 0 },
-            changed: Timespec { seconds: 0, nanoseconds: 0 },
+            accessed: Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            modified: Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            changed: Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            },
             reserved: [0; 3],
         })
     } else {
@@ -796,9 +806,18 @@ pub(super) fn status_for_fd(file_descriptor: i32) -> Result<CStat, i32> {
             size: 0,
             block_size: 4096,
             blocks: 0,
-            accessed: Timespec { seconds: 0, nanoseconds: 0 },
-            modified: Timespec { seconds: 0, nanoseconds: 0 },
-            changed: Timespec { seconds: 0, nanoseconds: 0 },
+            accessed: Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            modified: Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            changed: Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            },
             reserved: [0; 3],
         });
     }

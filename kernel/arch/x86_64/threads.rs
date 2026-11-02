@@ -87,18 +87,8 @@ define_context_switch!(["fxsave64 [rdx]"], ["fxrstor64 [rcx]"]);
 
 #[cfg(feature = "fpu-avx")]
 define_context_switch!(
-    [
-        "mov r8, rdx",
-        "mov eax, 7",
-        "xor edx, edx",
-        "xsave64 [r8]"
-    ],
-    [
-        "mov r8, rcx",
-        "mov eax, 7",
-        "xor edx, edx",
-        "xrstor64 [r8]"
-    ]
+    ["mov r8, rdx", "mov eax, 7", "xor edx, edx", "xsave64 [r8]"],
+    ["mov r8, rcx", "mov eax, 7", "xor edx, edx", "xrstor64 [r8]"]
 );
 
 unsafe extern "C" {
@@ -173,12 +163,5 @@ pub(crate) unsafe fn switch(
     old_fpu_context: &mut FpuContext,
     new_fpu_context: &FpuContext,
 ) {
-    unsafe {
-        kz_x86_64_context_switch(
-            old_stack,
-            new_stack,
-            old_fpu_context,
-            new_fpu_context,
-        )
-    }
+    unsafe { kz_x86_64_context_switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
 }

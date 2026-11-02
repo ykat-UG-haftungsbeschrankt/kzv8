@@ -9,9 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
-const PAGE_SIZE: usize = 4096;
-const MAX_FRAMES: usize = crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS / PAGE_SIZE;
-const BITMAP_WORDS: usize = MAX_FRAMES / u64::BITS as usize;
+
 
 extern "C" {
     static __bss_end: u8;
@@ -39,6 +37,10 @@ pub(crate) struct PhysicalAllocator {
 }
 
 impl PhysicalAllocator {
+    const PAGE_SIZE: usize = 4096;
+    const MAX_FRAMES: usize = crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS / Self::PAGE_SIZE;
+    const BITMAP_WORDS: usize = Self::MAX_FRAMES / u64::BITS as usize;
+
     const fn new() -> Self {
         Self {
             bitmap: [const { AtomicU64::new(u64::MAX) }; BITMAP_WORDS],
@@ -80,20 +82,20 @@ impl PhysicalAllocator {
             };
             let Some(start_address) = image_end
                 .max(region.start)
-                .checked_add(PAGE_SIZE - 1)
-                .map(|address| address & !(PAGE_SIZE - 1))
+                .checked_add(Self::PAGE_SIZE - 1)
+                .map(|address| address & !(Self::PAGE_SIZE - 1))
             else {
                 continue;
             };
             let end_address = region_end
                 .min(crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS)
-                & !(PAGE_SIZE - 1);
+                & !(Self::PAGE_SIZE - 1);
             if start_address >= end_address {
                 continue;
             }
 
-            let start_frame = start_address / PAGE_SIZE;
-            let end_frame = end_address / PAGE_SIZE;
+            let start_frame = start_address / Self::PAGE_SIZE;
+            let end_frame = end_address / Self::PAGE_SIZE;
             frame_count = frame_count.max(end_frame);
             next_hint = Some(next_hint.map_or(start_frame, |hint: usize| hint.min(start_frame)));
             for frame in start_frame..end_frame {
@@ -116,7 +118,7 @@ impl PhysicalAllocator {
             .store(next_hint.unwrap_or(0), Ordering::Relaxed);
         allocator
             .memory_bytes
-            .store(total_frames * PAGE_SIZE, Ordering::Relaxed);
+            .store(total_frames * Self::PAGE_SIZE, Ordering::Relaxed);
         allocator.initialized.store(true, Ordering::Release);
         true
     }
@@ -154,7 +156,7 @@ impl PhysicalAllocator {
                             Ordering::Relaxed,
                         );
                         return Some(Frame {
-                            address: frame * PAGE_SIZE,
+                            address: frame * Self::PAGE_SIZE,
                         });
                     }
                     Err(updated) => current = updated,
@@ -169,15 +171,15 @@ impl PhysicalAllocator {
         let _guard = allocator.lock.lock();
         if !allocator.initialized.load(Ordering::Acquire)
             || length == 0
-            || length % PAGE_SIZE != 0
-            || alignment < PAGE_SIZE
+            || length % Self::PAGE_SIZE != 0
+            || alignment < Self::PAGE_SIZE
             || !alignment.is_power_of_two()
         {
             return None;
         }
 
         let count = allocator.frame_count.load(Ordering::Relaxed);
-        let pages = length / PAGE_SIZE;
+        let pages = length / Self::PAGE_SIZE;
         if count == 0 || pages > count {
             return None;
         }
@@ -191,7 +193,7 @@ impl PhysicalAllocator {
             if end_frame > count {
                 continue;
             }
-            let Some(address) = frame.checked_mul(PAGE_SIZE) else {
+            let Some(address) = frame.checked_mul(Self::PAGE_SIZE) else {
                 continue;
             };
             if address & (alignment - 1) != 0 {
@@ -243,13 +245,13 @@ impl PhysicalAllocator {
     pub(crate) fn deallocate_contiguous(address: usize, length: usize) -> bool {
         let allocator = Self::get_instance();
         let _guard = allocator.lock.lock();
-        if length == 0 || length % PAGE_SIZE != 0 || address % PAGE_SIZE != 0 {
+        if length == 0 || length % Self::PAGE_SIZE != 0 || address % Self::PAGE_SIZE != 0 {
             return false;
         }
 
         let count = allocator.frame_count.load(Ordering::Relaxed);
-        let start_frame = address / PAGE_SIZE;
-        let pages = length / PAGE_SIZE;
+        let start_frame = address / Self::PAGE_SIZE;
+        let pages = length / Self::PAGE_SIZE;
         let Some(end_frame) = start_frame.checked_add(pages) else {
             return false;
         };
@@ -278,12 +280,12 @@ impl PhysicalAllocator {
     pub(crate) fn deallocate(frame: Frame) -> bool {
         let allocator = Self::get_instance();
         let _guard = allocator.lock.lock();
-        if frame.address % PAGE_SIZE != 0
+        if frame.address % Self::PAGE_SIZE != 0
             || frame.address >= crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS
         {
             return false;
         }
-        let index = frame.address / PAGE_SIZE;
+        let index = frame.address / Self::PAGE_SIZE;
         let count = allocator.frame_count.load(Ordering::Relaxed);
         if index >= count {
             return false;

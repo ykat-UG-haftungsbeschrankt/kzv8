@@ -144,12 +144,5 @@ pub(crate) unsafe fn switch(
     old_fpu_context: &mut FpuContext,
     new_fpu_context: &FpuContext,
 ) {
-    unsafe {
-        kz_aarch64_context_switch(
-            old_stack,
-            new_stack,
-            old_fpu_context,
-            new_fpu_context,
-        )
-    }
+    unsafe { kz_aarch64_context_switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
 }

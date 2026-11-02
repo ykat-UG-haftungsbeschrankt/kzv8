@@ -213,9 +213,9 @@ pub(crate) unsafe fn initialize() {
 }
 
 pub(crate) fn initialize_controller() -> bool {
-    let interrupt_count = unsafe {
-        ((core::ptr::read_volatile((GICD_BASE + 4) as *const u32) & 0x1f) + 1) * 32
-    } as usize;
+    let interrupt_count =
+        unsafe { ((core::ptr::read_volatile((GICD_BASE + 4) as *const u32) & 0x1f) + 1) * 32 }
+            as usize;
     if interrupt_count < GIC_SPI_END {
         return false;
     }
@@ -229,7 +229,10 @@ pub(crate) fn initialize_controller() -> bool {
         core::ptr::write_volatile((GICD_BASE + 0xc0c) as *mut u32, 0);
         let timer_group = (GICD_BASE + 0x80) as *mut u32;
         let group = core::ptr::read_volatile(timer_group);
-        core::ptr::write_volatile(timer_group, group | (1 << crate::kernel::arch::timer::INTERRUPT_ID));
+        core::ptr::write_volatile(
+            timer_group,
+            group | (1 << crate::kernel::arch::timer::INTERRUPT_ID),
+        );
         core::ptr::write_volatile(
             (GICD_BASE + 0x400 + crate::kernel::arch::timer::INTERRUPT_ID as usize) as *mut u8,
             0x80,
@@ -348,7 +351,9 @@ extern "C" fn aarch64_page_fault_dispatch() -> u64 {
     }
     let access = match exception_class {
         0x21 => crate::kernel::memory::virtual_memory::FaultAccess::Execute,
-        0x25 if syndrome & (1 << 6) != 0 => crate::kernel::memory::virtual_memory::FaultAccess::Write,
+        0x25 if syndrome & (1 << 6) != 0 => {
+            crate::kernel::memory::virtual_memory::FaultAccess::Write
+        }
         0x25 => crate::kernel::memory::virtual_memory::FaultAccess::Read,
         _ => return 0,
     };

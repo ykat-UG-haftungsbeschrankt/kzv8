@@ -10,7 +10,9 @@ use core::ffi::{c_char, c_int, c_void};
 use core::ptr::{read_volatile, write_volatile};
 
 use super::stdio::KzFile;
-use super::variadic::{self, VA_INT, VA_LLONG, VA_POINTER, VA_PTRDIFF, VA_SIZE, VA_ULLONG, VA_ULONG};
+use super::variadic::{
+    self, VA_INT, VA_LLONG, VA_POINTER, VA_PTRDIFF, VA_SIZE, VA_ULLONG, VA_ULONG,
+};
 
 const INT_MAX: usize = i32::MAX as usize;
 const EOF: i32 = -1;
@@ -112,17 +114,12 @@ unsafe fn emit_number(
         prefix[0] = b'0';
         prefix[1] = if uppercase { b'X' } else { b'x' };
         prefix_length = 2;
-    } else if alternate
-        && base == 8
-        && (digit_count == 0 || reversed[digit_count - 1] != b'0')
-    {
+    } else if alternate && base == 8 && (digit_count == 0 || reversed[digit_count - 1] != b'0') {
         prefix[0] = b'0';
         prefix_length = 1;
     }
-    let content_length = digit_count
-        + precision_zeroes
-        + prefix_length
-        + if sign != 0 { 1 } else { 0 };
+    let content_length =
+        digit_count + precision_zeroes + prefix_length + if sign != 0 { 1 } else { 0 };
     let padding = if width > 0 && width as usize > content_length {
         width as usize - content_length
     } else {
@@ -302,10 +299,13 @@ unsafe fn format_output(
             b'd' | b'i' => {
                 let raw = match length {
                     LENGTH_LONG_LONG => (unsafe { next_argument(arguments, VA_LLONG) }) as i64,
-                    LENGTH_LONG => (unsafe {
-                        next_argument(arguments, super::variadic::VA_LONG)
-                    }) as isize as i64,
-                    LENGTH_SIZE => (unsafe { next_argument(arguments, VA_PTRDIFF) }) as isize as i64,
+                    LENGTH_LONG => {
+                        (unsafe { next_argument(arguments, super::variadic::VA_LONG) }) as isize
+                            as i64
+                    }
+                    LENGTH_SIZE => {
+                        (unsafe { next_argument(arguments, VA_PTRDIFF) }) as isize as i64
+                    }
                     _ => (unsafe { next_argument(arguments, VA_INT) }) as i32 as i64,
                 };
                 let negative = raw < 0;
@@ -316,19 +316,8 @@ unsafe fn format_output(
                 };
                 unsafe {
                     emit_number(
-                        output,
-                        magnitude,
-                        negative,
-                        10,
-                        false,
-                        false,
-                        left,
-                        zero,
-                        plus,
-                        space,
-                        precision,
-                        width,
-                        false,
+                        output, magnitude, negative, 10, false, false, left, zero, plus, space,
+                        precision, width, false,
                     );
                 }
             }
@@ -337,16 +326,15 @@ unsafe fn format_output(
                     (unsafe { next_argument(arguments, VA_POINTER) }) as u64
                 } else {
                     match length {
-                        LENGTH_LONG_LONG => (unsafe {
-                            next_argument(arguments, VA_ULLONG)
-                        }) as u64,
-                        LENGTH_LONG => (unsafe {
-                            next_argument(arguments, super::variadic::VA_ULONG)
-                        }) as u64,
+                        LENGTH_LONG_LONG => (unsafe { next_argument(arguments, VA_ULLONG) }) as u64,
+                        LENGTH_LONG => {
+                            (unsafe { next_argument(arguments, super::variadic::VA_ULONG) }) as u64
+                        }
                         LENGTH_SIZE => (unsafe { next_argument(arguments, VA_SIZE) }) as u64,
-                        _ => (unsafe {
-                            next_argument(arguments, super::variadic::VA_UINT)
-                        }) as u32 as u64,
+                        _ => {
+                            (unsafe { next_argument(arguments, super::variadic::VA_UINT) }) as u32
+                                as u64
+                        }
                     }
                 };
                 let base = if specifier == b'o' {
@@ -375,19 +363,21 @@ unsafe fn format_output(
                 }
             }
             0 => unsafe { emit_character(output, b'%') },
-            _ => {
-                unsafe {
-                    emit_character(output, b'%');
-                    emit_character(output, specifier);
-                }
-            }
+            _ => unsafe {
+                emit_character(output, b'%');
+                emit_character(output, specifier);
+            },
         }
     }
     if output.capacity != 0 {
         let terminator = output.length.min(output.capacity - 1);
         unsafe { write_volatile(output.buffer.add(terminator), 0) };
     }
-    if output.length > INT_MAX { -1 } else { output.length as i32 }
+    if output.length > INT_MAX {
+        -1
+    } else {
+        output.length as i32
+    }
 }
 
 unsafe fn format_from_list(
@@ -435,10 +425,7 @@ pub unsafe extern "C" fn kz_rust_vsnprintf_chk(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn kz_rust_printf(
-    format: *const c_char,
-    arguments: *mut c_void,
-) -> i32 {
+pub unsafe extern "C" fn kz_rust_printf(format: *const c_char, arguments: *mut c_void) -> i32 {
     let length = unsafe { format_from_list(core::ptr::null_mut(), 0, format, arguments) };
     if length < 0 {
         return EOF;
@@ -452,9 +439,8 @@ pub unsafe extern "C" fn kz_rust_printf(
         return EOF;
     }
     buffer.resize(capacity, 0);
-    let written = unsafe {
-        format_from_list(buffer.as_mut_ptr().cast(), capacity, format, arguments)
-    };
+    let written =
+        unsafe { format_from_list(buffer.as_mut_ptr().cast(), capacity, format, arguments) };
     if written != length {
         return EOF;
     }
@@ -477,22 +463,22 @@ pub unsafe extern "C" fn kz_rust_vfprintf(
         return EOF;
     }
     let mut buffer = [0u8; 1024];
-    let length = unsafe {
-        format_from_list(buffer.as_mut_ptr().cast(), buffer.len(), format, arguments)
-    };
+    let length =
+        unsafe { format_from_list(buffer.as_mut_ptr().cast(), buffer.len(), format, arguments) };
     if length < 0 {
         return -1;
     }
     let count = (length as usize).min(buffer.len() - 1);
     let result = unsafe { fwrite(buffer.as_ptr().cast(), 1, count, stream) };
-    if result == count { result as i32 } else { -1 }
+    if result == count {
+        result as i32
+    } else {
+        -1
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn kz_rust_vprintf(
-    format: *const c_char,
-    arguments: *mut c_void,
-) -> i32 {
+pub unsafe extern "C" fn kz_rust_vprintf(format: *const c_char, arguments: *mut c_void) -> i32 {
     let stdout = unsafe { super::stdio::stdout };
     unsafe { kz_rust_vfprintf(stdout, format, arguments) }
 }
@@ -545,5 +531,9 @@ pub unsafe extern "C" fn fwrite(
     }
     let file_descriptor = unsafe { (*stream).descriptor };
     let written = unsafe { super::filesystem::write(file_descriptor, buffer, bytes) };
-    if written < 0 { 0 } else { written as usize / size }
+    if written < 0 {
+        0
+    } else {
+        written as usize / size
+    }
 }

@@ -93,7 +93,9 @@ pub unsafe extern "C" fn mmap(
         }
         return address_hint;
     }
-    let Some(address) = crate::kernel::memory::virtual_memory::reserve(length, PAGE_SIZE, permissions) else {
+    let Some(address) =
+        crate::kernel::memory::virtual_memory::reserve(length, PAGE_SIZE, permissions)
+    else {
         return fail(ENOMEM);
     };
     address as *mut c_void

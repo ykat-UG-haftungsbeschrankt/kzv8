@@ -87,7 +87,11 @@ unsafe fn allocate_stream(file_descriptor: i32) -> *mut KzFile {
 pub extern "C" fn putchar(character: i32) -> i32 {
     let byte = character as u8;
     let result = unsafe { kz_host_console_write(&byte, 1) };
-    if result == 1 { byte as i32 } else { EOF }
+    if result == 1 {
+        byte as i32
+    } else {
+        EOF
+    }
 }
 
 #[no_mangle]
@@ -102,7 +106,11 @@ pub unsafe extern "C" fn fclose(stream: *mut KzFile) -> i32 {
     let file_descriptor = unsafe { (*stream).descriptor };
     let result = super::filesystem::close(file_descriptor);
     unsafe { drop(Box::from_raw(stream)) };
-    if result == 0 { 0 } else { EOF }
+    if result == 0 {
+        0
+    } else {
+        EOF
+    }
 }
 
 #[no_mangle]
@@ -218,10 +226,7 @@ fn parse_file_mode(mode: *const c_char, allow_exclusive: bool) -> Result<i32, i3
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fdopen(
-    file_descriptor: i32,
-    mode: *const c_char,
-) -> *mut KzFile {
+pub unsafe extern "C" fn fdopen(file_descriptor: i32, mode: *const c_char) -> *mut KzFile {
     let flags = match parse_file_mode(mode, false) {
         Ok(flags) => flags,
         Err(error) => {
@@ -248,11 +253,9 @@ pub unsafe extern "C" fn fdopen(
             unsafe { stderr }
         };
     }
-    if let Err(error) = super::filesystem::fd_access(
-        file_descriptor,
-        access != O_WRONLY,
-        access != O_RDONLY,
-    ) {
+    if let Err(error) =
+        super::filesystem::fd_access(file_descriptor, access != O_WRONLY, access != O_RDONLY)
+    {
         set_errno(error);
         return core::ptr::null_mut();
     }
@@ -260,10 +263,7 @@ pub unsafe extern "C" fn fdopen(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fopen64(
-    path: *const c_char,
-    mode: *const c_char,
-) -> *mut KzFile {
+pub unsafe extern "C" fn fopen64(path: *const c_char, mode: *const c_char) -> *mut KzFile {
     let flags = match parse_file_mode(mode, true) {
         Ok(flags) => flags,
         Err(error) => {
@@ -279,10 +279,7 @@ pub unsafe extern "C" fn fopen64(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fopen(
-    path: *const c_char,
-    mode: *const c_char,
-) -> *mut KzFile {
+pub unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut KzFile {
     unsafe { fopen64(path, mode) }
 }
 
@@ -362,13 +359,13 @@ pub unsafe extern "C" fn fgetc(stream: *mut KzFile) -> i32 {
     }
     let mut character = 0u8;
     let result = unsafe {
-        super::filesystem::read(
-            (*stream).descriptor,
-            (&mut character as *mut u8).cast(),
-            1,
-        )
+        super::filesystem::read((*stream).descriptor, (&mut character as *mut u8).cast(), 1)
     };
-    if result == 1 { character as i32 } else { EOF }
+    if result == 1 {
+        character as i32
+    } else {
+        EOF
+    }
 }
 
 #[no_mangle]

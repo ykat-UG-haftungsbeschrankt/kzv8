@@ -5,6 +5,8 @@
  * free of charge, without warranty of any kind.
  */
 
+use crate::kernel::error::Error;
+
 const MAGIC: u32 = 0x7472_6976;
 const VERSION_MODERN: u32 = 2;
 const FEATURE_VERSION_1: u32 = 1;
@@ -28,17 +30,6 @@ const REG_QUEUE_DESC: usize = 0x80;
 const REG_QUEUE_AVAIL: usize = 0x90;
 const REG_QUEUE_USED: usize = 0xa0;
 const FEATURE_NET_MAC: u64 = 1 << 5;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Error {
-    InvalidDevice,
-    UnsupportedVersion,
-    MissingVersionFeature,
-    UnsupportedFeature,
-    FeatureNegotiation,
-    QueueUnavailable,
-    InvalidQueueSize,
-}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VirtioTransport {
@@ -68,9 +59,9 @@ impl VirtioTransport {
         let window = crate::kernel::arch::virtio_window();
         for slot in 0..window.slots {
             let base = window.start.checked_add(slot.checked_mul(window.stride)?)?;
-            let magic = unsafe { read_register(base, REG_MAGIC) };
-            let version = unsafe { read_register(base, REG_VERSION) };
-            let id = unsafe { read_register(base, REG_DEVICE_ID) };
+            let magic = unsafe { Self::read_register(base, REG_MAGIC) };
+            let version = unsafe { Self::read_register(base, REG_VERSION) };
+            let id = unsafe { Self::read_register(base, REG_DEVICE_ID) };
             if magic == MAGIC && version == VERSION_MODERN && id == device_id {
                 return Some(Self { base });
             }
@@ -93,38 +84,38 @@ impl VirtioTransport {
         let base = self.base;
         // SAFETY: this handle is restricted to the mapped VirtIO window, and MMU readiness is checked above.
         unsafe {
-            if read_register(base, REG_MAGIC) != MAGIC
-                || read_register(base, REG_VERSION) != VERSION_MODERN
-                || read_register(base, REG_DEVICE_ID) != device_id
+            if Self::read_register(base, REG_MAGIC) != MAGIC
+                || Self::read_register(base, REG_VERSION) != VERSION_MODERN
+                || Self::read_register(base, REG_DEVICE_ID) != device_id
             {
                 return Err(Error::InvalidDevice);
             }
 
-            write_register(base, REG_STATUS, 0);
-            write_register(base, REG_STATUS, 1);
-            write_register(base, REG_STATUS, 3);
+            Self::write_register(base, REG_STATUS, 0);
+            Self::write_register(base, REG_STATUS, 1);
+            Self::write_register(base, REG_STATUS, 3);
 
-            write_register(base, REG_DEVICE_FEATURES_SELECT, 0);
-            let offered_low = read_register(base, REG_DEVICE_FEATURES);
-            write_register(base, REG_DEVICE_FEATURES_SELECT, 1);
-            let offered_high = read_register(base, REG_DEVICE_FEATURES);
+            Self::write_register(base, REG_DEVICE_FEATURES_SELECT, 0);
+            let offered_low = Self::read_register(base, REG_DEVICE_FEATURES);
+            Self::write_register(base, REG_DEVICE_FEATURES_SELECT, 1);
+            let offered_high = Self::read_register(base, REG_DEVICE_FEATURES);
             if offered_high & FEATURE_VERSION_1 == 0 {
-                write_register(base, REG_STATUS, 0x80);
+                Self::write_register(base, REG_STATUS, 0x80);
                 return Err(Error::MissingVersionFeature);
             }
             let requested_low = requested_features as u32;
             let requested_high = (requested_features >> 32) as u32 | FEATURE_VERSION_1;
             if requested_low & !offered_low != 0 || requested_high & !offered_high != 0 {
-                write_register(base, REG_STATUS, 0x80);
+                Self::write_register(base, REG_STATUS, 0x80);
                 return Err(Error::UnsupportedFeature);
             }
-            write_register(base, REG_DRIVER_FEATURES_SELECT, 0);
-            write_register(base, REG_DRIVER_FEATURES, requested_low);
-            write_register(base, REG_DRIVER_FEATURES_SELECT, 1);
-            write_register(base, REG_DRIVER_FEATURES, requested_high);
-            write_register(base, REG_STATUS, 11);
-            if read_register(base, REG_STATUS) & 8 == 0 {
-                write_register(base, REG_STATUS, 0x80);
+            Self::write_register(base, REG_DRIVER_FEATURES_SELECT, 0);
+            Self::write_register(base, REG_DRIVER_FEATURES, requested_low);
+            Self::write_register(base, REG_DRIVER_FEATURES_SELECT, 1);
+            Self::write_register(base, REG_DRIVER_FEATURES, requested_high);
+            Self::write_register(base, REG_STATUS, 11);
+            if Self::read_register(base, REG_STATUS) & 8 == 0 {
+                Self::write_register(base, REG_STATUS, 0x80);
                 return Err(Error::FeatureNegotiation);
             }
         }
@@ -140,33 +131,33 @@ impl VirtioTransport {
         used: u64,
     ) -> Result<(), Error> {
         unsafe {
-            write_register(self.base, REG_QUEUE_SELECT, index);
-            if read_register(self.base, REG_QUEUE_READY) != 0 {
+            Self::write_register(self.base, REG_QUEUE_SELECT, index);
+            if Self::read_register(self.base, REG_QUEUE_READY) != 0 {
                 return Err(Error::QueueUnavailable);
             }
-            if read_register(self.base, REG_QUEUE_SIZE_MAX) < size {
+            if Self::read_register(self.base, REG_QUEUE_SIZE_MAX) < size {
                 return Err(Error::InvalidQueueSize);
             }
-            write_register(self.base, REG_QUEUE_SIZE, size);
-            write_address(self.base, REG_QUEUE_DESC, descriptors);
-            write_address(self.base, REG_QUEUE_AVAIL, available);
-            write_address(self.base, REG_QUEUE_USED, used);
+            Self::write_register(self.base, REG_QUEUE_SIZE, size);
+            Self::write_address(self.base, REG_QUEUE_DESC, descriptors);
+            Self::write_address(self.base, REG_QUEUE_AVAIL, available);
+            Self::write_address(self.base, REG_QUEUE_USED, used);
             crate::kernel::memory::dma::sync_for_device();
-            write_register(self.base, REG_QUEUE_READY, 1);
+            Self::write_register(self.base, REG_QUEUE_READY, 1);
         }
         Ok(())
     }
 
     pub(crate) fn activate(&self) -> bool {
         unsafe {
-            write_register(self.base, REG_STATUS, 15);
-            read_register(self.base, REG_STATUS) & 4 != 0
+            Self::write_register(self.base, REG_STATUS, 15);
+            Self::read_register(self.base, REG_STATUS) & 4 != 0
         }
     }
 
     pub(crate) fn notify(&self, queue: u32) {
         unsafe {
-            write_register(self.base, REG_QUEUE_NOTIFY, queue);
+            Self::write_register(self.base, REG_QUEUE_NOTIFY, queue);
         }
     }
 
@@ -178,7 +169,7 @@ impl VirtioTransport {
         {
             return None;
         }
-        Some(unsafe { read_register(self.base, config_offset) })
+        Some(unsafe { Self::read_register(self.base, config_offset) })
     }
 
     pub(crate) fn slot(&self) -> usize {
@@ -193,6 +184,27 @@ impl VirtioTransport {
     pub(crate) const fn net_mac_feature() -> u64 {
         FEATURE_NET_MAC
     }
+
+    /// # Safety
+    /// `base + offset` must be a valid, aligned register in the mapped transport window.
+    unsafe fn read_register(base: usize, offset: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
+    }
+
+    /// # Safety
+    /// `base + offset` must be a valid, aligned writable register in the mapped transport window.
+    unsafe fn write_register(base: usize, offset: usize, value: u32) {
+        unsafe { core::ptr::write_volatile((base + offset) as *mut u32, value) };
+    }
+
+    /// # Safety
+    /// `base + offset` and `base + offset + 4` must be valid address registers in the window.
+    unsafe fn write_address(base: usize, offset: usize, address: u64) {
+        unsafe {
+            Self::write_register(base, offset, address as u32);
+            Self::write_register(base, offset + 4, (address >> 32) as u32);
+        }
+    }
 }
 
 pub(crate) fn dispatch_interrupts() -> u64 {
@@ -203,30 +215,17 @@ pub(crate) fn dispatch_interrupts() -> u64 {
     let mut pending = 0u64;
     for slot in 0..window.slots.min(64) {
         let base = window.start + slot * window.stride;
-        let magic = unsafe { read_register(base, REG_MAGIC) };
-        let version = unsafe { read_register(base, REG_VERSION) };
-        let device_id = unsafe { read_register(base, REG_DEVICE_ID) };
+        let magic = unsafe { VirtioTransport::read_register(base, REG_MAGIC) };
+        let version = unsafe { VirtioTransport::read_register(base, REG_VERSION) };
+        let device_id = unsafe { VirtioTransport::read_register(base, REG_DEVICE_ID) };
         if magic != MAGIC || version != VERSION_MODERN || device_id == 0 {
             continue;
         }
-        let status = unsafe { read_register(base, REG_INTERRUPT_STATUS) };
+        let status = unsafe { VirtioTransport::read_register(base, REG_INTERRUPT_STATUS) };
         if status != 0 {
-            unsafe { write_register(base, REG_INTERRUPT_ACK, status) };
+            unsafe { VirtioTransport::write_register(base, REG_INTERRUPT_ACK, status) };
             pending |= 1u64 << slot;
         }
     }
     pending
-}
-
-unsafe fn read_register(base: usize, offset: usize) -> u32 {
-    core::ptr::read_volatile((base + offset) as *const u32)
-}
-
-unsafe fn write_register(base: usize, offset: usize, value: u32) {
-    core::ptr::write_volatile((base + offset) as *mut u32, value);
-}
-
-unsafe fn write_address(base: usize, offset: usize, address: u64) {
-    write_register(base, offset, address as u32);
-    write_register(base, offset + 4, (address >> 32) as u32);
 }

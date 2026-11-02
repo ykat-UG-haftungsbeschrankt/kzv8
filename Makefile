@@ -29,7 +29,7 @@ else
 $(error AARCH64_FPU_STATE must be on or off)
 endif
 
-.PHONY: all test run-x86_64 run-aarch64 v8-host-test v8-platform-test clean force
+.PHONY: all test doc run-x86_64 run-aarch64 v8-host-test v8-platform-test clean force
 all: build/x86_64/kernel.elf build/aarch64/kernel.bin
 
 force:
@@ -54,6 +54,9 @@ build/aarch64/kernel.bin: build/aarch64/kernel.elf
 
 test: all
 	python3 tests/qemu/smoke.py
+
+doc:
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) doc --manifest-path Cargo.toml
 
 v8-host-test:
 	ninja -C "$(V8_OUT)" v8_hello_world d8

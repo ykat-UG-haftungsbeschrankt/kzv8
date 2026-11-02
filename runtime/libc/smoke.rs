@@ -88,7 +88,15 @@ unsafe extern "C" {
 
 #[no_mangle]
 pub unsafe extern "C" fn kz_c_stdio_smoke() -> i32 {
-    if unsafe { printf(b"kz: C stdio printf %d %s 0x%x\n\0".as_ptr().cast(), 42, b"hello\0".as_ptr(), 42u32) } < 0 {
+    if unsafe {
+        printf(
+            b"kz: C stdio printf %d %s 0x%x\n\0".as_ptr().cast(),
+            42,
+            b"hello\0".as_ptr(),
+            42u32,
+        )
+    } < 0
+    {
         return -1;
     }
     if unsafe { puts(b"kz: C stdio puts works\0".as_ptr().cast()) } == -1 {
@@ -153,7 +161,8 @@ pub unsafe extern "C" fn kz_c_mmap_smoke() -> i32 {
         return -1;
     }
     let bytes = memory.cast::<u8>();
-    if unsafe { read_volatile(bytes) } != 0 || unsafe { read_volatile(bytes.add(length - 1)) } != 0 {
+    if unsafe { read_volatile(bytes) } != 0 || unsafe { read_volatile(bytes.add(length - 1)) } != 0
+    {
         return -1;
     }
     unsafe {
@@ -177,7 +186,8 @@ pub unsafe extern "C" fn kz_c_mmap_smoke() -> i32 {
         return -1;
     }
     let bytes = memory.cast::<u8>();
-    if unsafe { read_volatile(bytes) } != 0 || unsafe { read_volatile(bytes.add(length - 1)) } != 0 {
+    if unsafe { read_volatile(bytes) } != 0 || unsafe { read_volatile(bytes.add(length - 1)) } != 0
+    {
         return -1;
     }
     if unsafe { munmap(memory, length) } != 0 {
@@ -302,10 +312,7 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
         return -1;
     }
     while !SMOKE_READY.load(Ordering::Acquire) {
-        if unsafe {
-            pthread_cond_wait(core::ptr::addr_of_mut!(SMOKE_CONDITION), mutex)
-        } != 0
-        {
+        if unsafe { pthread_cond_wait(core::ptr::addr_of_mut!(SMOKE_CONDITION), mutex) } != 0 {
             return -1;
         }
     }
@@ -403,16 +410,15 @@ pub unsafe extern "C" fn kz_c_filesystem_smoke() -> i32 {
         super::filesystem::kz_rust_open(path.as_ptr().cast(), O_CREAT | O_EXCL | O_RDWR, 0o600)
     };
     if file_descriptor < 0
-        || unsafe { super::filesystem::write(file_descriptor, payload.as_ptr().cast(), payload.len()) }
-            != payload.len() as isize
+        || unsafe {
+            super::filesystem::write(file_descriptor, payload.as_ptr().cast(), payload.len())
+        } != payload.len() as isize
         || super::filesystem::lseek(file_descriptor, 0, SEEK_SET) != 0
         || unsafe {
             super::filesystem::read(file_descriptor, buffer.as_mut_ptr().cast(), payload.len())
         } != payload.len() as isize
         || buffer[..payload.len()] != payload[..]
-        || unsafe {
-            super::filesystem::fstat64(file_descriptor, status.as_mut_ptr().cast())
-        } != 0
+        || unsafe { super::filesystem::fstat64(file_descriptor, status.as_mut_ptr().cast()) } != 0
         || unsafe { status.assume_init_ref().size } != payload.len() as i64
     {
         unsafe {
@@ -547,7 +553,9 @@ pub unsafe extern "C" fn kz_c_filesystem_smoke() -> i32 {
     }
     unsafe { crate::kernel::scheduler::thread::__errno_location().write(0) };
     let missing = unsafe { super::filesystem::kz_rust_open(path.as_ptr().cast(), O_RDONLY, 0) };
-    if missing != -1 || unsafe { crate::kernel::scheduler::thread::__errno_location().read() } != ENOENT {
+    if missing != -1
+        || unsafe { crate::kernel::scheduler::thread::__errno_location().read() } != ENOENT
+    {
         return -1;
     }
     0

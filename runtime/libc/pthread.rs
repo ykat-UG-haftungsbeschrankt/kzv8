@@ -39,7 +39,6 @@ macro_rules! export_pthread {
     };
 }
 
-
 pub(crate) unsafe fn pthread_key_create(
     key: *mut u32,
     destructor: Option<unsafe extern "C" fn(*mut c_void)>,
