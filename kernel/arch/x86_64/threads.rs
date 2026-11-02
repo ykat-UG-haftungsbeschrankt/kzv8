@@ -8,6 +8,37 @@
 use core::mem::size_of;
 use core::ptr::{addr_of, addr_of_mut, copy_nonoverlapping, write_bytes};
 
+#[cfg(feature = "fpu-x87")]
+const FPU_CONTEXT_SIZE: usize = 108;
+#[cfg(all(feature = "fpu-sse", not(feature = "fpu-avx")))]
+const FPU_CONTEXT_SIZE: usize = 512;
+#[cfg(feature = "fpu-avx")]
+const FPU_CONTEXT_SIZE: usize = 832;
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+pub(crate) struct FpuContext {
+    _image: [u8; FPU_CONTEXT_SIZE],
+}
+
+impl FpuContext {
+    pub(crate) const INITIAL: Self = {
+        let mut image = [0; FPU_CONTEXT_SIZE];
+        if cfg!(feature = "fpu-x87") {
+            image[0] = 0x7f;
+            image[1] = 0x03;
+            image[8] = 0xff;
+            image[9] = 0xff;
+        } else if cfg!(all(feature = "fpu-sse", not(feature = "fpu-avx"))) {
+            image[0] = 0x7f;
+            image[1] = 0x03;
+            image[24] = 0x80;
+            image[25] = 0x1f;
+        }
+        Self { _image: image }
+    };
+}
+
 const TLS_BLOCK_SIZE: usize = 4096;
 
 static mut TLS_BLOCKS: [[u8; TLS_BLOCK_SIZE]; crate::arch::MAX_CPUS] =
@@ -19,31 +50,64 @@ unsafe extern "C" {
     static __tls_end: u8;
 }
 
-core::arch::global_asm!(
-    ".section .text",
-    ".global kz_x86_64_context_switch",
-    ".type kz_x86_64_context_switch,@function",
-    "kz_x86_64_context_switch:",
-    "push rbx",
-    "push rbp",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    "mov [rdi], rsp",
-    "mov rsp, rsi",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop rbp",
-    "pop rbx",
-    "ret",
-    ".size kz_x86_64_context_switch, .-kz_x86_64_context_switch",
+macro_rules! define_context_switch {
+    ([$($save:literal),+], [$($restore:literal),+]) => {
+        core::arch::global_asm!(
+            ".section .text",
+            ".global kz_x86_64_context_switch",
+            ".type kz_x86_64_context_switch,@function",
+            "kz_x86_64_context_switch:",
+            "push rbx",
+            "push rbp",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            $($save,)+
+            "mov [rdi], rsp",
+            "mov rsp, rsi",
+            $($restore,)+
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop rbp",
+            "pop rbx",
+            "ret",
+            ".size kz_x86_64_context_switch, .-kz_x86_64_context_switch",
+        );
+    };
+}
+
+#[cfg(feature = "fpu-x87")]
+define_context_switch!(["fnsave [rdx]"], ["frstor [rcx]"]);
+
+#[cfg(all(feature = "fpu-sse", not(feature = "fpu-avx")))]
+define_context_switch!(["fxsave64 [rdx]"], ["fxrstor64 [rcx]"]);
+
+#[cfg(feature = "fpu-avx")]
+define_context_switch!(
+    [
+        "mov r8, rdx",
+        "mov eax, 7",
+        "xor edx, edx",
+        "xsave64 [r8]"
+    ],
+    [
+        "mov r8, rcx",
+        "mov eax, 7",
+        "xor edx, edx",
+        "xrstor64 [r8]"
+    ]
 );
 
 unsafe extern "C" {
-    fn kz_x86_64_context_switch(old_stack: *mut usize, new_stack: usize);
+    fn kz_x86_64_context_switch(
+        old_stack: *mut usize,
+        new_stack: usize,
+        old_fpu_context: *mut FpuContext,
+        new_fpu_context: *const FpuContext,
+    );
 }
 
 pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
@@ -103,6 +167,18 @@ pub(crate) fn initialize_stack(stack: &mut [u8], entry: extern "C" fn() -> !) ->
     context as usize
 }
 
-pub(crate) unsafe fn switch(old_stack: &mut usize, new_stack: usize) {
-    unsafe { kz_x86_64_context_switch(old_stack, new_stack) }
+pub(crate) unsafe fn switch(
+    old_stack: &mut usize,
+    new_stack: usize,
+    old_fpu_context: &mut FpuContext,
+    new_fpu_context: &FpuContext,
+) {
+    unsafe {
+        kz_x86_64_context_switch(
+            old_stack,
+            new_stack,
+            old_fpu_context,
+            new_fpu_context,
+        )
+    }
 }

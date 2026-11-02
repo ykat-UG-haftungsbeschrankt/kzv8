@@ -6,7 +6,11 @@ static PAGE_ALLOCATOR_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
-    fn kz_v8_run_smoke(event_loop: *mut core::ffi::c_void) -> i32;
+    fn kz_v8_run_smoke(
+        event_loop: *mut core::ffi::c_void,
+        block_device: *mut core::ffi::c_void,
+        tcp_context: *mut core::ffi::c_void,
+    ) -> i32;
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -104,12 +108,26 @@ pub extern "C" fn kz_host_v8_set_page_permissions(
 }
 
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn run_smoke(event_loop: &mut crate::event_loop::EventLoop<16>) -> Option<i32> {
-    Some(unsafe { kz_v8_run_smoke(event_loop as *mut _ as *mut core::ffi::c_void) })
+pub(crate) fn run_smoke(
+    event_loop: &mut crate::event_loop::EventLoop<16>,
+    block_device: *mut core::ffi::c_void,
+    tcp_context: *mut core::ffi::c_void,
+) -> Option<i32> {
+    Some(unsafe {
+        kz_v8_run_smoke(
+            event_loop as *mut _ as *mut core::ffi::c_void,
+            block_device,
+            tcp_context,
+        )
+    })
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn run_smoke(_event_loop: &mut crate::event_loop::EventLoop<16>) -> Option<i32> {
+pub(crate) fn run_smoke(
+    _event_loop: &mut crate::event_loop::EventLoop<16>,
+    _block_device: *mut core::ffi::c_void,
+    _tcp_context: *mut core::ffi::c_void,
+) -> Option<i32> {
     None
 }
 

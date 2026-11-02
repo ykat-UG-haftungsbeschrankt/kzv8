@@ -30,6 +30,7 @@ fn main() {
     let repository_dir = package_dir.clone();
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let fpu_avx = env::var_os("CARGO_FEATURE_FPU_AVX").is_some();
     let clang = env::var_os("CLANG").unwrap_or_else(|| OsString::from("clang"));
     let objcopy = env::var_os("OBJCOPY").unwrap_or_else(|| OsString::from("llvm-objcopy"));
     let v8_cxx = env::var_os("V8_CXX")
@@ -74,6 +75,7 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=CLANG");
     println!("cargo:rerun-if-env-changed=OBJCOPY");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FPU_AVX");
     println!("cargo:rerun-if-env-changed=V8_CXX");
     println!("cargo:rerun-if-env-changed=V8_PLATFORM_OUT");
     let linker_script = repository_dir.join(linker_script);
@@ -83,8 +85,12 @@ fn main() {
     for (source_name, object_name) in sources {
         let source = package_dir.join(source_name);
         let object = output_dir.join(object_name);
-        let status = Command::new(&clang)
-            .arg(format!("--target={clang_target}"))
+        let mut command = Command::new(&clang);
+        command.arg(format!("--target={clang_target}"));
+        if target_arch == "x86_64" && fpu_avx {
+            command.arg("-DKZ_FPU_AVX");
+        }
+        let status = command
             .arg("-c")
             .arg(&source)
             .arg("-o")

@@ -14,6 +14,8 @@ mod threads;
 pub(crate) mod timer;
 mod virtio;
 
+pub(crate) use threads::FpuContext;
+
 pub(crate) const MAX_CPUS: usize = 8;
 pub(crate) const VM_ARENA_SIZE: usize = 1 << 30;
 pub(crate) const VM_BASE: usize = 511usize << 30;
@@ -83,8 +85,13 @@ pub(crate) fn high_memory_smoke() -> bool {
     false
 }
 
-pub(crate) fn switch_thread(old_stack: &mut usize, new_stack: usize) {
-    unsafe { threads::switch(old_stack, new_stack) }
+pub(crate) fn switch_thread(
+    old_stack: &mut usize,
+    new_stack: usize,
+    old_fpu_context: &mut FpuContext,
+    new_fpu_context: &FpuContext,
+) {
+    unsafe { threads::switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
 }
 
 pub(crate) fn initialize_interrupt_controller() -> bool {

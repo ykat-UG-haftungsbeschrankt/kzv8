@@ -1,12 +1,30 @@
 #include "v8_engine.h"
 
+#include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 
 #include "os_platform.h"
 #include "v8.h"
 
 extern "C" int kz_host_console_write(const char* data, size_t length);
+extern "C" uint64_t kz_host_time_ns();
+extern "C" void kz_host_wait_for_interrupt();
+extern "C" uint64_t kz_host_block_capacity(void* device);
+extern "C" int kz_host_block_read(void* device, uint64_t sector,
+									  uint8_t* output, size_t length);
+extern "C" int kz_host_block_write(void* device, uint64_t sector,
+									   const uint8_t* input, size_t length);
+extern "C" int kz_host_tcp_available(void* context);
+extern "C" int kz_host_tcp_connect(void* context, const uint8_t* address,
+										uint32_t remote_port);
+extern "C" int kz_host_tcp_send(void* context, const uint8_t* input,
+									 size_t length);
+extern "C" int kz_host_tcp_receive(void* context, uint8_t* output,
+										 size_t length);
+extern "C" int kz_host_tcp_close(void* context);
 
 struct KzRawEvent {
 	uint32_t kind;
@@ -15,6 +33,23 @@ struct KzRawEvent {
 	int32_t status;
 	uint32_t reserved;
 	uint64_t data;
+};
+
+struct TimerSlot {
+	uint64_t id = 0;
+	bool active = false;
+	v8::Global<v8::Function> callback;
+};
+
+struct TimerBindings {
+	void* event_loop = nullptr;
+	std::array<TimerSlot, 16> slots{};
+};
+
+struct DeviceBindings {
+	void* block_device = nullptr;
+	void* tcp_context = nullptr;
+	bool console_called = false;
 };
 
 extern "C" {
@@ -45,10 +80,284 @@ void throw_range_error(v8::Isolate* isolate, const char* message) {
 			v8::String::NewFromUtf8(isolate, message).ToLocalChecked()));
 }
 
-void* event_loop_context(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void throw_error(v8::Isolate* isolate, const char* message) {
+	isolate->ThrowException(v8::Exception::Error(
+			v8::String::NewFromUtf8(isolate, message).ToLocalChecked()));
+}
+
+void* function_data(const v8::FunctionCallbackInfo<v8::Value>& args) {
 	auto data = args.DataV2();
 	if (data.IsEmpty()) return nullptr;
 	return data.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault);
+}
+
+void* event_loop_context(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	return function_data(args);
+}
+
+bool value_to_u64(v8::Local<v8::Value> value, uint64_t* output);
+void report(const char* message, size_t length);
+
+void console_log(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* isolate = args.GetIsolate();
+	auto* devices = static_cast<DeviceBindings*>(function_data(args));
+	if (devices != nullptr) devices->console_called = true;
+	auto context = isolate->GetCurrentContext();
+	char output[512];
+	size_t length = 0;
+	for (int index = 0; index < args.Length() && length < sizeof(output); ++index) {
+		if (index != 0) output[length++] = ' ';
+		v8::Local<v8::String> text;
+		if (!args[index]->ToString(context).ToLocal(&text)) return;
+		v8::String::Utf8Value utf8(isolate, text);
+		if (*utf8 == nullptr) return;
+		size_t copy_length = static_cast<size_t>(utf8.length());
+		if (copy_length > sizeof(output) - length) {
+			copy_length = sizeof(output) - length;
+		}
+		std::memcpy(output + length, *utf8, copy_length);
+		length += copy_length;
+	}
+	if (length < sizeof(output)) output[length++] = '\n';
+	report(output, length);
+}
+
+void timer_set_timeout(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* isolate = args.GetIsolate();
+	auto* timers = static_cast<TimerBindings*>(function_data(args));
+	if (timers == nullptr || args.Length() < 2 || !args[0]->IsFunction() ||
+			!args[1]->IsNumber()) {
+		throw_type_error(isolate, "setTimeout expects a callback and delay in milliseconds");
+		return;
+	}
+	const double delay_ms = args[1].As<v8::Number>()->Value();
+	constexpr double kMaxSafeInteger = 9007199254740991.0;
+	if (!std::isfinite(delay_ms) || delay_ms < 0 ||
+			delay_ms * 1'000'000.0 > kMaxSafeInteger) {
+		throw_range_error(isolate, "timer delay is out of range");
+		return;
+	}
+	TimerSlot* slot = nullptr;
+	for (TimerSlot& candidate : timers->slots) {
+		if (!candidate.active) {
+			slot = &candidate;
+			break;
+		}
+	}
+	if (slot == nullptr) {
+		throw_range_error(isolate, "timer callback capacity exhausted");
+		return;
+	}
+	uint64_t timer_id = 0;
+	const auto delay_ns = static_cast<uint64_t>(delay_ms * 1'000'000.0);
+	if (!kz_host_event_loop_schedule_timer(timers->event_loop, delay_ns,
+													 &timer_id)) {
+		throw_range_error(isolate, "event loop timer capacity exhausted");
+		return;
+	}
+	slot->id = timer_id;
+	slot->active = true;
+	slot->callback.Reset(isolate, args[0].As<v8::Function>());
+	args.GetReturnValue().Set(v8::BigInt::NewFromUnsigned(isolate, timer_id));
+}
+
+void timer_clear_timeout(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* isolate = args.GetIsolate();
+	auto* timers = static_cast<TimerBindings*>(function_data(args));
+	uint64_t timer_id = 0;
+	if (timers == nullptr || args.Length() < 1 ||
+			!value_to_u64(args[0], &timer_id)) {
+		throw_type_error(isolate, "clearTimeout expects a timer id");
+		return;
+	}
+	const bool cancelled =
+			kz_host_event_loop_cancel_timer(timers->event_loop, timer_id) != 0;
+	if (cancelled) {
+		for (TimerSlot& slot : timers->slots) {
+			if (slot.active && slot.id == timer_id) {
+				slot.active = false;
+				slot.callback.Reset();
+				break;
+			}
+		}
+	}
+	args.GetReturnValue().Set(cancelled);
+}
+
+DeviceBindings* device_bindings(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	return static_cast<DeviceBindings*>(function_data(args));
+}
+
+void block_capacity(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* isolate = args.GetIsolate();
+	auto* bindings = device_bindings(args);
+	const uint64_t capacity = bindings == nullptr || bindings->block_device == nullptr
+												   ? 0
+												   : kz_host_block_capacity(bindings->block_device);
+	args.GetReturnValue().Set(v8::BigInt::NewFromUnsigned(isolate, capacity));
+}
+
+void block_read(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* isolate = args.GetIsolate();
+	auto* bindings = device_bindings(args);
+	uint64_t sector = 0;
+	if (bindings == nullptr || bindings->block_device == nullptr || args.Length() < 2 ||
+			!value_to_u64(args[0], &sector) || !args[1]->IsUint32()) {
+		throw_type_error(isolate, "block.read expects a sector and byte length");
+		return;
+	}
+	const uint32_t length =
+			args[1]->Uint32Value(isolate->GetCurrentContext()).FromMaybe(0);
+	if (length == 0 || length > 64 * 1024 || length % 512 != 0) {
+		throw_range_error(isolate, "block.read length must be sector aligned and at most 64 KiB");
+		return;
+	}
+	auto backing_store = v8::ArrayBuffer::NewBackingStore(isolate, length);
+	if (!backing_store) {
+		throw_error(isolate, "unable to allocate block read buffer");
+		return;
+	}
+	auto* output = static_cast<uint8_t*>(backing_store->Data());
+	const int status =
+			kz_host_block_read(bindings->block_device, sector, output, length);
+	if (status != static_cast<int>(length)) {
+		const char* message = status == -1 ? "block read rejected"
+										: status == -2 ? "block read submit failed"
+										: status == -3 ? "block read transfer failed"
+														 : status == -4 ? "block read timed out"
+																: "block read failed";
+		throw_error(isolate, message);
+		return;
+	}
+	auto buffer = v8::ArrayBuffer::New(isolate, std::move(backing_store));
+	args.GetReturnValue().Set(v8::Uint8Array::New(buffer, 0, length));
+}
+
+void block_write(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* isolate = args.GetIsolate();
+	auto* bindings = device_bindings(args);
+	uint64_t sector = 0;
+	if (bindings == nullptr || bindings->block_device == nullptr || args.Length() < 2 ||
+			!value_to_u64(args[0], &sector) || !args[1]->IsUint8Array()) {
+		throw_type_error(isolate, "block.write expects a sector and Uint8Array");
+		return;
+	}
+	auto input = args[1].As<v8::Uint8Array>();
+	const size_t length = input->ByteLength();
+	if (length == 0 || length > 64 * 1024 || length % 512 != 0) {
+		throw_range_error(isolate, "block.write length must be sector aligned and at most 64 KiB");
+		return;
+	}
+	auto backing_store = input->Buffer()->GetBackingStore();
+	auto* bytes = static_cast<const uint8_t*>(backing_store->Data()) +
+			input->ByteOffset();
+	const int written =
+			kz_host_block_write(bindings->block_device, sector, bytes, length);
+	if (written < 0) {
+		throw_error(isolate, "block write failed");
+		return;
+	}
+	args.GetReturnValue().Set(v8::Integer::New(isolate, written));
+}
+
+void tcp_available(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* bindings = device_bindings(args);
+	args.GetReturnValue().Set(bindings != nullptr &&
+												kz_host_tcp_available(bindings->tcp_context) != 0);
+}
+
+void tcp_connect(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* isolate = args.GetIsolate();
+	auto* bindings = device_bindings(args);
+	if (bindings == nullptr || args.Length() < 2 || !args[0]->IsUint8Array() ||
+			args[1]->IsUint32() == false) {
+		throw_type_error(isolate, "tcp.connect expects an IPv4 Uint8Array and port");
+		return;
+	}
+	auto address = args[0].As<v8::Uint8Array>();
+	if (address->Length() != 4) {
+		throw_range_error(isolate, "tcp.connect expects four IPv4 bytes");
+		return;
+	}
+	const uint32_t port =
+			args[1]->Uint32Value(isolate->GetCurrentContext()).FromMaybe(0);
+	auto backing_store = address->Buffer()->GetBackingStore();
+	auto* bytes = static_cast<const uint8_t*>(backing_store->Data()) +
+			address->ByteOffset();
+	const int status = kz_host_tcp_connect(bindings->tcp_context, bytes, port);
+	if (status != 1) {
+		const char* message = status == -1 ? "TCP connection arguments rejected"
+										: status == -2 ? "TCP device unavailable"
+										: status == -3 ? "TCP socket already open"
+														 : status == -4 ? "TCP socket creation failed"
+															: status == -5 ? "TCP connection closed"
+																: status == -7 ? "TCP network poll failed"
+																	 : "TCP connection timed out";
+		throw_error(isolate, message);
+		return;
+	}
+	args.GetReturnValue().Set(true);
+}
+
+void tcp_send(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* isolate = args.GetIsolate();
+	auto* bindings = device_bindings(args);
+	if (bindings == nullptr || args.Length() < 1 || !args[0]->IsUint8Array()) {
+		throw_type_error(isolate, "tcp.send expects a Uint8Array");
+		return;
+	}
+	auto input = args[0].As<v8::Uint8Array>();
+	const size_t length = input->ByteLength();
+	if (length == 0 || length > 4096) {
+		throw_range_error(isolate, "tcp.send length must be between 1 and 4096 bytes");
+		return;
+	}
+	auto backing_store = input->Buffer()->GetBackingStore();
+	auto* bytes = static_cast<const uint8_t*>(backing_store->Data()) +
+			input->ByteOffset();
+	const int written = kz_host_tcp_send(bindings->tcp_context, bytes, length);
+	if (written < 0) {
+		throw_error(isolate, "TCP send failed");
+		return;
+	}
+	args.GetReturnValue().Set(v8::Integer::New(isolate, written));
+}
+
+void tcp_receive(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* isolate = args.GetIsolate();
+	if (args.Length() < 1 || !args[0]->IsUint32()) {
+		throw_type_error(isolate, "tcp.receive expects a byte length");
+		return;
+	}
+	const uint32_t length =
+			args[0]->Uint32Value(isolate->GetCurrentContext()).FromMaybe(0);
+	if (length == 0 || length > 4096) {
+		throw_range_error(isolate, "tcp.receive length must be between 1 and 4096 bytes");
+		return;
+	}
+	auto backing_store = v8::ArrayBuffer::NewBackingStore(isolate, length);
+	if (!backing_store) {
+		throw_error(isolate, "unable to allocate TCP receive buffer");
+		return;
+	}
+	auto* output = static_cast<uint8_t*>(backing_store->Data());
+	auto* bindings = device_bindings(args);
+	const int received = bindings == nullptr
+									 ? -1
+									 : kz_host_tcp_receive(bindings->tcp_context, output, length);
+	if (received <= 0 || static_cast<uint32_t>(received) > length) {
+		throw_error(isolate, "TCP receive failed");
+		return;
+	}
+	auto buffer = v8::ArrayBuffer::New(isolate, std::move(backing_store));
+	args.GetReturnValue().Set(
+			v8::Uint8Array::New(buffer, 0, static_cast<size_t>(received)));
+}
+
+void tcp_close(const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* bindings = device_bindings(args);
+	args.GetReturnValue().Set(bindings != nullptr &&
+											kz_host_tcp_close(bindings->tcp_context) != 0);
 }
 
 bool value_to_u64(v8::Local<v8::Value> value, uint64_t* output) {
@@ -250,8 +559,9 @@ void set_event_loop_function(v8::Isolate* isolate,
 	object->Set(key, v8::FunctionTemplate::New(isolate, callback, data));
 }
 
-v8::Local<v8::ObjectTemplate> create_global_template(v8::Isolate* isolate,
-													 void* event_loop) {
+v8::Local<v8::ObjectTemplate> create_global_template(
+		v8::Isolate* isolate, void* event_loop, DeviceBindings* devices,
+		TimerBindings* timers) {
 	auto data = v8::External::New(isolate, event_loop,
 								  v8::kExternalPointerTypeTagDefault);
 	auto events = v8::ObjectTemplate::New(isolate);
@@ -271,6 +581,33 @@ v8::Local<v8::ObjectTemplate> create_global_template(v8::Isolate* isolate,
 							event_loop_next_deadline);
 	auto kz = v8::ObjectTemplate::New(isolate);
 	kz->Set(v8::String::NewFromUtf8Literal(isolate, "events"), events);
+	auto timer_data = v8::External::New(isolate, timers,
+												v8::kExternalPointerTypeTagDefault);
+	auto timer = v8::ObjectTemplate::New(isolate);
+	set_event_loop_function(isolate, timer, timer_data, "setTimeout",
+							timer_set_timeout);
+	set_event_loop_function(isolate, timer, timer_data, "clearTimeout",
+							timer_clear_timeout);
+	kz->Set(v8::String::NewFromUtf8Literal(isolate, "timer"), timer);
+	auto device_data = v8::External::New(isolate, devices,
+												v8::kExternalPointerTypeTagDefault);
+	auto block = v8::ObjectTemplate::New(isolate);
+	block->Set(v8::String::NewFromUtf8Literal(isolate, "available"),
+				v8::Boolean::New(isolate, devices->block_device != nullptr));
+	set_event_loop_function(isolate, block, device_data, "capacitySectors",
+							block_capacity);
+	set_event_loop_function(isolate, block, device_data, "read", block_read);
+	set_event_loop_function(isolate, block, device_data, "write", block_write);
+	kz->Set(v8::String::NewFromUtf8Literal(isolate, "block"), block);
+	auto tcp = v8::ObjectTemplate::New(isolate);
+	tcp->Set(v8::String::NewFromUtf8Literal(isolate, "available"),
+			 v8::Boolean::New(isolate,
+							 kz_host_tcp_available(devices->tcp_context) != 0));
+	set_event_loop_function(isolate, tcp, device_data, "connect", tcp_connect);
+	set_event_loop_function(isolate, tcp, device_data, "send", tcp_send);
+	set_event_loop_function(isolate, tcp, device_data, "receive", tcp_receive);
+	set_event_loop_function(isolate, tcp, device_data, "close", tcp_close);
+	kz->Set(v8::String::NewFromUtf8Literal(isolate, "tcp"), tcp);
 	auto global = v8::ObjectTemplate::New(isolate);
 	global->Set(v8::String::NewFromUtf8Literal(isolate, "kz"), kz);
 	return global;
@@ -314,9 +651,74 @@ void report_result(std::int32_t value) {
 	report(message, length);
 }
 
+bool global_boolean(v8::Isolate* isolate, v8::Local<v8::Context> context,
+					const char* name) {
+	auto key = v8::String::NewFromUtf8(isolate, name).ToLocalChecked();
+	v8::Local<v8::Value> value;
+	if (!context->Global()->Get(context, key).ToLocal(&value) ||
+			!value->IsBoolean()) {
+		return false;
+	}
+	return value.As<v8::Boolean>()->Value();
+}
+
+bool timers_pending(const TimerBindings& timers) {
+	for (const TimerSlot& slot : timers.slots) {
+		if (slot.active) return true;
+	}
+	return false;
+}
+
+bool dispatch_timer_event(v8::Isolate* isolate,
+							  v8::Local<v8::Context> context,
+							  TimerBindings* timers,
+							  const KzRawEvent& event) {
+	if (event.kind != 1) return true;
+	for (TimerSlot& slot : timers->slots) {
+		if (!slot.active || slot.id != event.id) continue;
+		auto callback = slot.callback.Get(isolate);
+		slot.active = false;
+		slot.callback.Reset();
+		v8::TryCatch try_catch(isolate);
+		v8::Local<v8::Value> result;
+		const bool called = callback
+								->Call(context, context->Global(), 0, nullptr)
+								.ToLocal(&result);
+		isolate->PerformMicrotaskCheckpoint();
+		return called && !try_catch.HasCaught();
+	}
+	return true;
+}
+
+bool pump_timer_callbacks(v8::Isolate* isolate,
+						  v8::Local<v8::Context> context,
+						  TimerBindings* timers,
+						  void* event_loop) {
+	const uint64_t started = kz_host_time_ns();
+	for (size_t iteration = 0;
+		 iteration < 1'000'000 && timers_pending(*timers); ++iteration) {
+		KzRawEvent event{};
+		const int has_event = kz_host_event_loop_poll(event_loop, &event);
+		if (has_event) {
+			if (!dispatch_timer_event(isolate, context, timers, event)) return false;
+		} else {
+			uint64_t deadline_ns = 0;
+			if (!kz_host_event_loop_next_deadline(event_loop, &deadline_ns)) {
+				return false;
+			}
+			if (kz_host_time_ns() < deadline_ns) {
+				kz_host_wait_for_interrupt();
+			}
+		}
+		if (kz_host_time_ns() - started >= 1'000'000'000) break;
+	}
+	return !timers_pending(*timers);
+}
+
 }  // namespace
 
-extern "C" int kz_v8_run_smoke(void* event_loop) {
+extern "C" int kz_v8_run_smoke(void* event_loop, void* block_device,
+								  void* tcp_context) {
 	if (event_loop == nullptr) return -6;
 	report("kz: V8 smoke entered\n", sizeof("kz: V8 smoke entered\n") - 1);
 #if !defined(KZ_FREESTANDING)
@@ -357,6 +759,10 @@ extern "C" int kz_v8_run_smoke(void* event_loop) {
 		return -4;
 	}
 	report("kz: V8 isolate created\n", sizeof("kz: V8 isolate created\n") - 1);
+	isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+	DeviceBindings devices{block_device, tcp_context};
+	TimerBindings timers{};
+	timers.event_loop = event_loop;
 
 	bool succeeded = false;
 	std::int32_t script_result = -1;
@@ -365,10 +771,24 @@ extern "C" int kz_v8_run_smoke(void* event_loop) {
 		v8::HandleScope handle_scope(isolate);
 		v8::Local<v8::Context> context =
 				v8::Context::New(isolate, nullptr,
-								 create_global_template(isolate, event_loop));
+								 create_global_template(isolate, event_loop, &devices,
+																 &timers));
 		if (!context.IsEmpty()) {
 			report("kz: V8 context created\n", sizeof("kz: V8 context created\n") - 1);
 			v8::Context::Scope context_scope(context);
+			auto console = v8::Object::New(isolate);
+			auto console_data = v8::External::New(
+					isolate, &devices, v8::kExternalPointerTypeTagDefault);
+			auto console_function = v8::Function::New(
+					context, console_log, console_data).ToLocalChecked();
+			console
+					->Set(context, v8::String::NewFromUtf8Literal(isolate, "log"),
+						  console_function)
+					.Check();
+			context->Global()
+					->Set(context, v8::String::NewFromUtf8Literal(isolate, "console"),
+						  console)
+					.Check();
 			v8::Local<v8::String> source = v8::String::NewFromUtf8Literal(
 					isolate,
 					"(function(){const token=kz.events.register(23n,1,7n);"
@@ -386,7 +806,37 @@ extern "C" int kz_v8_run_smoke(void* event_loop) {
 					"const cancelOk=kz.events.cancelTimer(canceled);"
 					"const noDeadline=kz.events.nextDeadline()===null;"
 					"const removed=kz.events.deregister(token);"
-					"return ready&&timed&&completed&&cancelOk&&noDeadline&&removed?6*7:-4;})()");
+					"globalThis.__kzBlockDone=false;globalThis.__kzTcpDone=false;"
+					"console.log('kz: JavaScript console binding OK');"
+					"if(kz.block.available){if(kz.block.capacitySectors()<10n)return -5;"
+					"const seed=kz.block.read(8n,512);"
+					"if(seed[0]!==90||seed[1]!==165)return -6;"
+					"const pattern=new Uint8Array(512);"
+					"for(let i=0;i<512;i++)pattern[i]=(i*17+3)&255;"
+					"if(kz.block.write(9n,pattern)!==512)return -7;"
+					"const actual=kz.block.read(9n,512);"
+					"for(let i=0;i<512;i++)if(actual[i]!==pattern[i])return -8;"
+					"console.log('kz: raw block binding OK');"
+					"globalThis.__kzBlockDone=true;}"
+					"if(kz.tcp.available){"
+					"if(!kz.tcp.connect(new Uint8Array([10,0,2,2]),17777))return -9;"
+					"const payload=new Uint8Array([75,90,33,10]);"
+					"if(kz.tcp.send(payload)!==payload.length)return -10;"
+					"const reply=kz.tcp.receive(payload.length);"
+					"let tcpOk=reply.length===payload.length;"
+					"for(let i=0;i<payload.length;i++)if(reply[i]!==payload[i])tcpOk=false;"
+					"kz.tcp.close();if(!tcpOk)return -11;"
+					"console.log('kz: TCP binding OK');"
+					"globalThis.__kzTcpDone=true;}"
+					"globalThis.__kzPromiseDone=false;"
+					"globalThis.__kzTimerDone=false;"
+					"globalThis.__kzTimerMicrotaskDone=false;"
+					"Promise.resolve().then(()=>{globalThis.__kzPromiseDone=true;});"
+					"const promiseDeferred=!globalThis.__kzPromiseDone;"
+					"kz.timer.setTimeout(()=>{globalThis.__kzTimerDone=true;"
+					"Promise.resolve().then(()=>{globalThis.__kzTimerMicrotaskDone=true;});},0);"
+					"return ready&&timed&&completed&&cancelOk&&noDeadline&&removed&&"
+					"promiseDeferred?6*7:-12;})()");
 			v8::Local<v8::Script> script;
 			if (v8::Script::Compile(context, source).ToLocal(&script)) {
 				report("kz: V8 script compiled\n", sizeof("kz: V8 script compiled\n") - 1);
@@ -394,10 +844,25 @@ extern "C" int kz_v8_run_smoke(void* event_loop) {
 				if (script->Run(context).ToLocal(&result)) {
 					report("kz: V8 script ran\n", sizeof("kz: V8 script ran\n") - 1);
 					script_result = result->Int32Value(context).FromMaybe(-1);
-					succeeded = script_result == 42;
+					isolate->PerformMicrotaskCheckpoint();
+					const bool promise_done =
+							global_boolean(isolate, context, "__kzPromiseDone");
+					const bool timer_done = pump_timer_callbacks(
+							isolate, context, &timers, event_loop);
+					const bool block_done =
+							global_boolean(isolate, context, "__kzBlockDone");
+					const bool tcp_done =
+							global_boolean(isolate, context, "__kzTcpDone");
+					succeeded = script_result == 42 && devices.console_called &&
+							block_done && tcp_done && promise_done && timer_done &&
+							global_boolean(isolate, context, "__kzTimerDone") &&
+							global_boolean(isolate, context,
+												"__kzTimerMicrotaskDone");
 					if (succeeded) {
 						report("kz: V8 event loop smoke OK\n",
 								 sizeof("kz: V8 event loop smoke OK\n") - 1);
+						report("kz: V8 explicit microtasks OK\n",
+								 sizeof("kz: V8 explicit microtasks OK\n") - 1);
 					}
 					report_result(script_result);
 				}
@@ -405,7 +870,13 @@ extern "C" int kz_v8_run_smoke(void* event_loop) {
 		}
 	}
 
-	for (size_t count = 0; count < 128 && kz_os_platform_pump_one(platform); count++) {
+	for (TimerSlot& slot : timers.slots) {
+		if (slot.active) {
+			static_cast<void>(
+					kz_host_event_loop_cancel_timer(event_loop, slot.id));
+			slot.active = false;
+			slot.callback.Reset();
+		}
 	}
 	report("kz: V8 disposing isolate\n", sizeof("kz: V8 disposing isolate\n") - 1);
 	isolate->Dispose();

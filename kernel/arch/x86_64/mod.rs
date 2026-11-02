@@ -16,6 +16,13 @@ mod threads;
 pub(crate) mod timer;
 mod virtio;
 
+#[cfg(all(feature = "fpu-x87", feature = "fpu-sse"))]
+compile_error!("select exactly one of fpu-x87, fpu-sse, or fpu-avx");
+#[cfg(not(any(feature = "fpu-x87", feature = "fpu-sse")))]
+compile_error!("select one of fpu-x87, fpu-sse, or fpu-avx");
+
+pub(crate) use threads::FpuContext;
+
 pub(crate) const MAX_CPUS: usize = 8;
 pub(crate) const VM_ARENA_SIZE: usize = 1 << 36;
 pub(crate) const VM_BASE: usize = 0x10_0000_0000;
@@ -104,8 +111,13 @@ pub(crate) fn high_memory_smoke() -> bool {
     mapped && released
 }
 
-pub(crate) fn switch_thread(old_stack: &mut usize, new_stack: usize) {
-    unsafe { threads::switch(old_stack, new_stack) }
+pub(crate) fn switch_thread(
+    old_stack: &mut usize,
+    new_stack: usize,
+    old_fpu_context: &mut FpuContext,
+    new_fpu_context: &FpuContext,
+) {
+    unsafe { threads::switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
 }
 
 pub(crate) fn initialize_interrupt_controller() -> bool {

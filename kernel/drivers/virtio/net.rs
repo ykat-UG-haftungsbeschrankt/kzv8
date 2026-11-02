@@ -5,16 +5,32 @@
  * free of charge, without warranty of any kind.
  */
 
-use alloc::boxed::Box;
-
 use crate::dma::{self, DmaBuffer};
 use crate::virtio_queue::{Descriptor, VirtQueue};
 use crate::virtio_transport::VirtioTransport;
 
 const DEVICE_ID: u32 = 1;
 const QUEUE_SIZE: usize = 8;
-const HEADER_SIZE: usize = 10;
+const HEADER_SIZE: usize = 12;
+const FEATURE_MRG_RXBUF: u64 = 1 << 15;
 pub(crate) const MTU: usize = 1500;
+
+fn allocate_queue() -> Option<DmaBuffer> {
+    let mut storage = dma::allocate(
+        core::mem::size_of::<VirtQueue<QUEUE_SIZE>>(),
+        core::mem::align_of::<VirtQueue<QUEUE_SIZE>>(),
+    )?;
+    let pointer = storage
+        .as_mut_slice()
+        .as_mut_ptr()
+        .cast::<VirtQueue<QUEUE_SIZE>>();
+    unsafe { pointer.write(VirtQueue::new()) };
+    Some(storage)
+}
+
+fn queue_from_dma(storage: &mut DmaBuffer) -> &mut VirtQueue<QUEUE_SIZE> {
+    unsafe { &mut *storage.as_mut_slice().as_mut_ptr().cast() }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
@@ -34,12 +50,13 @@ struct NetHeader {
     gso_size: u16,
     checksum_start: u16,
     checksum_offset: u16,
+    num_buffers: u16,
 }
 
 pub(crate) struct VirtioNet {
     transport: VirtioTransport,
-    receive_queue: Box<VirtQueue<QUEUE_SIZE>>,
-    transmit_queue: Box<VirtQueue<QUEUE_SIZE>>,
+    receive_queue: DmaBuffer,
+    transmit_queue: DmaBuffer,
     receive_buffer: DmaBuffer,
     transmit_buffer: DmaBuffer,
     receive_head: Option<u16>,
@@ -54,14 +71,18 @@ impl VirtioNet {
             VirtioTransport::initialize_with_features(
                 candidate.base(),
                 DEVICE_ID,
-                VirtioTransport::net_mac_feature(),
+                VirtioTransport::net_mac_feature() | FEATURE_MRG_RXBUF,
             )
         }
         .ok()?;
-        let mut receive_queue = Box::new(VirtQueue::new());
-        let mut transmit_queue = Box::new(VirtQueue::new());
-        receive_queue.configure(&transport, 0).ok()?;
-        transmit_queue.configure(&transport, 1).ok()?;
+        let mut receive_queue = allocate_queue()?;
+        let mut transmit_queue = allocate_queue()?;
+        queue_from_dma(&mut receive_queue)
+            .configure(&transport, 0)
+            .ok()?;
+        queue_from_dma(&mut transmit_queue)
+            .configure(&transport, 1)
+            .ok()?;
         if !transport.activate() {
             return None;
         }
@@ -123,8 +144,7 @@ impl VirtioNet {
                 false,
             ),
         ];
-        let head = self
-            .transmit_queue
+        let head = queue_from_dma(&mut self.transmit_queue)
             .submit(&descriptors)
             .ok_or(Error::QueueBusy)?;
         self.transmit_head = Some(head);
@@ -137,7 +157,7 @@ impl VirtioNet {
         let Some(expected) = self.transmit_head else {
             return Ok(true);
         };
-        let Some(used) = self.transmit_queue.poll_used() else {
+        let Some(used) = queue_from_dma(&mut self.transmit_queue).poll_used() else {
             return Ok(false);
         };
         self.transmit_head = None;
@@ -159,8 +179,7 @@ impl VirtioNet {
                 Descriptor::new(base, HEADER_SIZE as u32, true),
                 Descriptor::new(base + HEADER_SIZE as u64, MTU as u32, true),
             ];
-            let head = self
-                .receive_queue
+            let head = queue_from_dma(&mut self.receive_queue)
                 .submit(&descriptors)
                 .ok_or(Error::QueueBusy)?;
             dma::sync_for_device();
@@ -169,7 +188,7 @@ impl VirtioNet {
         }
 
         let head = self.receive_head.unwrap();
-        let Some(used) = self.receive_queue.poll_used() else {
+        let Some(used) = queue_from_dma(&mut self.receive_queue).poll_used() else {
             return Ok(None);
         };
         self.receive_head = None;

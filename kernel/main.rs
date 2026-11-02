@@ -54,8 +54,6 @@ mod virtio_block;
 mod virtio_net;
 #[path = "drivers/virtio/queue.rs"]
 mod virtio_queue;
-#[path = "drivers/virtio/rng.rs"]
-mod virtio_rng;
 #[path = "drivers/virtio/transport.rs"]
 mod virtio_transport;
 
@@ -103,9 +101,8 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         "unable to initialize the interrupt controller"
     );
     arch::timer::initialize();
-    let _block_device = block_device::BlockDevice::initialize();
+    let mut block_device = block_device::BlockDevice::initialize();
     let mut network_stack = net_stack::NetStack::initialize();
-    let _rng_device = virtio_rng::VirtioRng::initialize();
     let mut events = event_loop::EventLoop::<16>::new();
     let network_registration = events
         .register(
@@ -147,7 +144,12 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
             if unsafe { kz_c_pthread_smoke() } == 0 {
                 let _thread_status = console::write(b"kz: pthreads smoke OK\n");
             }
-            runtime::run(&mut events);
+            runtime::run(
+                &mut events,
+                block_device.as_mut(),
+                network_stack.as_mut(),
+                network_registration,
+            );
         }
     }
     scheduler::task::run_forever()

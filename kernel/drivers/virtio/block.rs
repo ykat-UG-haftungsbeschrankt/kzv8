@@ -5,8 +5,6 @@
  * free of charge, without warranty of any kind.
  */
 
-use alloc::boxed::Box;
-
 use crate::dma::{self, DmaBuffer};
 use crate::virtio_queue::{Descriptor, VirtQueue};
 use crate::virtio_transport::VirtioTransport;
@@ -34,7 +32,7 @@ pub(crate) enum Error {
 
 pub(crate) struct BlockDevice {
     transport: VirtioTransport,
-    queue: Box<VirtQueue<QUEUE_SIZE>>,
+    queue: DmaBuffer,
     capacity_sectors: u64,
     request_header: RequestHeader,
     request_status: u8,
@@ -46,8 +44,16 @@ impl BlockDevice {
     pub(crate) fn initialize() -> Option<Self> {
         let candidate = unsafe { VirtioTransport::find(DEVICE_ID)? };
         let transport = unsafe { VirtioTransport::initialize(candidate.base(), DEVICE_ID) }.ok()?;
-        let mut queue = Box::new(VirtQueue::new());
-        queue.configure(&transport, 0).ok()?;
+        let mut queue = dma::allocate(
+            core::mem::size_of::<VirtQueue<QUEUE_SIZE>>(),
+            core::mem::align_of::<VirtQueue<QUEUE_SIZE>>(),
+        )?;
+        let queue_pointer = queue
+            .as_mut_slice()
+            .as_mut_ptr()
+            .cast::<VirtQueue<QUEUE_SIZE>>();
+        unsafe { queue_pointer.write(VirtQueue::new()) };
+        unsafe { (&mut *queue_pointer).configure(&transport, 0) }.ok()?;
         if !transport.activate() {
             return None;
         }
@@ -104,6 +110,10 @@ impl BlockDevice {
         Ok(())
     }
 
+    fn queue_mut(&mut self) -> &mut VirtQueue<QUEUE_SIZE> {
+        unsafe { &mut *self.queue.as_mut_slice().as_mut_ptr().cast() }
+    }
+
     fn submit<'a>(
         &'a mut self,
         request_type: u32,
@@ -135,7 +145,7 @@ impl BlockDevice {
             ),
             Descriptor::new(&mut self.request_status as *mut u8 as u64, 1, true),
         ];
-        let head = self.queue.submit(&descriptors).ok_or(Error::QueueBusy)?;
+        let head = self.queue_mut().submit(&descriptors).ok_or(Error::QueueBusy)?;
         self.in_flight_head = Some(head);
         crate::dma::sync_for_device();
         self.transport.notify(0);
@@ -152,7 +162,7 @@ impl BlockDevice {
         let Some(expected) = self.in_flight_head else {
             return Ok(());
         };
-        let Some(used) = self.queue.poll_used() else {
+        let Some(used) = self.queue_mut().poll_used() else {
             return Err(Error::QueueBusy);
         };
         self.in_flight_head = None;
@@ -181,7 +191,7 @@ impl BlockTransfer<'_> {
         if self.complete {
             return Ok(true);
         }
-        let Some(used) = self.device.queue.poll_used() else {
+        let Some(used) = self.device.queue_mut().poll_used() else {
             return Ok(false);
         };
         self.device.in_flight_head = None;

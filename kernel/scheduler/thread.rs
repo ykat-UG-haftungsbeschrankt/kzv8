@@ -79,6 +79,10 @@ struct Thread {
     detached: bool,
     errno: i32,
     tls: [*mut c_void; MAX_TLS_KEYS],
+    #[cfg(target_arch = "x86_64")]
+    fpu_context: crate::arch::FpuContext,
+    #[cfg(target_arch = "aarch64")]
+    fpu_context: crate::arch::FpuContext,
 }
 
 impl Thread {
@@ -93,6 +97,10 @@ impl Thread {
         detached: false,
         errno: 0,
         tls: [core::ptr::null_mut(); MAX_TLS_KEYS],
+        #[cfg(target_arch = "x86_64")]
+        fpu_context: crate::arch::FpuContext::INITIAL,
+        #[cfg(target_arch = "aarch64")]
+        fpu_context: crate::arch::FpuContext::INITIAL,
     };
 }
 
@@ -188,7 +196,20 @@ fn switch_current(next_state: ThreadState) -> bool {
         CURRENT_SLOT = next;
         let old_stack = addr_of_mut!((*threads.add(current)).stack_pointer);
         let new_stack = (*threads.add(next)).stack_pointer;
-        crate::arch::switch_thread(&mut *old_stack, new_stack);
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::switch_thread(
+            &mut *old_stack,
+            new_stack,
+            &mut (*threads.add(current)).fpu_context,
+            &(*threads.add(next)).fpu_context,
+        );
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::switch_thread(
+            &mut *old_stack,
+            new_stack,
+            &mut (*threads.add(current)).fpu_context,
+            &(*threads.add(next)).fpu_context,
+        );
     }
     crate::arch::interrupts::restore(interrupt_state);
     true
@@ -235,7 +256,20 @@ fn exit_current(result: *mut c_void) -> ! {
             CURRENT_SLOT = next;
             let old_stack = addr_of_mut!((*threads.add(current)).stack_pointer);
             let new_stack = (*threads.add(next)).stack_pointer;
-            crate::arch::switch_thread(&mut *old_stack, new_stack);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::switch_thread(
+                &mut *old_stack,
+                new_stack,
+                &mut (*threads.add(current)).fpu_context,
+                &(*threads.add(next)).fpu_context,
+            );
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::switch_thread(
+                &mut *old_stack,
+                new_stack,
+                &mut (*threads.add(current)).fpu_context,
+                &(*threads.add(next)).fpu_context,
+            );
         }
     }
     crate::arch::halt()

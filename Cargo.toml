@@ -13,6 +13,13 @@ bench = false
 [dependencies]
 smoltcp = { version = "0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
 
+[features]
+default = ["fpu-sse"]
+fpu-x87 = []
+fpu-sse = []
+fpu-avx = ["fpu-sse"]
+aarch64-fpu-off = []
+
 [workspace]
 resolver = "2"
 

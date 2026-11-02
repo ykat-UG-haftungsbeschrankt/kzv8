@@ -45,6 +45,38 @@ _start:
     mov %cr4, %eax
     or $0x620, %eax
     mov %eax, %cr4
+#if defined(KZ_FPU_AVX)
+    mov $0, %eax
+    cpuid
+    cmp $0xd, %eax
+    jb .Lavx_unsupported
+    mov $1, %eax
+    cpuid
+    mov %ecx, %ebx
+    and $0x14000000, %ebx
+    cmp $0x14000000, %ebx
+    jne .Lavx_unsupported
+    mov $0xd, %eax
+    xor %ecx, %ecx
+    cpuid
+    and $7, %eax
+    cmp $7, %eax
+    jne .Lavx_unsupported
+    mov %cr4, %eax
+    or $0x40000, %eax
+    mov %eax, %cr4
+    xor %ecx, %ecx
+    mov $7, %eax
+    xor %edx, %edx
+    xsetbv
+    jmp .Lavx_ready
+.Lavx_unsupported:
+    cli
+.Lavx_halt:
+    hlt
+    jmp .Lavx_halt
+.Lavx_ready:
+#endif
     mov $pml4, %eax
     mov %eax, %cr3
     mov $0xc0000080, %ecx

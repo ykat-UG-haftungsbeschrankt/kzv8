@@ -52,6 +52,18 @@ rustup target add x86_64-unknown-none aarch64-unknown-none
 make test
 ```
 
+The x86 context-switch FPU format defaults to SSE. Select another mode with
+`make FPU_MODE=x87`, `make FPU_MODE=sse`, or `make FPU_MODE=avx`. AVX mode
+requires XSAVE and AVX support on every CPU and halts during startup otherwise.
+The x87 mode saves only x87 state; it is unsafe for code that uses SSE, including
+the current x86_64 V8 runtime. The AArch64 SIMD context is unaffected by
+`FPU_MODE`.
+
+For AArch64, the full SIMD context is saved by default. Set
+`AARCH64_FPU_STATE=off` to skip the full per-thread SIMD image; the switch still
+saves ABI-preserved `d8`-`d15`. Interrupt entry continues to preserve the full
+SIMD state.
+
 The root Cargo manifest defines the freestanding kernel package.
 `rust-toolchain.toml` selects stable Rust and the two targets. The kernel's
 build script assembles architecture entry code with Clang and applies the

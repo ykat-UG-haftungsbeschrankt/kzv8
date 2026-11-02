@@ -10,6 +10,13 @@ use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 static PAGE_FAULT_DIAGNOSTIC: AtomicBool = AtomicBool::new(false);
+const FPU_MODE: usize = if cfg!(feature = "fpu-x87") {
+    0
+} else if cfg!(feature = "fpu-avx") {
+    2
+} else {
+    1
+};
 
 core::arch::global_asm!(
     ".section .text,\"ax\"",
@@ -38,11 +45,33 @@ core::arch::global_asm!(
     "push r14",
     "push r15",
     "mov r12, rsp",
+    ".if {fpu_mode} == 0",
+    "sub rsp, 128",
+    "and rsp, -16",
+    "fnsave [rsp]",
+    ".elseif {fpu_mode} == 1",
     "sub rsp, 528",
     "and rsp, -16",
     "fxsave64 [rsp]",
+    ".else",
+    "sub rsp, 896",
+    "and rsp, -64",
+    "mov r8, rsp",
+    "mov eax, 7",
+    "xor edx, edx",
+    "xsave64 [r8]",
+    ".endif",
     "call x86_irq_dispatch",
+    ".if {fpu_mode} == 0",
+    "frstor [rsp]",
+    ".elseif {fpu_mode} == 1",
     "fxrstor64 [rsp]",
+    ".else",
+    "mov r8, rsp",
+    "mov eax, 7",
+    "xor edx, edx",
+    "xrstor64 [r8]",
+    ".endif",
     "mov rsp, r12",
     "pop r15",
     "pop r14",
@@ -79,13 +108,35 @@ core::arch::global_asm!(
     "push r14",
     "push r15",
     "mov r12, rsp",
+    ".if {fpu_mode} == 0",
+    "sub rsp, 128",
+    "and rsp, -16",
+    "fnsave [rsp]",
+    ".elseif {fpu_mode} == 1",
     "sub rsp, 528",
     "and rsp, -16",
     "fxsave64 [rsp]",
+    ".else",
+    "sub rsp, 896",
+    "and rsp, -64",
+    "mov r8, rsp",
+    "mov eax, 7",
+    "xor edx, edx",
+    "xsave64 [r8]",
+    ".endif",
     "mov rdi, cr2",
     "mov rsi, [r12 + 120]",
     "call x86_page_fault_dispatch",
+    ".if {fpu_mode} == 0",
+    "frstor [rsp]",
+    ".elseif {fpu_mode} == 1",
     "fxrstor64 [rsp]",
+    ".else",
+    "mov r8, rsp",
+    "mov eax, 7",
+    "xor edx, edx",
+    "xrstor64 [r8]",
+    ".endif",
     "mov rsp, r12",
     "test rax, rax",
     "jz x86_unhandled_interrupt",
@@ -109,6 +160,7 @@ core::arch::global_asm!(
     ".global x86_spurious_interrupt",
     "x86_spurious_interrupt:",
     "iretq",
+    fpu_mode = const FPU_MODE,
 );
 
 unsafe extern "C" {

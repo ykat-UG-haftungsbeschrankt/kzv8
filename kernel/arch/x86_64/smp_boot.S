@@ -43,6 +43,38 @@ ap_trampoline_pm32:
     movl %cr4, %eax
     orl $0x620, %eax
     movl %eax, %cr4
+#if defined(KZ_FPU_AVX)
+    movl $0, %eax
+    cpuid
+    cmpl $0xd, %eax
+    jb .Lap_avx_unsupported
+    movl $1, %eax
+    cpuid
+    movl %ecx, %ebx
+    andl $0x14000000, %ebx
+    cmpl $0x14000000, %ebx
+    jne .Lap_avx_unsupported
+    movl $0xd, %eax
+    xorl %ecx, %ecx
+    cpuid
+    andl $7, %eax
+    cmpl $7, %eax
+    jne .Lap_avx_unsupported
+    movl %cr4, %eax
+    orl $0x40000, %eax
+    movl %eax, %cr4
+    xorl %ecx, %ecx
+    movl $7, %eax
+    xorl %edx, %edx
+    xsetbv
+    jmp .Lap_avx_ready
+.Lap_avx_unsupported:
+    cli
+.Lap_avx_halt:
+    hlt
+    jmp .Lap_avx_halt
+.Lap_avx_ready:
+#endif
     movl $0x80000001, %eax
     cpuid
     movl %edx, %ebx
