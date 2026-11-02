@@ -5,6 +5,9 @@ use crate::sync::IrqSpinLock;
 
 pub(crate) const PAGE_SIZE: usize = 4096;
 
+#[cfg(target_arch = "x86_64")]
+const VM_ARENA_SIZE: usize = 1 << 35;
+#[cfg(target_arch = "aarch64")]
 const VM_ARENA_SIZE: usize = 1 << 30;
 const MAX_VM_PAGES: usize = VM_ARENA_SIZE / PAGE_SIZE;
 const MAX_VM_AREAS: usize = 16384;
@@ -12,7 +15,7 @@ const VM_RESERVED: u8 = 1 << 7;
 const VM_PERMISSION_MASK: u8 = 0x07;
 
 #[cfg(target_arch = "x86_64")]
-const VM_BASE: usize = 0xffff_8000_0000_0000;
+const VM_BASE: usize = 0x10_0000_0000;
 #[cfg(target_arch = "aarch64")]
 const VM_BASE: usize = 511usize << 30;
 
@@ -47,6 +50,10 @@ pub(super) fn initialize() {
     crate::arch::initialize_mmu();
 }
 
+pub(crate) const fn allocator_base() -> usize {
+    VM_BASE
+}
+
 fn rounded_length(length: usize) -> Option<usize> {
     length
         .checked_add(PAGE_SIZE - 1)
@@ -60,10 +67,19 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
 }
 
 pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Option<usize> {
+    reserve_with_hint(None, length, alignment, permissions)
+}
+
+pub(crate) fn reserve_with_hint(
+    hint: Option<usize>,
+    length: usize,
+    alignment: usize,
+    permissions: i32,
+) -> Option<usize> {
     if length == 0
         || alignment == 0
         || !alignment.is_power_of_two()
-        || !(0..=4).contains(&permissions)
+        || !(0..=5).contains(&permissions)
     {
         return None;
     }
@@ -85,10 +101,21 @@ pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Opti
     }
     let area_slot = area_slot?;
 
-    let mut candidate_page = 0usize;
+    let mut candidate_page = if let Some(address) = hint {
+        if address < VM_BASE || address % alignment != 0 {
+            return None;
+        }
+        address.checked_sub(VM_BASE)? / PAGE_SIZE
+    } else {
+        0
+    };
     loop {
         let candidate_address = VM_BASE.checked_add(candidate_page.checked_mul(PAGE_SIZE)?)?;
-        let address = align_up(candidate_address, alignment)?;
+        let address = if hint.is_some() {
+            candidate_address
+        } else {
+            align_up(candidate_address, alignment)?
+        };
         let start_page = address.checked_sub(VM_BASE)? / PAGE_SIZE;
         let end_page = start_page.checked_add(page_count)?;
         if end_page > MAX_VM_PAGES {
@@ -98,11 +125,15 @@ pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Opti
         let occupied = (start_page..end_page)
             .find(|page| PAGE_STATE[*page].load(Ordering::Acquire) & VM_RESERVED != 0);
         if let Some(occupied_page) = occupied {
+            if hint.is_some() {
+                return None;
+            }
             candidate_page = occupied_page + 1;
             continue;
         }
 
-        let state = VM_RESERVED | permissions as u8;
+        let state_permissions = if permissions == 5 { 0 } else { permissions as u8 };
+        let state = VM_RESERVED | state_permissions;
         for page in start_page..end_page {
             PAGE_STATE[page].store(state, Ordering::Release);
         }
@@ -155,6 +186,125 @@ pub(crate) fn release(address: usize, length: usize) -> bool {
         return false;
     }
 
+    let released = release_pages(start_page, end_page);
+    unsafe { areas.add(area_slot).write(VmArea::EMPTY) };
+    released
+}
+
+pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -> bool {
+    if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 || new_length > length {
+        return false;
+    }
+    let Some(length) = rounded_length(length) else {
+        return false;
+    };
+    let Some(new_length) = rounded_length(new_length) else {
+        return false;
+    };
+    if new_length > length {
+        return false;
+    }
+    if new_length == length {
+        return true;
+    }
+
+    let Some(offset) = address.checked_sub(VM_BASE) else {
+        return false;
+    };
+    let start_page = offset / PAGE_SIZE;
+    let old_page_count = length / PAGE_SIZE;
+    let new_page_count = new_length / PAGE_SIZE;
+    let Some(release_start) = start_page.checked_add(new_page_count) else {
+        return false;
+    };
+    let Some(release_end) = start_page.checked_add(old_page_count) else {
+        return false;
+    };
+    if release_end > MAX_VM_PAGES {
+        return false;
+    }
+
+    let _guard = VM_LOCK.lock();
+    let areas = addr_of_mut!(VM_AREAS).cast::<VmArea>();
+    let mut slot = None;
+    for index in 0..MAX_VM_AREAS {
+        let area = unsafe { &*areas.add(index) };
+        if area.active && area.start_page == start_page && area.page_count == old_page_count {
+            slot = Some(index);
+            break;
+        }
+    }
+    let Some(slot) = slot else {
+        return false;
+    };
+    if (release_start..release_end)
+        .any(|page| PAGE_STATE[page].load(Ordering::Acquire) & VM_RESERVED == 0)
+    {
+        return false;
+    }
+
+    let released = release_pages(release_start, release_end);
+    if new_page_count == 0 {
+        unsafe { areas.add(slot).write(VmArea::EMPTY) };
+    } else {
+        unsafe {
+            (*areas.add(slot)).page_count = new_page_count;
+        }
+    }
+    released
+}
+
+pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -> bool {
+    if address < VM_BASE
+        || address % PAGE_SIZE != 0
+        || length == 0
+        || !(0..=4).contains(&permissions)
+    {
+        return false;
+    }
+    let Some(length) = rounded_length(length) else {
+        return false;
+    };
+    let Some(start_page) = address.checked_sub(VM_BASE).map(|offset| offset / PAGE_SIZE) else {
+        return false;
+    };
+    let page_count = length / PAGE_SIZE;
+    let Some(end_page) = start_page.checked_add(page_count) else {
+        return false;
+    };
+    if end_page > MAX_VM_PAGES {
+        return false;
+    }
+
+    let _guard = VM_LOCK.lock();
+    let areas = addr_of_mut!(VM_AREAS).cast::<VmArea>();
+    let range_reserved = (0..MAX_VM_AREAS).any(|index| {
+        let area = unsafe { &*areas.add(index) };
+        area.active
+            && start_page >= area.start_page
+            && end_page <= area.start_page.saturating_add(area.page_count)
+    });
+    if !range_reserved {
+        return false;
+    }
+
+    for page in start_page..end_page {
+        let state = PAGE_STATE[page].load(Ordering::Acquire);
+        if state & VM_RESERVED == 0 {
+            return false;
+        }
+        let virtual_address = VM_BASE + page * PAGE_SIZE;
+        if crate::arch::page_has_backing(virtual_address)
+            && !crate::arch::set_page_permissions(virtual_address, PAGE_SIZE, permissions)
+        {
+            return false;
+        }
+        PAGE_STATE[page].store(VM_RESERVED | permissions as u8, Ordering::Release);
+    }
+    true
+}
+
+fn release_pages(start_page: usize, end_page: usize) -> bool {
     let mut released = true;
     for page in start_page..end_page {
         let virtual_address = VM_BASE + page * PAGE_SIZE;
@@ -165,7 +315,6 @@ pub(crate) fn release(address: usize, length: usize) -> bool {
         }
         PAGE_STATE[page].store(0, Ordering::Release);
     }
-    unsafe { areas.add(area_slot).write(VmArea::EMPTY) };
     released
 }
 

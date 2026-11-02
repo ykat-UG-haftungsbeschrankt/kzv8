@@ -72,7 +72,6 @@ pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i
         || address % PAGE_SIZE != 0
         || length % PAGE_SIZE != 0
         || address.checked_add(length).is_none()
-        || address.checked_add(length).unwrap() > crate::platform::MAX_PHYSICAL_ADDRESS
     {
         return false;
     }
@@ -152,7 +151,7 @@ pub(crate) fn unmap_page(virtual_address: usize) -> Option<usize> {
     let _guard = PAGE_TABLE_LOCK.lock();
     let entry = page_table_entry(virtual_address, false)?;
     let current = unsafe { read_volatile(entry) };
-    if current & PRESENT == 0 {
+    if current == 0 {
         return None;
     }
     unsafe {
@@ -173,6 +172,17 @@ pub(crate) fn page_is_mapped(virtual_address: usize) -> bool {
     let _guard = PAGE_TABLE_LOCK.lock();
     match page_table_entry(virtual_address, false) {
         Some(entry) => unsafe { read_volatile(entry) & PRESENT != 0 },
+        None => false,
+    }
+}
+
+pub(crate) fn page_has_backing(virtual_address: usize) -> bool {
+    if virtual_address % PAGE_SIZE != 0 {
+        return false;
+    }
+    let _guard = PAGE_TABLE_LOCK.lock();
+    match page_table_entry(virtual_address, false) {
+        Some(entry) => unsafe { read_volatile(entry) & PAGE_ADDRESS_MASK != 0 },
         None => false,
     }
 }

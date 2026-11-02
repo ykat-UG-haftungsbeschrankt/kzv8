@@ -12,7 +12,8 @@ extern "C" {
 uint64_t kz_host_time_ns();
 int64_t kz_host_wall_time_ms();
 #if defined(KZ_FREESTANDING)
-void* kz_host_v8_allocate_pages(size_t length, size_t alignment,
+void* kz_host_v8_random_mmap_addr();
+void* kz_host_v8_allocate_pages(void* hint, size_t length, size_t alignment,
 																int permissions);
 int kz_host_v8_free_pages(void* address, size_t length);
 int kz_host_v8_release_pages(void* address, size_t length, size_t new_length);
@@ -51,11 +52,11 @@ class KernelPageAllocator final : public v8::PageAllocator {
 	size_t AllocatePageSize() override { return 4096; }
 	size_t CommitPageSize() override { return 4096; }
 	void SetRandomMmapSeed(int64_t) override {}
-	void* GetRandomMmapAddr() override { return nullptr; }
+	void* GetRandomMmapAddr() override { return kz_host_v8_random_mmap_addr(); }
 
-	void* AllocatePages(void*, size_t length, size_t alignment,
+	void* AllocatePages(void* hint, size_t length, size_t alignment,
 											Permission permissions) override {
-		return kz_host_v8_allocate_pages(length, alignment,
+		return kz_host_v8_allocate_pages(hint, length, alignment,
 																		 static_cast<int>(permissions));
 	}
 

@@ -1,5 +1,8 @@
 use core::mem::size_of;
 use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static PAGE_FAULT_DIAGNOSTIC: AtomicBool = AtomicBool::new(false);
 
 core::arch::global_asm!(
     ".section .text,\"ax\"",
@@ -351,5 +354,14 @@ extern "C" fn x86_page_fault_dispatch(address: usize, error_code: u64) -> u64 {
     } else {
         crate::memory::FaultAccess::Read
     };
-    crate::memory::resolve_page_fault(address, access) as u64
+    let resolved = crate::memory::resolve_page_fault(address, access);
+    if !PAGE_FAULT_DIAGNOSTIC.swap(true, Ordering::AcqRel) {
+        let message = if resolved {
+            b"kz: first lazy page fault resolved\n" as &[u8]
+        } else {
+            b"kz: first lazy page fault rejected\n" as &[u8]
+        };
+        let _written = crate::console::write(message);
+    }
+    resolved as u64
 }

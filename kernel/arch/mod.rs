@@ -161,6 +161,17 @@ pub(crate) fn page_is_mapped(virtual_address: usize) -> bool {
     }
 }
 
+pub(crate) fn page_has_backing(virtual_address: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        paging::page_has_backing(virtual_address)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        ram_map::page_is_mapped(virtual_address)
+    }
+}
+
 pub(crate) fn notify_executor() {
     smp::notify_executor();
 }

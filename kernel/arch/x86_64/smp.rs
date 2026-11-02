@@ -17,6 +17,11 @@ unsafe extern "C" {
 
 pub(crate) fn start_secondary_cpus() {
     let cpu_count = detected_cpu_count().min(super::MAX_CPUS);
+    let _diagnostic = crate::console::write(if cpu_count == 1 {
+        b"kz: smp detected 1 cpu\n"
+    } else {
+        b"kz: smp detected multiple cpus\n"
+    });
     if cpu_count < 2 {
         return;
     }

@@ -105,7 +105,7 @@ pub unsafe extern "C" fn mprotect(
         set_errno(EINVAL);
         return -1;
     };
-    if !crate::arch::set_page_permissions(address as usize, length, permissions) {
+    if !crate::memory::set_permissions(address as usize, length, permissions) {
         set_errno(ENOMEM);
         return -1;
     }

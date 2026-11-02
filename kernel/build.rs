@@ -145,6 +145,7 @@ fn main() {
             .args([
                 "-std=c11",
                 "-ffreestanding",
+                "-fPIC",
                 "-fno-builtin",
                 "-fno-stack-protector",
                 "-fno-unwind-tables",
@@ -198,6 +199,7 @@ fn main() {
                     "-std=c++20",
                     "-nostdinc++",
                     "-ffreestanding",
+                    "-fPIC",
                     "-fno-exceptions",
                     "-fno-rtti",
                     "-fno-stack-protector",
