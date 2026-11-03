@@ -5,13 +5,14 @@ mod runtime_libc;
 #[path = "v8.rs"]
 mod runtime_v8;
 
-use crate::kernel::arch;
+use crate::kernel::arch::traits::MemoryArchitecture as _;
+use crate::kernel::arch::MemoryArchitecture;
 use crate::kernel::block::device::BlockDevice;
 use crate::kernel::driver::virtio::console::Console;
 use crate::kernel::event::r#loop::{EventLoop, EventSourceToken};
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::net::stack::NetStack;
-use crate::kernel::KernelContext;
+use crate::KernelContext;
 
 extern "C" {
     fn kz_c_stdio_smoke() -> i32;
@@ -48,7 +49,7 @@ pub(crate) fn run(context: KernelContext<'_>) {
     if unsafe { kz_c_free_smoke() } == 0 {
         let _free_status = Console::write(b"kz: free smoke OK\n");
     }
-    if arch::high_memory_smoke() {
+    if MemoryArchitecture::high_memory_smoke() {
         let _high_memory_status = Console::write(b"kz: RAM above 4 GiB mapped\n");
     }
     if unsafe { kz_c_pthread_smoke() } == 0 {

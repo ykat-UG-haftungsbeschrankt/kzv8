@@ -565,7 +565,7 @@ impl VirtualAreasLock {
 
 pub(crate) const PAGE_SIZE: usize = VirtualAreas::PAGE_SIZE;
 
-pub(super) fn initialize() {
+pub(crate) fn initialize() {
     VirtualAreasLock::initialize();
 }
 

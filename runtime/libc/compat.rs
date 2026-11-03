@@ -350,7 +350,7 @@ pub unsafe extern "C" fn wcsnrtombs(
     let mut bytes_written = 0;
     let mut characters = 0;
     while characters < character_count && unsafe { read_volatile(cursor) } != 0 {
-        let mut encoded = [0i8; 4];
+        let mut encoded = [0 as c_char; 4];
         let amount = unsafe { wcrtomb(encoded.as_mut_ptr(), read_volatile(cursor), state) };
         if amount == usize::MAX {
             return usize::MAX;
@@ -390,7 +390,7 @@ pub extern "C" fn ungetwc(_character: i32, _stream: *mut c_void) -> u32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn fputwc(character: i32, stream: *mut c_void) -> u32 {
-    let mut encoded = [0i8; 4];
+    let mut encoded = [0 as c_char; 4];
     let length = unsafe { wcrtomb(encoded.as_mut_ptr(), character, core::ptr::null_mut()) };
     if length == usize::MAX
         || unsafe { fwrite(encoded.as_ptr().cast(), 1, length, stream) } != length
