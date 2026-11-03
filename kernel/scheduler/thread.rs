@@ -63,9 +63,6 @@ struct Thread {
     detached: bool,
     errno: i32,
     tls: [*mut c_void; MAX_TLS_KEYS],
-    #[cfg(target_arch = "x86_64")]
-    fpu_context: crate::kernel::arch::FpuContext,
-    #[cfg(target_arch = "aarch64")]
     fpu_context: crate::kernel::arch::FpuContext,
 }
 
@@ -81,9 +78,6 @@ impl Thread {
         detached: false,
         errno: 0,
         tls: [core::ptr::null_mut(); MAX_TLS_KEYS],
-        #[cfg(target_arch = "x86_64")]
-        fpu_context: crate::kernel::arch::FpuContext::INITIAL,
-        #[cfg(target_arch = "aarch64")]
         fpu_context: crate::kernel::arch::FpuContext::INITIAL,
     };
 }
@@ -98,8 +92,8 @@ impl ThreadStack {
     /// `index` must be valid, and the caller must ensure exclusive access to that stack.
     pub(crate) unsafe fn slice_at(index: usize) -> &'static mut [u8] {
         let manager = ThreadManager::get_instance();
-        let stacks = unsafe { addr_of_mut!((*manager).stacks).cast::<ThreadStack>() };
-        let stack = unsafe { stacks.add(index) };
+        let stacks = addr_of_mut!((*manager).stacks).cast::<ThreadStack>();
+        let stack = stacks.wrapping_add(index);
         unsafe { from_raw_parts_mut(addr_of_mut!((*stack).0).cast::<u8>(), Self::STACK_SIZE) }
     }
 
@@ -112,8 +106,11 @@ impl ThreadStack {
         }
 
         let manager = ThreadManager::get_instance();
-        let stacks = unsafe { addr_of_mut!((*manager).stacks).cast::<ThreadStack>() };
-        unsafe { (stacks.add(index).cast::<c_void>(), Self::STACK_SIZE) }
+        let stacks = addr_of_mut!((*manager).stacks).cast::<ThreadStack>();
+        (
+            stacks.wrapping_add(index).cast::<c_void>(),
+            Self::STACK_SIZE,
+        )
     }
 }
 
@@ -151,25 +148,17 @@ impl ThreadManager {
 
     pub(crate) fn initialize() {
         let interrupt_state = crate::kernel::arch::interrupts::disable();
-        let manager = Self::get_instance();
-        unsafe {
-            let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-            for index in 0..Self::MAX_THREADS {
-                threads.add(index).write(Thread::EMPTY);
-            }
-            let keys = addr_of_mut!((*manager).tls_keys).cast::<TlsKey>();
-            for index in 0..Self::MAX_TLS_KEYS {
-                keys.add(index).write(TlsKey::EMPTY);
-            }
-            threads.add(0).write(Thread {
-                id: MAIN_THREAD_ID,
-                state: ThreadState::Running,
-                ..Thread::EMPTY
-            });
-            (*manager).current_slot = 0;
-            (*manager).next_thread_id = MAIN_THREAD_ID + 1;
-            (*manager).initialized = true;
-        }
+        let manager = unsafe { &mut *Self::get_instance() };
+        manager.threads.fill(Thread::EMPTY);
+        manager.tls_keys.fill(TlsKey::EMPTY);
+        manager.threads[0] = Thread {
+            id: MAIN_THREAD_ID,
+            state: ThreadState::Running,
+            ..Thread::EMPTY
+        };
+        manager.current_slot = 0;
+        manager.next_thread_id = MAIN_THREAD_ID + 1;
+        manager.initialized = true;
         crate::kernel::arch::interrupts::restore(interrupt_state);
     }
 

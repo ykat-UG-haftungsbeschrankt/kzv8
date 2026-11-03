@@ -142,19 +142,18 @@ pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
 
 pub(crate) fn initialize_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize {
     const STACK_WORDS: usize = 8;
-    let top = (stack.as_mut_ptr() as usize + stack.len()) & !0xf;
-    let context = (top - STACK_WORDS * size_of::<usize>()) as *mut usize;
-    unsafe {
-        context.add(0).write(0);
-        context.add(1).write(0);
-        context.add(2).write(0);
-        context.add(3).write(0);
-        context.add(4).write(0);
-        context.add(5).write(0);
-        context.add(6).write(entry as usize);
-        context.add(7).write(0);
-    }
-    context as usize
+    let stack_start = stack.as_mut_ptr() as usize;
+    let top = (stack_start + stack.len()) & !0xf;
+    let context_start = top - STACK_WORDS * size_of::<usize>();
+    let context_offset = context_start - stack_start;
+    let context_end = context_offset + STACK_WORDS * size_of::<usize>();
+    let context = &mut stack[context_offset..context_end];
+    context.fill(0);
+
+    let entry_offset = 6 * size_of::<usize>();
+    context[entry_offset..entry_offset + size_of::<usize>()]
+        .copy_from_slice(&(entry as usize).to_ne_bytes());
+    context_start
 }
 
 pub(crate) unsafe fn switch(

@@ -129,11 +129,8 @@ impl Heap {
         let Some(metadata_slot) = heap.slabs.iter().position(|slab| !slab.active) else {
             return null_mut();
         };
-        let Some(page) = crate::kernel::memory::virtual_memory::reserve(
-            Self::PAGE_SIZE,
-            Self::PAGE_SIZE,
-            2,
-        )
+        let Some(page) =
+            crate::kernel::memory::virtual_memory::reserve(Self::PAGE_SIZE, Self::PAGE_SIZE, 2)
         else {
             return null_mut();
         };

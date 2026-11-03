@@ -7,63 +7,171 @@
 
 use crate::kernel::error::Error;
 
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum Register {
+    Magic = 0x00,
+    Version = 0x04,
+    DeviceId = 0x08,
+    DeviceFeatures = 0x10,
+    DeviceFeaturesSelect = 0x14,
+    DriverFeatures = 0x20,
+    DriverFeaturesSelect = 0x24,
+    QueueSelect = 0x30,
+    QueueSizeMax = 0x34,
+    QueueSize = 0x38,
+    QueueReady = 0x44,
+    QueueNotify = 0x50,
+    InterruptStatus = 0x60,
+    InterruptAck = 0x64,
+    Status = 0x70,
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum AddressRegister {
+    QueueDesc = 0x80,
+    QueueAvail = 0x90,
+    QueueUsed = 0xa0,
+}
+
+const REGISTER_WINDOW_SIZE: usize =
+    AddressRegister::QueueUsed as usize + core::mem::size_of::<u64>();
+
+#[derive(Clone, Copy)]
+struct MappedMmioWindow {
+    start: usize,
+    slots: usize,
+    stride: usize,
+}
+
+impl MappedMmioWindow {
+    fn from_arch() -> Option<Self> {
+        if !crate::kernel::memory::virtual_memory::mmu_ready() {
+            return None;
+        }
+        let window = crate::kernel::arch::virtio_window();
+        let register_size = core::mem::size_of::<u32>();
+        if window.slots == 0
+            || window.stride < REGISTER_WINDOW_SIZE
+            || window.stride % register_size != 0
+            || window.start % register_size != 0
+        {
+            return None;
+        }
+        let length = window.stride.checked_mul(window.slots)?;
+        let _window_end = window.start.checked_add(length)?;
+        Some(Self {
+            start: window.start,
+            slots: window.slots,
+            stride: window.stride,
+        })
+    }
+
+    fn region(&self, slot: usize) -> Option<MmioRegion> {
+        if slot >= self.slots {
+            return None;
+        }
+        let base = self.start.checked_add(slot.checked_mul(self.stride)?)?;
+        base.checked_add(self.stride)?;
+        Some(MmioRegion {
+            base,
+            stride: self.stride,
+            slot,
+        })
+    }
+
+    fn region_at_base(&self, base: usize) -> Option<MmioRegion> {
+        let offset = base.checked_sub(self.start)?;
+        if offset % self.stride != 0 {
+            return None;
+        }
+        let region = self.region(offset / self.stride)?;
+        (region.base == base).then_some(region)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MmioRegion {
+    base: usize,
+    stride: usize,
+    slot: usize,
+}
+
+impl MmioRegion {
+    fn checked_address(&self, offset: usize) -> Option<usize> {
+        let register_size = core::mem::size_of::<u32>();
+        if offset % register_size != 0 || offset.checked_add(register_size)? > self.stride {
+            return None;
+        }
+        self.base.checked_add(offset)
+    }
+
+    fn read_u32(&self, offset: usize) -> Option<u32> {
+        let address = self.checked_address(offset)?;
+        // SAFETY: regions come from the architecture's mapped VirtIO window, and the checked
+        // offset is aligned and contained within the region.
+        Some(unsafe { core::ptr::read_volatile(address as *const u32) })
+    }
+
+    fn write_u32(&self, offset: usize, value: u32) -> Option<()> {
+        let address = self.checked_address(offset)?;
+        // SAFETY: regions come from the architecture's mapped VirtIO window, and the checked
+        // offset is aligned and contained within the region.
+        unsafe { core::ptr::write_volatile(address as *mut u32, value) };
+        Some(())
+    }
+
+    fn read_register(&self, register: Register) -> u32 {
+        self.read_u32(register as usize)
+            .expect("typed VirtIO register must fit the region")
+    }
+
+    fn write_register(&self, register: Register, value: u32) {
+        self.write_u32(register as usize, value)
+            .expect("typed VirtIO register must fit the region");
+    }
+
+    fn write_address(&self, register: AddressRegister, address: u64) {
+        let offset = register as usize;
+        self.write_u32(offset, address as u32)
+            .expect("typed VirtIO address register must fit the region");
+        self.write_u32(offset + core::mem::size_of::<u32>(), (address >> 32) as u32)
+            .expect("typed VirtIO address register must fit the region");
+    }
+
+    fn read_config(&self, offset: usize) -> Option<u32> {
+        self.read_u32(0x100usize.checked_add(offset)?)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VirtioTransport {
-    base: usize,
+    region: MmioRegion,
 }
 
 impl VirtioTransport {
     const MAGIC: u32 = 0x7472_6976;
     const VERSION_MODERN: u32 = 2;
     const FEATURE_VERSION_1: u32 = 1;
-
-    const REG_MAGIC: usize = 0x00;
-    const REG_VERSION: usize = 0x04;
-    const REG_DEVICE_ID: usize = 0x08;
-    const REG_DEVICE_FEATURES: usize = 0x10;
-    const REG_DEVICE_FEATURES_SELECT: usize = 0x14;
-    const REG_DRIVER_FEATURES: usize = 0x20;
-    const REG_DRIVER_FEATURES_SELECT: usize = 0x24;
-    const REG_QUEUE_SELECT: usize = 0x30;
-    const REG_QUEUE_SIZE_MAX: usize = 0x34;
-    const REG_QUEUE_SIZE: usize = 0x38;
-    const REG_QUEUE_READY: usize = 0x44;
-    const REG_QUEUE_NOTIFY: usize = 0x50;
-    const REG_INTERRUPT_STATUS: usize = 0x60;
-    const REG_INTERRUPT_ACK: usize = 0x64;
-    const REG_STATUS: usize = 0x70;
-    const REG_QUEUE_DESC: usize = 0x80;
-    const REG_QUEUE_AVAIL: usize = 0x90;
-    const REG_QUEUE_USED: usize = 0xa0;
     const FEATURE_NET_MAC: u64 = 1 << 5;
 
     pub(crate) fn from_base(base: usize) -> Option<Self> {
-        if !crate::kernel::memory::virtual_memory::mmu_ready() {
-            return None;
-        }
-        let window = crate::kernel::arch::virtio_window();
-        let offset = base.checked_sub(window.start)?;
-        if window.stride == 0
-            || offset % window.stride != 0
-            || offset / window.stride >= window.slots
-        {
-            return None;
-        }
-        Some(Self { base })
+        let window = MappedMmioWindow::from_arch()?;
+        Some(Self {
+            region: window.region_at_base(base)?,
+        })
     }
 
     pub(crate) fn find(device_id: u32) -> Option<Self> {
-        if !crate::kernel::memory::virtual_memory::mmu_ready() {
-            return None;
-        }
-        let window = crate::kernel::arch::virtio_window();
+        let window = MappedMmioWindow::from_arch()?;
         for slot in 0..window.slots {
-            let base = window.start.checked_add(slot.checked_mul(window.stride)?)?;
-            let magic = unsafe { Self::read_register(base, Self::REG_MAGIC) };
-            let version = unsafe { Self::read_register(base, Self::REG_VERSION) };
-            let id = unsafe { Self::read_register(base, Self::REG_DEVICE_ID) };
+            let region = window.region(slot)?;
+            let magic = region.read_register(Register::Magic);
+            let version = region.read_register(Register::Version);
+            let id = region.read_register(Register::DeviceId);
             if magic == Self::MAGIC && version == Self::VERSION_MODERN && id == device_id {
-                return Some(Self { base });
+                return Some(Self { region });
             }
         }
         None
@@ -78,46 +186,40 @@ impl VirtioTransport {
         device_id: u32,
         requested_features: u64,
     ) -> Result<Self, Error> {
-        if !crate::kernel::memory::virtual_memory::mmu_ready() {
+        let region = self.region;
+        if region.read_register(Register::Magic) != Self::MAGIC
+            || region.read_register(Register::Version) != Self::VERSION_MODERN
+            || region.read_register(Register::DeviceId) != device_id
+        {
             return Err(Error::NoDev);
         }
-        let base = self.base;
-        // SAFETY: this handle is restricted to the mapped VirtIO window, and MMU readiness is checked above.
-        unsafe {
-            if Self::read_register(base, Self::REG_MAGIC) != Self::MAGIC
-                || Self::read_register(base, Self::REG_VERSION) != Self::VERSION_MODERN
-                || Self::read_register(base, Self::REG_DEVICE_ID) != device_id
-            {
-                return Err(Error::NoDev);
-            }
 
-            Self::write_register(base, Self::REG_STATUS, 0);
-            Self::write_register(base, Self::REG_STATUS, 1);
-            Self::write_register(base, Self::REG_STATUS, 3);
+        region.write_register(Register::Status, 0);
+        region.write_register(Register::Status, 1);
+        region.write_register(Register::Status, 3);
 
-            Self::write_register(base, Self::REG_DEVICE_FEATURES_SELECT, 0);
-            let offered_low = Self::read_register(base, Self::REG_DEVICE_FEATURES);
-            Self::write_register(base, Self::REG_DEVICE_FEATURES_SELECT, 1);
-            let offered_high = Self::read_register(base, Self::REG_DEVICE_FEATURES);
-            if offered_high & Self::FEATURE_VERSION_1 == 0 {
-                Self::write_register(base, Self::REG_STATUS, 0x80);
-                return Err(Error::OpNotSupp);
-            }
-            let requested_low = requested_features as u32;
-            let requested_high = (requested_features >> 32) as u32 | Self::FEATURE_VERSION_1;
-            if requested_low & !offered_low != 0 || requested_high & !offered_high != 0 {
-                Self::write_register(base, Self::REG_STATUS, 0x80);
-                return Err(Error::OpNotSupp);
-            }
-            Self::write_register(base, Self::REG_DRIVER_FEATURES_SELECT, 0);
-            Self::write_register(base, Self::REG_DRIVER_FEATURES, requested_low);
-            Self::write_register(base, Self::REG_DRIVER_FEATURES_SELECT, 1);
-            Self::write_register(base, Self::REG_DRIVER_FEATURES, requested_high);
-            Self::write_register(base, Self::REG_STATUS, 11);
-            if Self::read_register(base, Self::REG_STATUS) & 8 == 0 {
-                Self::write_register(base, Self::REG_STATUS, 0x80);
-                return Err(Error::Proto);
-            }
+        region.write_register(Register::DeviceFeaturesSelect, 0);
+        let offered_low = region.read_register(Register::DeviceFeatures);
+        region.write_register(Register::DeviceFeaturesSelect, 1);
+        let offered_high = region.read_register(Register::DeviceFeatures);
+        if offered_high & Self::FEATURE_VERSION_1 == 0 {
+            region.write_register(Register::Status, 0x80);
+            return Err(Error::OpNotSupp);
+        }
+        let requested_low = requested_features as u32;
+        let requested_high = (requested_features >> 32) as u32 | Self::FEATURE_VERSION_1;
+        if requested_low & !offered_low != 0 || requested_high & !offered_high != 0 {
+            region.write_register(Register::Status, 0x80);
+            return Err(Error::OpNotSupp);
+        }
+        region.write_register(Register::DriverFeaturesSelect, 0);
+        region.write_register(Register::DriverFeatures, requested_low);
+        region.write_register(Register::DriverFeaturesSelect, 1);
+        region.write_register(Register::DriverFeatures, requested_high);
+        region.write_register(Register::Status, 11);
+        if region.read_register(Register::Status) & 8 == 0 {
+            region.write_register(Register::Status, 0x80);
+            return Err(Error::Proto);
         }
         Ok(self)
     }
@@ -130,80 +232,47 @@ impl VirtioTransport {
         available: u64,
         used: u64,
     ) -> Result<(), Error> {
-        unsafe {
-            Self::write_register(self.base, Self::REG_QUEUE_SELECT, index);
-            if Self::read_register(self.base, Self::REG_QUEUE_READY) != 0 {
-                return Err(Error::Busy);
-            }
-            if Self::read_register(self.base, Self::REG_QUEUE_SIZE_MAX) < size {
-                return Err(Error::Inval);
-            }
-            Self::write_register(self.base, Self::REG_QUEUE_SIZE, size);
-            Self::write_address(self.base, Self::REG_QUEUE_DESC, descriptors);
-            Self::write_address(self.base, Self::REG_QUEUE_AVAIL, available);
-            Self::write_address(self.base, Self::REG_QUEUE_USED, used);
-            crate::kernel::memory::dma::sync_for_device();
-            Self::write_register(self.base, Self::REG_QUEUE_READY, 1);
+        self.region.write_register(Register::QueueSelect, index);
+        if self.region.read_register(Register::QueueReady) != 0 {
+            return Err(Error::Busy);
         }
+        if self.region.read_register(Register::QueueSizeMax) < size {
+            return Err(Error::Inval);
+        }
+        self.region.write_register(Register::QueueSize, size);
+        self.region
+            .write_address(AddressRegister::QueueDesc, descriptors);
+        self.region
+            .write_address(AddressRegister::QueueAvail, available);
+        self.region.write_address(AddressRegister::QueueUsed, used);
+        crate::kernel::memory::dma::sync_for_device();
+        self.region.write_register(Register::QueueReady, 1);
         Ok(())
     }
 
     pub(crate) fn activate(&self) -> bool {
-        unsafe {
-            Self::write_register(self.base, Self::REG_STATUS, 15);
-            Self::read_register(self.base, Self::REG_STATUS) & 4 != 0
-        }
+        self.region.write_register(Register::Status, 15);
+        self.region.read_register(Register::Status) & 4 != 0
     }
 
     pub(crate) fn notify(&self, queue: u32) {
-        unsafe {
-            Self::write_register(self.base, Self::REG_QUEUE_NOTIFY, queue);
-        }
+        self.region.write_register(Register::QueueNotify, queue);
     }
 
     pub(crate) fn read_device_config(&self, offset: usize) -> Option<u32> {
-        let window = crate::kernel::arch::virtio_window();
-        let config_offset = 0x100usize.checked_add(offset)?;
-        if offset % core::mem::size_of::<u32>() != 0
-            || config_offset.checked_add(core::mem::size_of::<u32>())? > window.stride
-        {
-            return None;
-        }
-        Some(unsafe { Self::read_register(self.base, config_offset) })
+        self.region.read_config(offset)
     }
 
     pub(crate) fn slot(&self) -> usize {
-        let window = crate::kernel::arch::virtio_window();
-        (self.base - window.start) / window.stride
+        self.region.slot
     }
 
     pub(crate) fn base(&self) -> usize {
-        self.base
+        self.region.base
     }
 
     pub(crate) const fn net_mac_feature() -> u64 {
         Self::FEATURE_NET_MAC
-    }
-
-    /// # Safety
-    /// `base + offset` must be a valid, aligned register in the mapped transport window.
-    unsafe fn read_register(base: usize, offset: usize) -> u32 {
-        unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
-    }
-
-    /// # Safety
-    /// `base + offset` must be a valid, aligned writable register in the mapped transport window.
-    unsafe fn write_register(base: usize, offset: usize, value: u32) {
-        unsafe { core::ptr::write_volatile((base + offset) as *mut u32, value) };
-    }
-
-    /// # Safety
-    /// `base + offset` and `base + offset + 4` must be valid address registers in the window.
-    unsafe fn write_address(base: usize, offset: usize, address: u64) {
-        unsafe {
-            Self::write_register(base, offset, address as u32);
-            Self::write_register(base, offset + 4, (address >> 32) as u32);
-        }
     }
 }
 
@@ -211,26 +280,26 @@ pub(crate) fn dispatch_interrupts() -> u64 {
     if !crate::kernel::memory::virtual_memory::mmu_ready() {
         return 0;
     }
-    let window = crate::kernel::arch::virtio_window();
+    let Some(window) = MappedMmioWindow::from_arch() else {
+        return 0;
+    };
     let mut pending = 0u64;
     for slot in 0..window.slots.min(64) {
-        let base = window.start + slot * window.stride;
-        let magic = unsafe { VirtioTransport::read_register(base, VirtioTransport::REG_MAGIC) };
-        let version = unsafe { VirtioTransport::read_register(base, VirtioTransport::REG_VERSION) };
-        let device_id =
-            unsafe { VirtioTransport::read_register(base, VirtioTransport::REG_DEVICE_ID) };
+        let Some(region) = window.region(slot) else {
+            break;
+        };
+        let magic = region.read_register(Register::Magic);
+        let version = region.read_register(Register::Version);
+        let device_id = region.read_register(Register::DeviceId);
         if magic != VirtioTransport::MAGIC
             || version != VirtioTransport::VERSION_MODERN
             || device_id == 0
         {
             continue;
         }
-        let status =
-            unsafe { VirtioTransport::read_register(base, VirtioTransport::REG_INTERRUPT_STATUS) };
+        let status = region.read_register(Register::InterruptStatus);
         if status != 0 {
-            unsafe {
-                VirtioTransport::write_register(base, VirtioTransport::REG_INTERRUPT_ACK, status)
-            };
+            region.write_register(Register::InterruptAck, status);
             pending |= 1u64 << slot;
         }
     }

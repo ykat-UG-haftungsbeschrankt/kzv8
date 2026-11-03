@@ -124,18 +124,22 @@ pub(crate) fn initialize_stack(stack: &mut [u8], entry: extern "C" fn() -> !) ->
     const STACK_WORDS: usize = 20;
     #[cfg(not(feature = "aarch64-fpu-off"))]
     const STACK_WORDS: usize = 12;
-    let top = (stack.as_mut_ptr() as usize + stack.len()) & !0xf;
-    let context = (top - STACK_WORDS * size_of::<usize>()) as *mut usize;
-    unsafe {
-        for index in 0..STACK_WORDS {
-            context.add(index).write(0);
-        }
-        #[cfg(feature = "aarch64-fpu-off")]
-        context.add(9).write(entry as usize);
-        #[cfg(not(feature = "aarch64-fpu-off"))]
-        context.add(1).write(entry as usize);
-    }
-    context as usize
+    let stack_start = stack.as_mut_ptr() as usize;
+    let top = (stack_start + stack.len()) & !0xf;
+    let context_start = top - STACK_WORDS * size_of::<usize>();
+    let context_offset = context_start - stack_start;
+    let context_end = context_offset + STACK_WORDS * size_of::<usize>();
+    let context = &mut stack[context_offset..context_end];
+    context.fill(0);
+
+    #[cfg(feature = "aarch64-fpu-off")]
+    let entry_index = 9;
+    #[cfg(not(feature = "aarch64-fpu-off"))]
+    let entry_index = 1;
+    let entry_offset = entry_index * size_of::<usize>();
+    context[entry_offset..entry_offset + size_of::<usize>()]
+        .copy_from_slice(&(entry as usize).to_ne_bytes());
+    context_start
 }
 
 pub(crate) unsafe fn switch(

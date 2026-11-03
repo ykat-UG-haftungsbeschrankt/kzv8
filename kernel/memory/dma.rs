@@ -12,7 +12,7 @@ use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
 #[repr(C, align(4096))]
 pub(crate) struct DmaArena {
-    bytes: UnsafeCell<[u8; DMA_ARENA_SIZE]>,
+    bytes: UnsafeCell<[u8; Self::DMA_ARENA_SIZE]>,
     next: AtomicUsize,
 }
 
