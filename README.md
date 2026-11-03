@@ -1,14 +1,15 @@
 # kz
 
-**An experimental freestanding Rust kernel with an embedded V8 runtime on x86_64.**
+**An experimental freestanding Rust kernel with an embedded V8 runtime on x86_64 and AArch64.**
 
-An AArch64 boot path is also present, but V8 and the device-backed JavaScript
-smoke run only on x86_64. This is a kernel prototype, not a general-purpose OS.
+AArch64 runs the built-in JavaScript smoke under QEMU, but its smoke path
+attaches only a VirtIO console; block and network JavaScript bindings are
+x86_64-only. This is a kernel prototype, not a general-purpose OS.
 
 | Target | Status |
 | --- | --- |
 | x86_64 | Builds with V8 and passes the device-backed QEMU smoke test. |
-| AArch64 | Boot path and smoke harness are present; V8 is not integrated. |
+| AArch64 | Builds with V8 and passes the console-only QEMU smoke test. |
 
 ## Implemented
 
@@ -22,6 +23,8 @@ smoke run only on x86_64. This is a kernel prototype, not a general-purpose OS.
   Multiboot map or AArch64 device tree.
 - Architecture interrupt vectors, x86 APIC/IOAPIC routing, AArch64 GICv2
   routing, and counter-based timers.
+- AArch64 linker-provided TLS initialized through `TPIDR_EL0` for the C++ V8
+  runtime.
 - A bitmap frame allocator, coalescing 256 KiB kernel heap, and bounded DMA
   arena for the configured QEMU RAM maps.
 - Modern VirtIO-MMIO console, block, and Ethernet drivers with DMA-backed
@@ -35,12 +38,13 @@ smoke run only on x86_64. This is a kernel prototype, not a general-purpose OS.
 - An anonymous Linux-shaped `mmap`/`munmap` subset backed by physical frames.
 - A bounded, timer-preemptive pthread subset on the boot CPU, with fixed stacks,
   join/detach, mutexes, and condition variables.
-- A freestanding x86_64 V8 embedder with a cooperative task runner and kernel
-  page allocator. Its built-in JavaScript smoke exercises console, timers,
-  event-loop, raw block, and TCP bindings, with explicit microtask checkpoints.
-- A device-backed x86_64 QEMU smoke test for block read/write and TCP echo, plus
-  kernel, allocator, libc, and V8 checks. AArch64 does not integrate V8 or
-  attach block/network devices in its smoke path.
+- A freestanding V8 embedder on x86_64 and AArch64 with a cooperative task
+  runner and kernel page allocator. Its built-in JavaScript smoke exercises
+  console, timers, and the event loop on both targets; x86_64 also exercises
+  raw block and TCP bindings.
+- QEMU smoke tests for both targets cover kernel, allocator, libc, pthread, and
+  V8 startup/runtime behavior. The x86_64 test also verifies block read/write
+  and TCP echo with attached devices.
 
 There is no kernel-side ELF loader, on-disk filesystem, or full libc. Pthreads
 are time-sliced by timer interrupts; the async task executor is cooperative.
@@ -52,9 +56,9 @@ output device.
 
 Required: stable Rust with Cargo and the `x86_64-unknown-none` and
 `aarch64-unknown-none` targets, Clang, llvm-objcopy, Make, Ninja, Node.js/npm,
-Python 3, and QEMU's x86_64 and AArch64 system emulators. The x86_64 build also
-generates and builds the pinned V8 monolith with the repository's GN/Ninja
-setup.
+Python 3, and QEMU's x86_64 and AArch64 system emulators. Both architecture
+builds generate and build the pinned V8 monolith with the repository's
+GN/Ninja setup.
 
 ```sh
 rustup target add x86_64-unknown-none aarch64-unknown-none
@@ -132,15 +136,27 @@ kz: V8 platform disposed
 kz: V8 evaluated 6 * 7 = 42
 ```
 
-When it builds, the AArch64 guest prints `aarch64` instead of `x86_64`, omits
-the lazy-fault, V8, and 4 GiB diagnostics, and reports `kz: V8 not integrated`.
+A successful AArch64 run includes these V8 markers:
+
+```text
+kz: V8 page allocator hooks OK
+kz: V8 isolate created
+kz: V8 context created
+kz: JavaScript console binding OK
+kz: JS result: 42
+kz: V8 evaluated 6 * 7 = 42
+```
+
+The AArch64 smoke omits the lazy-fault and 4 GiB diagnostics and does not attach
+block or network devices.
 
 ## Internals and kernel API
 
 `kernel/main.rs` initializes memory, interrupts, timers, the optional block and
 network devices, and a fixed-capacity `EventLoop<16>`. It passes the live event
-loop and device handles to `runtime/run.rs`. That module starts the x86_64 V8
-embedder; AArch64 continues without V8.
+loop and device handles to `runtime/run.rs`, which starts the V8 smoke on both
+architectures. Block and network devices are attached only by the x86_64 smoke
+runner.
 
 The JavaScript bridge is an internal C ABI, not a syscall interface:
 
@@ -172,8 +188,8 @@ permits one outstanding request at a time.
 
 ## JavaScript interface
 
-The x86_64 embedder runs one built-in script; there is no JavaScript file loader
-or REPL yet. Its current host surface is:
+The x86_64 and AArch64 embedders run one built-in script; there is no JavaScript
+file loader or REPL yet. Their current host surface is:
 
 | Surface | API | Notes |
 | --- | --- | --- |
@@ -188,7 +204,8 @@ or REPL yet. Its current host surface is:
 `kz.block.available` and `kz.tcp.available` report whether each device is
 present. Block read/write and TCP connect/send/receive operations are
 synchronous, bounded prototype bindings with a five-second timeout; TCP I/O is
-not Promise-based. `kz.tcp.close()` releases the active socket.
+not Promise-based. These device bindings are exercised on x86_64 only.
+`kz.tcp.close()` releases the active socket.
 `kz.events.scheduleTimer` takes nanoseconds; `kz.timer.setTimeout` takes
 milliseconds. Microtasks are explicitly processed after the script and after
 each timer callback.

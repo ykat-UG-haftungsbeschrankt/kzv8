@@ -6,6 +6,7 @@
  */
 
 use core::mem::size_of;
+use core::ptr::{addr_of, addr_of_mut, copy_nonoverlapping, write_bytes};
 
 #[cfg(feature = "aarch64-fpu-off")]
 const FPU_CONTEXT_SIZE: usize = 16;
@@ -22,6 +23,62 @@ impl FpuContext {
     pub(crate) const INITIAL: Self = Self {
         _image: [0; FPU_CONTEXT_SIZE],
     };
+}
+
+const TLS_BLOCK_SIZE: usize = 4096;
+const TLS_DATA_OFFSET: usize = 16;
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct TlsBlock([u8; TLS_BLOCK_SIZE]);
+
+static mut TLS_BLOCKS: [TlsBlock; crate::kernel::arch::MAX_CPUS] =
+    [TlsBlock([0; TLS_BLOCK_SIZE]); crate::kernel::arch::MAX_CPUS];
+
+unsafe extern "C" {
+    static __tls_start: u8;
+    static __tls_data_end: u8;
+    static __tls_end: u8;
+}
+
+pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
+    if cpu_id >= crate::kernel::arch::MAX_CPUS {
+        return false;
+    }
+
+    unsafe {
+        let tls_start = addr_of!(__tls_start) as usize;
+        let tls_data_end = addr_of!(__tls_data_end) as usize;
+        let tls_end = addr_of!(__tls_end) as usize;
+        let Some(tls_size) = tls_end.checked_sub(tls_start) else {
+            return false;
+        };
+        let Some(tls_data_size) = tls_data_end.checked_sub(tls_start) else {
+            return false;
+        };
+        if tls_data_size > tls_size
+            || tls_size > TLS_BLOCK_SIZE.saturating_sub(TLS_DATA_OFFSET)
+        {
+            return false;
+        }
+
+        let blocks = addr_of_mut!(TLS_BLOCKS).cast::<u8>();
+        let tls_block = blocks.add(cpu_id * TLS_BLOCK_SIZE);
+        write_bytes(tls_block, 0, TLS_BLOCK_SIZE);
+        copy_nonoverlapping(
+            tls_start as *const u8,
+            tls_block.add(TLS_DATA_OFFSET),
+            tls_data_size,
+        );
+
+        core::arch::asm!(
+            "msr tpidr_el0, {thread_pointer}",
+            "isb",
+            thread_pointer = in(reg) tls_block,
+            options(nostack, preserves_flags),
+        );
+    }
+    true
 }
 
 const SAVE_FULL_FPU_CONTEXT: usize = if cfg!(feature = "aarch64-fpu-off") {

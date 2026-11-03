@@ -246,10 +246,10 @@ def check(architecture):
         expected += "kz: first lazy page fault resolved\n"
     expected += f"kz: {architecture} Rust kernel booted\n"
     expected += "kz: virtio-console transmit OK\n"
+    expected += "kz: RAM above 128 MiB detected\n"
     expected += "kz: C stdio printf 42 hello 0x2a\n"
     expected += "kz: C stdio puts works\n"
     expected += "!\n"
-    expected += "kz: RAM above 128 MiB detected\n"
     expected += "kz: mmap smoke OK\n"
     expected += "kz: malloc/free smoke OK\n"
     if architecture == "x86_64":

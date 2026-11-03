@@ -17,6 +17,8 @@ mod virtio;
 unsafe extern "C" {
     static _start: u8;
     static __bss_end: u8;
+    static stack_bottom: u8;
+    static stack_top: u8;
 }
 
 pub(crate) use threads::FpuContext;
@@ -46,8 +48,8 @@ pub(crate) fn initialize_thread_stack(stack: &mut [u8], entry: extern "C" fn() -
     threads::initialize_stack(stack, entry)
 }
 
-pub(crate) fn initialize_thread_local_storage(_cpu_id: usize) -> bool {
-    true
+pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
+    threads::initialize_thread_local_storage(cpu_id)
 }
 
 pub(crate) fn fallback_time_ns() -> u64 {
@@ -64,8 +66,10 @@ pub(crate) fn dma_sync_for_cpu() {
 
 pub(crate) fn decommit_debug(_code: u8) {}
 
-pub(crate) fn current_thread_stack_bounds(stack_size: usize) -> (*mut core::ffi::c_void, usize) {
-    (core::ptr::null_mut(), stack_size)
+pub(crate) fn current_thread_stack_bounds(_stack_size: usize) -> (*mut core::ffi::c_void, usize) {
+    let start = core::ptr::addr_of!(stack_bottom) as usize;
+    let end = core::ptr::addr_of!(stack_top) as usize;
+    (start as *mut core::ffi::c_void, end.saturating_sub(start))
 }
 
 pub(crate) fn high_memory_smoke() -> bool {
@@ -198,8 +202,8 @@ impl crate::kernel::arch::traits::ThreadArchitecture for super::ThreadArchitectu
         self::initialize_thread_stack(stack, entry)
     }
 
-    fn initialize_thread_local_storage(_cpu_id: usize) -> bool {
-        self::initialize_thread_local_storage(_cpu_id)
+    fn initialize_thread_local_storage(cpu_id: usize) -> bool {
+        self::initialize_thread_local_storage(cpu_id)
     }
 
     fn current_thread_stack_bounds(stack_size: usize) -> (*mut core::ffi::c_void, usize) {

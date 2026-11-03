@@ -34,6 +34,7 @@ el1_start:
     b 3b
 
 .section .bss,"aw",%nobits
+.global stack_bottom, stack_top
 .balign 16
 stack_bottom:
     .skip 65536

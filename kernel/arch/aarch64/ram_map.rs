@@ -21,6 +21,7 @@ const PXN: u64 = 1 << 53;
 const PAGE_SIZE: usize = 4096;
 const L2_BLOCK_SIZE: u64 = 1 << 21;
 const PAGE_TABLE_COUNT: usize = 2048;
+const VIRTUAL_ADDRESS_LIMIT: usize = 1usize << 39;
 const L1_ADDRESS_MASK: u64 = 0x0000_ffff_c000_0000;
 const L2_ADDRESS_MASK: u64 = 0x0000_ffff_ffe0_0000;
 const PAGE_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
@@ -269,12 +270,13 @@ pub(crate) fn page_has_backing(virtual_address: usize) -> bool {
 }
 
 pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
+    let Some(end) = address.checked_add(length) else {
+        return false;
+    };
     if length == 0
         || address % PAGE_SIZE != 0
         || length % PAGE_SIZE != 0
-        || address.checked_add(length).is_none()
-        || address.checked_add(length).unwrap()
-            > crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS
+        || end > VIRTUAL_ADDRESS_LIMIT
     {
         return false;
     }
