@@ -25,11 +25,14 @@ pub(crate) use threads::FpuContext;
 
 pub(crate) struct MemoryArch;
 
-pub(crate) const MAX_CPUS: usize = 8;
-pub(crate) const VM_ARENA_SIZE: usize = 1 << 36;
-pub(crate) const VM_BASE: usize = 0x10_0000_0000;
-pub(crate) const BOOT_MESSAGE: &[u8] = b"kz: x86_64 Rust kernel booted\n";
-pub(crate) const BOOT_INFO_ERROR: &str = "unable to read the Multiboot memory map";
+pub(crate) const MAX_CPUS: usize = <MemoryArch as crate::kernel::arch::CpuArchitecture>::MAX_CPUS;
+pub(crate) const VM_ARENA_SIZE: usize =
+    <MemoryArch as crate::kernel::arch::MemoryArchitecture>::VM_ARENA_SIZE;
+pub(crate) const VM_BASE: usize = <MemoryArch as crate::kernel::arch::MemoryArchitecture>::VM_BASE;
+pub(crate) const BOOT_MESSAGE: &[u8] =
+    <MemoryArch as crate::kernel::arch::BootArchitecture>::BOOT_MESSAGE;
+pub(crate) const BOOT_INFO_ERROR: &str =
+    <MemoryArch as crate::kernel::arch::BootArchitecture>::BOOT_INFO_ERROR;
 
 unsafe extern "C" {
     static _start: u8;

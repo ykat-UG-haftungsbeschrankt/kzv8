@@ -11,6 +11,7 @@ use crate::kernel::driver::virtio::console::Console;
 use crate::kernel::event::r#loop::{EventLoop, EventSourceToken};
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::net::stack::NetStack;
+use crate::kernel::KernelContext;
 
 extern "C" {
     fn kz_c_stdio_smoke() -> i32;
@@ -20,13 +21,17 @@ extern "C" {
     fn kz_c_pthread_smoke() -> i32;
 }
 
-pub(crate) fn run(
-    events: &mut EventLoop<16>,
-    block_device: Option<&mut BlockDevice>,
-    network_stack: Option<&mut NetStack>,
-    network_registration: Option<EventSourceToken>,
-    future_smoke_ok: bool,
-) {
+
+
+pub(crate) fn run(context: KernelContext<'_>) {
+    let KernelContext {
+        events,
+        block_device,
+        network_stack,
+        network_registration,
+        future_smoke_ok,
+    } = context;
+
     if future_smoke_ok {
         let _future_status = Console::write(b"kz: Rust futures smoke OK\n");
     }

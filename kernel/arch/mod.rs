@@ -93,6 +93,4 @@ mod arch;
 #[path = "x86_64/mod.rs"]
 mod arch;
 
-pub(crate) use arch::MemoryArch as ActiveArch;
-pub(crate) use arch::MemoryArch as ActiveMemoryArch;
 pub(crate) use arch::*;

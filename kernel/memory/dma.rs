@@ -93,12 +93,14 @@ impl DmaArena {
 
     pub(crate) fn sync_for_device() {
         fence(Ordering::SeqCst);
-        crate::kernel::arch::dma_sync_for_device();
+        <crate::kernel::arch::MemoryArch as crate::kernel::arch::DeviceArchitecture>::
+            dma_sync_for_device();
     }
 
     pub(crate) fn sync_for_cpu() {
         fence(Ordering::SeqCst);
-        crate::kernel::arch::dma_sync_for_cpu();
+        <crate::kernel::arch::MemoryArch as crate::kernel::arch::DeviceArchitecture>::
+            dma_sync_for_cpu();
     }
 
 }

@@ -78,7 +78,8 @@ impl TaskWaker {
                 }
             };
             if notify {
-                crate::kernel::arch::notify_executor();
+                <crate::kernel::arch::MemoryArch as crate::kernel::arch::CpuArchitecture>::
+                    notify_executor();
             }
         }
     }
@@ -120,7 +121,8 @@ where
             task.wakeable.store(true, Ordering::Release);
         }
         task.ready.store(true, Ordering::Release);
-        crate::kernel::arch::notify_executor();
+        <crate::kernel::arch::MemoryArch as crate::kernel::arch::CpuArchitecture>::
+            notify_executor();
         return Ok(());
     }
     Err(Error::Again)
@@ -198,12 +200,15 @@ pub(crate) fn run_until_stalled() {
 pub(crate) fn run_forever() -> ! {
     loop {
         run_until_stalled();
-        let interrupt_state = crate::kernel::arch::interrupts::disable();
+        let interrupt_state = <crate::kernel::arch::MemoryArch as crate::kernel::arch::
+            InterruptArchitecture>::disable_interrupts();
         if has_ready_tasks() {
-            crate::kernel::arch::interrupts::restore(interrupt_state);
+            <crate::kernel::arch::MemoryArch as crate::kernel::arch::InterruptArchitecture>::
+                restore_interrupts(interrupt_state);
             continue;
         }
-        crate::kernel::arch::wait_for_interrupt();
+        <crate::kernel::arch::MemoryArch as crate::kernel::arch::CpuArchitecture>::
+            wait_for_interrupt();
     }
 }
 
