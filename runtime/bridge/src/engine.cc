@@ -724,7 +724,7 @@ void reject_pending_import(PendingImport* pending,
 							   v8::Local<v8::Context> context,
 							   v8::Local<v8::Value> reason) {
 	if (pending == nullptr || !pending->active) return;
-	auto resolver = pending->resolver.Get(context->GetIsolate());
+	auto resolver = pending->resolver.Get(v8::Isolate::GetCurrent());
 	if (!resolver.IsEmpty()) resolver->Reject(context, reason).FromMaybe(false);
 	release_pending_import(pending);
 }
@@ -732,7 +732,7 @@ void reject_pending_import(PendingImport* pending,
 bool compile_module_response(v8::Local<v8::Context> context,
 							 v8::Local<v8::Value> response,
 							 v8::Local<v8::Module>* output) {
-	auto* isolate = context->GetIsolate();
+	auto* isolate = v8::Isolate::GetCurrent();
 	if (!response->IsObject()) {
 		throw_type_error(isolate, "VFAT loader returned a non-object");
 		return false;
@@ -785,7 +785,7 @@ bool compile_module_response(v8::Local<v8::Context> context,
 		return false;
 	}
 	v8::Local<v8::String> url_string = url_value.As<v8::String>();
-	v8::ScriptOrigin origin(isolate, url_string);
+	v8::ScriptOrigin origin(url_string);
 	v8::ScriptCompiler::Source module_source(source_string, origin);
 	v8::Local<v8::Module> module;
 	if (!v8::ScriptCompiler::CompileModule(isolate, &module_source)
@@ -808,7 +808,7 @@ v8::MaybeLocal<v8::Module> resolve_module(
 		v8::Local<v8::Context> context, v8::Local<v8::String> specifier,
 		v8::Local<v8::FixedArray> import_attributes,
 		v8::Local<v8::Module> referrer) {
-	auto* isolate = context->GetIsolate();
+	auto* isolate = v8::Isolate::GetCurrent();
 	if (!import_attributes.IsEmpty() && import_attributes->Length() != 0) {
 		throw_type_error(isolate, "import attributes are not supported by VFAT");
 		return {};
@@ -861,7 +861,7 @@ bool attach_module_handlers(v8::Local<v8::Context> context,
 							PendingImport* pending,
 							v8::FunctionCallback fulfilled_callback,
 							v8::FunctionCallback rejected_callback) {
-	auto* isolate = context->GetIsolate();
+				auto* isolate = v8::Isolate::GetCurrent();
 	auto data = v8::External::New(
 			isolate, pending, v8::kExternalPointerTypeTagDefault);
 	v8::Local<v8::Function> fulfilled;
@@ -959,7 +959,7 @@ v8::MaybeLocal<v8::Promise> host_import_module_dynamically(
 		v8::Local<v8::Context> context, v8::Local<v8::Data> host_defined_options,
 		v8::Local<v8::Value> resource_name, v8::Local<v8::String> specifier,
 		v8::Local<v8::FixedArray> import_attributes) {
-	auto* isolate = context->GetIsolate();
+	auto* isolate = v8::Isolate::GetCurrent();
 	v8::Local<v8::Promise::Resolver> resolver;
 	if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) return {};
 	auto promise = resolver->GetPromise();
@@ -1056,7 +1056,7 @@ bool run_vfat_esm_smoke(v8::Local<v8::Context> context,
 	auto source = v8::String::NewFromUtf8Literal(isolate, trampoline_source);
 	auto resource_name = v8::String::NewFromUtf8Literal(isolate,
 														"kz:///boot.mjs");
-	v8::ScriptOrigin origin(isolate, resource_name);
+	v8::ScriptOrigin origin(resource_name);
 	v8::ScriptCompiler::Source module_source(source, origin);
 	v8::Local<v8::Module> trampoline;
 	if (!v8::ScriptCompiler::CompileModule(isolate, &module_source)

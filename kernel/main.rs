@@ -25,10 +25,11 @@ pub(crate) mod net;
 #[path = "../runtime/run.rs"]
 pub(crate) mod runtime;
 pub(crate) mod scheduler;
+pub(crate) mod vfs;
 
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
-    pub(crate) use crate::{arch, block, driver, error, event, memory, net, runtime, scheduler};
+    pub(crate) use crate::{arch, block, driver, error, event, memory, net, runtime, scheduler, vfs};
 }
 
 pub(crate) struct KernelContext<'a> {
