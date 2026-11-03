@@ -5,8 +5,8 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::kernel::drivers::virtio::queue::{Descriptor, DmaQueue};
-use crate::kernel::drivers::virtio::transport::VirtioTransport;
+use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
+use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
 

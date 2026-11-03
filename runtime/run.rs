@@ -7,7 +7,7 @@ mod runtime_v8;
 
 use crate::kernel::arch;
 use crate::kernel::block::device::BlockDevice;
-use crate::kernel::drivers::virtio::console::Console;
+use crate::kernel::driver::virtio::console::Console;
 use crate::kernel::event::r#loop::{EventLoop, EventSourceToken};
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::net::stack::NetStack;

@@ -445,7 +445,7 @@ extern "C" fn x86_page_fault_dispatch(address: usize, error_code: u64) -> u64 {
         } else {
             b"kz: first lazy page fault rejected\n" as &[u8]
         };
-        let _written = crate::kernel::drivers::virtio::console::Console::write(message);
+        let _written = crate::kernel::driver::virtio::console::Console::write(message);
     }
     resolved as u64
 }

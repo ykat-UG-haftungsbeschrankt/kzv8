@@ -21,6 +21,11 @@ else
 $(error FPU_MODE must be x87, sse, or avx)
 endif
 
+KERNEL_SMOKE_FEATURES :=
+ifeq ($(KERNEL_SMOKE_TESTS),1)
+KERNEL_SMOKE_FEATURES := --features kernel-smoke-tests
+endif
+
 ifeq ($(AARCH64_FPU_STATE),on)
 AARCH64_FPU_FEATURES :=
 else ifeq ($(AARCH64_FPU_STATE),off)
@@ -38,7 +43,7 @@ build/x86_64/kernel64.elf: force
 	mkdir -p $(@D)
 	cd runtime/v8/src && buildtools/linux64/gn gen out.gn/x64.platform --args="$$(cat ../args-platform.gn)"
 	ninja -C "$(V8_PLATFORM_OUT)" v8_monolith
-	RUSTFLAGS="$(KERNEL_X86_RUSTFLAGS) $${RUSTFLAGS}" CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_PLATFORM_OUT="$(V8_PLATFORM_OUT)" $(CARGO) build --manifest-path Cargo.toml --release --target x86_64-unknown-none $(KERNEL_FPU_FEATURES)
+	RUSTFLAGS="$(KERNEL_X86_RUSTFLAGS) $${RUSTFLAGS}" CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_PLATFORM_OUT="$(V8_PLATFORM_OUT)" $(CARGO) build --manifest-path Cargo.toml --release --target x86_64-unknown-none $(KERNEL_FPU_FEATURES) $(KERNEL_SMOKE_FEATURES)
 	cp "$(CARGO_TARGET_DIR)/x86_64-unknown-none/release/kernel" $@
 
 build/x86_64/kernel.elf: build/x86_64/kernel64.elf
@@ -46,13 +51,14 @@ build/x86_64/kernel.elf: build/x86_64/kernel64.elf
 
 build/aarch64/kernel.elf: force
 	mkdir -p $(@D)
-	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" $(CARGO) build --manifest-path Cargo.toml --release --target aarch64-unknown-none $(AARCH64_FPU_FEATURES)
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" $(CARGO) build --manifest-path Cargo.toml --release --target aarch64-unknown-none $(AARCH64_FPU_FEATURES) $(KERNEL_SMOKE_FEATURES)
 	cp "$(CARGO_TARGET_DIR)/aarch64-unknown-none/release/kernel" $@
 
 build/aarch64/kernel.bin: build/aarch64/kernel.elf
 	$(OBJCOPY) -O binary $< $@
 
-test: all
+test:
+	$(MAKE) KERNEL_SMOKE_TESTS=1 all
 	python3 tests/qemu/smoke.py
 
 doc:

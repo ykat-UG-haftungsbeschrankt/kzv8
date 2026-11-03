@@ -62,7 +62,7 @@ pub unsafe extern "C" fn kz_host_console_write(data: *const u8, length: usize) -
     } else {
         core::slice::from_raw_parts(data, length)
     };
-    if crate::kernel::drivers::virtio::console::Console::write(bytes) {
+    if crate::kernel::driver::virtio::console::Console::write(bytes) {
         length as i32
     } else {
         -1

@@ -116,6 +116,9 @@ pub(crate) fn wait_for_interrupt() {
 }
 
 impl crate::kernel::arch::MemoryArchitecture for MemoryArch {
+    const VM_ARENA_SIZE: usize = VM_ARENA_SIZE;
+    const VM_BASE: usize = VM_BASE;
+
     fn initialize_mmu() {
         paging::initialize();
         unsafe { ram_map::map_high_memory() };
@@ -162,5 +165,117 @@ impl crate::kernel::arch::MemoryArchitecture for MemoryArch {
 
     fn page_has_backing(virtual_address: usize) -> bool {
         paging::page_has_backing(virtual_address)
+    }
+
+    fn high_memory_smoke() -> bool {
+        self::high_memory_smoke()
+    }
+}
+
+impl crate::kernel::arch::BootArchitecture for MemoryArch {
+    const BOOT_MESSAGE: &'static [u8] = BOOT_MESSAGE;
+    const BOOT_INFO_ERROR: &'static str = BOOT_INFO_ERROR;
+
+    unsafe fn initialize_boot_info(boot_info: usize, boot_magic: usize) -> bool {
+        unsafe { self::initialize_boot_info(boot_info, boot_magic) }
+    }
+}
+
+impl crate::kernel::arch::DeviceArchitecture for MemoryArch {
+    const VIRTIO_WINDOW: crate::kernel::arch::VirtioWindow = virtio::virtio_window();
+
+    fn dma_sync_for_device() {
+        self::dma_sync_for_device();
+    }
+
+    fn dma_sync_for_cpu() {
+        self::dma_sync_for_cpu();
+    }
+}
+
+impl crate::kernel::arch::ThreadArchitecture for MemoryArch {
+    type FpuContext = threads::FpuContext;
+
+    fn initialize_thread_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize {
+        self::initialize_thread_stack(stack, entry)
+    }
+
+    fn initialize_thread_local_storage(cpu_id: usize) -> bool {
+        self::initialize_thread_local_storage(cpu_id)
+    }
+
+    fn current_thread_stack_bounds(stack_size: usize) -> (*mut core::ffi::c_void, usize) {
+        self::current_thread_stack_bounds(stack_size)
+    }
+
+    fn switch_thread(
+        old_stack: &mut usize,
+        new_stack: usize,
+        old_fpu_context: &mut Self::FpuContext,
+        new_fpu_context: &Self::FpuContext,
+    ) {
+        self::switch_thread(old_stack, new_stack, old_fpu_context, new_fpu_context);
+    }
+}
+
+impl crate::kernel::arch::InterruptArchitecture for MemoryArch {
+    unsafe fn initialize_interrupts() {
+        unsafe { interrupts::initialize() };
+    }
+
+    fn initialize_interrupt_controller() -> bool {
+        interrupts::initialize_controller()
+    }
+
+    fn disable_interrupts() -> u64 {
+        interrupts::disable()
+    }
+
+    fn enable_interrupts() {
+        interrupts::enable();
+    }
+
+    fn restore_interrupts(flags: u64) {
+        interrupts::restore(flags);
+    }
+
+    fn interrupts_enabled() -> bool {
+        interrupts::enabled()
+    }
+}
+
+impl crate::kernel::arch::TimerArchitecture for MemoryArch {
+    fn initialize_timer() {
+        timer::initialize();
+    }
+
+    fn now_ns() -> Option<u64> {
+        timer::now_ns()
+    }
+
+    fn fallback_time_ns() -> u64 {
+        self::fallback_time_ns()
+    }
+}
+
+impl crate::kernel::arch::CpuArchitecture for MemoryArch {
+    const MAX_CPUS: usize = MAX_CPUS;
+
+    fn halt() -> ! {
+        self::halt()
+    }
+
+    fn notify_executor() {
+        self::notify_executor();
+    }
+
+    fn wait_for_interrupt() {
+        self::wait_for_interrupt();
+    }
+}
+
+impl crate::kernel::arch::DebugArchitecture for MemoryArch {
+    fn decommit_debug(code: u8) {
+        self::decommit_debug(code);
     }
 }

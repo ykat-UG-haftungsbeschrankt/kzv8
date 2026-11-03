@@ -6,7 +6,7 @@
  */
 
 use crate::kernel::block::request::{Operation, Request};
-use crate::kernel::drivers::virtio::block;
+use crate::kernel::driver::virtio::block;
 
 pub(crate) struct BlockDevice {
     device: virtio_block::BlockDevice,

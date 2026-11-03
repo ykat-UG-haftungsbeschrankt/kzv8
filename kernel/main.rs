@@ -10,11 +10,9 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 pub(crate) mod arch;
 pub(crate) mod block;
-pub(crate) mod drivers;
+pub(crate) mod driver;
 pub(crate) mod error;
 pub(crate) mod event;
 pub(crate) mod memory;
@@ -23,18 +21,20 @@ pub(crate) mod net;
 pub(crate) mod runtime;
 pub(crate) mod scheduler;
 
+#[cfg(feature = "kernel-smoke-tests")]
+#[path = "../tests/kernel/futures.rs"]
+mod future_smoke;
+
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
-    pub(crate) use crate::{arch, block, drivers, error, event, memory, net, runtime, scheduler};
+    pub(crate) use crate::{arch, block, driver, error, event, memory, net, runtime, scheduler};
 }
-
-static FUTURE_SMOKE_DONE: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
 pub extern "C" fn kz_handle_virtio_interrupt() {
-    let pending = drivers::virtio::transport::dispatch_interrupts();
+    let pending = driver::virtio::transport::dispatch_interrupts();
     event::r#loop::EventLoop::<16>::record_device_interrupts(pending);
-    drivers::virtio::console::Console::handle_interrupt(pending);
+    driver::virtio::console::Console::handle_interrupt(pending);
 }
 
 #[no_mangle]
@@ -82,19 +82,18 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         }
         let _event = events.wait(now_ns);
     }
-    let console_ready = drivers::virtio::console::Console::initialize();
-    let future_smoke_started = scheduler::task::spawn(futures_smoke()).is_ok();
-    if future_smoke_started {
-        scheduler::task::run_until_stalled();
-    }
-    let future_smoke_ok = future_smoke_started && FUTURE_SMOKE_DONE.load(Ordering::Acquire);
+    let console_ready = driver::virtio::console::Console::initialize();
+    #[cfg(feature = "kernel-smoke-tests")]
+    let future_smoke_ok = future_smoke::run();
+    #[cfg(not(feature = "kernel-smoke-tests"))]
+    let future_smoke_ok = false;
     arch::interrupts::enable();
     if console_ready {
-        if drivers::virtio::console::Console::write(arch::BOOT_MESSAGE)
-            && drivers::virtio::console::Console::write(b"kz: virtio-console transmit OK\n")
+        if driver::virtio::console::Console::write(arch::BOOT_MESSAGE)
+            && driver::virtio::console::Console::write(b"kz: virtio-console transmit OK\n")
         {
             runtime::run(
-                &mut events,
+                events.as_mut(),
                 block_device.as_mut(),
                 network_stack.as_mut(),
                 network_registration,
@@ -103,11 +102,6 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
         }
     }
     scheduler::task::run_forever()
-}
-
-async fn futures_smoke() {
-    scheduler::task::yield_now().await;
-    FUTURE_SMOKE_DONE.store(true, Ordering::Release);
 }
 
 #[panic_handler]

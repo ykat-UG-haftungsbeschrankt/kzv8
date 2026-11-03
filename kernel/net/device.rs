@@ -10,7 +10,7 @@ use smoltcp::phy::{
 };
 use smoltcp::time::Instant;
 
-use crate::kernel::drivers::virtio::net::{self, VirtioNet};
+use crate::kernel::driver::virtio::net::{self, VirtioNet};
 
 pub(crate) struct EthernetDevice {
     device: VirtioNet,
