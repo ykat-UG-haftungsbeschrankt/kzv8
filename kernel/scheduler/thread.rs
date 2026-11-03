@@ -14,34 +14,35 @@ use crate::kernel::arch::traits::{
     CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
 };
 
-type StartRoutine = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
-type FpuContext = <crate::kernel::arch::ThreadArchitecture as crate::kernel::arch::traits::ThreadArchitecture>::FpuContext;
+pub(crate) type StartRoutine = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+pub(crate) type FpuContext =
+    <crate::kernel::arch::ThreadArchitecture as crate::kernel::arch::traits::ThreadArchitecture>::FpuContext;
 
 #[repr(C)]
-struct ThreadAttributes {
-    stack_size: usize,
-    detach_state: i32,
-    stack_address: *mut c_void,
+pub(crate) struct ThreadAttributes {
+    pub(crate) stack_size: usize,
+    pub(crate) detach_state: i32,
+    pub(crate) stack_address: *mut c_void,
 }
 
 #[repr(C)]
-struct PthreadMutex {
-    owner: AtomicUsize,
+pub(crate) struct PthreadMutex {
+    pub(crate) owner: AtomicUsize,
 }
 
 #[repr(C)]
-struct PthreadCondition {
-    generation: AtomicUsize,
+pub(crate) struct PthreadCondition {
+    pub(crate) generation: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
-struct TlsKey {
-    active: bool,
-    destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+pub(crate) struct TlsKey {
+    pub(crate) active: bool,
+    pub(crate) destructor: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
 impl TlsKey {
-    const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         active: false,
         destructor: None,
     };
@@ -57,22 +58,22 @@ pub(crate) enum ThreadState {
 }
 
 #[derive(Clone, Copy)]
-struct Thread {
-    id: usize,
-    stack_pointer: usize,
-    state: ThreadState,
-    start_routine: Option<StartRoutine>,
-    argument: *mut c_void,
-    result: *mut c_void,
-    joiner: usize,
-    detached: bool,
-    errno: i32,
-    tls: [*mut c_void; ThreadManager::MAX_TLS_KEYS],
-    fpu_context: FpuContext,
+pub(crate) struct Thread {
+    pub(crate) id: usize,
+    pub(crate) stack_pointer: usize,
+    pub(crate) state: ThreadState,
+    pub(crate) start_routine: Option<StartRoutine>,
+    pub(crate) argument: *mut c_void,
+    pub(crate) result: *mut c_void,
+    pub(crate) joiner: usize,
+    pub(crate) detached: bool,
+    pub(crate) errno: i32,
+    pub(crate) tls: [*mut c_void; ThreadManager::MAX_TLS_KEYS],
+    pub(crate) fpu_context: FpuContext,
 }
 
 impl Thread {
-    const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         id: 0,
         stack_pointer: 0,
         state: ThreadState::Unused,
@@ -92,7 +93,7 @@ impl Thread {
 pub(crate) struct ThreadStack([u8; Self::STACK_SIZE]);
 
 impl ThreadStack {
-    const STACK_SIZE: usize = 16 * 1024;
+    pub(crate) const STACK_SIZE: usize = 16 * 1024;
     /// # Safety
     /// `index` must be valid, and the caller must ensure exclusive access to that stack.
     pub(crate) unsafe fn slice_at(index: usize) -> &'static mut [u8] {
@@ -121,19 +122,19 @@ impl ThreadStack {
 }
 
 pub(crate) struct ThreadManager {
-    threads: [Thread; Self::MAX_THREADS],
-    tls_keys: [TlsKey; Self::MAX_TLS_KEYS],
+    pub(crate) threads: [Thread; Self::MAX_THREADS],
+    pub(crate) tls_keys: [TlsKey; Self::MAX_TLS_KEYS],
     stacks: [ThreadStack; Self::MAX_THREADS],
-    current_slot: usize,
-    next_thread_id: usize,
-    initialized: bool,
+    pub(crate) current_slot: usize,
+    pub(crate) next_thread_id: usize,
+    pub(crate) initialized: bool,
     fallback_errno: i32,
 }
 
 impl ThreadManager {
-    const MAX_THREADS: usize = 8;
-    const MAX_TLS_KEYS: usize = 64;
-    const MAIN_THREAD_ID: usize = 1;
+    pub(crate) const MAX_THREADS: usize = 8;
+    pub(crate) const MAX_TLS_KEYS: usize = 64;
+    pub(crate) const MAIN_THREAD_ID: usize = 1;
 
     const fn new() -> Self {
         Self {
@@ -147,7 +148,7 @@ impl ThreadManager {
         }
     }
 
-    fn get_instance() -> *mut Self {
+    pub(crate) fn get_instance() -> *mut Self {
         static mut INSTANCE: ThreadManager = ThreadManager::new();
         addr_of_mut!(INSTANCE)
     }
@@ -168,7 +169,7 @@ impl ThreadManager {
         crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
     }
 
-    fn errno_location() -> *mut i32 {
+    pub(crate) fn errno_location() -> *mut i32 {
         let manager = Self::get_instance();
         unsafe {
             if (*manager).initialized {
@@ -321,4 +322,9 @@ impl ThreadManager {
         }
         Self::exit_current(core::ptr::null_mut())
     }
+}
+
+#[no_mangle]
+pub extern "C" fn __errno_location() -> *mut i32 {
+    ThreadManager::errno_location()
 }

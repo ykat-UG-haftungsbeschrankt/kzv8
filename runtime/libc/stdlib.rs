@@ -3,10 +3,8 @@ use core::ffi::c_void;
 use core::mem::{align_of, size_of};
 use core::ptr::null_mut;
 
+use super::errno::{EINVAL, ENOMEM};
 use crate::kernel::memory::heap::Heap;
-
-const EINVAL: i32 = 22;
-const ENOMEM: i32 = 12;
 
 fn set_errno(error: i32) {
     unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };

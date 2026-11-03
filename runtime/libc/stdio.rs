@@ -9,11 +9,9 @@ use alloc::boxed::Box;
 use core::ffi::{c_char, c_void};
 use core::ptr::{read_volatile, write_volatile};
 
+use super::errno::{EBADF, EFAULT, EINVAL, EOVERFLOW};
+
 const EOF: i32 = -1;
-const EINVAL: i32 = 22;
-const EFAULT: i32 = 14;
-const EOVERFLOW: i32 = 75;
-const EBADF: i32 = 9;
 
 const O_ACCMODE: i32 = 0o3;
 const O_RDONLY: i32 = 0o0;

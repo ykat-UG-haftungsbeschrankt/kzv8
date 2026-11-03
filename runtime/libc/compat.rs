@@ -9,7 +9,7 @@ use core::ffi::{c_char, c_void};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU8, Ordering};
 
-const EINVAL: i32 = 22;
+use super::errno::EINVAL;
 const WEOF: u32 = u32::MAX;
 
 #[repr(C)]

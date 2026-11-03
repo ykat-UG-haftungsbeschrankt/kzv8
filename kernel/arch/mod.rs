@@ -22,6 +22,8 @@ pub(crate) struct DebugArchitecture;
 pub(crate) struct MemoryArchitecture;
 
 pub(crate) mod traits {
+    use super::VirtioWindow;
+
     pub(crate) trait BootArchitecture {
         const BOOT_MESSAGE: &'static [u8];
         const BOOT_INFO_ERROR: &'static str;
@@ -103,3 +105,5 @@ mod arch;
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]
 mod arch;
+
+pub(crate) use arch::*;

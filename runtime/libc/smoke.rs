@@ -10,13 +10,12 @@ use core::mem::MaybeUninit;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use super::errno::{EINVAL, ENOENT};
 use crate::kernel::arch::traits::TimerArchitecture as _;
 
 use super::filesystem::CStat;
 use super::stdio::KzFile;
 
-const EINVAL: i32 = 22;
-const ENOENT: i32 = 2;
 const O_RDONLY: i32 = 0;
 const O_RDWR: i32 = 2;
 const O_CREAT: i32 = 0o100;

@@ -10,10 +10,10 @@ use core::ffi::c_void;
 use crate::kernel::arch::traits::MemoryArchitecture as _;
 use crate::kernel::arch::MemoryArchitecture;
 
+use super::errno::{EINVAL, ENOMEM};
+
 const PAGE_SIZE: usize = 4096;
 
-const EINVAL: i32 = 22;
-const ENOMEM: i32 = 12;
 const MADV_WILLNEED: i32 = 3;
 const MADV_DONTNEED: i32 = 4;
 const MADV_FREE: i32 = 8;

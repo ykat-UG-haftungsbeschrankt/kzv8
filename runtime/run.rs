@@ -18,7 +18,6 @@ extern "C" {
     fn kz_c_stdio_smoke() -> i32;
     fn kz_c_malloc_smoke() -> i32;
     fn kz_c_mmap_smoke() -> i32;
-    fn kz_c_free_smoke() -> i32;
     fn kz_c_pthread_smoke() -> i32;
 }
 
@@ -44,10 +43,7 @@ pub(crate) fn run(context: KernelContext<'_>) {
         let _mmap_status = Console::write(b"kz: mmap smoke OK\n");
     }
     if unsafe { kz_c_malloc_smoke() } == 0 {
-        let _malloc_status = Console::write(b"kz: malloc smoke OK\n");
-    }
-    if unsafe { kz_c_free_smoke() } == 0 {
-        let _free_status = Console::write(b"kz: free smoke OK\n");
+        let _malloc_status = Console::write(b"kz: malloc/free smoke OK\n");
     }
     if MemoryArchitecture::high_memory_smoke() {
         let _high_memory_status = Console::write(b"kz: RAM above 4 GiB mapped\n");

@@ -350,12 +350,12 @@ extern "C" fn aarch64_page_fault_dispatch() -> u64 {
         return 0;
     }
     let access = match exception_class {
-        0x21 => crate::kernel::memory::virtual_memory::FaultAccess::Execute,
+        0x21 => crate::kernel::memory::r#virtual::FaultAccess::Execute,
         0x25 if syndrome & (1 << 6) != 0 => {
-            crate::kernel::memory::virtual_memory::FaultAccess::Write
+            crate::kernel::memory::r#virtual::FaultAccess::Write
         }
-        0x25 => crate::kernel::memory::virtual_memory::FaultAccess::Read,
+        0x25 => crate::kernel::memory::r#virtual::FaultAccess::Read,
         _ => return 0,
     };
-    crate::kernel::memory::virtual_memory::resolve_page_fault(address as usize, access) as u64
+    crate::kernel::memory::r#virtual::resolve_page_fault(address as usize, access) as u64
 }

@@ -68,7 +68,7 @@ impl VirtualAreas {
     }
 
     pub(crate) const fn allocator_base() -> usize {
-        VM_BASE
+        Self::VM_BASE
     }
 
     fn rounded_length(length: usize) -> Option<usize> {
@@ -285,7 +285,7 @@ impl VirtualAreas {
             Self::decommit_debug(b'b');
             return false;
         };
-        let Some(offset) = address.checked_sub(VM_BASE) else {
+        let Some(offset) = address.checked_sub(Self::VM_BASE) else {
             Self::decommit_debug(b'c');
             return false;
         };

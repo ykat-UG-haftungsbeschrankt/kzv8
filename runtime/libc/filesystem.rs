@@ -11,19 +11,10 @@ use core::ptr::{read_volatile, write_volatile};
 
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
-const EBADF: i32 = 9;
-const EBUSY: i32 = 16;
-const EEXIST: i32 = 17;
-const EFAULT: i32 = 14;
-const EFBIG: i32 = 27;
-const EINVAL: i32 = 22;
-const EISDIR: i32 = 21;
-const EMFILE: i32 = 24;
-const ENAMETOOLONG: i32 = 36;
-const ENOENT: i32 = 2;
-const ENOMEM: i32 = 12;
-const ENOTDIR: i32 = 20;
-const ENOTEMPTY: i32 = 39;
+use super::errno::{
+    EBADF, EBUSY, EEXIST, EFAULT, EFBIG, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT, ENOMEM,
+    ENOTDIR, ENOTEMPTY,
+};
 
 const O_ACCMODE: i32 = 0o3;
 const O_RDONLY: i32 = 0o0;

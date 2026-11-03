@@ -11,16 +11,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::variadic::{self, VA_INT, VA_POINTER, VA_UINT, VA_ULONG};
 
-const EAGAIN: i32 = 11;
-const EBUSY: i32 = 16;
-const EBADF: i32 = 9;
-const EFAULT: i32 = 14;
-const EINVAL: i32 = 22;
-const EIO: i32 = 5;
-const ENOSYS: i32 = 38;
-const ENOMEM: i32 = 12;
-const ERANGE: i32 = 34;
-const EOVERFLOW: i32 = 75;
+use super::errno::{
+    EAGAIN, EBADF, EBUSY, EFAULT, EINVAL, EIO, ENOMEM, ENOSYS, EOVERFLOW, ERANGE,
+};
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
