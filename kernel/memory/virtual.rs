@@ -58,13 +58,13 @@ impl VirtualAreas {
         areas: [VmArea::EMPTY; Self::MAX_VM_AREAS],
     };
 
-    pub(super) fn initialize() {
+    fn initialize(&mut self) {
         MemoryArchitecture::initialize_mmu();
-        MMU_READY.store(true, Ordering::Release);
+        self.mmu_ready.store(true, Ordering::Release);
     }
 
-    pub(crate) fn mmu_ready() -> bool {
-        MMU_READY.load(Ordering::Acquire)
+    fn mmu_ready(&self) -> bool {
+        self.mmu_ready.load(Ordering::Acquire)
     }
 
     pub(crate) const fn allocator_base() -> usize {
@@ -132,7 +132,7 @@ impl VirtualAreas {
             }
 
             let occupied = (start_page..end_page)
-                .find(|page| Self::PAGE_STATE[*page].load(Ordering::Acquire) & Self::VM_RESERVED != 0);
+                .find(|page| self.page_state[*page].load(Ordering::Acquire) & Self::VM_RESERVED != 0);
             if let Some(occupied_page) = occupied {
                 if hint.is_some() {
                     return None;
@@ -148,7 +148,7 @@ impl VirtualAreas {
             };
             let state = Self::VM_RESERVED | state_permissions;
             for page in start_page..end_page {
-                Self::PAGE_STATE[page].store(state, Ordering::Release);
+                self.page_state[page].store(state, Ordering::Release);
             }
             self.areas[area_slot] = VmArea {
                 start_page,
@@ -184,12 +184,12 @@ impl VirtualAreas {
             return false;
         };
         if (start_page..end_page)
-            .any(|page| Self::PAGE_STATE[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
+            .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             return false;
         }
 
-        let released = Self::release_pages(start_page, end_page);
+        let released = self.release_pages(start_page, end_page);
         self.areas[area_slot] = VmArea::EMPTY;
         released
     }
@@ -222,7 +222,7 @@ impl VirtualAreas {
         };
         let area = self.areas[area_slot];
         if (start_page..end_page)
-            .any(|page| Self::PAGE_STATE[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
+            .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             return false;
         }
@@ -239,7 +239,7 @@ impl VirtualAreas {
             None
         };
 
-        let released = Self::release_pages(start_page, end_page);
+        let released = self.release_pages(start_page, end_page);
         match (prefix_page_count, suffix_page_count) {
             (0, 0) => self.areas[area_slot] = VmArea::EMPTY,
             (0, suffix_page_count) => {
@@ -278,7 +278,7 @@ impl VirtualAreas {
     }
 
     fn decommit(&self, address: usize, length: usize) -> bool {
-        if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 {
+        if address < Self::VM_BASE || address % Self::PAGE_SIZE != 0 || length == 0 {
             Self::decommit_debug(b'a');
             return false;
         }
@@ -290,12 +290,12 @@ impl VirtualAreas {
             Self::decommit_debug(b'c');
             return false;
         };
-        let start_page = offset / PAGE_SIZE;
-        let page_count = length / PAGE_SIZE;
+        let start_page = offset / Self::PAGE_SIZE;
+        let page_count = length / Self::PAGE_SIZE;
         let Some(end_page) = start_page.checked_add(page_count) else {
             return false;
         };
-        if end_page > MAX_VM_PAGES {
+        if end_page > Self::MAX_VM_PAGES {
             Self::decommit_debug(b'd');
             return false;
         }
@@ -310,7 +310,7 @@ impl VirtualAreas {
             return false;
         }
         if (start_page..end_page)
-            .any(|page| PAGE_STATE[page].load(Ordering::Acquire) & VM_RESERVED == 0)
+            .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             Self::decommit_debug(b'f');
             return false;
@@ -320,12 +320,12 @@ impl VirtualAreas {
         for page in start_page..end_page {
             let virtual_address = Self::VM_BASE + page * Self::PAGE_SIZE;
             if let Some(physical_address) = MemoryArchitecture::unmap_page(virtual_address) {
-                if !PhysicalAllocator::deallocate_contiguous(physical_address, PAGE_SIZE) {
+                if !PhysicalAllocator::deallocate_contiguous(physical_address, Self::PAGE_SIZE) {
                     decommitted = false;
                     Self::decommit_debug(b'g');
                 }
             }
-            PAGE_STATE[page].store(VM_RESERVED, Ordering::Release);
+            self.page_state[page].store(Self::VM_RESERVED, Ordering::Release);
         }
         if decommitted {
             Self::decommit_debug(b'.');
@@ -372,12 +372,12 @@ impl VirtualAreas {
             return false;
         };
         if (release_start..release_end)
-            .any(|page| PAGE_STATE[page].load(Ordering::Acquire) & VM_RESERVED == 0)
+            .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             return false;
         }
 
-        let released = Self::release_pages(release_start, release_end);
+        let released = self.release_pages(release_start, release_end);
         if new_page_count == 0 {
             self.areas[slot] = VmArea::EMPTY;
         } else {
@@ -421,8 +421,8 @@ impl VirtualAreas {
         }
 
         for page in start_page..end_page {
-            let state = PAGE_STATE[page].load(Ordering::Acquire);
-            if state & VM_RESERVED == 0 {
+            let state = self.page_state[page].load(Ordering::Acquire);
+            if state & Self::VM_RESERVED == 0 {
                 return false;
             }
             let virtual_address = Self::VM_BASE + page * Self::PAGE_SIZE;
@@ -435,21 +435,21 @@ impl VirtualAreas {
             {
                 return false;
             }
-            PAGE_STATE[page].store(VM_RESERVED | permissions as u8, Ordering::Release);
+            self.page_state[page].store(Self::VM_RESERVED | permissions as u8, Ordering::Release);
         }
         true
     }
 
-    fn release_pages(start_page: usize, end_page: usize) -> bool {
+    fn release_pages(&mut self, start_page: usize, end_page: usize) -> bool {
         let mut released = true;
         for page in start_page..end_page {
             let virtual_address = Self::VM_BASE + page * Self::PAGE_SIZE;
             if let Some(physical_address) = MemoryArchitecture::unmap_page(virtual_address) {
-                if !PhysicalAllocator::deallocate_contiguous(physical_address, PAGE_SIZE) {
+                if !PhysicalAllocator::deallocate_contiguous(physical_address, Self::PAGE_SIZE) {
                     released = false;
                 }
             }
-            PAGE_STATE[page].store(0, Ordering::Release);
+            self.page_state[page].store(0, Ordering::Release);
         }
         released
     }
@@ -464,7 +464,7 @@ impl VirtualAreas {
         }
         let page = offset / Self::PAGE_SIZE;
 
-        let state = PAGE_STATE[page].load(Ordering::Acquire);
+        let state = self.page_state[page].load(Ordering::Acquire);
         if state & Self::VM_RESERVED == 0 {
             return false;
         }
@@ -498,10 +498,20 @@ impl VirtualAreas {
     }
 }
 
+struct VirtualAreasLock;
+
 impl VirtualAreasLock {
     pub(crate) fn get_instance() -> &'static IrqSpinLock<VirtualAreas> {
         static VM_AREAS: IrqSpinLock<VirtualAreas> = IrqSpinLock::new(VirtualAreas::EMPTY);
         &VM_AREAS
+    }
+
+    fn initialize() {
+        Self::get_instance().lock().initialize();
+    }
+
+    fn mmu_ready() -> bool {
+        Self::get_instance().lock().mmu_ready()
     }
 
     pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Option<usize> {
@@ -552,4 +562,63 @@ impl VirtualAreasLock {
     pub(crate) fn translate(address: usize) -> Option<usize> {
         Self::is_identity_mapped(address).then_some(address)
     }
+}
+
+pub(crate) const PAGE_SIZE: usize = VirtualAreas::PAGE_SIZE;
+
+pub(super) fn initialize() {
+    VirtualAreasLock::initialize();
+}
+
+pub(crate) fn mmu_ready() -> bool {
+    VirtualAreasLock::mmu_ready()
+}
+
+pub(crate) const fn allocator_base() -> usize {
+    VirtualAreas::allocator_base()
+}
+
+pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Option<usize> {
+    VirtualAreasLock::reserve(length, alignment, permissions)
+}
+
+pub(crate) fn reserve_with_hint(
+    hint: Option<usize>,
+    length: usize,
+    alignment: usize,
+    permissions: i32,
+) -> Option<usize> {
+    VirtualAreasLock::reserve_with_hint(hint, length, alignment, permissions)
+}
+
+pub(crate) fn release(address: usize, length: usize) -> bool {
+    VirtualAreasLock::release(address, length)
+}
+
+pub(crate) fn release_range(address: usize, length: usize) -> bool {
+    VirtualAreasLock::release_range(address, length)
+}
+
+pub(crate) fn decommit(address: usize, length: usize) -> bool {
+    VirtualAreasLock::decommit(address, length)
+}
+
+pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -> bool {
+    VirtualAreasLock::release_suffix(address, length, new_length)
+}
+
+pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -> bool {
+    VirtualAreasLock::set_permissions(address, length, permissions)
+}
+
+pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
+    VirtualAreasLock::resolve_page_fault(address, access)
+}
+
+pub(crate) fn is_identity_mapped(address: usize) -> bool {
+    VirtualAreasLock::is_identity_mapped(address)
+}
+
+pub(crate) fn translate(address: usize) -> Option<usize> {
+    VirtualAreasLock::translate(address)
 }
