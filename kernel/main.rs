@@ -26,10 +26,6 @@ pub(crate) mod net;
 pub(crate) mod runtime;
 pub(crate) mod scheduler;
 
-#[cfg(feature = "kernel-smoke-tests")]
-#[path = "../tests/kernel/futures.rs"]
-mod future_smoke;
-
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
     pub(crate) use crate::{arch, block, driver, error, event, memory, net, runtime, scheduler};
@@ -40,7 +36,6 @@ pub(crate) struct KernelContext<'a> {
     pub(crate) block_device: Option<&'a mut block::device::BlockDevice>,
     pub(crate) network_stack: Option<&'a mut net::stack::NetStack>,
     pub(crate) network_registration: Option<event::r#loop::EventSourceToken>,
-    pub(crate) future_smoke_ok: bool,
 }
 
 struct Kernel;
@@ -97,10 +92,6 @@ impl Kernel {
             let _event = events.wait(now_ns);
         }
         let console_ready = driver::virtio::console::Console::initialize();
-        #[cfg(feature = "kernel-smoke-tests")]
-        let future_smoke_ok = future_smoke::run();
-        #[cfg(not(feature = "kernel-smoke-tests"))]
-        let future_smoke_ok = false;
         arch::InterruptArchitecture::enable_interrupts();
         if console_ready {
             if driver::virtio::console::Console::write(arch::BootArchitecture::BOOT_MESSAGE)
@@ -110,8 +101,7 @@ impl Kernel {
                     events: &mut events,
                     block_device: block_device.as_mut(),
                     network_stack: network_stack.as_mut(),
-                    network_registration,
-                    future_smoke_ok,
+                    network_registration
                 });
             }
         }
