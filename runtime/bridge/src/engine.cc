@@ -52,6 +52,27 @@ struct DeviceBindings {
 	bool console_called = false;
 };
 
+struct ModuleCacheEntry {
+	bool used = false;
+	std::array<char, 256> url{};
+	v8::Global<v8::Module> module;
+};
+
+struct PendingImport {
+	bool active = false;
+	v8::Global<v8::Promise::Resolver> resolver;
+	v8::Global<v8::Module> module;
+};
+
+struct ModuleLoader {
+	v8::Global<v8::Function> read_module;
+	v8::Global<v8::Function> read_module_sync;
+	std::array<ModuleCacheEntry, 32> modules{};
+	std::array<PendingImport, 16> pending{};
+};
+
+constexpr uint32_t kModuleLoaderDataSlot = 0;
+
 extern "C" {
 int kz_host_event_loop_poll(void* context, KzRawEvent* output);
 int kz_host_event_loop_schedule_timer(void* context, uint64_t delay_ns,
@@ -660,6 +681,407 @@ bool global_boolean(v8::Isolate* isolate, v8::Local<v8::Context> context,
 		return false;
 	}
 	return value.As<v8::Boolean>()->Value();
+}
+
+ModuleLoader* module_loader(v8::Isolate* isolate) {
+	return static_cast<ModuleLoader*>(isolate->GetData(kModuleLoaderDataSlot));
+}
+
+ModuleCacheEntry* find_module(ModuleLoader* loader, const char* url) {
+	for (ModuleCacheEntry& entry : loader->modules) {
+		if (entry.used && std::strcmp(entry.url.data(), url) == 0) return &entry;
+	}
+	return nullptr;
+}
+
+ModuleCacheEntry* allocate_module(ModuleLoader* loader) {
+	for (ModuleCacheEntry& entry : loader->modules) {
+		if (!entry.used) return &entry;
+	}
+	return nullptr;
+}
+
+PendingImport* allocate_pending_import(
+		ModuleLoader* loader, v8::Isolate* isolate,
+		v8::Local<v8::Promise::Resolver> resolver) {
+	for (PendingImport& pending : loader->pending) {
+		if (pending.active) continue;
+		pending.active = true;
+		pending.resolver.Reset(isolate, resolver);
+		return &pending;
+	}
+	return nullptr;
+}
+
+void release_pending_import(PendingImport* pending) {
+	if (pending == nullptr) return;
+	pending->resolver.Reset();
+	pending->module.Reset();
+	pending->active = false;
+}
+
+void reject_pending_import(PendingImport* pending,
+							   v8::Local<v8::Context> context,
+							   v8::Local<v8::Value> reason) {
+	if (pending == nullptr || !pending->active) return;
+	auto resolver = pending->resolver.Get(context->GetIsolate());
+	if (!resolver.IsEmpty()) resolver->Reject(context, reason).FromMaybe(false);
+	release_pending_import(pending);
+}
+
+bool compile_module_response(v8::Local<v8::Context> context,
+							 v8::Local<v8::Value> response,
+							 v8::Local<v8::Module>* output) {
+	auto* isolate = context->GetIsolate();
+	if (!response->IsObject()) {
+		throw_type_error(isolate, "VFAT loader returned a non-object");
+		return false;
+	}
+	v8::Local<v8::Object> object;
+	if (!response->ToObject(context).ToLocal(&object)) return false;
+	v8::Local<v8::Value> url_value;
+	v8::Local<v8::Value> bytes_value;
+	if (!object
+			->Get(context, v8::String::NewFromUtf8Literal(isolate, "url"))
+			.ToLocal(&url_value) ||
+		!object
+			->Get(context, v8::String::NewFromUtf8Literal(isolate, "bytes"))
+			.ToLocal(&bytes_value) ||
+		!url_value->IsString() || !bytes_value->IsUint8Array()) {
+		throw_type_error(isolate, "VFAT loader must return a URL and Uint8Array");
+		return false;
+	}
+
+	v8::String::Utf8Value url_utf8(isolate, url_value);
+	if (*url_utf8 == nullptr || url_utf8.length() == 0 ||
+			static_cast<size_t>(url_utf8.length()) >= ModuleCacheEntry{}.url.size()) {
+		throw_range_error(isolate, "VFAT module URL is too long");
+		return false;
+	}
+	std::array<char, 256> canonical_url{};
+	std::memcpy(canonical_url.data(), *url_utf8,
+				static_cast<size_t>(url_utf8.length()));
+	if (ModuleCacheEntry* cached =
+			find_module(module_loader(isolate), canonical_url.data())) {
+		*output = cached->module.Get(isolate);
+		return !output->IsEmpty();
+	}
+
+	auto source_bytes = bytes_value.As<v8::Uint8Array>();
+	const size_t source_length = source_bytes->ByteLength();
+	if (source_length > 4 * 1024 * 1024 || source_length > 0x7fffffffU) {
+		throw_range_error(isolate, "VFAT module source exceeds the size limit");
+		return false;
+	}
+	auto backing_store = source_bytes->Buffer()->GetBackingStore();
+	const char* source_data =
+			static_cast<const char*>(backing_store->Data()) +
+			source_bytes->ByteOffset();
+	v8::Local<v8::String> source_string;
+	if (!v8::String::NewFromUtf8(isolate, source_data,
+									 v8::NewStringType::kNormal,
+									 static_cast<int>(source_length))
+				.ToLocal(&source_string)) {
+		return false;
+	}
+	v8::Local<v8::String> url_string = url_value.As<v8::String>();
+	v8::ScriptOrigin origin(isolate, url_string);
+	v8::ScriptCompiler::Source module_source(source_string, origin);
+	v8::Local<v8::Module> module;
+	if (!v8::ScriptCompiler::CompileModule(isolate, &module_source)
+			.ToLocal(&module)) {
+		return false;
+	}
+	ModuleCacheEntry* entry = allocate_module(module_loader(isolate));
+	if (entry == nullptr) {
+		throw_range_error(isolate, "VFAT module cache capacity exhausted");
+		return false;
+	}
+	entry->used = true;
+	std::memcpy(entry->url.data(), canonical_url.data(), canonical_url.size());
+	entry->module.Reset(isolate, module);
+	*output = module;
+	return true;
+}
+
+v8::MaybeLocal<v8::Module> resolve_module(
+		v8::Local<v8::Context> context, v8::Local<v8::String> specifier,
+		v8::Local<v8::FixedArray> import_attributes,
+		v8::Local<v8::Module> referrer) {
+	auto* isolate = context->GetIsolate();
+	if (!import_attributes.IsEmpty() && import_attributes->Length() != 0) {
+		throw_type_error(isolate, "import attributes are not supported by VFAT");
+		return {};
+	}
+	ModuleLoader* loader = module_loader(isolate);
+	if (loader == nullptr || loader->read_module_sync.IsEmpty()) {
+		throw_error(isolate, "VFAT module resolver is not initialized");
+		return {};
+	}
+	v8::Local<v8::Value> arguments[] = {specifier, referrer->GetResourceName()};
+	v8::Local<v8::Value> response;
+	if (!loader->read_module_sync.Get(isolate)
+			->Call(context, context->Global(), 2, arguments)
+			.ToLocal(&response)) {
+		return {};
+	}
+	v8::Local<v8::Module> module;
+	if (!compile_module_response(context, response, &module)) return {};
+	return module;
+}
+
+void module_evaluation_fulfilled(
+		const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* pending = static_cast<PendingImport*>(function_data(args));
+	if (pending == nullptr || !pending->active) return;
+	auto* isolate = args.GetIsolate();
+	auto context = isolate->GetCurrentContext();
+	auto resolver = pending->resolver.Get(isolate);
+	auto module = pending->module.Get(isolate);
+	if (!resolver.IsEmpty() && !module.IsEmpty()) {
+		resolver->Resolve(context, module->GetModuleNamespace()).FromMaybe(false);
+	}
+	release_pending_import(pending);
+}
+
+void module_evaluation_rejected(
+		const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* pending = static_cast<PendingImport*>(function_data(args));
+	if (pending == nullptr || !pending->active) return;
+	auto context = args.GetIsolate()->GetCurrentContext();
+	auto reason = args.Length() > 0
+					  ? args[0]
+					  : v8::Exception::Error(v8::String::NewFromUtf8Literal(
+										args.GetIsolate(), "module evaluation failed"));
+	reject_pending_import(pending, context, reason);
+}
+
+bool attach_module_handlers(v8::Local<v8::Context> context,
+							v8::Local<v8::Promise> promise,
+							PendingImport* pending,
+							v8::FunctionCallback fulfilled_callback,
+							v8::FunctionCallback rejected_callback) {
+	auto* isolate = context->GetIsolate();
+	auto data = v8::External::New(
+			isolate, pending, v8::kExternalPointerTypeTagDefault);
+	v8::Local<v8::Function> fulfilled;
+	v8::Local<v8::Function> rejected;
+	if (!v8::Function::New(context, fulfilled_callback, data).ToLocal(&fulfilled) ||
+			!v8::Function::New(context, rejected_callback, data).ToLocal(&rejected)) {
+		return false;
+	}
+	v8::Local<v8::Promise> chained;
+	return promise->Then(context, fulfilled, rejected).ToLocal(&chained);
+}
+
+void module_source_fulfilled(
+		const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* pending = static_cast<PendingImport*>(function_data(args));
+	if (pending == nullptr || !pending->active) return;
+	auto* isolate = args.GetIsolate();
+	auto context = isolate->GetCurrentContext();
+	ModuleLoader* loader = module_loader(isolate);
+	if (loader == nullptr || args.Length() == 0) {
+		reject_pending_import(
+				pending, context,
+				v8::Exception::Error(v8::String::NewFromUtf8Literal(
+						isolate, "VFAT module load returned no source")));
+		return;
+	}
+	v8::TryCatch try_catch(isolate);
+	v8::Local<v8::Module> module;
+	if (!compile_module_response(context, args[0], &module)) {
+		auto reason = try_catch.HasCaught()
+						 ? try_catch.Exception()
+						 : v8::Exception::Error(v8::String::NewFromUtf8Literal(
+										 isolate, "unable to compile VFAT module"));
+		reject_pending_import(pending, context, reason);
+		return;
+	}
+	pending->module.Reset(isolate, module);
+	if (module->GetStatus() == v8::Module::kErrored) {
+		reject_pending_import(pending, context, module->GetException());
+		return;
+	}
+	if (module->GetStatus() == v8::Module::kUninstantiated) {
+		const auto instantiated = module->InstantiateModule(context, resolve_module);
+		if (instantiated.IsNothing() || !instantiated.FromMaybe(false)) {
+			auto reason = try_catch.HasCaught()
+						 ? try_catch.Exception()
+						 : v8::Exception::Error(v8::String::NewFromUtf8Literal(
+										 isolate, "unable to instantiate VFAT module"));
+			reject_pending_import(pending, context, reason);
+			return;
+		}
+	}
+	if (module->GetStatus() == v8::Module::kEvaluated) {
+		auto resolver = pending->resolver.Get(isolate);
+		if (!resolver.IsEmpty()) {
+			resolver->Resolve(context, module->GetModuleNamespace()).FromMaybe(false);
+		}
+		release_pending_import(pending);
+		return;
+	}
+
+	v8::Local<v8::Promise> evaluation;
+	if (!module->Evaluate(context).ToLocal(&evaluation)) {
+		auto reason = try_catch.HasCaught()
+						 ? try_catch.Exception()
+						 : v8::Exception::Error(v8::String::NewFromUtf8Literal(
+										 isolate, "unable to evaluate VFAT module"));
+		reject_pending_import(pending, context, reason);
+		return;
+	}
+	if (!attach_module_handlers(context, evaluation, pending,
+								module_evaluation_fulfilled,
+								module_evaluation_rejected)) {
+		auto reason = try_catch.HasCaught()
+						 ? try_catch.Exception()
+						 : v8::Exception::Error(v8::String::NewFromUtf8Literal(
+										 isolate, "unable to observe module evaluation"));
+		reject_pending_import(pending, context, reason);
+	}
+}
+
+void module_source_rejected(
+		const v8::FunctionCallbackInfo<v8::Value>& args) {
+	auto* pending = static_cast<PendingImport*>(function_data(args));
+	if (pending == nullptr || !pending->active) return;
+	auto context = args.GetIsolate()->GetCurrentContext();
+	auto reason = args.Length() > 0
+					  ? args[0]
+					  : v8::Exception::Error(v8::String::NewFromUtf8Literal(
+										args.GetIsolate(), "VFAT module load rejected"));
+	reject_pending_import(pending, context, reason);
+}
+
+v8::MaybeLocal<v8::Promise> host_import_module_dynamically(
+		v8::Local<v8::Context> context, v8::Local<v8::Data> host_defined_options,
+		v8::Local<v8::Value> resource_name, v8::Local<v8::String> specifier,
+		v8::Local<v8::FixedArray> import_attributes) {
+	auto* isolate = context->GetIsolate();
+	v8::Local<v8::Promise::Resolver> resolver;
+	if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) return {};
+	auto promise = resolver->GetPromise();
+	if (!import_attributes.IsEmpty() && import_attributes->Length() != 0) {
+		resolver->Reject(context, v8::Exception::TypeError(
+				v8::String::NewFromUtf8Literal(isolate,
+						"import attributes are not supported by VFAT")))
+				.FromMaybe(false);
+		return promise;
+	}
+	ModuleLoader* loader = module_loader(isolate);
+	if (loader == nullptr || loader->read_module.IsEmpty()) {
+		resolver->Reject(context, v8::Exception::Error(
+				v8::String::NewFromUtf8Literal(isolate,
+						"VFAT module loader is not initialized")))
+				.FromMaybe(false);
+		return promise;
+	}
+	PendingImport* pending = allocate_pending_import(loader, isolate, resolver);
+	if (pending == nullptr) {
+		resolver->Reject(context, v8::Exception::RangeError(
+				v8::String::NewFromUtf8Literal(isolate,
+						"too many pending module imports")))
+				.FromMaybe(false);
+		return promise;
+	}
+	v8::Local<v8::Value> arguments[] = {specifier, resource_name};
+	v8::Local<v8::Value> load_result;
+	v8::TryCatch try_catch(isolate);
+	if (!loader->read_module.Get(isolate)
+			->Call(context, context->Global(), 2, arguments)
+			.ToLocal(&load_result) || !load_result->IsPromise()) {
+		auto reason = try_catch.HasCaught()
+						 ? try_catch.Exception()
+						 : v8::Exception::Error(v8::String::NewFromUtf8Literal(
+										 isolate, "VFAT loader did not return a promise"));
+		reject_pending_import(pending, context, reason);
+		return promise;
+	}
+	if (!attach_module_handlers(context, load_result.As<v8::Promise>(), pending,
+								module_source_fulfilled,
+								module_source_rejected)) {
+		auto reason = try_catch.HasCaught()
+						 ? try_catch.Exception()
+						 : v8::Exception::Error(v8::String::NewFromUtf8Literal(
+										 isolate, "unable to observe VFAT load promise"));
+		reject_pending_import(pending, context, reason);
+	}
+	return promise;
+}
+
+bool run_vfat_esm_smoke(v8::Local<v8::Context> context,
+						v8::Isolate* isolate, ModuleLoader* loader,
+						const uint8_t* bootstrap_source,
+						size_t bootstrap_length) {
+	if (bootstrap_source == nullptr || bootstrap_length == 0 ||
+			bootstrap_length > 0x7fffffffU) {
+		return false;
+	}
+	v8::TryCatch try_catch(isolate);
+	v8::Local<v8::String> bootstrap_text;
+	if (!v8::String::NewFromUtf8(isolate,
+								reinterpret_cast<const char*>(bootstrap_source),
+								v8::NewStringType::kNormal,
+								static_cast<int>(bootstrap_length))
+				.ToLocal(&bootstrap_text)) {
+		return false;
+	}
+	v8::Local<v8::Script> bootstrap;
+	if (!v8::Script::Compile(context, bootstrap_text).ToLocal(&bootstrap)) return false;
+	v8::Local<v8::Value> bootstrap_result;
+	if (!bootstrap->Run(context).ToLocal(&bootstrap_result)) return false;
+
+	auto global = context->Global();
+	v8::Local<v8::Value> read_module;
+	v8::Local<v8::Value> read_module_sync;
+	if (!global
+			->Get(context, v8::String::NewFromUtf8Literal(
+						isolate, "__kzVfatReadModule"))
+			.ToLocal(&read_module) ||
+		!global
+			->Get(context, v8::String::NewFromUtf8Literal(
+						isolate, "__kzVfatReadModuleSync"))
+			.ToLocal(&read_module_sync) ||
+		!read_module->IsFunction() || !read_module_sync->IsFunction()) {
+		return false;
+	}
+	loader->read_module.Reset(isolate, read_module.As<v8::Function>());
+	loader->read_module_sync.Reset(isolate,
+									read_module_sync.As<v8::Function>());
+
+	static constexpr char trampoline_source[] =
+			"await import('virtiovfat:///app/main.js');";
+	auto source = v8::String::NewFromUtf8Literal(isolate, trampoline_source);
+	auto resource_name = v8::String::NewFromUtf8Literal(isolate,
+														"kz:///boot.mjs");
+	v8::ScriptOrigin origin(isolate, resource_name);
+	v8::ScriptCompiler::Source module_source(source, origin);
+	v8::Local<v8::Module> trampoline;
+	if (!v8::ScriptCompiler::CompileModule(isolate, &module_source)
+			.ToLocal(&trampoline)) {
+		return false;
+	}
+	const auto instantiated = trampoline->InstantiateModule(context, resolve_module);
+	if (instantiated.IsNothing() || !instantiated.FromMaybe(false)) return false;
+	v8::Local<v8::Promise> evaluation;
+	if (!trampoline->Evaluate(context).ToLocal(&evaluation)) return false;
+	isolate->PerformMicrotaskCheckpoint();
+	return evaluation->State() == v8::Promise::kFulfilled &&
+			global_boolean(isolate, context, "__kzAppLoaded");
+}
+
+void reset_module_loader(ModuleLoader* loader) {
+	loader->read_module.Reset();
+	loader->read_module_sync.Reset();
+	for (ModuleCacheEntry& module : loader->modules) {
+		module.module.Reset();
+		module.used = false;
+	}
+	for (PendingImport& pending : loader->pending) {
+		release_pending_import(&pending);
+	}
 }
 
 bool timers_pending(const TimerBindings& timers) {

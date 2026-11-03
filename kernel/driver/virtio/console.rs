@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+use core::fmt::Write as _;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::kernel::driver::virtio::queue::{Descriptor, QueueCell};
@@ -35,6 +36,18 @@ pub(crate) struct Console {
     base: AtomicUsize,
     slot: AtomicUsize,
     output: IrqSpinLock<OutputQueue>,
+}
+
+struct ConsoleWriter;
+
+impl core::fmt::Write for ConsoleWriter {
+    fn write_str(&mut self, message: &str) -> core::fmt::Result {
+        if Console::write(message.as_bytes()) {
+            Ok(())
+        } else {
+            Err(core::fmt::Error)
+        }
+    }
 }
 
 impl Console {
@@ -72,6 +85,18 @@ impl Console {
         console.base.store(base, Ordering::Release);
         console.slot.store(transport.slot(), Ordering::Release);
         true
+    }
+
+    pub(crate) fn write_device_list() {
+        let mut writer = ConsoleWriter;
+        crate::kernel::driver::virtio::transport::for_each_device(|device_id| {
+            let _ = core::write!(
+                &mut writer,
+                "kz: virtio device_id={} type={}\n",
+                device_id,
+                VirtioTransport::device_type_name(device_id)
+            );
+        });
     }
 
     pub(crate) fn write(message: &[u8]) -> bool {

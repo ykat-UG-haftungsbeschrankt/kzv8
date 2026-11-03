@@ -9,5 +9,5 @@
     "rootDir": ".",
     "outDir": "dist"
   },
-  "include": ["main.ts", "host.d.ts"]
+  "include": ["main.ts", "feature-module.ts", "host.d.ts"]
 }

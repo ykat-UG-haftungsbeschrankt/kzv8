@@ -1,4 +1,5 @@
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -7,6 +8,153 @@ from pathlib import Path
 
 
 TCP_TEST_PORT = 17777
+SECTOR_SIZE = 512
+DISK_SECTORS = 16 * 1024 * 1024 // SECTOR_SIZE
+FAT_PARTITION_START = 2048
+
+
+def put_u16(buffer, offset, value):
+    struct.pack_into("<H", buffer, offset, value)
+
+
+def put_u32(buffer, offset, value):
+    struct.pack_into("<I", buffer, offset, value)
+
+
+def short_entry(alias, attributes, cluster, size):
+    name = alias.encode("ascii")
+    if len(name) != 11:
+        raise ValueError(f"invalid 8.3 alias: {alias!r}")
+    entry = bytearray(32)
+    entry[:11] = name
+    entry[11] = attributes
+    put_u16(entry, 20, cluster >> 16)
+    put_u16(entry, 26, cluster & 0xFFFF)
+    put_u32(entry, 28, size)
+    return entry
+
+
+def lfn_entries(name, alias):
+    short_name = alias.encode("ascii")
+    checksum = 0
+    for value in short_name:
+        checksum = (((checksum & 1) << 7) + (checksum >> 1) + value) & 0xFF
+    encoded = name.encode("utf-16le")
+    units = list(struct.unpack(f"<{len(encoded) // 2}H", encoded))
+    units.append(0)
+    while len(units) % 13:
+        units.append(0xFFFF)
+    positions = (1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)
+    count = len(units) // 13
+    entries = []
+    for ordinal in range(count, 0, -1):
+        entry = bytearray([0xFF] * 32)
+        entry[0] = ordinal | (0x40 if ordinal == count else 0)
+        entry[11] = 0x0F
+        entry[12] = 0
+        entry[13] = checksum
+        put_u16(entry, 26, 0)
+        for index, position in enumerate(positions):
+            put_u16(entry, position, units[(ordinal - 1) * 13 + index])
+        entries.append(entry)
+    return entries
+
+
+def create_fat16_image(path, app_files):
+    disk = bytearray(DISK_SECTORS * SECTOR_SIZE)
+    volume_sectors = DISK_SECTORS - FAT_PARTITION_START
+    reserved_sectors = 1
+    fat_count = 2
+    root_entry_count = 512
+    root_directory_sectors = root_entry_count * 32 // SECTOR_SIZE
+    fat_sectors = 1
+    while True:
+        clusters = (volume_sectors - reserved_sectors - fat_count * fat_sectors
+                    - root_directory_sectors)
+        required = ((clusters + 2) * 2 + SECTOR_SIZE - 1) // SECTOR_SIZE
+        if required == fat_sectors:
+            break
+        fat_sectors = required
+    cluster_count = (volume_sectors - reserved_sectors - fat_count * fat_sectors
+                     - root_directory_sectors)
+    if not 4085 <= cluster_count < 65525:
+        raise ValueError("test image is not a valid FAT16 volume")
+
+    mbr = memoryview(disk)[:SECTOR_SIZE]
+    mbr[446 + 4] = 0x06
+    put_u32(mbr, 446 + 8, FAT_PARTITION_START)
+    put_u32(mbr, 446 + 12, volume_sectors)
+    mbr[510:512] = b"\x55\xaa"
+
+    boot_offset = FAT_PARTITION_START * SECTOR_SIZE
+    boot = memoryview(disk)[boot_offset:boot_offset + SECTOR_SIZE]
+    boot[:3] = b"\xeb\x3c\x90"
+    boot[3:11] = b"MSWIN4.1"
+    put_u16(boot, 11, SECTOR_SIZE)
+    boot[13] = 1
+    put_u16(boot, 14, reserved_sectors)
+    boot[16] = fat_count
+    put_u16(boot, 17, root_entry_count)
+    put_u16(boot, 19, volume_sectors)
+    boot[21] = 0xF8
+    put_u16(boot, 22, fat_sectors)
+    put_u16(boot, 24, 63)
+    put_u16(boot, 26, 255)
+    put_u32(boot, 28, FAT_PARTITION_START)
+    boot[38] = 0x29
+    put_u32(boot, 39, 0x4B5A2026)
+    boot[43:54] = b"KZAPP      "
+    boot[54:62] = b"FAT16   "
+    boot[510:512] = b"\x55\xaa"
+
+    fat_start = FAT_PARTITION_START + reserved_sectors
+
+    def set_fat_entry(cluster, value):
+        byte_offset = cluster * 2
+        for copy in range(fat_count):
+            offset = ((fat_start + copy * fat_sectors) * SECTOR_SIZE
+                      + byte_offset)
+            put_u16(disk, offset, value)
+
+    set_fat_entry(0, 0xFFF8)
+    set_fat_entry(1, 0xFFFF)
+    set_fat_entry(2, 0xFFFF)
+
+    root_sector = fat_start + fat_count * fat_sectors
+    root_offset = root_sector * SECTOR_SIZE
+    disk[root_offset:root_offset + 32] = short_entry("APP        ", 0x10, 2, 0)
+    data_sector = root_sector + root_directory_sectors
+    app_directory = bytearray(SECTOR_SIZE)
+    directory_offset = 0
+    next_cluster = 3
+
+    for name, alias, contents in app_files:
+        contents = bytes(contents)
+        cluster_count_for_file = max(1, (len(contents) + SECTOR_SIZE - 1) // SECTOR_SIZE)
+        clusters = list(range(next_cluster, next_cluster + cluster_count_for_file))
+        next_cluster += cluster_count_for_file
+        if next_cluster >= cluster_count + 2:
+            raise ValueError("test app exceeds FAT16 image capacity")
+        for index, cluster in enumerate(clusters):
+            set_fat_entry(cluster, clusters[index + 1] if index + 1 < len(clusters) else 0xFFFF)
+            chunk = contents[index * SECTOR_SIZE:(index + 1) * SECTOR_SIZE]
+            sector = data_sector + cluster - 2
+            data_offset = sector * SECTOR_SIZE
+            disk[data_offset:data_offset + len(chunk)] = chunk
+
+        for entry in lfn_entries(name, alias):
+            app_directory[directory_offset:directory_offset + 32] = entry
+            directory_offset += 32
+        entry = short_entry(alias, 0x20, clusters[0], len(contents))
+        app_directory[directory_offset:directory_offset + 32] = entry
+        directory_offset += 32
+        if directory_offset + 32 > SECTOR_SIZE:
+            raise ValueError("app directory exceeds its test cluster")
+
+    app_offset = data_sector * SECTOR_SIZE
+    disk[app_offset:app_offset + SECTOR_SIZE] = app_directory
+    disk[8 * SECTOR_SIZE:9 * SECTOR_SIZE] = bytes([0x5A, 0xA5]) + bytes(510)
+    path.write_bytes(disk)
 
 
 def serve_echo_once(listener, state):
@@ -52,10 +200,13 @@ def check(architecture):
     if architecture == "x86_64":
         temporary_directory = tempfile.TemporaryDirectory()
         disk_path = Path(temporary_directory.name) / "smoke.raw"
-        with disk_path.open("wb") as disk:
-            disk.truncate(16 * 1024 * 1024)
-            disk.seek(8 * 512)
-            disk.write(bytes([0x5A, 0xA5]) + bytes(510))
+        app_dist = Path("app/dist")
+        create_fat16_image(disk_path, [
+            ("main.js", "MAIN    JS ", (app_dist / "main.js").read_bytes()),
+            ("feature-module.js", "FEATUR~1JS ",
+             (app_dist / "feature-module.js").read_bytes()),
+            ("write-check.bin", "WRITECK BIN", b"write-check"),
+        ])
         echo_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         echo_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         echo_listener.bind(("0.0.0.0", TCP_TEST_PORT))
@@ -95,6 +246,10 @@ def check(architecture):
         expected += "kz: first lazy page fault resolved\n"
     expected += f"kz: {architecture} Rust kernel booted\n"
     expected += "kz: virtio-console transmit OK\n"
+    if architecture == "x86_64":
+        expected += "kz: virtio device_id=2 type=block\n"
+        expected += "kz: virtio device_id=1 type=network\n"
+    expected += "kz: virtio device_id=3 type=console\n"
     expected += "kz: C stdio printf 42 hello 0x2a\n"
     expected += "kz: C stdio puts works\n"
     expected += "!\n"

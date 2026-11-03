@@ -51,9 +51,10 @@ output device.
 ## Build and test
 
 Required: stable Rust with Cargo and the `x86_64-unknown-none` and
-`aarch64-unknown-none` targets, Clang, llvm-objcopy, Make, Ninja, Python 3, and
-QEMU's x86_64 and AArch64 system emulators. The x86_64 build also generates and
-builds the pinned V8 monolith with the repository's GN/Ninja setup.
+`aarch64-unknown-none` targets, Clang, llvm-objcopy, Make, Ninja, Node.js/npm,
+Python 3, and QEMU's x86_64 and AArch64 system emulators. The x86_64 build also
+generates and builds the pinned V8 monolith with the repository's GN/Ninja
+setup.
 
 ```sh
 rustup target add x86_64-unknown-none aarch64-unknown-none

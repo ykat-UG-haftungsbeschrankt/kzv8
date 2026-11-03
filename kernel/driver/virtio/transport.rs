@@ -179,6 +179,53 @@ impl VirtioTransport {
         None
     }
 
+    pub(crate) const fn device_type_name(device_id: u32) -> &'static str {
+        match device_id {
+            1 => "network",
+            2 => "block",
+            3 => "console",
+            4 => "entropy",
+            5 => "balloon",
+            6 => "iomem",
+            7 => "rpmsg",
+            8 => "scsi",
+            9 => "9p",
+            10 => "mac80211-wlan",
+            11 => "rproc-serial",
+            12 => "caif",
+            13 => "memory-balloon",
+            16 => "gpu",
+            17 => "clock",
+            18 => "input",
+            19 => "vsock",
+            20 => "crypto",
+            21 => "signal-dist",
+            22 => "pstore",
+            23 => "iommu",
+            24 => "memory",
+            25 => "sound",
+            26 => "filesystem",
+            27 => "pmem",
+            28 => "rpmb",
+            29 => "mac80211-hwsim",
+            30 => "video-encoder",
+            31 => "video-decoder",
+            32 => "scmi",
+            33 => "nitro-secure-module",
+            34 => "i2c-adapter",
+            35 => "watchdog",
+            36 => "can",
+            37 => "dmabuf",
+            38 => "parameter-server",
+            39 => "audio-policy",
+            40 => "bluetooth",
+            41 => "gpio",
+            42 => "rtc",
+            43 => "tpm",
+            _ => "unknown",
+        }
+    }
+
     pub(crate) fn initialize(self, device_id: u32) -> Result<Self, Error> {
         self.initialize_with_features(device_id, 0)
     }
@@ -275,6 +322,26 @@ impl VirtioTransport {
 
     pub(crate) const fn net_mac_feature() -> u64 {
         Self::FEATURE_NET_MAC
+    }
+}
+
+pub(crate) fn for_each_device(mut callback: impl FnMut(u32)) {
+    let Some(window) = MappedMmioWindow::from_arch() else {
+        return;
+    };
+    for slot in 0..window.slots {
+        let Some(region) = window.region(slot) else {
+            break;
+        };
+        let magic = region.read_register(Register::Magic);
+        let version = region.read_register(Register::Version);
+        let device_id = region.read_register(Register::DeviceId);
+        if magic == VirtioTransport::MAGIC
+            && version == VirtioTransport::VERSION_MODERN
+            && device_id != 0
+        {
+            callback(device_id);
+        }
     }
 }
 

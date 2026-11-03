@@ -30,7 +30,7 @@ else
 $(error AARCH64_FPU_STATE must be on or off)
 endif
 
-.PHONY: all test doc run-x86_64 run-aarch64 v8-host-test v8-platform-test clean force
+.PHONY: all test app-build doc run-x86_64 run-aarch64 v8-host-test v8-platform-test clean force
 all: build/x86_64/kernel.elf build/aarch64/kernel.bin
 
 force:
@@ -55,8 +55,13 @@ build/aarch64/kernel.elf: force
 build/aarch64/kernel.bin: build/aarch64/kernel.elf
 	$(OBJCOPY) -O binary $< $@
 
-test:
+app-build:
+	npm --prefix app ci --no-audit --no-fund
+	npm --prefix app run build
+
+test: app-build
 	$(MAKE) all
+	node tests/v8/vfat-smoke.js
 	python3 tests/qemu/smoke.py
 
 doc:

@@ -190,6 +190,9 @@ pub unsafe extern "C" fn strstr(haystack: *const i8, needle: *const i8) -> *mut 
             if needle_byte == 0 {
                 return unsafe { haystack_bytes.add(start_index).cast_mut().cast() };
             }
+            if haystack_byte == 0 {
+                return core::ptr::null_mut();
+            }
             if haystack_byte != needle_byte {
                 break;
             }

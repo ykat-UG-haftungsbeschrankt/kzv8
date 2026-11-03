@@ -97,6 +97,7 @@ impl Kernel {
             if driver::virtio::console::Console::write(arch::BootArchitecture::BOOT_MESSAGE)
                 && driver::virtio::console::Console::write(b"kz: virtio-console transmit OK\n")
             {
+                driver::virtio::console::Console::write_device_list();
                 runtime::run(KernelContext {
                     events: &mut events,
                     block_device: block_device.as_mut(),
