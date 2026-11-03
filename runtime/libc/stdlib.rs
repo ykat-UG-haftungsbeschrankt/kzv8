@@ -1,6 +1,9 @@
+use core::alloc::Layout;
 use core::ffi::c_void;
 use core::mem::{align_of, size_of};
 use core::ptr::null_mut;
+
+use crate::kernel::memory::heap::Heap;
 
 const EINVAL: i32 = 22;
 const ENOMEM: i32 = 12;
@@ -10,29 +13,34 @@ fn set_errno(error: i32) {
 }
 
 pub(crate) fn remaining() -> usize {
-    GLOBAL_ALLOCATOR.remaining(&HEAP.lock())
+    let heap = Heap::get_instance();
+    heap.remaining_in(&heap.state.lock())
 }
 
 pub(crate) fn allocate_c_layout(size: usize, alignment: usize) -> *mut c_void {
     let Ok(layout) = Layout::from_size_align(size.max(1), alignment) else {
         return null_mut();
     };
-    unsafe { GLOBAL_ALLOCATOR.alloc(layout).cast::<c_void>() }
+    let heap = Heap::get_instance();
+    heap.allocate(&mut heap.state.lock(), layout).cast::<c_void>()
 }
 
 pub(crate) fn deallocate_c_pointer(pointer: *mut c_void) {
-    if !pointer.is_null() {
-        GLOBAL_ALLOCATOR.deallocate(&mut HEAP.lock(), pointer.cast::<u8>());
+    if pointer.is_null() {
+        return;
     }
+    let heap = Heap::get_instance();
+    heap.deallocate(&mut heap.state.lock(), pointer.cast::<u8>());
 }
 
 pub(crate) fn c_allocation_capacity(pointer: *const u8) -> Option<usize> {
-    GLOBAL_ALLOCATOR.allocation_capacity(&HEAP.lock(), pointer)
+    let heap = Heap::get_instance();
+    heap.allocation_capacity(&heap.state.lock(), pointer)
 }
 
 #[no_mangle]
 pub extern "C" fn malloc(size: usize) -> *mut c_void {
-    let pointer = crate::kernel::memory::heap::allocate_c_layout(size, align_of::<u128>());
+    let pointer = allocate_c_layout(size, align_of::<u128>());
     if pointer.is_null() {
         set_errno(ENOMEM);
     }
@@ -45,7 +53,7 @@ pub extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
         set_errno(EINVAL);
         return null_mut();
     }
-    let pointer = crate::kernel::memory::heap::allocate_c_layout(size, alignment);
+    let pointer = allocate_c_layout(size, alignment);
     if pointer.is_null() {
         set_errno(ENOMEM);
     }
@@ -65,7 +73,7 @@ pub unsafe extern "C" fn posix_memalign(
     {
         return EINVAL;
     }
-    let pointer = crate::kernel::memory::heap::allocate_c_layout(size, alignment);
+    let pointer = allocate_c_layout(size, alignment);
     if pointer.is_null() {
         return ENOMEM;
     }
@@ -75,12 +83,12 @@ pub unsafe extern "C" fn posix_memalign(
 
 #[no_mangle]
 pub extern "C" fn free(pointer: *mut c_void) {
-    crate::kernel::memory::heap::deallocate_c_pointer(pointer);
+    deallocate_c_pointer(pointer);
 }
 
 #[no_mangle]
 pub extern "C" fn malloc_usable_size(pointer: *mut c_void) -> usize {
-    crate::kernel::memory::heap::c_allocation_capacity(pointer.cast::<u8>()).unwrap_or(0)
+    c_allocation_capacity(pointer.cast::<u8>()).unwrap_or(0)
 }
 
 #[no_mangle]
@@ -105,8 +113,7 @@ pub unsafe extern "C" fn realloc(pointer: *mut c_void, size: usize) -> *mut c_vo
         return null_mut();
     }
 
-    let Some(capacity) = crate::kernel::memory::heap::c_allocation_capacity(pointer.cast::<u8>())
-    else {
+    let Some(capacity) = c_allocation_capacity(pointer.cast::<u8>()) else {
         return null_mut();
     };
     let replacement = malloc(size);

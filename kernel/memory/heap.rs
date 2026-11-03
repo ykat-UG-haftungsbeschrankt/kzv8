@@ -47,7 +47,7 @@ impl LargeAllocation {
     };
 }
 
-struct HeapState {
+pub(crate) struct HeapState {
     initialized: bool,
     slabs: [Slab; Heap::MAX_SLABS],
     class_heads: [usize; Heap::CLASS_SIZES.len()],
@@ -66,8 +66,11 @@ impl HeapState {
 }
 
 pub(crate) struct Heap {
-    state: IrqSpinLock<HeapState>,
+    pub(crate) state: IrqSpinLock<HeapState>,
 }
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: Heap = Heap::new();
 
 impl Heap {
     const PAGE_SIZE: usize = crate::kernel::memory::r#virtual::PAGE_SIZE;
@@ -82,13 +85,11 @@ impl Heap {
         }
     }
 
-    #[global_allocator]
-    fn get_instance() -> &'static Self {
-        static GLOBAL_ALLOCATOR: Heap = Heap::new();
+    pub(crate) fn get_instance() -> &'static Self {
         &GLOBAL_ALLOCATOR
     }
 
-    fn allocate(&self, heap: &mut HeapState, layout: Layout) -> *mut u8 {
+    pub(crate) fn allocate(&self, heap: &mut HeapState, layout: Layout) -> *mut u8 {
         if !heap.initialized {
             return null_mut();
         }
@@ -164,8 +165,7 @@ impl Heap {
             return null_mut();
         };
         let alignment = alignment.max(Self::PAGE_SIZE);
-        let Some(address) = crate::kernel::memory::r#virtual::reserve(length, alignment, 2)
-        else {
+        let Some(address) = crate::kernel::memory::r#virtual::reserve(length, alignment, 2) else {
             return null_mut();
         };
         heap.large_allocations[metadata_slot] = LargeAllocation {
@@ -176,7 +176,7 @@ impl Heap {
         address as *mut u8
     }
 
-    fn deallocate(&self, heap: &mut HeapState, pointer: *mut u8) {
+    pub(crate) fn deallocate(&self, heap: &mut HeapState, pointer: *mut u8) {
         if pointer.is_null() || !heap.initialized {
             return;
         }
@@ -187,8 +187,7 @@ impl Heap {
             .position(|allocation| allocation.active && allocation.address == address)
         {
             let allocation = heap.large_allocations[index];
-            if crate::kernel::memory::r#virtual::release(allocation.address, allocation.length)
-            {
+            if crate::kernel::memory::r#virtual::release(allocation.address, allocation.length) {
                 heap.large_allocations[index] = LargeAllocation::EMPTY;
             }
             return;
@@ -245,7 +244,11 @@ impl Heap {
         }
     }
 
-    fn allocation_capacity(&self, heap: &HeapState, pointer: *const u8) -> Option<usize> {
+    pub(crate) fn allocation_capacity(
+        &self,
+        heap: &HeapState,
+        pointer: *const u8,
+    ) -> Option<usize> {
         if pointer.is_null() || !heap.initialized {
             return None;
         }
@@ -276,7 +279,7 @@ impl Heap {
         (slab.bitmap[slot / u64::BITS as usize] & mask != 0).then_some(class_size)
     }
 
-    fn remaining(&self, heap: &HeapState) -> usize {
+    pub(crate) fn remaining_in(&self, heap: &HeapState) -> usize {
         let mut total = 0usize;
         for slab in &heap.slabs {
             if slab.active {
@@ -296,6 +299,7 @@ impl Heap {
         heap.large_allocations.fill(LargeAllocation::EMPTY);
         heap.initialized = true;
     }
+
 }
 
 unsafe impl GlobalAlloc for Heap {
