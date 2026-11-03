@@ -13,6 +13,13 @@ use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 #[derive(Clone, Copy)]
+pub(crate) enum FaultAccess {
+    Read,
+    Write,
+    Execute,
+}
+
+#[derive(Clone, Copy)]
 struct VmArea {
     start_page: usize,
     page_count: usize,
@@ -50,18 +57,7 @@ impl VirtualAreas {
         mmu_ready: AtomicBool::new(false),
         areas: [VmArea::EMPTY; Self::MAX_VM_AREAS],
     };
-}
 
-static VM_AREAS: IrqSpinLock<VirtualAreas> = IrqSpinLock::new(VirtualAreas::EMPTY);
-
-#[derive(Clone, Copy)]
-pub(crate) enum FaultAccess {
-    Read,
-    Write,
-    Execute,
-}
-
-impl VirtualAreas {
     pub(super) fn initialize() {
         MemoryArchitecture::initialize_mmu();
         MMU_READY.store(true, Ordering::Release);
@@ -502,51 +498,58 @@ impl VirtualAreas {
     }
 }
 
-pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Option<usize> {
-    VM_AREAS.lock().reserve(length, alignment, permissions)
-}
+impl VirtualAreasLock {
+    pub(crate) fn get_instance() -> &'static IrqSpinLock<VirtualAreas> {
+        static VM_AREAS: IrqSpinLock<VirtualAreas> = IrqSpinLock::new(VirtualAreas::EMPTY);
+        &VM_AREAS
+    }
 
-pub(crate) fn reserve_with_hint(
-    hint: Option<usize>,
-    length: usize,
-    alignment: usize,
-    permissions: i32,
-) -> Option<usize> {
-    VM_AREAS
-        .lock()
-        .reserve_with_hint(hint, length, alignment, permissions)
-}
+    pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Option<usize> {
+        Self::get_instance().lock().reserve(length, alignment, permissions)
+    }
 
-pub(crate) fn release(address: usize, length: usize) -> bool {
-    VM_AREAS.lock().release(address, length)
-}
+    pub(crate) fn reserve_with_hint(
+        hint: Option<usize>,
+        length: usize,
+        alignment: usize,
+        permissions: i32,
+    ) -> Option<usize> {
+        Self::get_instance()
+            .lock()
+            .reserve_with_hint(hint, length, alignment, permissions)
+    }
 
-pub(crate) fn release_range(address: usize, length: usize) -> bool {
-    VM_AREAS.lock().release_range(address, length)
-}
+    pub(crate) fn release(address: usize, length: usize) -> bool {
+        Self::get_instance().lock().release(address, length)
+    }
 
-pub(crate) fn decommit(address: usize, length: usize) -> bool {
-    VM_AREAS.lock().decommit(address, length)
-}
+    pub(crate) fn release_range(address: usize, length: usize) -> bool {
+        Self::get_instance().lock().release_range(address, length)
+    }
 
-pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -> bool {
-    VM_AREAS.lock().release_suffix(address, length, new_length)
-}
+    pub(crate) fn decommit(address: usize, length: usize) -> bool {
+        Self::get_instance().lock().decommit(address, length)
+    }
 
-pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -> bool {
-    VM_AREAS
-        .lock()
-        .set_permissions(address, length, permissions)
-}
+    pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -> bool {
+        Self::get_instance().lock().release_suffix(address, length, new_length)
+    }
 
-pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
-    VM_AREAS.lock().resolve_page_fault(address, access)
-}
+    pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -> bool {
+        Self::get_instance()
+            .lock()
+            .set_permissions(address, length, permissions)
+    }
 
-pub(crate) fn is_identity_mapped(address: usize) -> bool {
-    MemoryArchitecture::is_identity_mapped(address)
-}
+    pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
+        Self::get_instance().lock().resolve_page_fault(address, access)
+    }
 
-pub(crate) fn translate(address: usize) -> Option<usize> {
-    is_identity_mapped(address).then_some(address)
+    pub(crate) fn is_identity_mapped(address: usize) -> bool {
+        MemoryArchitecture::is_identity_mapped(address)
+    }
+
+    pub(crate) fn translate(address: usize) -> Option<usize> {
+        Self::is_identity_mapped(address).then_some(address)
+    }
 }
