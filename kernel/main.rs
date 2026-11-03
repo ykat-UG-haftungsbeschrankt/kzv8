@@ -31,16 +31,16 @@ pub(crate) mod kernel {
 }
 
 pub(crate) struct KernelContext<'a> {
-    pub(crate) events: &'a mut EventLoop<16>,
-    pub(crate) block_device: Option<&'a mut BlockDevice>,
-    pub(crate) network_stack: Option<&'a mut NetStack>,
-    pub(crate) network_registration: Option<EventSourceToken>,
+    pub(crate) events: &'a mut event::r#loop::EventLoop<16>,
+    pub(crate) block_device: Option<&'a mut block::device::BlockDevice>,
+    pub(crate) network_stack: Option<&'a mut net::stack::NetStack>,
+    pub(crate) network_registration: Option<event::r#loop::EventSourceToken>,
     pub(crate) future_smoke_ok: bool,
 }
 
-impl Kernel {
-    type Output = ();
+struct Kernel;
 
+impl Kernel {
     fn interrupt() {
         let pending = driver::virtio::transport::dispatch_interrupts();
         event::r#loop::EventLoop::<16>::record_device_interrupts(pending);
