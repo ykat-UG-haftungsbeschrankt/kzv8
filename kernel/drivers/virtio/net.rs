@@ -10,16 +10,12 @@ use crate::kernel::drivers::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
 
-const DEVICE_ID: u32 = 1;
-const QUEUE_SIZE: usize = 8;
-const HEADER_SIZE: usize = 12;
-const FEATURE_MRG_RXBUF: u64 = 1 << 15;
-pub(crate) const MTU: usize = 1500;
+
 
 pub(crate) struct VirtioNet {
     transport: VirtioTransport,
-    receive_queue: DmaQueue<QUEUE_SIZE>,
-    transmit_queue: DmaQueue<QUEUE_SIZE>,
+    receive_queue: DmaQueue<{Self::QUEUE_SIZE}>,
+    transmit_queue: DmaQueue<{ Self::QUEUE_SIZE }>,
     receive_buffer: DmaBuffer,
     transmit_buffer: DmaBuffer,
     receive_head: Option<u16>,
@@ -28,12 +24,18 @@ pub(crate) struct VirtioNet {
 }
 
 impl VirtioNet {
+    const DEVICE_ID: u32 = 1;
+    const QUEUE_SIZE: usize = 8;
+    const HEADER_SIZE: usize = 12;
+    const FEATURE_MRG_RXBUF: u64 = 1 << 15;
+    pub(crate) const MTU: usize = 1500;
+
     pub(crate) fn initialize() -> Option<Self> {
-        let candidate = VirtioTransport::find(DEVICE_ID)?;
+        let candidate = VirtioTransport::find(Self::DEVICE_ID)?;
         let transport = candidate
             .initialize_with_features(
-                DEVICE_ID,
-                VirtioTransport::net_mac_feature() | FEATURE_MRG_RXBUF,
+                Self::DEVICE_ID,
+                VirtioTransport::net_mac_feature() | Self::FEATURE_MRG_RXBUF,
             )
             .ok()?;
         let mut receive_queue = DmaQueue::new()?;
@@ -43,8 +45,8 @@ impl VirtioNet {
         if !transport.activate() {
             return None;
         }
-        let receive_buffer = DmaArena::allocate(HEADER_SIZE + MTU, 16)?;
-        let transmit_buffer = DmaArena::allocate(HEADER_SIZE + MTU, 16)?;
+        let receive_buffer = DmaArena::allocate(Self::HEADER_SIZE + Self::MTU, 16)?;
+        let transmit_buffer = DmaArena::allocate(Self::HEADER_SIZE + Self::MTU, 16)?;
         let mac_low = transport.read_device_config(0)?;
         let mac_high = transport.read_device_config(4)?;
         let mac_address = [
@@ -76,19 +78,19 @@ impl VirtioNet {
     }
 
     pub(crate) fn transmit(&mut self, frame: &[u8]) -> Result<(), Error> {
-        if frame.len() > MTU {
+        if frame.len() > Self::MTU {
             return Err(Error::MsgSize);
         }
         if self.transmit_head.is_some() && !self.poll_transmit()? {
             return Err(Error::Busy);
         }
         let buffer = self.transmit_buffer.as_mut_slice();
-        buffer[..HEADER_SIZE].fill(0);
-        buffer[HEADER_SIZE..HEADER_SIZE + frame.len()].copy_from_slice(frame);
+        buffer[..Self::HEADER_SIZE].fill(0);
+        buffer[Self::HEADER_SIZE..Self::HEADER_SIZE + frame.len()].copy_from_slice(frame);
         let base = self.transmit_buffer.bus_address();
         let descriptors = [
-            Descriptor::new(base, HEADER_SIZE as u32, false),
-            Descriptor::new(base + HEADER_SIZE as u64, frame.len() as u32, false),
+            Descriptor::new(base, Self::HEADER_SIZE as u32, false),
+            Descriptor::new(base + Self::HEADER_SIZE as u64, frame.len() as u32, false),
         ];
         let head = self
             .transmit_queue
@@ -123,8 +125,8 @@ impl VirtioNet {
             buffer.fill(0);
             let base = self.receive_buffer.bus_address();
             let descriptors = [
-                Descriptor::new(base, HEADER_SIZE as u32, true),
-                Descriptor::new(base + HEADER_SIZE as u64, MTU as u32, true),
+                Descriptor::new(base, Self::HEADER_SIZE as u32, true),
+                Descriptor::new(base + Self::HEADER_SIZE as u64, Self::MTU as u32, true),
             ];
             let head = self.receive_queue.submit(&descriptors).ok_or(Error::Busy)?;
             dma::sync_for_device();
@@ -140,12 +142,12 @@ impl VirtioNet {
         if used.id != u32::from(head) {
             return Err(Error::Proto);
         }
-        let frame_length = (used.length as usize).saturating_sub(HEADER_SIZE);
-        if frame_length > output.len() || frame_length > MTU {
+        let frame_length = (used.length as usize).saturating_sub(Self::HEADER_SIZE);
+        if frame_length > output.len() || frame_length > Self::MTU {
             return Err(Error::MsgSize);
         }
         let buffer = self.receive_buffer.as_mut_slice();
-        output[..frame_length].copy_from_slice(&buffer[HEADER_SIZE..HEADER_SIZE + frame_length]);
+        output[..frame_length].copy_from_slice(&buffer[Self::HEADER_SIZE..Self::HEADER_SIZE + frame_length]);
         Ok(Some(frame_length))
     }
 }

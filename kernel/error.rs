@@ -257,9 +257,3 @@ pub(crate) enum Error {
     /// Maximum value of zrtos_error_t.
     Max = i32::MAX,
 }
-
-impl Error {
-    pub(crate) const FIRST: Self = Self::Error;
-    pub(crate) const PERM: Self = Self::Error;
-    pub(crate) const LAST: Self = Self::RemoteIo;
-}

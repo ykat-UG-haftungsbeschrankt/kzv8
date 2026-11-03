@@ -432,13 +432,13 @@ extern "C" fn x86_page_fault_dispatch(address: usize, error_code: u64) -> u64 {
         return 0;
     }
     let access = if error_code & (1 << 4) != 0 {
-        crate::kernel::memory::virtual_memory::FaultAccess::Execute
+        crate::kernel::memory::r#virtual::FaultAccess::Execute
     } else if error_code & (1 << 1) != 0 {
-        crate::kernel::memory::virtual_memory::FaultAccess::Write
+        crate::kernel::memory::r#virtual::FaultAccess::Write
     } else {
-        crate::kernel::memory::virtual_memory::FaultAccess::Read
+        crate::kernel::memory::r#virtual::FaultAccess::Read
     };
-    let resolved = crate::kernel::memory::virtual_memory::resolve_page_fault(address, access);
+    let resolved = crate::kernel::memory::r#virtual::resolve_page_fault(address, access);
     if !PAGE_FAULT_DIAGNOSTIC.swap(true, Ordering::AcqRel) {
         let message = if resolved {
             b"kz: first lazy page fault resolved\n" as &[u8]

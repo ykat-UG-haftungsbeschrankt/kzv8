@@ -30,7 +30,7 @@ impl OutputQueue {
 }
 
 pub(crate) struct Console {
-    queue: QueueCell<Console::QUEUE_SIZE>,
+    queue: QueueCell<{ Self::QUEUE_SIZE }>,
     base: AtomicUsize,
     slot: AtomicUsize,
     output: IrqSpinLock<OutputQueue>,
@@ -58,10 +58,10 @@ impl Console {
 
     pub(crate) fn initialize() -> bool {
         let console = Self::get_instance();
-        let Some(candidate) = VirtioTransport::find(Console::VIRTIO_CONSOLE_DEVICE_ID) else {
+        let Some(candidate) = VirtioTransport::find(Self::VIRTIO_CONSOLE_DEVICE_ID) else {
             return false;
         };
-        let Ok(transport) = candidate.initialize(Console::VIRTIO_CONSOLE_DEVICE_ID) else {
+        let Ok(transport) = candidate.initialize(Self::VIRTIO_CONSOLE_DEVICE_ID) else {
             return false;
         };
         let base = transport.base();
@@ -75,7 +75,7 @@ impl Console {
 
     pub(crate) fn write(message: &[u8]) -> bool {
         let console = Self::get_instance();
-        if message.len() > Console::MAX_CHUNK_SIZE {
+        if message.len() > Self::MAX_CHUNK_SIZE {
             return false;
         }
         if message.is_empty() {
@@ -86,11 +86,11 @@ impl Console {
             return false;
         }
         let mut output = console.output.lock();
-        if message.len() > Console::OUTPUT_CAPACITY - output.length {
+        if message.len() > Self::OUTPUT_CAPACITY - output.length {
             return false;
         }
-        let tail = (output.head + output.length) % Console::OUTPUT_CAPACITY;
-        let first_length = message.len().min(Console::OUTPUT_CAPACITY - tail);
+        let tail = (output.head + output.length) % Self::OUTPUT_CAPACITY;
+        let first_length = message.len().min(Self::OUTPUT_CAPACITY - tail);
         output.bytes[tail..tail + first_length].copy_from_slice(&message[..first_length]);
         output.bytes[..message.len() - first_length].copy_from_slice(&message[first_length..]);
         output.length += message.len();
@@ -121,7 +121,7 @@ impl Console {
         if used.id != u32::from(expected) {
             return;
         }
-        output.head = (output.head + output.active_length) % Console::OUTPUT_CAPACITY;
+        output.head = (output.head + output.active_length) % Self::OUTPUT_CAPACITY;
         output.length -= output.active_length;
         output.active_length = 0;
         output.active_head = None;
@@ -140,8 +140,8 @@ impl Console {
         }
         let length = output
             .length
-            .min(Console::MAX_CHUNK_SIZE)
-            .min(Console::OUTPUT_CAPACITY - output.head);
+            .min(Self::MAX_CHUNK_SIZE)
+            .min(Self::OUTPUT_CAPACITY - output.head);
         let descriptor = Descriptor::new(
             output.bytes[output.head..output.head + length].as_ptr() as u64,
             length as u32,

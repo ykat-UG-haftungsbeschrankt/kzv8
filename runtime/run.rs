@@ -25,8 +25,9 @@ pub(crate) fn run(
     block_device: Option<&mut BlockDevice>,
     network_stack: Option<&mut NetStack>,
     network_registration: Option<EventSourceToken>,
+    future_smoke_ok: bool,
 ) {
-    if future_smoke_started && FUTURE_SMOKE_DONE.load(Ordering::Acquire) {
+    if future_smoke_ok {
         let _future_status = Console::write(b"kz: Rust futures smoke OK\n");
     }
     if PhysicalAllocator::memory_bytes() > 128 * 1024 * 1024 {

@@ -47,7 +47,7 @@ struct MappedMmioWindow {
 
 impl MappedMmioWindow {
     fn from_arch() -> Option<Self> {
-        if !crate::kernel::memory::virtual_memory::mmu_ready() {
+        if !crate::kernel::memory::r#virtual::mmu_ready() {
             return None;
         }
         let window = crate::kernel::arch::virtio_window();
@@ -277,7 +277,7 @@ impl VirtioTransport {
 }
 
 pub(crate) fn dispatch_interrupts() -> u64 {
-    if !crate::kernel::memory::virtual_memory::mmu_ready() {
+    if !crate::kernel::memory::r#virtual::mmu_ready() {
         return 0;
     }
     let Some(window) = MappedMmioWindow::from_arch() else {

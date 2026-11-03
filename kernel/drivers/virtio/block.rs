@@ -10,11 +10,6 @@ use crate::kernel::drivers::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
 
-const DEVICE_ID: u32 = 2;
-const QUEUE_SIZE: usize = 8;
-const SECTOR_SIZE: usize = 512;
-const MAX_TRANSFER_SIZE: usize = 64 * 1024;
-
 #[repr(C)]
 struct RequestHeader {
     request_type: u32,
@@ -24,7 +19,7 @@ struct RequestHeader {
 
 pub(crate) struct BlockDevice {
     transport: VirtioTransport,
-    queue: DmaQueue<QUEUE_SIZE>,
+    queue: DmaQueue<{ Self::QUEUE_SIZE }>,
     capacity_sectors: u64,
     request_header: RequestHeader,
     request_status: u8,
@@ -33,15 +28,20 @@ pub(crate) struct BlockDevice {
 }
 
 impl BlockDevice {
+    const DEVICE_ID: u32 = 2;
+    const QUEUE_SIZE: usize = 8;
+    const SECTOR_SIZE: usize = 512;
+    const MAX_TRANSFER_SIZE: usize = 64 * 1024;
+
     pub(crate) fn initialize() -> Option<Self> {
-        let candidate = VirtioTransport::find(DEVICE_ID)?;
-        let transport = candidate.initialize(DEVICE_ID).ok()?;
+        let candidate = VirtioTransport::find(Self::DEVICE_ID)?;
+        let transport = candidate.initialize(Self::DEVICE_ID).ok()?;
         let mut queue = DmaQueue::new()?;
         queue.configure(&transport, 0).ok()?;
         if !transport.activate() {
             return None;
         }
-        let dma_buffer = DmaArena::allocate(MAX_TRANSFER_SIZE, 16)?;
+        let dma_buffer = DmaArena::allocate(Self::MAX_TRANSFER_SIZE, 16)?;
         let capacity_sectors = u64::from(transport.read_device_config(0)?)
             | (u64::from(transport.read_device_config(4)?) << 32);
         Some(Self {
@@ -82,11 +82,11 @@ impl BlockDevice {
     }
 
     fn validate_request(&self, sector: u64, length: usize) -> Result<(), Error> {
-        if length == 0 || length % SECTOR_SIZE != 0 || length > MAX_TRANSFER_SIZE {
+        if length == 0 || length % Self::SECTOR_SIZE != 0 || length > Self::MAX_TRANSFER_SIZE {
             return Err(Error::Inval);
         }
         if sector
-            .checked_add((length / SECTOR_SIZE) as u64)
+            .checked_add((length / Self::SECTOR_SIZE) as u64)
             .is_none_or(|end| end > self.capacity_sectors)
         {
             return Err(Error::Inval);

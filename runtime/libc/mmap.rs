@@ -88,13 +88,13 @@ pub unsafe extern "C" fn mmap(
         if address_hint.is_null() || permissions != 0 {
             return fail(EINVAL);
         }
-        if !crate::kernel::memory::virtual_memory::decommit(address_hint as usize, length) {
+        if !crate::kernel::memory::r#virtual::decommit(address_hint as usize, length) {
             return fail(ENOMEM);
         }
         return address_hint;
     }
     let Some(address) =
-        crate::kernel::memory::virtual_memory::reserve(length, PAGE_SIZE, permissions)
+        crate::kernel::memory::r#virtual::reserve(length, PAGE_SIZE, permissions)
     else {
         return fail(ENOMEM);
     };
@@ -133,7 +133,7 @@ pub unsafe extern "C" fn mprotect(address: *mut c_void, length: usize, protectio
         return -1;
     };
     let address = address as usize;
-    if crate::kernel::memory::virtual_memory::set_permissions(address, length, permissions) {
+    if crate::kernel::memory::r#virtual::set_permissions(address, length, permissions) {
         return 0;
     }
     if ActiveMemoryArch::protect_kernel_image_pages(address, length, permissions) {
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn munmap(address: *mut c_void, length: usize) -> i32 {
         set_errno(EINVAL);
         return -1;
     };
-    if !crate::kernel::memory::virtual_memory::release_range(address, length) {
+    if !crate::kernel::memory::r#virtual::release_range(address, length) {
         set_errno(EINVAL);
         return -1;
     }

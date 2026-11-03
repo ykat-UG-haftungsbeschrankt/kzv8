@@ -69,11 +69,8 @@ pub(crate) struct Heap {
     state: IrqSpinLock<HeapState>,
 }
 
-#[global_allocator]
-static GLOBAL_ALLOCATOR: Heap = Heap::new();
-
 impl Heap {
-    const PAGE_SIZE: usize = crate::kernel::memory::virtual_memory::PAGE_SIZE;
+    const PAGE_SIZE: usize = crate::kernel::memory::r#virtual::PAGE_SIZE;
     const CLASS_SIZES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
     const MAX_SLABS: usize = 8192;
     const MAX_LARGE_ALLOCATIONS: usize = 512;
@@ -85,7 +82,9 @@ impl Heap {
         }
     }
 
+    #[global_allocator]
     fn get_instance() -> &'static Self {
+        static GLOBAL_ALLOCATOR: Heap = Heap::new();
         &GLOBAL_ALLOCATOR
     }
 
@@ -130,7 +129,7 @@ impl Heap {
             return null_mut();
         };
         let Some(page) =
-            crate::kernel::memory::virtual_memory::reserve(Self::PAGE_SIZE, Self::PAGE_SIZE, 2)
+            crate::kernel::memory::r#virtual::reserve(Self::PAGE_SIZE, Self::PAGE_SIZE, 2)
         else {
             return null_mut();
         };
@@ -165,7 +164,7 @@ impl Heap {
             return null_mut();
         };
         let alignment = alignment.max(Self::PAGE_SIZE);
-        let Some(address) = crate::kernel::memory::virtual_memory::reserve(length, alignment, 2)
+        let Some(address) = crate::kernel::memory::r#virtual::reserve(length, alignment, 2)
         else {
             return null_mut();
         };
@@ -188,7 +187,7 @@ impl Heap {
             .position(|allocation| allocation.active && allocation.address == address)
         {
             let allocation = heap.large_allocations[index];
-            if crate::kernel::memory::virtual_memory::release(allocation.address, allocation.length)
+            if crate::kernel::memory::r#virtual::release(allocation.address, allocation.length)
             {
                 heap.large_allocations[index] = LargeAllocation::EMPTY;
             }
@@ -226,7 +225,7 @@ impl Heap {
             slab.used -= 1;
             slab.used == 0
         };
-        if unused && crate::kernel::memory::virtual_memory::release(page, Self::PAGE_SIZE) {
+        if unused && crate::kernel::memory::r#virtual::release(page, Self::PAGE_SIZE) {
             let mut previous = Self::NO_INDEX;
             let mut current = heap.class_heads[class_index];
             while current != Self::NO_INDEX {
