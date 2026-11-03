@@ -105,10 +105,10 @@ unsafe fn split_l2_block(entry: *mut u64, create: bool) -> Option<*mut u64> {
         0b11 => Some((descriptor & TABLE_ADDRESS_MASK) as *mut u64),
         0b01 => {
             let table = unsafe { allocate_page_table()? };
-            let base = descriptor & L1_ADDRESS_MASK;
-            let attributes = descriptor & !L1_ADDRESS_MASK & !0b11;
+            let base = descriptor & L2_ADDRESS_MASK;
+            let attributes = descriptor & !L2_ADDRESS_MASK & !0b11;
             for index in 0..TABLE_ENTRIES {
-                let address = base + (index as u64 * L2_BLOCK_SIZE);
+                let address = base + (index as u64 * PAGE_SIZE as u64);
                 unsafe {
                     write_volatile(table.add(index), address | attributes | PAGE_DESCRIPTOR);
                 }
@@ -132,12 +132,12 @@ unsafe fn split_l1_block(entry: *mut u64, create: bool) -> Option<*mut u64> {
         0b11 => Some((descriptor & TABLE_ADDRESS_MASK) as *mut u64),
         0b01 => {
             let table = unsafe { allocate_page_table()? };
-            let base = descriptor & L2_ADDRESS_MASK;
-            let attributes = descriptor & !L2_ADDRESS_MASK & !0b11;
+            let base = descriptor & L1_ADDRESS_MASK;
+            let attributes = descriptor & !L1_ADDRESS_MASK & !0b11;
             for index in 0..TABLE_ENTRIES {
-                let address = base + (index as u64 * PAGE_SIZE as u64);
+                let address = base + (index as u64 * L2_BLOCK_SIZE);
                 unsafe {
-                    write_volatile(table.add(index), address | attributes | 0b11);
+                    write_volatile(table.add(index), address | attributes | BLOCK_DESCRIPTOR);
                 }
             }
             unsafe { write_volatile(entry, (table as u64 & TABLE_ADDRESS_MASK) | 0b11) };

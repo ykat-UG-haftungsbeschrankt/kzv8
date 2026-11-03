@@ -14,6 +14,11 @@ mod threads;
 pub(crate) mod timer;
 mod virtio;
 
+unsafe extern "C" {
+    static _start: u8;
+    static __bss_end: u8;
+}
+
 pub(crate) use threads::FpuContext;
 
 pub(crate) const MAX_CPUS: usize =
@@ -121,8 +126,23 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
             })
     }
 
-    fn protect_kernel_image_pages(_address: usize, _length: usize, _permissions: i32) -> bool {
-        false
+    fn protect_kernel_image_pages(address: usize, length: usize, permissions: i32) -> bool {
+        const PAGE_SIZE: usize = crate::kernel::memory::r#virtual::PAGE_SIZE;
+        if permissions != 1 || address % PAGE_SIZE != 0 || length % PAGE_SIZE != 0 {
+            return false;
+        }
+        let Some(end) = address.checked_add(length) else {
+            return false;
+        };
+        let (image_start, image_end) = unsafe {
+            (
+                core::ptr::addr_of!(_start) as usize,
+                core::ptr::addr_of!(__bss_end) as usize,
+            )
+        };
+        address >= image_start
+            && end <= image_end
+            && ram_map::set_page_permissions(address, length, permissions)
     }
 
     fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool {

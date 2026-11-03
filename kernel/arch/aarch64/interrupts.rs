@@ -199,7 +199,18 @@ unsafe extern "C" {
 const GICD_BASE: usize = 0x0800_0000;
 const GICC_BASE: usize = 0x0801_0000;
 const GIC_SPI_FIRST: usize = 32;
-const GIC_SPI_END: usize = 64;
+const VIRTIO_SPI_BASE: usize = GIC_SPI_FIRST + 16;
+const GIC_SPI_END: usize = VIRTIO_SPI_BASE + super::virtio::virtio_window().slots;
+const GICD_TYPER_SECURITY_EXTENSIONS: u32 = 1 << 10;
+
+fn group_enable_value() -> u32 {
+    let security_extensions = unsafe {
+        core::ptr::read_volatile((GICD_BASE + 4) as *const u32)
+            & GICD_TYPER_SECURITY_EXTENSIONS
+            != 0
+    };
+    if security_extensions { 2 } else { 1 }
+}
 
 pub(crate) unsafe fn initialize() {
     let vectors = core::ptr::addr_of!(aarch64_vector_table);
@@ -213,26 +224,32 @@ pub(crate) unsafe fn initialize() {
 }
 
 pub(crate) fn initialize_controller() -> bool {
-    let interrupt_count =
-        unsafe { ((core::ptr::read_volatile((GICD_BASE + 4) as *const u32) & 0x1f) + 1) * 32 }
-            as usize;
+    let gicd_type = unsafe { core::ptr::read_volatile((GICD_BASE + 4) as *const u32) };
+    let interrupt_count = ((gicd_type & 0x1f) + 1) as usize * 32;
     if interrupt_count < GIC_SPI_END {
         return false;
     }
+    let security_extensions = gicd_type & GICD_TYPER_SECURITY_EXTENSIONS != 0;
+    let group_enable = if security_extensions { 2 } else { 1 };
 
     unsafe {
         core::ptr::write_volatile(GICD_BASE as *mut u32, 0);
-        core::ptr::write_volatile((GICD_BASE + 0x184) as *mut u32, u32::MAX);
-        core::ptr::write_volatile((GICD_BASE + 0x284) as *mut u32, u32::MAX);
-        core::ptr::write_volatile((GICD_BASE + 0x84) as *mut u32, u32::MAX);
-        core::ptr::write_volatile((GICD_BASE + 0xc08) as *mut u32, 0);
-        core::ptr::write_volatile((GICD_BASE + 0xc0c) as *mut u32, 0);
-        let timer_group = (GICD_BASE + 0x80) as *mut u32;
-        let group = core::ptr::read_volatile(timer_group);
-        core::ptr::write_volatile(
-            timer_group,
-            group | (1 << crate::kernel::arch::timer::INTERRUPT_ID),
-        );
+        let first_config_register = GIC_SPI_FIRST / 16;
+        let last_config_register = (GIC_SPI_END - 1) / 16;
+        for register in first_config_register..=last_config_register {
+            core::ptr::write_volatile(
+                (GICD_BASE + 0xc00 + register * core::mem::size_of::<u32>()) as *mut u32,
+                0,
+            );
+        }
+        if security_extensions {
+            let timer_group = (GICD_BASE + 0x80) as *mut u32;
+            let group = core::ptr::read_volatile(timer_group);
+            core::ptr::write_volatile(
+                timer_group,
+                group | (1 << crate::kernel::arch::timer::INTERRUPT_ID),
+            );
+        }
         core::ptr::write_volatile(
             (GICD_BASE + 0x400 + crate::kernel::arch::timer::INTERRUPT_ID as usize) as *mut u8,
             0x80,
@@ -242,25 +259,48 @@ pub(crate) fn initialize_controller() -> bool {
             1 << crate::kernel::arch::timer::INTERRUPT_ID,
         );
         for interrupt in GIC_SPI_FIRST..GIC_SPI_END {
+            let register_offset = (interrupt / u32::BITS as usize) * core::mem::size_of::<u32>();
+            let interrupt_mask = 1u32 << (interrupt % u32::BITS as usize);
+            if security_extensions {
+                let group_register = (GICD_BASE + 0x80 + register_offset) as *mut u32;
+                let group = core::ptr::read_volatile(group_register);
+                core::ptr::write_volatile(group_register, group | interrupt_mask);
+            }
             core::ptr::write_volatile((GICD_BASE + 0x400 + interrupt) as *mut u8, 0x80);
-            core::ptr::write_volatile((GICD_BASE + 0x800 + interrupt) as *mut u8, 1);
+            core::ptr::write_volatile(
+                (GICD_BASE + 0x180 + register_offset) as *mut u32,
+                interrupt_mask,
+            );
+            core::ptr::write_volatile(
+                (GICD_BASE + 0x280 + register_offset) as *mut u32,
+                interrupt_mask,
+            );
+            core::ptr::write_volatile(
+                (GICD_BASE + 0x100 + register_offset) as *mut u32,
+                interrupt_mask,
+            );
         }
-        core::ptr::write_volatile((GICD_BASE + 0x104) as *mut u32, u32::MAX);
-        core::ptr::write_volatile(GICD_BASE as *mut u32, 2);
+        for first_interrupt in (GIC_SPI_FIRST..GIC_SPI_END).step_by(4) {
+            core::ptr::write_volatile(
+                (GICD_BASE + 0x800 + first_interrupt) as *mut u32,
+                0x0101_0101,
+            );
+        }
+        core::ptr::write_volatile(GICD_BASE as *mut u32, group_enable);
         core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
     }
-    initialize_cpu_interface()
+    initialize_cpu_interface(group_enable)
 }
 
 pub(crate) fn initialize_secondary_controller() -> bool {
-    initialize_cpu_interface()
+    initialize_cpu_interface(group_enable_value())
 }
 
-fn initialize_cpu_interface() -> bool {
+fn initialize_cpu_interface(group_enable: u32) -> bool {
     unsafe {
         core::ptr::write_volatile((GICC_BASE + 0x04) as *mut u32, 0xff);
         core::ptr::write_volatile((GICC_BASE + 0x08) as *mut u32, 0);
-        core::ptr::write_volatile(GICC_BASE as *mut u32, 2);
+        core::ptr::write_volatile(GICC_BASE as *mut u32, group_enable);
         core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
     }
     true

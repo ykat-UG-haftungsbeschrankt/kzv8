@@ -246,10 +246,6 @@ def check(architecture):
         expected += "kz: first lazy page fault resolved\n"
     expected += f"kz: {architecture} Rust kernel booted\n"
     expected += "kz: virtio-console transmit OK\n"
-    if architecture == "x86_64":
-        expected += "kz: virtio device_id=2 type=block\n"
-        expected += "kz: virtio device_id=1 type=network\n"
-    expected += "kz: virtio device_id=3 type=console\n"
     expected += "kz: C stdio printf 42 hello 0x2a\n"
     expected += "kz: C stdio puts works\n"
     expected += "!\n"
@@ -283,8 +279,30 @@ def check(architecture):
     expected += "kz: V8 runtime disposed\n"
     expected += "kz: V8 platform disposed\n"
     expected += "kz: V8 evaluated 6 * 7 = 42\n"
+
+    expected_devices = ["kz: virtio device_id=3 type=console"]
+    if architecture == "x86_64":
+        expected_devices.extend([
+            "kz: virtio device_id=2 type=block",
+            "kz: virtio device_id=1 type=network",
+        ])
+    actual_devices = [
+        line.decode().rstrip("\n")
+        for line in output.splitlines(keepends=True)
+        if line.startswith(b"kz: virtio device_id=")
+    ]
+    if sorted(actual_devices) != sorted(expected_devices):
+        raise RuntimeError(
+            f"{architecture}: unexpected VirtIO devices {actual_devices!r}"
+            + (f"\nTCP echo server: {echo_state!r}" if echo_listener else "")
+        )
+    output_without_device_lines = b"".join(
+        line
+        for line in output.splitlines(keepends=True)
+        if not line.startswith(b"kz: virtio device_id=")
+    )
     expected = expected.encode()
-    if output != expected:
+    if output_without_device_lines != expected:
         raise RuntimeError(
             f"{architecture}: unexpected output {output!r}\n{errors}"
             + (f"\nTCP echo server: {echo_state!r}" if echo_listener else "")

@@ -93,6 +93,7 @@ impl Kernel {
             let _event = events.wait(now_ns);
         }
         let console_ready = driver::virtio::console::Console::initialize();
+        vfs::mount_virtio_devices();
         arch::InterruptArchitecture::enable_interrupts();
         if console_ready {
             if driver::virtio::console::Console::write(arch::BootArchitecture::BOOT_MESSAGE)

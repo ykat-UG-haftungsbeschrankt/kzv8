@@ -325,7 +325,13 @@ impl VirtioTransport {
     }
 }
 
-pub(crate) fn for_each_device(mut callback: impl FnMut(u32)) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VirtioDeviceInfo {
+    pub(crate) device_id: u32,
+    pub(crate) slot: usize,
+}
+
+pub(crate) fn for_each_device(mut callback: impl FnMut(VirtioDeviceInfo)) {
     let Some(window) = MappedMmioWindow::from_arch() else {
         return;
     };
@@ -340,7 +346,10 @@ pub(crate) fn for_each_device(mut callback: impl FnMut(u32)) {
             && version == VirtioTransport::VERSION_MODERN
             && device_id != 0
         {
-            callback(device_id);
+            callback(VirtioDeviceInfo {
+                device_id,
+                slot: region.slot,
+            });
         }
     }
 }

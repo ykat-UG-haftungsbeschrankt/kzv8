@@ -89,12 +89,12 @@ impl Console {
 
     pub(crate) fn write_device_list() {
         let mut writer = ConsoleWriter;
-        crate::kernel::driver::virtio::transport::for_each_device(|device_id| {
+        crate::kernel::driver::virtio::transport::for_each_device(|device| {
             let _ = core::write!(
                 &mut writer,
                 "kz: virtio device_id={} type={}\n",
-                device_id,
-                VirtioTransport::device_type_name(device_id)
+                device.device_id,
+                VirtioTransport::device_type_name(device.device_id)
             );
         });
     }
