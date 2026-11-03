@@ -33,7 +33,7 @@ impl EthernetDevice {
 }
 
 pub(crate) struct RxToken {
-    frame: [u8; virtio_net::MTU],
+    frame: [u8; net::VirtioNet::MTU],
     length: usize,
 }
 
@@ -55,7 +55,7 @@ impl SmolTxToken for TxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut frame = [0u8; virtio_net::MTU];
+        let mut frame = [0u8; net::VirtioNet::MTU];
         let length = length.min(frame.len());
         let result = function(&mut frame[..length]);
         let _ = self.device.transmit(&frame[..length]);
@@ -74,7 +74,7 @@ impl Device for EthernetDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let mut frame = [0u8; virtio_net::MTU];
+        let mut frame = [0u8; net::VirtioNet::MTU];
         let length = self.device.poll_receive(&mut frame).ok().flatten()?;
         Some((
             RxToken { frame, length },
@@ -92,7 +92,7 @@ impl Device for EthernetDevice {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut capabilities = DeviceCapabilities::default();
-        capabilities.max_transmission_unit = virtio_net::MTU;
+        capabilities.max_transmission_unit = net::VirtioNet::MTU;
         capabilities.medium = Medium::Ethernet;
         capabilities
     }

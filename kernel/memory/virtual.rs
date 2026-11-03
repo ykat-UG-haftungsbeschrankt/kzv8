@@ -146,7 +146,7 @@ impl VirtualAreas {
             } else {
                 permissions as u8
             };
-            let state = VM_RESERVED | state_permissions;
+            let state = Self::VM_RESERVED | state_permissions;
             for page in start_page..end_page {
                 Self::PAGE_STATE[page].store(state, Ordering::Release);
             }

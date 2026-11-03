@@ -7,15 +7,16 @@
 
 use crate::kernel::block::request::{Operation, Request};
 use crate::kernel::driver::virtio::block;
+use crate::kernel::error::Error;
 
 pub(crate) struct BlockDevice {
-    device: virtio_block::BlockDevice,
+    device: block::BlockDevice,
 }
 
 impl BlockDevice {
     pub(crate) fn initialize() -> Option<Self> {
         Some(Self {
-            device: virtio_block::BlockDevice::initialize()?,
+            device: block::BlockDevice::initialize()?,
         })
     }
 
@@ -30,7 +31,7 @@ impl BlockDevice {
     pub(crate) fn submit<'a>(
         &'a mut self,
         request: Request<'a>,
-    ) -> Result<virtio_block::BlockTransfer<'a>, virtio_block::Error> {
+    ) -> Result<block::BlockTransfer<'a>, Error> {
         match request.operation {
             Operation::Read(output) => self.device.submit_read(request.sector, output),
             Operation::Write(input) => self.device.submit_write(request.sector, input),
