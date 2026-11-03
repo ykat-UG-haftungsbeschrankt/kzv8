@@ -176,8 +176,8 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
 }
 
 impl crate::kernel::arch::traits::BootArchitecture for super::BootArchitecture {
-    const BOOT_MESSAGE: &'static [u8] = BOOT_MESSAGE;
-    const BOOT_INFO_ERROR: &'static str = BOOT_INFO_ERROR;
+    const BOOT_MESSAGE: &'static [u8] = b"kz: x86_64 Rust kernel booted\n";
+    const BOOT_INFO_ERROR: &'static str = "unable to read the Multiboot memory map";
 
     unsafe fn initialize_boot_info(boot_info: usize, boot_magic: usize) -> bool {
         unsafe { self::initialize_boot_info(boot_info, boot_magic) }

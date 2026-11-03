@@ -67,7 +67,7 @@ struct Thread {
     joiner: usize,
     detached: bool,
     errno: i32,
-    tls: [*mut c_void; MAX_TLS_KEYS],
+    tls: [*mut c_void; ThreadManager::MAX_TLS_KEYS],
     fpu_context: FpuContext,
 }
 
@@ -82,7 +82,7 @@ impl Thread {
         joiner: 0,
         detached: false,
         errno: 0,
-        tls: [core::ptr::null_mut(); MAX_TLS_KEYS],
+        tls: [core::ptr::null_mut(); ThreadManager::MAX_TLS_KEYS],
         fpu_context: FpuContext::INITIAL,
     };
 }
@@ -107,12 +107,12 @@ impl ThreadStack {
             return crate::kernel::arch::ThreadArchitecture::
                 current_thread_stack_bounds(Self::STACK_SIZE);
         }
-        if index >= MAX_THREADS {
+        if index >= ThreadManager::MAX_THREADS {
             return (core::ptr::null_mut(), 0);
         }
 
         let manager = ThreadManager::get_instance();
-        let stacks = addr_of_mut!((*manager).stacks).cast::<ThreadStack>();
+        let stacks = unsafe { addr_of_mut!((*manager).stacks).cast::<ThreadStack>() };
         (
             stacks.wrapping_add(index).cast::<c_void>(),
             Self::STACK_SIZE,
@@ -141,7 +141,7 @@ impl ThreadManager {
             tls_keys: [TlsKey::EMPTY; Self::MAX_TLS_KEYS],
             stacks: [ThreadStack([0; ThreadStack::STACK_SIZE]); Self::MAX_THREADS],
             current_slot: 0,
-            next_thread_id: MAIN_THREAD_ID + 1,
+            next_thread_id: Self::MAIN_THREAD_ID + 1,
             initialized: false,
             fallback_errno: 0,
         }
@@ -158,12 +158,12 @@ impl ThreadManager {
         manager.threads.fill(Thread::EMPTY);
         manager.tls_keys.fill(TlsKey::EMPTY);
         manager.threads[0] = Thread {
-            id: MAIN_THREAD_ID,
+            id: Self::MAIN_THREAD_ID,
             state: ThreadState::Running,
             ..Thread::EMPTY
         };
         manager.current_slot = 0;
-        manager.next_thread_id = MAIN_THREAD_ID + 1;
+        manager.next_thread_id = Self::MAIN_THREAD_ID + 1;
         manager.initialized = true;
         crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
     }
