@@ -295,8 +295,12 @@ impl PhysicalAllocator {
         if allocator.usable[word_index].load(Ordering::Acquire) & mask == 0 {
             return false;
         }
-        let previous = allocator.bitmap[word_index].fetch_or(mask, Ordering::AcqRel);
-        previous & mask != 0
+        let previous = allocator.bitmap[word_index].fetch_and(!mask, Ordering::AcqRel);
+        if previous & mask == 0 {
+            return false;
+        }
+        allocator.next_hint.store(index, Ordering::Relaxed);
+        true
     }
 
     pub(crate) fn free_frames() -> usize {
