@@ -14,7 +14,7 @@ fn set_errno(error: i32) {
 
 pub(crate) fn remaining() -> usize {
     let heap = Heap::get_instance();
-    heap.remaining_in(&heap.state.lock())
+    heap.remaining(&heap.state.lock())
 }
 
 pub(crate) fn allocate_c_layout(size: usize, alignment: usize) -> *mut c_void {

@@ -279,7 +279,7 @@ impl Heap {
         (slab.bitmap[slot / u64::BITS as usize] & mask != 0).then_some(class_size)
     }
 
-    pub(crate) fn remaining_in(&self, heap: &HeapState) -> usize {
+    pub(crate) fn remaining(&self, heap: &HeapState) -> usize {
         let mut total = 0usize;
         for slab in &heap.slabs {
             if slab.active {
