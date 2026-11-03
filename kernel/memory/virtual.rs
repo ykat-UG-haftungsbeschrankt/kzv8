@@ -41,8 +41,17 @@ impl VmArea {
     };
 }
 
-static VM_AREAS: IrqSpinLock<[VmArea; MAX_VM_AREAS]> =
-    IrqSpinLock::new([VmArea::EMPTY; MAX_VM_AREAS]);
+struct VirtualAreas {
+    areas: [VmArea; MAX_VM_AREAS],
+}
+
+impl VirtualAreas {
+    const EMPTY: Self = Self {
+        areas: [VmArea::EMPTY; MAX_VM_AREAS],
+    };
+}
+
+static VM_AREAS: IrqSpinLock<VirtualAreas> = IrqSpinLock::new(VirtualAreas::EMPTY);
 
 #[derive(Clone, Copy)]
 pub(crate) enum FaultAccess {
@@ -64,6 +73,7 @@ pub(crate) const fn allocator_base() -> usize {
     VM_BASE
 }
 
+impl VirtualAreas {
 fn rounded_length(length: usize) -> Option<usize> {
     length
         .checked_add(PAGE_SIZE - 1)
@@ -76,11 +86,12 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
         .map(|value| value & !(alignment - 1))
 }
 
-pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Option<usize> {
-    reserve_with_hint(None, length, alignment, permissions)
+fn reserve(&mut self, length: usize, alignment: usize, permissions: i32) -> Option<usize> {
+    self.reserve_with_hint(None, length, alignment, permissions)
 }
 
-pub(crate) fn reserve_with_hint(
+fn reserve_with_hint(
+    &mut self,
     hint: Option<usize>,
     length: usize,
     alignment: usize,
@@ -100,8 +111,7 @@ pub(crate) fn reserve_with_hint(
     }
     let alignment = alignment.max(PAGE_SIZE);
 
-    let mut areas = VM_AREAS.lock();
-    let area_slot = areas.iter().position(|area| !area.active)?;
+    let area_slot = self.areas.iter().position(|area| !area.active)?;
 
     let mut candidate_page = if let Some(address) = hint {
         if address < VM_BASE || address % alignment != 0 {
@@ -143,7 +153,7 @@ pub(crate) fn reserve_with_hint(
         for page in start_page..end_page {
             PAGE_STATE[page].store(state, Ordering::Release);
         }
-        areas[area_slot] = VmArea {
+        self.areas[area_slot] = VmArea {
             start_page,
             page_count,
             active: true,
@@ -152,7 +162,7 @@ pub(crate) fn reserve_with_hint(
     }
 }
 
-pub(crate) fn release(address: usize, length: usize) -> bool {
+fn release(&mut self, address: usize, length: usize) -> bool {
     if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 {
         return false;
     }
@@ -171,8 +181,7 @@ pub(crate) fn release(address: usize, length: usize) -> bool {
         return false;
     }
 
-    let mut areas = VM_AREAS.lock();
-    let Some(area_slot) = areas.iter().position(|area| {
+    let Some(area_slot) = self.areas.iter().position(|area| {
         area.active && area.start_page == start_page && area.page_count == page_count
     }) else {
         return false;
@@ -183,12 +192,12 @@ pub(crate) fn release(address: usize, length: usize) -> bool {
         return false;
     }
 
-    let released = release_pages(start_page, end_page);
-    areas[area_slot] = VmArea::EMPTY;
+    let released = Self::release_pages(start_page, end_page);
+    self.areas[area_slot] = VmArea::EMPTY;
     released
 }
 
-pub(crate) fn release_range(address: usize, length: usize) -> bool {
+fn release_range(&mut self, address: usize, length: usize) -> bool {
     if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 {
         return false;
     }
@@ -207,15 +216,14 @@ pub(crate) fn release_range(address: usize, length: usize) -> bool {
         return false;
     }
 
-    let mut areas = VM_AREAS.lock();
-    let Some(area_slot) = areas.iter().position(|area| {
+    let Some(area_slot) = self.areas.iter().position(|area| {
         area.active
             && start_page >= area.start_page
             && end_page <= area.start_page.saturating_add(area.page_count)
     }) else {
         return false;
     };
-    let area = areas[area_slot];
+    let area = self.areas[area_slot];
     if (start_page..end_page)
         .any(|page| PAGE_STATE[page].load(Ordering::Acquire) & VM_RESERVED == 0)
     {
@@ -226,7 +234,7 @@ pub(crate) fn release_range(address: usize, length: usize) -> bool {
     let prefix_page_count = start_page - area.start_page;
     let suffix_page_count = area_end - end_page;
     let split_slot = if prefix_page_count != 0 && suffix_page_count != 0 {
-        let Some(slot) = areas.iter().position(|area| !area.active) else {
+        let Some(slot) = self.areas.iter().position(|area| !area.active) else {
             return false;
         };
         Some(slot)
@@ -234,30 +242,30 @@ pub(crate) fn release_range(address: usize, length: usize) -> bool {
         None
     };
 
-    let released = release_pages(start_page, end_page);
+    let released = Self::release_pages(start_page, end_page);
     match (prefix_page_count, suffix_page_count) {
-        (0, 0) => areas[area_slot] = VmArea::EMPTY,
+        (0, 0) => self.areas[area_slot] = VmArea::EMPTY,
         (0, suffix_page_count) => {
-            areas[area_slot] = VmArea {
+            self.areas[area_slot] = VmArea {
                 start_page: end_page,
                 page_count: suffix_page_count,
                 active: true,
             }
         }
         (prefix_page_count, 0) => {
-            areas[area_slot] = VmArea {
+            self.areas[area_slot] = VmArea {
                 start_page: area.start_page,
                 page_count: prefix_page_count,
                 active: true,
             }
         }
         (prefix_page_count, suffix_page_count) => {
-            areas[area_slot] = VmArea {
+            self.areas[area_slot] = VmArea {
                 start_page: area.start_page,
                 page_count: prefix_page_count,
                 active: true,
             };
-            areas[split_slot.unwrap()] = VmArea {
+            self.areas[split_slot.unwrap()] = VmArea {
                 start_page: end_page,
                 page_count: suffix_page_count,
                 active: true,
@@ -272,12 +280,12 @@ fn decommit_debug(code: u8) {
         decommit_debug(code);
 }
 
-pub(crate) fn decommit(address: usize, length: usize) -> bool {
+fn decommit(&self, address: usize, length: usize) -> bool {
     if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 {
         decommit_debug(b'a');
         return false;
     }
-    let Some(length) = rounded_length(length) else {
+    let Some(length) = Self::rounded_length(length) else {
         decommit_debug(b'b');
         return false;
     };
@@ -295,8 +303,7 @@ pub(crate) fn decommit(address: usize, length: usize) -> bool {
         return false;
     }
 
-    let _areas = VM_AREAS.lock();
-    let range_reserved = _areas.iter().any(|area| {
+    let range_reserved = self.areas.iter().any(|area| {
         area.active
             && start_page >= area.start_page
             && end_page <= area.start_page.saturating_add(area.page_count)
@@ -329,14 +336,14 @@ pub(crate) fn decommit(address: usize, length: usize) -> bool {
     decommitted
 }
 
-pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -> bool {
+fn release_suffix(&mut self, address: usize, length: usize, new_length: usize) -> bool {
     if address < VM_BASE || address % PAGE_SIZE != 0 || length == 0 || new_length > length {
         return false;
     }
-    let Some(length) = rounded_length(length) else {
+    let Some(length) = Self::rounded_length(length) else {
         return false;
     };
-    let Some(new_length) = rounded_length(new_length) else {
+    let Some(new_length) = Self::rounded_length(new_length) else {
         return false;
     };
     if new_length > length {
@@ -362,8 +369,7 @@ pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -
         return false;
     }
 
-    let mut areas = VM_AREAS.lock();
-    let Some(slot) = areas.iter().position(|area| {
+    let Some(slot) = self.areas.iter().position(|area| {
         area.active && area.start_page == start_page && area.page_count == old_page_count
     }) else {
         return false;
@@ -374,16 +380,16 @@ pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -
         return false;
     }
 
-    let released = release_pages(release_start, release_end);
+    let released = Self::release_pages(release_start, release_end);
     if new_page_count == 0 {
-        areas[slot] = VmArea::EMPTY;
+        self.areas[slot] = VmArea::EMPTY;
     } else {
-        areas[slot].page_count = new_page_count;
+        self.areas[slot].page_count = new_page_count;
     }
     released
 }
 
-pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -> bool {
+fn set_permissions(&self, address: usize, length: usize, permissions: i32) -> bool {
     if address < VM_BASE
         || address % PAGE_SIZE != 0
         || length == 0
@@ -391,7 +397,7 @@ pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -
     {
         return false;
     }
-    let Some(length) = rounded_length(length) else {
+    let Some(length) = Self::rounded_length(length) else {
         return false;
     };
     let Some(start_page) = address
@@ -408,8 +414,7 @@ pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -
         return false;
     }
 
-    let areas = VM_AREAS.lock();
-    let range_reserved = areas.iter().any(|area| {
+    let range_reserved = self.areas.iter().any(|area| {
         area.active
             && start_page >= area.start_page
             && end_page <= area.start_page.saturating_add(area.page_count)
@@ -448,7 +453,7 @@ fn release_pages(start_page: usize, end_page: usize) -> bool {
     released
 }
 
-pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
+fn resolve_page_fault(&self, address: usize, access: FaultAccess) -> bool {
     let page_address = address & !(PAGE_SIZE - 1);
     let Some(offset) = page_address.checked_sub(VM_BASE) else {
         return false;
@@ -458,7 +463,6 @@ pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
     }
     let page = offset / PAGE_SIZE;
 
-    let _areas = VM_AREAS.lock();
     let state = PAGE_STATE[page].load(Ordering::Acquire);
     if state & VM_RESERVED == 0 {
         return false;
@@ -490,6 +494,50 @@ pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
     }
     let _released = PhysicalAllocator::deallocate(frame);
     false
+}
+}
+
+pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Option<usize> {
+    VM_AREAS.lock().reserve(length, alignment, permissions)
+}
+
+pub(crate) fn reserve_with_hint(
+    hint: Option<usize>,
+    length: usize,
+    alignment: usize,
+    permissions: i32,
+) -> Option<usize> {
+    VM_AREAS
+        .lock()
+        .reserve_with_hint(hint, length, alignment, permissions)
+}
+
+pub(crate) fn release(address: usize, length: usize) -> bool {
+    VM_AREAS.lock().release(address, length)
+}
+
+pub(crate) fn release_range(address: usize, length: usize) -> bool {
+    VM_AREAS.lock().release_range(address, length)
+}
+
+pub(crate) fn decommit(address: usize, length: usize) -> bool {
+    VM_AREAS.lock().decommit(address, length)
+}
+
+pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -> bool {
+    VM_AREAS
+        .lock()
+        .release_suffix(address, length, new_length)
+}
+
+pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -> bool {
+    VM_AREAS
+        .lock()
+        .set_permissions(address, length, permissions)
+}
+
+pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
+    VM_AREAS.lock().resolve_page_fault(address, access)
 }
 
 pub(crate) fn is_identity_mapped(address: usize) -> bool {

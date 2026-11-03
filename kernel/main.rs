@@ -119,7 +119,7 @@ impl Kernel {
     }
 
     fn halt() -> ! {
-        <arch::MemoryArchitecture as arch::CpuArchitecture>::halt()
+        arch::CpuArchitecture::halt()
     }
 }
 

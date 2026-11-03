@@ -176,7 +176,7 @@ impl crate::kernel::arch::traits::MemoryArchitecture for MemoryArchitecture {
     }
 }
 
-impl crate::kernel::arch::BootArchitecture for MemoryArchitecture {
+impl crate::kernel::arch::traits::BootArchitecture for BootArchitecture {
     const BOOT_MESSAGE: &'static [u8] = BOOT_MESSAGE;
     const BOOT_INFO_ERROR: &'static str = BOOT_INFO_ERROR;
 
@@ -185,7 +185,7 @@ impl crate::kernel::arch::BootArchitecture for MemoryArchitecture {
     }
 }
 
-impl crate::kernel::arch::DeviceArchitecture for MemoryArchitecture {
+impl crate::kernel::arch::traits::DeviceArchitecture for DeviceArchitecture {
     const VIRTIO_WINDOW: crate::kernel::arch::VirtioWindow = virtio::virtio_window();
 
     fn dma_sync_for_device() {
@@ -197,7 +197,7 @@ impl crate::kernel::arch::DeviceArchitecture for MemoryArchitecture {
     }
 }
 
-impl crate::kernel::arch::ThreadArchitecture for MemoryArchitecture {
+impl crate::kernel::arch::traits::ThreadArchitecture for ThreadArchitecture {
     type FpuContext = threads::FpuContext;
 
     fn initialize_thread_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize {
@@ -222,7 +222,7 @@ impl crate::kernel::arch::ThreadArchitecture for MemoryArchitecture {
     }
 }
 
-impl crate::kernel::arch::InterruptArchitecture for MemoryArchitecture {
+impl crate::kernel::arch::traits::InterruptArchitecture for InterruptArchitecture {
     unsafe fn initialize_interrupts() {
         unsafe { interrupts::initialize() };
     }
@@ -248,7 +248,7 @@ impl crate::kernel::arch::InterruptArchitecture for MemoryArchitecture {
     }
 }
 
-impl crate::kernel::arch::TimerArchitecture for MemoryArchitecture {
+impl crate::kernel::arch::traits::TimerArchitecture for TimerArchitecture {
     fn initialize_timer() {
         timer::initialize();
     }
@@ -262,7 +262,7 @@ impl crate::kernel::arch::TimerArchitecture for MemoryArchitecture {
     }
 }
 
-impl crate::kernel::arch::CpuArchitecture for MemoryArchitecture {
+impl crate::kernel::arch::traits::CpuArchitecture for CpuArchitecture {
     const MAX_CPUS: usize = MAX_CPUS;
 
     fn halt() -> ! {
@@ -278,7 +278,7 @@ impl crate::kernel::arch::CpuArchitecture for MemoryArchitecture {
     }
 }
 
-impl crate::kernel::arch::DebugArchitecture for MemoryArchitecture {
+impl crate::kernel::arch::traits::DebugArchitecture for DebugArchitecture {
     fn decommit_debug(code: u8) {
         self::decommit_debug(code);
     }
