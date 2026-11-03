@@ -224,7 +224,9 @@ pub(crate) fn unmap_page(virtual_address: usize) -> Option<usize> {
     let _guard = PAGE_TABLE_LOCK.lock();
     let entry = unsafe { page_table_entry(virtual_address, false)? };
     let current = unsafe { read_volatile(entry) };
-    if current & 0b11 != 0b11 {
+    let descriptor_type = current & 0b11;
+    let physical_address = current & PAGE_ADDRESS_MASK;
+    if descriptor_type != 0b11 && (descriptor_type != 0 || physical_address == 0) {
         return None;
     }
     unsafe {
@@ -238,7 +240,7 @@ pub(crate) fn unmap_page(virtual_address: usize) -> Option<usize> {
             options(nostack, preserves_flags),
         );
     }
-    Some((current & PAGE_ADDRESS_MASK) as usize)
+    Some(physical_address as usize)
 }
 
 pub(crate) fn page_is_mapped(virtual_address: usize) -> bool {
@@ -250,6 +252,19 @@ pub(crate) fn page_is_mapped(virtual_address: usize) -> bool {
         return false;
     };
     unsafe { read_volatile(entry) & 0b11 == 0b11 }
+}
+
+pub(crate) fn page_has_backing(virtual_address: usize) -> bool {
+    if virtual_address % PAGE_SIZE != 0 {
+        return false;
+    }
+    let _guard = PAGE_TABLE_LOCK.lock();
+    let Some(entry) = (unsafe { page_table_entry(virtual_address, false) }) else {
+        return false;
+    };
+    let descriptor = unsafe { read_volatile(entry) };
+    descriptor & 0b11 == 0b11
+        || (descriptor & 0b11 == 0 && descriptor & PAGE_ADDRESS_MASK != 0)
 }
 
 pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
@@ -273,12 +288,13 @@ pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i
         };
         let current = unsafe { read_volatile(entry) };
         if matches!(permissions, 0 | 5) {
-            unsafe { write_volatile(entry, 0) };
+            unsafe { write_volatile(entry, current & PAGE_ADDRESS_MASK) };
         } else {
-            let physical_address = if current & 0b11 == 0 {
+            let current_address = current & PAGE_ADDRESS_MASK;
+            let physical_address = if current & 0b11 == 0 && current_address == 0 {
                 page as u64 & PAGE_ADDRESS_MASK
             } else {
-                current & PAGE_ADDRESS_MASK
+                current_address
             };
             let Some(page_attributes) = page_attributes(permissions) else {
                 return false;

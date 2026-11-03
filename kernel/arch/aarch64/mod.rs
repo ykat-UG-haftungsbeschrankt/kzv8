@@ -18,7 +18,8 @@ pub(crate) use threads::FpuContext;
 
 pub(crate) struct MemoryArchitecture;
 
-pub(crate) const MAX_CPUS: usize = <MemoryArchitecture as crate::kernel::arch::CpuArchitecture>::MAX_CPUS;
+pub(crate) const MAX_CPUS: usize =
+    <CpuArchitecture as crate::kernel::arch::traits::CpuArchitecture>::MAX_CPUS;
 pub(crate) const VM_ARENA_SIZE: usize =
     <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
 pub(crate) const VM_BASE: usize =
@@ -98,8 +99,8 @@ pub(crate) fn wait_for_interrupt() {
 }
 
 impl crate::kernel::arch::traits::MemoryArchitecture for MemoryArchitecture {
-    const VM_ARENA_SIZE: usize = VM_ARENA_SIZE;
-    const VM_BASE: usize = VM_BASE;
+    const VM_ARENA_SIZE: usize = 1 << 30;
+    const VM_BASE: usize = 511usize << 30;
 
     fn initialize_mmu() {
         let memory_regions =
@@ -143,7 +144,7 @@ impl crate::kernel::arch::traits::MemoryArchitecture for MemoryArchitecture {
     }
 
     fn page_has_backing(virtual_address: usize) -> bool {
-        ram_map::page_is_mapped(virtual_address)
+        ram_map::page_has_backing(virtual_address)
     }
 
     fn high_memory_smoke() -> bool {
@@ -238,7 +239,7 @@ impl crate::kernel::arch::traits::TimerArchitecture for TimerArchitecture {
 }
 
 impl crate::kernel::arch::traits::CpuArchitecture for CpuArchitecture {
-    const MAX_CPUS: usize = MAX_CPUS;
+    const MAX_CPUS: usize = 8;
 
     fn halt() -> ! {
         self::halt()

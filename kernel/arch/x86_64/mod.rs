@@ -25,7 +25,8 @@ pub(crate) use threads::FpuContext;
 
 pub(crate) struct MemoryArchitecture;
 
-pub(crate) const MAX_CPUS: usize = <MemoryArchitecture as crate::kernel::arch::CpuArchitecture>::MAX_CPUS;
+pub(crate) const MAX_CPUS: usize =
+    <CpuArchitecture as crate::kernel::arch::traits::CpuArchitecture>::MAX_CPUS;
 pub(crate) const VM_ARENA_SIZE: usize =
     <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
 pub(crate) const VM_BASE: usize =
@@ -120,8 +121,8 @@ pub(crate) fn wait_for_interrupt() {
 }
 
 impl crate::kernel::arch::traits::MemoryArchitecture for MemoryArchitecture {
-    const VM_ARENA_SIZE: usize = VM_ARENA_SIZE;
-    const VM_BASE: usize = VM_BASE;
+    const VM_ARENA_SIZE: usize = 1 << 36;
+    const VM_BASE: usize = 0x10_0000_0000;
 
     fn initialize_mmu() {
         paging::initialize();
@@ -263,7 +264,7 @@ impl crate::kernel::arch::traits::TimerArchitecture for TimerArchitecture {
 }
 
 impl crate::kernel::arch::traits::CpuArchitecture for CpuArchitecture {
-    const MAX_CPUS: usize = MAX_CPUS;
+    const MAX_CPUS: usize = 8;
 
     fn halt() -> ! {
         self::halt()
