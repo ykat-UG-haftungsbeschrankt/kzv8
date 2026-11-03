@@ -98,7 +98,6 @@ A successful x86_64 run includes these runtime markers:
 kz: first lazy page fault resolved
 kz: x86_64 Rust kernel booted
 kz: virtio-console transmit OK
-kz: Rust futures smoke OK
 kz: C stdio printf 42 hello 0x2a
 kz: C stdio puts works
 !

@@ -19,7 +19,6 @@ fpu-x87 = []
 fpu-sse = []
 fpu-avx = ["fpu-sse"]
 aarch64-fpu-off = []
-kernel-smoke-tests = []
 
 [workspace]
 resolver = "2"

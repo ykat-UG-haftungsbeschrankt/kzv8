@@ -29,12 +29,8 @@ pub(crate) fn run(context: KernelContext<'_>) {
         block_device,
         network_stack,
         network_registration,
-        future_smoke_ok,
     } = context;
 
-    if future_smoke_ok {
-        let _future_status = Console::write(b"kz: Rust futures smoke OK\n");
-    }
     if PhysicalAllocator::memory_bytes() > 128 * 1024 * 1024 {
         let _memory_status = Console::write(b"kz: RAM above 128 MiB detected\n");
     }

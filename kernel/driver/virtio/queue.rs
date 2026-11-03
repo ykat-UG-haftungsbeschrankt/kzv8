@@ -7,7 +7,7 @@
 
 use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
-use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
+use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 use crate::kernel::scheduler::sync::{IrqSpinGuard, IrqSpinLock};
 
 const DESC_NEXT: u16 = 1;
@@ -145,7 +145,7 @@ impl<const N: usize> VirtQueue<N> {
                 head,
             );
         }
-        crate::kernel::memory::dma::sync_for_device();
+        DmaArena::sync_for_device();
         unsafe {
             core::ptr::write_volatile(
                 core::ptr::addr_of_mut!(self.available.index),
@@ -161,7 +161,7 @@ impl<const N: usize> VirtQueue<N> {
         if self.last_used == used_index {
             return None;
         }
-        crate::kernel::memory::dma::sync_for_cpu();
+        DmaArena::sync_for_cpu();
         let slot = usize::from(self.last_used) % N;
         let element =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.used.ring[slot])) };

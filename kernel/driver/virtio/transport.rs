@@ -7,6 +7,7 @@
 
 use crate::kernel::arch::traits::DeviceArchitecture as _;
 use crate::kernel::error::Error;
+use crate::kernel::memory::dma::DmaArena;
 
 #[repr(usize)]
 #[derive(Clone, Copy)]
@@ -246,7 +247,7 @@ impl VirtioTransport {
         self.region
             .write_address(AddressRegister::QueueAvail, available);
         self.region.write_address(AddressRegister::QueueUsed, used);
-        crate::kernel::memory::dma::sync_for_device();
+        DmaArena::sync_for_device();
         self.region.write_register(Register::QueueReady, 1);
         Ok(())
     }

@@ -8,7 +8,7 @@
 use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
-use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
+use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 
 #[repr(C)]
 struct RequestHeader {
@@ -127,7 +127,7 @@ impl BlockDevice {
         ];
         let head = self.queue.submit(&descriptors).ok_or(Error::Busy)?;
         self.in_flight_head = Some(head);
-        crate::kernel::memory::dma::sync_for_device();
+        DmaArena::sync_for_device();
         self.transport.notify(0);
         Ok(BlockTransfer {
             device: self,
@@ -146,7 +146,7 @@ impl BlockDevice {
             return Err(Error::Busy);
         };
         self.in_flight_head = None;
-        dma::sync_for_cpu();
+        DmaArena::sync_for_cpu();
         if used.id != u32::from(expected) {
             return Err(Error::Proto);
         }
@@ -175,7 +175,7 @@ impl BlockTransfer<'_> {
             return Ok(false);
         };
         self.device.in_flight_head = None;
-        dma::sync_for_cpu();
+        DmaArena::sync_for_cpu();
         self.complete = true;
         if used.id != u32::from(self.head) {
             return Err(Error::Proto);

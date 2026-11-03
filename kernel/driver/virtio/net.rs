@@ -8,7 +8,7 @@
 use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
-use crate::kernel::memory::dma::{self, DmaArena, DmaBuffer};
+use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 
 
 
@@ -97,7 +97,7 @@ impl VirtioNet {
             .submit(&descriptors)
             .ok_or(Error::Busy)?;
         self.transmit_head = Some(head);
-        dma::sync_for_device();
+        DmaArena::sync_for_device();
         self.transport.notify(1);
         Ok(())
     }
@@ -129,7 +129,7 @@ impl VirtioNet {
                 Descriptor::new(base + Self::HEADER_SIZE as u64, Self::MTU as u32, true),
             ];
             let head = self.receive_queue.submit(&descriptors).ok_or(Error::Busy)?;
-            dma::sync_for_device();
+            DmaArena::sync_for_device();
             self.transport.notify(0);
             self.receive_head = Some(head);
         }

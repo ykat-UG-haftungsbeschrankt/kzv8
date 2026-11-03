@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::kernel::driver::virtio::queue::{Descriptor, QueueCell};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
+use crate::kernel::memory::dma::DmaArena;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 struct OutputQueue {
@@ -152,7 +153,7 @@ impl Console {
         };
         output.active_head = Some(head);
         output.active_length = length;
-        crate::kernel::memory::dma::sync_for_device();
+        DmaArena::sync_for_device();
         true
     }
 }

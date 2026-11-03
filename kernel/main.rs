@@ -97,11 +97,11 @@ impl Kernel {
             if driver::virtio::console::Console::write(arch::BootArchitecture::BOOT_MESSAGE)
                 && driver::virtio::console::Console::write(b"kz: virtio-console transmit OK\n")
             {
-                runtime::run(runtime::KernelContext {
+                runtime::run(KernelContext {
                     events: &mut events,
                     block_device: block_device.as_mut(),
                     network_stack: network_stack.as_mut(),
-                    network_registration
+                    network_registration,
                 });
             }
         }
