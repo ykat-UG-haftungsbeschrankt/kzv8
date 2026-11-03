@@ -33,8 +33,8 @@ smoke run only on x86_64. This is a kernel prototype, not a general-purpose OS.
   AArch64; `printf`, `puts`, and `putchar` write to the VirtIO console.
 - Freestanding C `malloc` and `free` backed by the kernel heap.
 - An anonymous Linux-shaped `mmap`/`munmap` subset backed by physical frames.
-- A bounded, cooperative pthread subset with fixed stacks, join/detach, mutexes,
-  and condition variables.
+- A bounded, timer-preemptive pthread subset on the boot CPU, with fixed stacks,
+  join/detach, mutexes, and condition variables.
 - A freestanding x86_64 V8 embedder with a cooperative task runner and kernel
   page allocator. Its built-in JavaScript smoke exercises console, timers,
   event-loop, raw block, and TCP bindings, with explicit microtask checkpoints.
@@ -42,10 +42,11 @@ smoke run only on x86_64. This is a kernel prototype, not a general-purpose OS.
   kernel, allocator, libc, and V8 checks. AArch64 does not integrate V8 or
   attach block/network devices in its smoke path.
 
-There is no kernel-side ELF loader, on-disk filesystem, or full libc. Kernel
-threads are cooperatively scheduled. Boot assembly, paging, and interrupt
-vectors are architecture-specific; VirtIO transport and drivers are shared.
-The VirtIO console is the kernel's output device.
+There is no kernel-side ELF loader, on-disk filesystem, or full libc. Pthreads
+are time-sliced by timer interrupts; the async task executor is cooperative.
+Boot assembly, paging, and interrupt vectors are architecture-specific;
+VirtIO transport and drivers are shared. The VirtIO console is the kernel's
+output device.
 
 ## Build and test
 
@@ -268,6 +269,7 @@ Kernel-side V8 remains experimental: it runs at kernel privilege, uses
 synchronous device bindings, and has no user-script loading or isolated
 execution environment.
 
-The intended design statically links V8 into the image. Preemptive or SMP
-threads and ELF application loading are not part of the initial design. Running
-V8 at kernel privilege means native runtime bugs can compromise the whole system.
+The intended design statically links V8 into the image. Single-CPU preemptive
+pthread scheduling is implemented; SMP scheduling and ELF application loading
+remain outside the initial design. Running V8 at kernel privilege means native
+runtime bugs can compromise the whole system.

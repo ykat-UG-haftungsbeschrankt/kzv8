@@ -170,6 +170,36 @@ pub unsafe extern "C" fn strchr(text: *const i8, character: i32) -> *mut i8 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn strstr(haystack: *const i8, needle: *const i8) -> *mut i8 {
+    let haystack_bytes = haystack.cast::<u8>();
+    let needle_bytes = needle.cast::<u8>();
+    if unsafe { read_volatile(needle_bytes) } == 0 {
+        return haystack.cast_mut();
+    }
+    let mut start_index = 0;
+    loop {
+        if unsafe { read_volatile(haystack_bytes.add(start_index)) } == 0 {
+            return core::ptr::null_mut();
+        }
+        let mut needle_index = 0;
+        loop {
+            let haystack_byte = unsafe {
+                read_volatile(haystack_bytes.add(start_index + needle_index))
+            };
+            let needle_byte = unsafe { read_volatile(needle_bytes.add(needle_index)) };
+            if needle_byte == 0 {
+                return unsafe { haystack_bytes.add(start_index).cast_mut().cast() };
+            }
+            if haystack_byte != needle_byte {
+                break;
+            }
+            needle_index += 1;
+        }
+        start_index += 1;
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn __memcpy_chk(
     destination: *mut c_void,
     source: *const c_void,

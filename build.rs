@@ -30,6 +30,11 @@ fn main() {
     let repository_dir = package_dir.clone();
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let v8_target = if target_arch == "aarch64" {
+        "aarch64-unknown-linux-gnu"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    };
     let fpu_avx = env::var_os("CARGO_FEATURE_FPU_AVX").is_some();
     let clang = env::var_os("CLANG").unwrap_or_else(|| OsString::from("clang"));
     let objcopy = env::var_os("OBJCOPY").unwrap_or_else(|| OsString::from("llvm-objcopy"));
@@ -44,9 +49,20 @@ fn main() {
         })
         .map(PathBuf::into_os_string)
         .unwrap_or_else(|| OsString::from("clang++"));
-    let v8_platform_output = env::var_os("V8_PLATFORM_OUT")
+    let (v8_platform_output_env, default_v8_platform_output) = if target_arch == "aarch64" {
+        (
+            "V8_AARCH64_PLATFORM_OUT",
+            repository_dir.join("runtime/v8/src/out.gn/arm64.platform"),
+        )
+    } else {
+        (
+            "V8_PLATFORM_OUT",
+            repository_dir.join("runtime/v8/src/out.gn/x64.platform"),
+        )
+    };
+    let v8_platform_output = env::var_os(v8_platform_output_env)
         .map(PathBuf::from)
-        .unwrap_or_else(|| repository_dir.join("runtime/v8/src/out.gn/x64.platform"));
+        .unwrap_or(default_v8_platform_output);
     let v8_platform_output = if v8_platform_output.is_absolute() {
         v8_platform_output
     } else {
@@ -78,6 +94,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FPU_AVX");
     println!("cargo:rerun-if-env-changed=V8_CXX");
     println!("cargo:rerun-if-env-changed=V8_PLATFORM_OUT");
+    println!("cargo:rerun-if-env-changed=V8_AARCH64_PLATFORM_OUT");
     let linker_script = repository_dir.join(linker_script);
     println!("cargo:rerun-if-changed={}", linker_script.display());
     println!("cargo:rustc-link-arg=-T{}", linker_script.display());
@@ -181,17 +198,31 @@ fn main() {
         println!("cargo:rustc-link-arg={}", object.display());
     }
 
-    if target_arch == "x86_64" {
+    if target_arch == "x86_64" || target_arch == "aarch64" {
         let v8_source = repository_dir.join("runtime/v8/src");
         let v8_archive = v8_platform_output.join("obj/libv8_monolith.a");
-        let libcxx_archive = v8_platform_output
-            .join("obj/buildtools/third_party/libc++/libc++.a");
-        let libcxxabi_archive = v8_platform_output
-            .join("obj/buildtools/third_party/libc++abi/libc++abi.a");
+        let target_obj = v8_platform_output.join("obj");
+        let libcxx_archive = target_obj.join("buildtools/third_party/libc++/libc++.a");
+        let libcxxabi_archive = target_obj.join("buildtools/third_party/libc++abi/libc++abi.a");
         for archive in [&v8_archive, &libcxx_archive, &libcxxabi_archive] {
             assert!(archive.is_file(), "missing V8 archive: {}", archive.display());
             println!("cargo:rerun-if-changed={}", archive.display());
         }
+        let compiler_rt_archive = if target_arch == "aarch64" {
+            let output = Command::new(&v8_cxx)
+                .arg("--print-resource-dir")
+                .output()
+                .expect("failed to locate the V8 Clang resource directory");
+            assert!(output.status.success(), "failed to query the V8 Clang resource directory");
+            let resource_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            let archive = resource_dir
+                .join("lib/aarch64-unknown-linux-gnu/libclang_rt.builtins.a");
+            assert!(archive.is_file(), "missing compiler runtime archive: {}", archive.display());
+            println!("cargo:rerun-if-changed={}", archive.display());
+            Some(archive)
+        } else {
+            None
+        };
 
         for (source, object) in [
             ("runtime/bridge/src/platform.cc", "v8_platform.o"),
@@ -199,8 +230,12 @@ fn main() {
         ] {
             let source = repository_dir.join(source);
             let object = output_dir.join(object);
-            let status = Command::new(&v8_cxx)
-                .arg("--target=x86_64-unknown-linux-gnu")
+            let mut command = Command::new(&v8_cxx);
+            command.arg(format!("--target={v8_target}"));
+            if target_arch == "x86_64" {
+                command.arg("-mno-red-zone");
+            }
+            let status = command
                 .args([
                     "-std=c++20",
                     "-nostdinc++",
@@ -211,7 +246,6 @@ fn main() {
                     "-fno-stack-protector",
                     "-fno-unwind-tables",
                     "-fno-asynchronous-unwind-tables",
-                    "-mno-red-zone",
                     "-Wall",
                     "-Wextra",
                     "-Wno-unused-parameter",
@@ -222,7 +256,6 @@ fn main() {
                     "-DKZ_FREESTANDING",
                     "-DV8_HAVE_TARGET_OS",
                     "-DV8_TARGET_OS_LINUX",
-                    "-DV8_TARGET_ARCH_X64",
                     "-DV8_ENABLE_SANDBOX",
                     "-DV8_COMPRESS_POINTERS",
                     "-DV8_COMPRESS_POINTERS_IN_SHARED_CAGE",
@@ -243,6 +276,11 @@ fn main() {
                 .arg(v8_source.join("third_party/abseil-cpp"))
                 .arg("-I")
                 .arg(repository_dir.join("runtime/bridge/include"))
+                .arg(if target_arch == "aarch64" {
+                    "-DV8_TARGET_ARCH_ARM64"
+                } else {
+                    "-DV8_TARGET_ARCH_X64"
+                })
                 .arg("-c")
                 .arg(&source)
                 .arg("-o")
@@ -264,15 +302,19 @@ fn main() {
             &mut rust_archives,
         );
         collect_rlibs(
-            &v8_platform_output.join(
-                "local_rustc_sysroot/lib/rustlib/x86_64-unknown-linux-gnu/lib",
-            ),
+            &v8_platform_output
+                .join("local_rustc_sysroot/lib/rustlib")
+                .join(v8_target)
+                .join("lib"),
             &mut rust_archives,
         );
         rust_archives.sort();
 
         println!("cargo:rustc-link-arg=--start-group");
         for archive in [v8_archive, libcxx_archive, libcxxabi_archive] {
+            println!("cargo:rustc-link-arg={}", archive.display());
+        }
+        if let Some(archive) = compiler_rt_archive {
             println!("cargo:rustc-link-arg={}", archive.display());
         }
         for archive in rust_archives {

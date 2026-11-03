@@ -12,6 +12,23 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use super::errno::EINVAL;
 const WEOF: u32 = u32::MAX;
 
+#[cfg(target_arch = "aarch64")]
+const AT_HWCAP: usize = 16;
+#[cfg(target_arch = "aarch64")]
+const HWCAP_FP: usize = 1 << 0;
+#[cfg(target_arch = "aarch64")]
+const HWCAP_ASIMD: usize = 1 << 1;
+
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub extern "C" fn getauxval(kind: usize) -> usize {
+    if kind == AT_HWCAP {
+        HWCAP_FP | HWCAP_ASIMD
+    } else {
+        0
+    }
+}
+
 #[repr(C)]
 struct LocaleStub {
     active: i32,

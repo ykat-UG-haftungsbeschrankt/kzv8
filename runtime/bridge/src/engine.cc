@@ -853,8 +853,12 @@ extern "C" int kz_v8_run_smoke(void* event_loop, void* block_device,
 							global_boolean(isolate, context, "__kzBlockDone");
 					const bool tcp_done =
 							global_boolean(isolate, context, "__kzTcpDone");
+					const bool block_required = devices.block_device != nullptr;
+					const bool tcp_required =
+							kz_host_tcp_available(devices.tcp_context) != 0;
 					succeeded = script_result == 42 && devices.console_called &&
-							block_done && tcp_done && promise_done && timer_done &&
+							(!block_required || block_done) &&
+							(!tcp_required || tcp_done) && promise_done && timer_done &&
 							global_boolean(isolate, context, "__kzTimerDone") &&
 							global_boolean(isolate, context,
 												"__kzTimerMicrotaskDone");

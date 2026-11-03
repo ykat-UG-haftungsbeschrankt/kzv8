@@ -6,6 +6,7 @@ FPU_MODE ?= sse
 AARCH64_FPU_STATE ?= on
 V8_OUT ?= runtime/v8/src/out.gn/x64.release
 V8_PLATFORM_OUT ?= runtime/v8/src/out.gn/x64.platform
+V8_AARCH64_PLATFORM_OUT ?= runtime/v8/src/out.gn/arm64.platform
 V8_CXX ?= runtime/v8/src/third_party/llvm-build/Release+Asserts/bin/clang++
 KERNEL_X86_RUSTFLAGS ?= -C relocation-model=static -C link-arg=-no-pie -C link-arg=--error-limit=0
 V8_RUST_LIBS ?= $(shell find "$(V8_PLATFORM_OUT)/obj/third_party/rust" -type f -name '*.rlib' -print) $(wildcard $(V8_PLATFORM_OUT)/local_rustc_sysroot/lib/rustlib/x86_64-unknown-linux-gnu/lib/*.rlib)
@@ -46,7 +47,9 @@ build/x86_64/kernel.elf: build/x86_64/kernel64.elf
 
 build/aarch64/kernel.elf: force
 	mkdir -p $(@D)
-	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" $(CARGO) build --manifest-path Cargo.toml --release --target aarch64-unknown-none $(AARCH64_FPU_FEATURES)
+	cd runtime/v8/src && buildtools/linux64/gn gen out.gn/arm64.platform --args="$$(cat ../args-platform-aarch64.gn)"
+	ninja -C "$(V8_AARCH64_PLATFORM_OUT)" v8_monolith libc++
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_AARCH64_PLATFORM_OUT="$(V8_AARCH64_PLATFORM_OUT)" $(CARGO) build --manifest-path Cargo.toml --release --target aarch64-unknown-none $(AARCH64_FPU_FEATURES)
 	cp "$(CARGO_TARGET_DIR)/aarch64-unknown-none/release/kernel" $@
 
 build/aarch64/kernel.bin: build/aarch64/kernel.elf
