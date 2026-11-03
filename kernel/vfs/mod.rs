@@ -26,17 +26,9 @@ pub(crate) trait DirectoryPlugin: Send + Sync {
 }
 
 pub(crate) trait FilePlugin: Send + Sync {
-    fn read_at<'a>(
-        &'a self,
-        offset: u64,
-        buffer: &'a mut [u8],
-    ) -> VfsFuture<'a, VfsResult<usize>>;
+    fn read_at<'a>(&'a self, offset: u64, buffer: &'a mut [u8]) -> VfsFuture<'a, VfsResult<usize>>;
 
-    fn write_at<'a>(
-        &'a self,
-        _offset: u64,
-        _buffer: &'a [u8],
-    ) -> VfsFuture<'a, VfsResult<usize>> {
+    fn write_at<'a>(&'a self, _offset: u64, _buffer: &'a [u8]) -> VfsFuture<'a, VfsResult<usize>> {
         Box::pin(async { Err(Error::Rofs) })
     }
 }

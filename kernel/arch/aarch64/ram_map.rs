@@ -14,6 +14,7 @@ const TABLE_ENTRIES: usize = 512;
 const BLOCK_SIZE: u64 = 1 << 30;
 const BLOCK_DESCRIPTOR: u64 = 0b01;
 const ACCESS_FLAG: u64 = 1 << 10;
+const PAGE_DESCRIPTOR: u64 = 0b11;
 const INNER_SHAREABLE: u64 = 0b11 << 8;
 const UXN: u64 = 1 << 54;
 const PXN: u64 = 1 << 53;
@@ -109,7 +110,7 @@ unsafe fn split_l2_block(entry: *mut u64, create: bool) -> Option<*mut u64> {
             for index in 0..TABLE_ENTRIES {
                 let address = base + (index as u64 * L2_BLOCK_SIZE);
                 unsafe {
-                    write_volatile(table.add(index), address | attributes | BLOCK_DESCRIPTOR);
+                    write_volatile(table.add(index), address | attributes | PAGE_DESCRIPTOR);
                 }
             }
             unsafe { write_volatile(entry, (table as u64 & TABLE_ADDRESS_MASK) | 0b11) };

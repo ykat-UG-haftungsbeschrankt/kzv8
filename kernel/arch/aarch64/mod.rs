@@ -97,8 +97,8 @@ pub(crate) fn wait_for_interrupt() {
 }
 
 impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitecture {
-    const VM_ARENA_SIZE: usize = 1 << 30;
-    const VM_BASE: usize = 511usize << 30;
+    const VM_ARENA_SIZE: usize = 64 << 30;
+    const VM_BASE: usize = 448usize << 30;
 
     fn initialize_mmu() {
         let memory_regions =

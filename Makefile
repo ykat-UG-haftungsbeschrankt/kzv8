@@ -8,6 +8,7 @@ V8_OUT ?= runtime/v8/src/out.gn/x64.release
 V8_PLATFORM_OUT ?= runtime/v8/src/out.gn/x64.platform
 V8_AARCH64_PLATFORM_OUT ?= runtime/v8/src/out.gn/arm64.platform
 V8_CXX ?= runtime/v8/src/third_party/llvm-build/Release+Asserts/bin/clang++
+QEMU_GDB_PORT ?= 1234
 KERNEL_X86_RUSTFLAGS ?= -C relocation-model=static -C link-arg=-no-pie -C link-arg=--error-limit=0
 V8_RUST_LIBS ?= $(shell find "$(V8_PLATFORM_OUT)/obj/third_party/rust" -type f -name '*.rlib' -print) $(wildcard $(V8_PLATFORM_OUT)/local_rustc_sysroot/lib/rustlib/x86_64-unknown-linux-gnu/lib/*.rlib)
 V8_RUST_ALLOCATOR_LIBS ?= $(wildcard $(V8_PLATFORM_OUT)/obj/build/rust/allocator/*.rlib)
@@ -30,7 +31,7 @@ else
 $(error AARCH64_FPU_STATE must be on or off)
 endif
 
-.PHONY: all test app-build doc run-x86_64 run-aarch64 v8-host-test v8-platform-test clean force
+.PHONY: all test app-build doc run-x86_64 run-aarch64 debug-x86_64 debug-aarch64 v8-host-test v8-platform-test clean force
 all: build/x86_64/kernel.elf build/aarch64/kernel.bin
 
 force:
@@ -100,6 +101,12 @@ run-x86_64: build/x86_64/kernel.elf
 
 run-aarch64: build/aarch64/kernel.bin
 	qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a72 -accel tcg -m 128M -smp 2 -display none -serial none -monitor none -no-reboot -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev stdio,id=console,signal=off -device virtconsole,chardev=console
+
+debug-x86_64: build/x86_64/kernel.elf
+	qemu-system-x86_64 -machine microvm,acpi=off -accel tcg -m 5G -smp 2 -display none -serial none -monitor none -no-reboot -S -gdb tcp:127.0.0.1:$(QEMU_GDB_PORT) -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev stdio,id=console,signal=off -device virtconsole,chardev=console
+
+debug-aarch64: build/aarch64/kernel.bin
+	qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a72 -accel tcg -m 128M -smp 2 -display none -serial none -monitor none -no-reboot -S -gdb tcp:127.0.0.1:$(QEMU_GDB_PORT) -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev stdio,id=console,signal=off -device virtconsole,chardev=console
 
 clean:
 	#rm -rf build

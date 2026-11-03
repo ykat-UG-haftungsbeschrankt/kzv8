@@ -62,9 +62,8 @@ make test
 ```
 
 Build an image directly with `make build/x86_64/kernel.elf` or
-`make build/aarch64/kernel.bin`. The x86_64 build and device-backed QEMU smoke
-pass. The current AArch64 build is blocked by `c_char` type mismatches in
-`runtime/libc/compat.rs`, so `make test` stops before booting that guest.
+`make build/aarch64/kernel.bin`. `make test` builds both images and runs the
+application and QEMU smoke tests.
 
 For an interactive x86_64 boot, run `make run-x86_64`; for AArch64, use
 `make run-aarch64` after its build is available. These targets attach a console
@@ -208,6 +207,31 @@ bindings are available in the x86_64 smoke test, which supplies those devices.
 The x86 target uses `microvm,acpi=off`: its interrupt routing currently assumes
 the first IO-APIC and fixed VirtIO GSI assignments. QEMU's ACPI-enabled microvm
 can add a second IO-APIC with a different VirtIO GSI base.
+
+## Kernel debugging
+
+The debug targets pause QEMU before the first instruction and expose its GDB
+stub on `127.0.0.1:1234`. Run one target in a terminal, then attach with GDB in
+another. The port can be changed with `QEMU_GDB_PORT`.
+
+For AArch64:
+
+```sh
+make debug-aarch64
+gdb-multiarch build/aarch64/kernel.elf
+```
+
+```gdb
+set architecture aarch64
+target remote 127.0.0.1:1234
+break kernel_main
+continue
+```
+
+For x86_64, use `make debug-x86_64` and load
+`build/x86_64/kernel64.elf` in `gdb-multiarch`; connect to the same remote port,
+set architecture to `i386:x86-64`, then set a breakpoint and continue. Disconnect
+GDB and press Ctrl-A then X in the QEMU terminal to stop the VM.
 
 The x86 build is linked as ELF64 and converted to an ELF32 container for
 QEMU's Multiboot loader. It still executes 64-bit Rust after the boot
