@@ -16,16 +16,17 @@ mod virtio;
 
 pub(crate) use threads::FpuContext;
 
-pub(crate) struct MemoryArch;
+pub(crate) struct MemoryArchitecture;
 
-pub(crate) const MAX_CPUS: usize = <MemoryArch as crate::kernel::arch::CpuArchitecture>::MAX_CPUS;
+pub(crate) const MAX_CPUS: usize = <MemoryArchitecture as crate::kernel::arch::CpuArchitecture>::MAX_CPUS;
 pub(crate) const VM_ARENA_SIZE: usize =
-    <MemoryArch as crate::kernel::arch::MemoryArchitecture>::VM_ARENA_SIZE;
-pub(crate) const VM_BASE: usize = <MemoryArch as crate::kernel::arch::MemoryArchitecture>::VM_BASE;
+    <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
+pub(crate) const VM_BASE: usize =
+    <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_BASE;
 pub(crate) const BOOT_MESSAGE: &[u8] =
-    <MemoryArch as crate::kernel::arch::BootArchitecture>::BOOT_MESSAGE;
+    <MemoryArchitecture as crate::kernel::arch::BootArchitecture>::BOOT_MESSAGE;
 pub(crate) const BOOT_INFO_ERROR: &str =
-    <MemoryArch as crate::kernel::arch::BootArchitecture>::BOOT_INFO_ERROR;
+    <MemoryArchitecture as crate::kernel::arch::BootArchitecture>::BOOT_INFO_ERROR;
 
 /// # Safety
 /// `boot_info` must point to the mapped FDT blob supplied by the boot firmware.
@@ -96,7 +97,7 @@ pub(crate) fn wait_for_interrupt() {
     unsafe { core::arch::asm!("msr daifclr, #0xf", "wfe") };
 }
 
-impl crate::kernel::arch::MemoryArchitecture for MemoryArch {
+impl crate::kernel::arch::traits::MemoryArchitecture for MemoryArchitecture {
     const VM_ARENA_SIZE: usize = VM_ARENA_SIZE;
     const VM_BASE: usize = VM_BASE;
 
@@ -150,7 +151,7 @@ impl crate::kernel::arch::MemoryArchitecture for MemoryArch {
     }
 }
 
-impl crate::kernel::arch::BootArchitecture for MemoryArch {
+impl crate::kernel::arch::BootArchitecture for MemoryArchitecture {
     const BOOT_MESSAGE: &'static [u8] = BOOT_MESSAGE;
     const BOOT_INFO_ERROR: &'static str = BOOT_INFO_ERROR;
 
@@ -159,7 +160,7 @@ impl crate::kernel::arch::BootArchitecture for MemoryArch {
     }
 }
 
-impl crate::kernel::arch::DeviceArchitecture for MemoryArch {
+impl crate::kernel::arch::DeviceArchitecture for MemoryArchitecture {
     const VIRTIO_WINDOW: crate::kernel::arch::VirtioWindow = virtio::virtio_window();
 
     fn dma_sync_for_device() {
@@ -171,7 +172,7 @@ impl crate::kernel::arch::DeviceArchitecture for MemoryArch {
     }
 }
 
-impl crate::kernel::arch::ThreadArchitecture for MemoryArch {
+impl crate::kernel::arch::ThreadArchitecture for MemoryArchitecture {
     type FpuContext = threads::FpuContext;
 
     fn initialize_thread_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize {
@@ -196,7 +197,7 @@ impl crate::kernel::arch::ThreadArchitecture for MemoryArch {
     }
 }
 
-impl crate::kernel::arch::InterruptArchitecture for MemoryArch {
+impl crate::kernel::arch::InterruptArchitecture for MemoryArchitecture {
     unsafe fn initialize_interrupts() {
         unsafe { interrupts::initialize() };
     }
@@ -222,7 +223,7 @@ impl crate::kernel::arch::InterruptArchitecture for MemoryArch {
     }
 }
 
-impl crate::kernel::arch::TimerArchitecture for MemoryArch {
+impl crate::kernel::arch::TimerArchitecture for MemoryArchitecture {
     fn initialize_timer() {
         timer::initialize();
     }
@@ -236,7 +237,7 @@ impl crate::kernel::arch::TimerArchitecture for MemoryArch {
     }
 }
 
-impl crate::kernel::arch::CpuArchitecture for MemoryArch {
+impl crate::kernel::arch::CpuArchitecture for MemoryArchitecture {
     const MAX_CPUS: usize = MAX_CPUS;
 
     fn halt() -> ! {
@@ -252,7 +253,7 @@ impl crate::kernel::arch::CpuArchitecture for MemoryArch {
     }
 }
 
-impl crate::kernel::arch::DebugArchitecture for MemoryArch {
+impl crate::kernel::arch::DebugArchitecture for MemoryArchitecture {
     fn decommit_debug(code: u8) {
         self::decommit_debug(code);
     }

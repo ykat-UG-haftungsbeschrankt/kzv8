@@ -49,19 +49,19 @@ impl Kernel {
 
     fn main(boot_info: usize, boot_magic: usize) -> !{
         let _interrupt_state =
-            <arch::MemoryArch as arch::InterruptArchitecture>::disable_interrupts();
+            <arch::MemoryArchitecture as arch::InterruptArchitecture>::disable_interrupts();
         unsafe {
-            <arch::MemoryArch as arch::InterruptArchitecture>::initialize_interrupts();
+            <arch::MemoryArchitecture as arch::InterruptArchitecture>::initialize_interrupts();
         }
         // SAFETY: the bootloader supplies the architecture-specific boot-info pointer.
         assert!(
             unsafe {
-                <arch::MemoryArch as arch::BootArchitecture>::initialize_boot_info(
+                <arch::MemoryArchitecture as arch::BootArchitecture>::initialize_boot_info(
                     boot_info, boot_magic,
                 )
             },
             "{}",
-            <arch::MemoryArch as arch::BootArchitecture>::BOOT_INFO_ERROR
+            <arch::MemoryArchitecture as arch::BootArchitecture>::BOOT_INFO_ERROR
         );
         memory::r#virtual::initialize();
         assert!(
@@ -71,15 +71,15 @@ impl Kernel {
         memory::heap::Heap::initialize();
         scheduler::thread::ThreadManager::initialize();
         assert!(
-            <arch::MemoryArch as arch::ThreadArchitecture>::initialize_thread_local_storage(0),
+            <arch::MemoryArchitecture as arch::ThreadArchitecture>::initialize_thread_local_storage(0),
             "unable to initialize thread-local storage"
         );
         memory::dma::DmaArena::initialize();
         assert!(
-            <arch::MemoryArch as arch::InterruptArchitecture>::initialize_interrupt_controller(),
+            <arch::MemoryArchitecture as arch::InterruptArchitecture>::initialize_interrupt_controller(),
             "unable to initialize the interrupt controller"
         );
-        <arch::MemoryArch as arch::TimerArchitecture>::initialize_timer();
+        <arch::MemoryArchitecture as arch::TimerArchitecture>::initialize_timer();
         let mut block_device = block::device::BlockDevice::initialize();
         let mut network_stack = net::stack::NetStack::initialize();
         let mut events = event::r#loop::EventLoop::<16>::new();
@@ -101,7 +101,7 @@ impl Kernel {
         let future_smoke_ok = future_smoke::run();
         #[cfg(not(feature = "kernel-smoke-tests"))]
         let future_smoke_ok = false;
-        <arch::MemoryArch as arch::InterruptArchitecture>::enable_interrupts();
+        <arch::MemoryArchitecture as arch::InterruptArchitecture>::enable_interrupts();
         if console_ready {
             if driver::virtio::console::Console::write(arch::BOOT_MESSAGE)
                 && driver::virtio::console::Console::write(b"kz: virtio-console transmit OK\n")
@@ -119,7 +119,7 @@ impl Kernel {
     }
 
     fn halt() -> ! {
-        <arch::MemoryArch as arch::CpuArchitecture>::halt()
+        <arch::MemoryArchitecture as arch::CpuArchitecture>::halt()
     }
 }
 

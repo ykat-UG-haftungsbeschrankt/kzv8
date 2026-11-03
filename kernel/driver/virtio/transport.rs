@@ -50,7 +50,7 @@ impl MappedMmioWindow {
         if !crate::kernel::memory::r#virtual::mmu_ready() {
             return None;
         }
-        let window = <crate::kernel::arch::MemoryArch as crate::kernel::arch::DeviceArchitecture>::
+        let window = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::DeviceArchitecture>::
             VIRTIO_WINDOW;
         let register_size = core::mem::size_of::<u32>();
         if window.slots == 0

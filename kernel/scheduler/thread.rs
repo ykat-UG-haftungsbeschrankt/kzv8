@@ -99,7 +99,7 @@ impl ThreadStack {
 
     pub(crate) fn bounds(index: usize) -> (*mut c_void, usize) {
         if index == 0 {
-            return <crate::kernel::arch::MemoryArch as crate::kernel::arch::ThreadArchitecture>::
+            return <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::ThreadArchitecture>::
                 current_thread_stack_bounds(Self::STACK_SIZE);
         }
         if index >= MAX_THREADS {
@@ -148,7 +148,7 @@ impl ThreadManager {
     }
 
     pub(crate) fn initialize() {
-        let interrupt_state = <crate::kernel::arch::MemoryArch as crate::kernel::arch::
+        let interrupt_state = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::
             InterruptArchitecture>::disable_interrupts();
         let manager = unsafe { &mut *Self::get_instance() };
         manager.threads.fill(Thread::EMPTY);
@@ -161,7 +161,7 @@ impl ThreadManager {
         manager.current_slot = 0;
         manager.next_thread_id = MAIN_THREAD_ID + 1;
         manager.initialized = true;
-        <crate::kernel::arch::MemoryArch as crate::kernel::arch::InterruptArchitecture>::
+        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::InterruptArchitecture>::
             restore_interrupts(interrupt_state);
     }
 
@@ -203,13 +203,13 @@ impl ThreadManager {
     }
 
     fn switch_current(next_state: ThreadState) -> bool {
-        let interrupt_state = <crate::kernel::arch::MemoryArch as crate::kernel::arch::
+        let interrupt_state = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::
             InterruptArchitecture>::disable_interrupts();
         let manager = Self::get_instance();
         let current = unsafe { (*manager).current_slot };
         let next = unsafe { Self::find_ready(current) };
         let Some(next) = next else {
-            <crate::kernel::arch::MemoryArch as crate::kernel::arch::InterruptArchitecture>::
+            <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::InterruptArchitecture>::
                 restore_interrupts(interrupt_state);
             return false;
         };
@@ -222,7 +222,7 @@ impl ThreadManager {
             let old_stack = addr_of_mut!((*threads.add(current)).stack_pointer);
             let new_stack = (*threads.add(next)).stack_pointer;
             #[cfg(target_arch = "x86_64")]
-            <crate::kernel::arch::MemoryArch as crate::kernel::arch::ThreadArchitecture>::
+            <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::ThreadArchitecture>::
                 switch_thread(
                 &mut *old_stack,
                 new_stack,
@@ -230,7 +230,7 @@ impl ThreadManager {
                 &(*threads.add(next)).fpu_context,
             );
             #[cfg(target_arch = "aarch64")]
-            <crate::kernel::arch::MemoryArch as crate::kernel::arch::ThreadArchitecture>::
+            <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::ThreadArchitecture>::
                 switch_thread(
                 &mut *old_stack,
                 new_stack,
@@ -238,7 +238,7 @@ impl ThreadManager {
                 &(*threads.add(next)).fpu_context,
             );
         }
-        <crate::kernel::arch::MemoryArch as crate::kernel::arch::InterruptArchitecture>::
+        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::InterruptArchitecture>::
             restore_interrupts(interrupt_state);
         true
     }
@@ -248,7 +248,7 @@ impl ThreadManager {
     }
 
     pub(crate) fn current_thread_id() -> usize {
-        let interrupt_state = <crate::kernel::arch::MemoryArch as crate::kernel::arch::
+        let interrupt_state = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::
             InterruptArchitecture>::disable_interrupts();
         let manager = Self::get_instance();
         let id = unsafe {
@@ -259,13 +259,13 @@ impl ThreadManager {
                 0
             }
         };
-        <crate::kernel::arch::MemoryArch as crate::kernel::arch::InterruptArchitecture>::
+        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::InterruptArchitecture>::
             restore_interrupts(interrupt_state);
         id
     }
 
     pub(crate) fn exit_current(result: *mut c_void) -> ! {
-        let _interrupt_state = <crate::kernel::arch::MemoryArch as crate::kernel::arch::
+        let _interrupt_state = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::
             InterruptArchitecture>::disable_interrupts();
         let manager = Self::get_instance();
         unsafe {
@@ -290,7 +290,7 @@ impl ThreadManager {
                 let old_stack = addr_of_mut!((*threads.add(current)).stack_pointer);
                 let new_stack = (*threads.add(next)).stack_pointer;
                 #[cfg(target_arch = "x86_64")]
-                <crate::kernel::arch::MemoryArch as crate::kernel::arch::ThreadArchitecture>::
+                <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::ThreadArchitecture>::
                     switch_thread(
                     &mut *old_stack,
                     new_stack,
@@ -298,7 +298,7 @@ impl ThreadManager {
                     &(*threads.add(next)).fpu_context,
                 );
                 #[cfg(target_arch = "aarch64")]
-                <crate::kernel::arch::MemoryArch as crate::kernel::arch::ThreadArchitecture>::
+                <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::ThreadArchitecture>::
                     switch_thread(
                     &mut *old_stack,
                     new_stack,
@@ -307,11 +307,11 @@ impl ThreadManager {
                 );
             }
         }
-        <crate::kernel::arch::MemoryArch as crate::kernel::arch::CpuArchitecture>::halt()
+        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::CpuArchitecture>::halt()
     }
 
     extern "C" fn thread_trampoline() -> ! {
-        let interrupt_state = <crate::kernel::arch::MemoryArch as crate::kernel::arch::
+        let interrupt_state = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::
             InterruptArchitecture>::disable_interrupts();
         let manager = Self::get_instance();
         let current = unsafe { (*manager).current_slot };
@@ -320,9 +320,9 @@ impl ThreadManager {
             let thread = threads.add(current);
             ((*thread).start_routine, (*thread).argument)
         };
-        <crate::kernel::arch::MemoryArch as crate::kernel::arch::InterruptArchitecture>::
+        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::InterruptArchitecture>::
             restore_interrupts(interrupt_state);
-        <crate::kernel::arch::MemoryArch as crate::kernel::arch::InterruptArchitecture>::
+        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::InterruptArchitecture>::
             enable_interrupts();
 
         if let Some(start_routine) = start_routine {

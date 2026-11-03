@@ -12,6 +12,7 @@ pub(crate) struct VirtioWindow {
     pub(crate) stride: usize,
 }
 
+struct BootArchitecture;
 pub(crate) trait BootArchitecture {
     const BOOT_MESSAGE: &'static [u8];
     const BOOT_INFO_ERROR: &'static str;
@@ -21,6 +22,7 @@ pub(crate) trait BootArchitecture {
     unsafe fn initialize_boot_info(boot_info: usize, boot_magic: usize) -> bool;
 }
 
+struct DeviceArchitecture;
 pub(crate) trait DeviceArchitecture {
     const VIRTIO_WINDOW: VirtioWindow;
 
@@ -28,6 +30,7 @@ pub(crate) trait DeviceArchitecture {
     fn dma_sync_for_cpu();
 }
 
+struct ThreadArchitecture;
 pub(crate) trait ThreadArchitecture {
     type FpuContext: Copy;
 
@@ -42,6 +45,7 @@ pub(crate) trait ThreadArchitecture {
     );
 }
 
+struct InterruptArchitecture;
 pub(crate) trait InterruptArchitecture {
     /// # Safety
     /// Must be called with interrupts disabled before enabling interrupt delivery.
@@ -53,12 +57,14 @@ pub(crate) trait InterruptArchitecture {
     fn interrupts_enabled() -> bool;
 }
 
+struct TimerArchitecture;
 pub(crate) trait TimerArchitecture {
     fn initialize_timer();
     fn now_ns() -> Option<u64>;
     fn fallback_time_ns() -> u64;
 }
 
+struct CpuArchitecture;
 pub(crate) trait CpuArchitecture {
     const MAX_CPUS: usize;
 
@@ -67,23 +73,27 @@ pub(crate) trait CpuArchitecture {
     fn wait_for_interrupt();
 }
 
+struct DebugArchitecture;
 pub(crate) trait DebugArchitecture {
     fn decommit_debug(code: u8);
 }
 
-pub(crate) trait MemoryArchitecture {
-    const VM_ARENA_SIZE: usize;
-    const VM_BASE: usize;
+struct MemoryArchitecture;
+pub(crate) mod traits {
+    pub(crate) trait MemoryArchitecture {
+        const VM_ARENA_SIZE: usize;
+        const VM_BASE: usize;
 
-    fn initialize_mmu();
-    fn is_identity_mapped(address: usize) -> bool;
-    fn protect_kernel_image_pages(address: usize, length: usize, permissions: i32) -> bool;
-    fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool;
-    fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool;
-    fn unmap_page(virtual_address: usize) -> Option<usize>;
-    fn page_is_mapped(virtual_address: usize) -> bool;
-    fn page_has_backing(virtual_address: usize) -> bool;
-    fn high_memory_smoke() -> bool;
+        fn initialize_mmu();
+        fn is_identity_mapped(address: usize) -> bool;
+        fn protect_kernel_image_pages(address: usize, length: usize, permissions: i32) -> bool;
+        fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool;
+        fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool;
+        fn unmap_page(virtual_address: usize) -> Option<usize>;
+        fn page_is_mapped(virtual_address: usize) -> bool;
+        fn page_has_backing(virtual_address: usize) -> bool;
+        fn high_memory_smoke() -> bool;
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
