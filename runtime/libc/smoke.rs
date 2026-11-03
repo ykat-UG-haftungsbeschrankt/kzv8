@@ -10,6 +10,8 @@ use core::mem::MaybeUninit;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::kernel::arch::traits::TimerArchitecture as _;
+
 use super::filesystem::CStat;
 use super::stdio::KzFile;
 
@@ -241,14 +243,14 @@ unsafe extern "C" fn smoke_preemption_worker(_argument: *mut c_void) -> *mut c_v
 }
 
 fn wait_for_preemption_stage(stage: usize) -> bool {
-    let timeout_ticks = crate::kernel::arch::timer::frequency_hz().map(|frequency| frequency / 4);
-    let start_ticks = crate::kernel::arch::timer::ticks();
+    let start_ns = crate::kernel::arch::TimerArchitecture::now_ns();
     for _ in 0..50_000_000 {
         if SMOKE_PREEMPTION_STAGE.load(Ordering::Acquire) >= stage {
             return true;
         }
-        if timeout_ticks.is_some_and(|timeout| {
-            crate::kernel::arch::timer::ticks().wrapping_sub(start_ticks) >= timeout
+        if start_ns.is_some_and(|start| {
+            crate::kernel::arch::TimerArchitecture::now_ns()
+                .is_some_and(|now| now.wrapping_sub(start) >= 250_000_000)
         }) {
             return false;
         }

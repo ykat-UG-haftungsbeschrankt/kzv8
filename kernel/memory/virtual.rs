@@ -7,7 +7,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use crate::kernel::arch::traits::MemoryArchitecture as _;
+use crate::kernel::arch::traits::{DebugArchitecture as _, MemoryArchitecture as _};
 use crate::kernel::arch::MemoryArchitecture;
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::scheduler::sync::IrqSpinLock;
@@ -273,8 +273,7 @@ impl VirtualAreas {
     }
 
     fn decommit_debug(code: u8) {
-        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::DebugArchitecture>::
-            decommit_debug(code);
+        crate::kernel::arch::DebugArchitecture::decommit_debug(code);
     }
 
     fn decommit(&self, address: usize, length: usize) -> bool {

@@ -13,6 +13,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use crate::kernel::arch::traits::{CpuArchitecture as _, InterruptArchitecture as _};
 use crate::kernel::error::Error;
 
 use super::sync::IrqSpinLock;
@@ -78,8 +79,7 @@ impl TaskWaker {
                 }
             };
             if notify {
-                <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::CpuArchitecture>::
-                    notify_executor();
+                crate::kernel::arch::CpuArchitecture::notify_executor();
             }
         }
     }
@@ -121,8 +121,7 @@ where
             task.wakeable.store(true, Ordering::Release);
         }
         task.ready.store(true, Ordering::Release);
-        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::CpuArchitecture>::
-            notify_executor();
+        crate::kernel::arch::CpuArchitecture::notify_executor();
         return Ok(());
     }
     Err(Error::Again)
@@ -200,15 +199,12 @@ pub(crate) fn run_until_stalled() {
 pub(crate) fn run_forever() -> ! {
     loop {
         run_until_stalled();
-        let interrupt_state = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::
-            InterruptArchitecture>::disable_interrupts();
+        let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
         if has_ready_tasks() {
-            <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::InterruptArchitecture>::
-                restore_interrupts(interrupt_state);
+            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
             continue;
         }
-        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::CpuArchitecture>::
-            wait_for_interrupt();
+        crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
     }
 }
 

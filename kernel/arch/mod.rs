@@ -12,14 +12,14 @@ pub(crate) struct VirtioWindow {
     pub(crate) stride: usize,
 }
 
-struct BootArchitecture;
-struct DeviceArchitecture;
-struct ThreadArchitecture;
-struct InterruptArchitecture;
-struct TimerArchitecture;
-struct CpuArchitecture;
-struct DebugArchitecture;
-struct MemoryArchitecture;
+pub(crate) struct BootArchitecture;
+pub(crate) struct DeviceArchitecture;
+pub(crate) struct ThreadArchitecture;
+pub(crate) struct InterruptArchitecture;
+pub(crate) struct TimerArchitecture;
+pub(crate) struct CpuArchitecture;
+pub(crate) struct DebugArchitecture;
+pub(crate) struct MemoryArchitecture;
 
 pub(crate) mod traits {
     pub(crate) trait BootArchitecture {

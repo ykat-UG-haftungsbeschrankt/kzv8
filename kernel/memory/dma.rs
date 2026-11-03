@@ -8,6 +8,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
+use crate::kernel::arch::traits::DeviceArchitecture as _;
 
 
 #[repr(C, align(4096))]
@@ -93,14 +94,12 @@ impl DmaArena {
 
     pub(crate) fn sync_for_device() {
         fence(Ordering::SeqCst);
-        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::DeviceArchitecture>::
-            dma_sync_for_device();
+        crate::kernel::arch::DeviceArchitecture::dma_sync_for_device();
     }
 
     pub(crate) fn sync_for_cpu() {
         fence(Ordering::SeqCst);
-        <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::DeviceArchitecture>::
-            dma_sync_for_cpu();
+        crate::kernel::arch::DeviceArchitecture::dma_sync_for_cpu();
     }
 
 }

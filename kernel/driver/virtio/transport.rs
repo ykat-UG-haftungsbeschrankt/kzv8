@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+use crate::kernel::arch::traits::DeviceArchitecture as _;
 use crate::kernel::error::Error;
 
 #[repr(usize)]
@@ -50,8 +51,7 @@ impl MappedMmioWindow {
         if !crate::kernel::memory::r#virtual::mmu_ready() {
             return None;
         }
-        let window = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::DeviceArchitecture>::
-            VIRTIO_WINDOW;
+        let window = crate::kernel::arch::DeviceArchitecture::VIRTIO_WINDOW;
         let register_size = core::mem::size_of::<u32>();
         if window.slots == 0
             || window.stride < REGISTER_WINDOW_SIZE

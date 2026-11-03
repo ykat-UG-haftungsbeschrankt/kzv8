@@ -7,7 +7,8 @@
 
 use core::ffi::c_void;
 
-use crate::kernel::arch::{ActiveMemoryArch, MemoryArchitecture as _};
+use crate::kernel::arch::traits::MemoryArchitecture as _;
+use crate::kernel::arch::MemoryArchitecture;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -136,7 +137,7 @@ pub unsafe extern "C" fn mprotect(address: *mut c_void, length: usize, protectio
     if crate::kernel::memory::r#virtual::set_permissions(address, length, permissions) {
         return 0;
     }
-    if ActiveMemoryArch::protect_kernel_image_pages(address, length, permissions) {
+    if MemoryArchitecture::protect_kernel_image_pages(address, length, permissions) {
         return 0;
     }
     set_errno(ENOMEM);

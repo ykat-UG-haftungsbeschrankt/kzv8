@@ -8,6 +8,7 @@
 use core::ffi::c_void;
 use core::slice;
 
+use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::block::device::BlockDevice;
 use crate::kernel::block::request::Request;
 use crate::kernel::event::completion::Completion;
@@ -71,9 +72,9 @@ pub unsafe extern "C" fn kz_host_console_write(data: *const u8, length: usize) -
 
 #[no_mangle]
 pub extern "C" fn kz_host_time_ns() -> u64 {
-    match crate::kernel::arch::timer::now_ns() {
+    match crate::kernel::arch::TimerArchitecture::now_ns() {
         Some(now_ns) if now_ns != 0 => now_ns,
-        _ => crate::kernel::arch::fallback_time_ns(),
+        _ => crate::kernel::arch::TimerArchitecture::fallback_time_ns(),
     }
 }
 
@@ -92,7 +93,7 @@ pub unsafe extern "C" fn kz_host_event_loop_poll(
     }
     let events = unsafe { &mut *context.cast::<EventLoop<16>>() };
     let now_ns =
-        crate::kernel::arch::timer::now_ns().unwrap_or_else(crate::kernel::arch::fallback_time_ns);
+        crate::kernel::arch::TimerArchitecture::now_ns().unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns);
     let Some(event) = events.poll_raw(now_ns) else {
         return 0;
     };
@@ -111,7 +112,7 @@ pub unsafe extern "C" fn kz_host_event_loop_schedule_timer(
     }
     let events = unsafe { &mut *context.cast::<EventLoop<16>>() };
     let now_ns =
-        crate::kernel::arch::timer::now_ns().unwrap_or_else(crate::kernel::arch::fallback_time_ns);
+        crate::kernel::arch::TimerArchitecture::now_ns().unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns);
     let Some(deadline_ns) = now_ns.checked_add(delay_ns) else {
         return 0;
     };
@@ -270,7 +271,7 @@ pub unsafe extern "C" fn kz_host_block_read(
                 if host_time_ns().saturating_sub(started) >= BLOCK_TRANSFER_TIMEOUT_NS {
                     return -4;
                 }
-                crate::kernel::arch::wait_for_interrupt();
+                crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
             }
             Err(_) => return -3,
         }
@@ -302,7 +303,7 @@ pub unsafe extern "C" fn kz_host_block_write(
                 if host_time_ns().saturating_sub(started) >= BLOCK_TRANSFER_TIMEOUT_NS {
                     return -4;
                 }
-                crate::kernel::arch::wait_for_interrupt();
+                crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
             }
             Err(_) => return -3,
         }
@@ -311,12 +312,12 @@ pub unsafe extern "C" fn kz_host_block_write(
 }
 
 fn host_time_ns() -> u64 {
-    crate::kernel::arch::timer::now_ns().unwrap_or_else(crate::kernel::arch::fallback_time_ns)
+    crate::kernel::arch::TimerArchitecture::now_ns().unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns)
 }
 
 #[no_mangle]
 pub extern "C" fn kz_host_wait_for_interrupt() {
-    crate::kernel::arch::wait_for_interrupt();
+    crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
 }
 
 fn poll_tcp_context(context: &mut TcpContext) -> bool {
@@ -397,7 +398,7 @@ pub unsafe extern "C" fn kz_host_tcp_connect(
         if host_time_ns().saturating_sub(started) >= TCP_TIMEOUT_NS {
             break;
         }
-        crate::kernel::arch::wait_for_interrupt();
+        crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
     }
     remove_tcp_socket(context, handle);
     failure
@@ -438,7 +439,7 @@ pub unsafe extern "C" fn kz_host_tcp_send(
         if host_time_ns().saturating_sub(started) >= TCP_TIMEOUT_NS {
             break;
         }
-        crate::kernel::arch::wait_for_interrupt();
+        crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
     }
     -1
 }
@@ -480,7 +481,7 @@ pub unsafe extern "C" fn kz_host_tcp_receive(
         if host_time_ns().saturating_sub(started) >= TCP_TIMEOUT_NS {
             break;
         }
-        crate::kernel::arch::wait_for_interrupt();
+        crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
     }
     received as i32
 }
