@@ -48,7 +48,7 @@ impl TlsKey {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ThreadState {
+pub(crate) enum ThreadState {
     Unused,
     Running,
     Ready,
@@ -181,7 +181,7 @@ impl ThreadManager {
         }
     }
 
-    unsafe fn find_thread(id: usize) -> Option<usize> {
+    pub(crate) unsafe fn find_thread(id: usize) -> Option<usize> {
         let manager = Self::get_instance();
         let threads = unsafe { addr_of_mut!((*manager).threads).cast::<Thread>() };
         for index in 0..Self::MAX_THREADS {
@@ -205,7 +205,7 @@ impl ThreadManager {
         None
     }
 
-    fn switch_current(next_state: ThreadState) -> bool {
+    pub(crate) fn switch_current(next_state: ThreadState) -> bool {
         let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
         let manager = Self::get_instance();
         let current = unsafe { (*manager).current_slot };
@@ -303,7 +303,7 @@ impl ThreadManager {
         crate::kernel::arch::CpuArchitecture::halt()
     }
 
-    extern "C" fn thread_trampoline() -> ! {
+    pub(crate) extern "C" fn thread_trampoline() -> ! {
         let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
         let manager = Self::get_instance();
         let current = unsafe { (*manager).current_slot };
