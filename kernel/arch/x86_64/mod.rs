@@ -23,18 +23,16 @@ compile_error!("select one of fpu-x87, fpu-sse, or fpu-avx");
 
 pub(crate) use threads::FpuContext;
 
-pub(crate) struct MemoryArchitecture;
-
 pub(crate) const MAX_CPUS: usize =
-    <CpuArchitecture as crate::kernel::arch::traits::CpuArchitecture>::MAX_CPUS;
+    <super::CpuArchitecture as crate::kernel::arch::traits::CpuArchitecture>::MAX_CPUS;
 pub(crate) const VM_ARENA_SIZE: usize =
-    <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
+    <super::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
 pub(crate) const VM_BASE: usize =
-    <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_BASE;
+    <super::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_BASE;
 pub(crate) const BOOT_MESSAGE: &[u8] =
-    <MemoryArchitecture as crate::kernel::arch::BootArchitecture>::BOOT_MESSAGE;
+    <super::BootArchitecture as crate::kernel::arch::traits::BootArchitecture>::BOOT_MESSAGE;
 pub(crate) const BOOT_INFO_ERROR: &str =
-    <MemoryArchitecture as crate::kernel::arch::BootArchitecture>::BOOT_INFO_ERROR;
+    <super::BootArchitecture as crate::kernel::arch::traits::BootArchitecture>::BOOT_INFO_ERROR;
 
 unsafe extern "C" {
     static _start: u8;
@@ -120,7 +118,7 @@ pub(crate) fn wait_for_interrupt() {
     unsafe { core::arch::asm!("sti", "hlt") };
 }
 
-impl crate::kernel::arch::traits::MemoryArchitecture for MemoryArchitecture {
+impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitecture {
     const VM_ARENA_SIZE: usize = 1 << 36;
     const VM_BASE: usize = 0x10_0000_0000;
 
@@ -177,7 +175,7 @@ impl crate::kernel::arch::traits::MemoryArchitecture for MemoryArchitecture {
     }
 }
 
-impl crate::kernel::arch::traits::BootArchitecture for BootArchitecture {
+impl crate::kernel::arch::traits::BootArchitecture for super::BootArchitecture {
     const BOOT_MESSAGE: &'static [u8] = BOOT_MESSAGE;
     const BOOT_INFO_ERROR: &'static str = BOOT_INFO_ERROR;
 
@@ -186,7 +184,7 @@ impl crate::kernel::arch::traits::BootArchitecture for BootArchitecture {
     }
 }
 
-impl crate::kernel::arch::traits::DeviceArchitecture for DeviceArchitecture {
+impl crate::kernel::arch::traits::DeviceArchitecture for super::DeviceArchitecture {
     const VIRTIO_WINDOW: crate::kernel::arch::VirtioWindow = virtio::virtio_window();
 
     fn dma_sync_for_device() {
@@ -198,7 +196,7 @@ impl crate::kernel::arch::traits::DeviceArchitecture for DeviceArchitecture {
     }
 }
 
-impl crate::kernel::arch::traits::ThreadArchitecture for ThreadArchitecture {
+impl crate::kernel::arch::traits::ThreadArchitecture for super::ThreadArchitecture {
     type FpuContext = threads::FpuContext;
 
     fn initialize_thread_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize {
@@ -223,7 +221,7 @@ impl crate::kernel::arch::traits::ThreadArchitecture for ThreadArchitecture {
     }
 }
 
-impl crate::kernel::arch::traits::InterruptArchitecture for InterruptArchitecture {
+impl crate::kernel::arch::traits::InterruptArchitecture for super::InterruptArchitecture {
     unsafe fn initialize_interrupts() {
         unsafe { interrupts::initialize() };
     }
@@ -249,7 +247,7 @@ impl crate::kernel::arch::traits::InterruptArchitecture for InterruptArchitectur
     }
 }
 
-impl crate::kernel::arch::traits::TimerArchitecture for TimerArchitecture {
+impl crate::kernel::arch::traits::TimerArchitecture for super::TimerArchitecture {
     fn initialize_timer() {
         timer::initialize();
     }
@@ -263,7 +261,7 @@ impl crate::kernel::arch::traits::TimerArchitecture for TimerArchitecture {
     }
 }
 
-impl crate::kernel::arch::traits::CpuArchitecture for CpuArchitecture {
+impl crate::kernel::arch::traits::CpuArchitecture for super::CpuArchitecture {
     const MAX_CPUS: usize = 8;
 
     fn halt() -> ! {
@@ -279,7 +277,7 @@ impl crate::kernel::arch::traits::CpuArchitecture for CpuArchitecture {
     }
 }
 
-impl crate::kernel::arch::traits::DebugArchitecture for DebugArchitecture {
+impl crate::kernel::arch::traits::DebugArchitecture for super::DebugArchitecture {
     fn decommit_debug(code: u8) {
         self::decommit_debug(code);
     }
