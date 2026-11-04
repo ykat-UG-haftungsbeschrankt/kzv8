@@ -37,7 +37,7 @@ impl BlockDevice {
         let candidate = VirtioTransport::find(Self::DEVICE_ID)?;
         let transport = candidate.initialize(Self::DEVICE_ID).ok()?;
         let mut queue = DmaQueue::new()?;
-        queue.configure(&transport, 0).ok()?;
+        queue.configure_with_min_size(&transport, 0, 3).ok()?;
         if !transport.activate() {
             return None;
         }

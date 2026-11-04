@@ -178,15 +178,16 @@ def serve_echo_once(listener, state):
 
 def check(architecture):
     common = [
-        "-accel", "tcg", "-smp", "1",
+        "-accel", "tcg", "-smp", "2" if architecture == "x86_64" else "1",
         "-display", "none", "-serial", "none", "-monitor", "none",
         "-no-reboot", "-global", "virtio-mmio.force-legacy=false",
         "-device", "virtio-serial-device",
         "-chardev", "stdio,id=console,signal=off",
         "-device", "virtconsole,chardev=console",
+        "-device", "virtio-balloon-device",
     ]
     if architecture == "x86_64":
-        command = ["qemu-system-x86_64", "-machine", "microvm,acpi=off", "-m", "5G",
+        command = ["qemu-system-x86_64", "-machine", "microvm,acpi=off", "-cpu", "max", "-m", "5G",
                    "-kernel", "build/x86_64/kernel.elf"]
     else:
         command = ["qemu-system-aarch64", "-machine", "virt,gic-version=2",
@@ -246,6 +247,9 @@ def check(architecture):
         expected += "kz: first lazy page fault resolved\n"
     expected += f"kz: {architecture} Rust kernel booted\n"
     expected += "kz: virtio-console transmit OK\n"
+    if architecture == "x86_64":
+        expected += "kz: smp secondary cpus online\n"
+    expected += "kz: virtio balloon ready\n"
     expected += "kz: RAM above 128 MiB detected\n"
     expected += "kz: C stdio printf 42 hello 0x2a\n"
     expected += "kz: C stdio puts works\n"
@@ -281,7 +285,10 @@ def check(architecture):
     expected += "kz: V8 platform disposed\n"
     expected += "kz: V8 evaluated 6 * 7 = 42\n"
 
-    expected_devices = ["kz: virtio device_id=3 type=console"]
+    expected_devices = [
+        "kz: virtio device_id=3 type=console",
+        "kz: virtio device_id=5 type=balloon",
+    ]
     if architecture == "x86_64":
         expected_devices.extend([
             "kz: virtio device_id=2 type=block",

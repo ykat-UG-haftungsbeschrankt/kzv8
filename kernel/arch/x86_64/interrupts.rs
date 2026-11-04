@@ -179,6 +179,9 @@ const IO_APIC_BASE: usize = 0xfec0_0000;
 const APIC_BASE_MSR: u32 = 0x1b;
 const APIC_ENABLE: u64 = 1 << 11;
 const X2APIC_ENABLE: u64 = 1 << 10;
+const X2APIC_ID_MSR: u32 = 0x802;
+const X2APIC_ICR_MSR: u32 = 0x830;
+const X2APIC_MSR_BASE: u32 = 0x800;
 const VIRTIO_GSI_BASE: usize = 5;
 
 #[repr(C, packed)]
@@ -261,14 +264,18 @@ pub(crate) fn initialize_controller() -> bool {
         return false;
     }
 
-    let apic_id = read_local_apic(0x20) & 0xff00_0000;
+    let apic_id = current_apic_id();
+    if apic_id > u32::from(u8::MAX) {
+        return false;
+    }
+    let apic_destination = apic_id << 24;
     let maximum_irq = (read_io_apic(1) >> 16) & 0xff;
     if maximum_irq < VIRTIO_GSI_BASE as u32 {
         return false;
     }
     for irq in 0..=maximum_irq as usize {
         let redirection = 0x10 + (irq * 2) as u8;
-        write_io_apic(redirection + 1, apic_id);
+        write_io_apic(redirection + 1, apic_destination);
         write_io_apic(redirection, (1 << 16) | VIRTIO_VECTOR as u32);
     }
 
@@ -283,11 +290,16 @@ pub(crate) fn initialize_controller() -> bool {
 }
 
 pub(crate) fn initialize_local_controller() -> bool {
-    let apic_base = read_msr(APIC_BASE_MSR);
-    if apic_base & X2APIC_ENABLE != 0 {
+    let mut apic_base = read_msr(APIC_BASE_MSR);
+    let supports_x2apic = unsafe { core::arch::x86_64::__cpuid(1).ecx & (1 << 21) != 0 };
+    if supports_x2apic {
+        apic_base |= APIC_ENABLE | X2APIC_ENABLE;
+    } else if apic_base & X2APIC_ENABLE != 0 {
         return false;
+    } else {
+        apic_base |= APIC_ENABLE;
     }
-    write_msr(APIC_BASE_MSR, apic_base | APIC_ENABLE);
+    write_msr(APIC_BASE_MSR, apic_base);
 
     write_local_apic(0x80, 0);
     write_local_apic(0xf0, (1 << 8) | SPURIOUS_VECTOR as u32);
@@ -324,9 +336,20 @@ pub extern "C" fn x86_irq_dispatch() {
     write_local_apic(0xb0, 0);
 }
 
-pub(crate) fn send_ipi(destination: u8, command: u32) {
-    write_local_apic(0x310, u32::from(destination) << 24);
-    write_local_apic(0x300, command);
+pub(crate) fn send_ipi(destination: u32, command: u32) -> bool {
+    if read_msr(APIC_BASE_MSR) & X2APIC_ENABLE != 0 {
+        write_msr(
+            X2APIC_ICR_MSR,
+            (u64::from(destination) << 32) | u64::from(command),
+        );
+        true
+    } else if destination <= u32::from(u8::MAX) {
+        write_local_apic(0x310, destination << 24);
+        write_local_apic(0x300, command);
+        true
+    } else {
+        false
+    }
 }
 
 pub(crate) fn ipi_pending() -> bool {
@@ -363,11 +386,27 @@ fn write_msr(index: u32, value: u64) {
 }
 
 fn read_local_apic(offset: usize) -> u32 {
-    unsafe { core::ptr::read_volatile((LOCAL_APIC_BASE + offset) as *const u32) }
+    if read_msr(APIC_BASE_MSR) & X2APIC_ENABLE != 0 {
+        read_msr(X2APIC_MSR_BASE + (offset as u32 / 16)) as u32
+    } else {
+        unsafe { core::ptr::read_volatile((LOCAL_APIC_BASE + offset) as *const u32) }
+    }
 }
 
 fn write_local_apic(offset: usize, value: u32) {
-    unsafe { core::ptr::write_volatile((LOCAL_APIC_BASE + offset) as *mut u32, value) }
+    if read_msr(APIC_BASE_MSR) & X2APIC_ENABLE != 0 {
+        write_msr(X2APIC_MSR_BASE + (offset as u32 / 16), u64::from(value));
+    } else {
+        unsafe { core::ptr::write_volatile((LOCAL_APIC_BASE + offset) as *mut u32, value) }
+    }
+}
+
+pub(crate) fn current_apic_id() -> u32 {
+    if read_msr(APIC_BASE_MSR) & X2APIC_ENABLE != 0 {
+        read_msr(X2APIC_ID_MSR) as u32
+    } else {
+        read_local_apic(0x20) >> 24
+    }
 }
 
 fn read_io_apic(index: u8) -> u32 {

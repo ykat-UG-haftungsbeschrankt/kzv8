@@ -72,8 +72,6 @@ pub(crate) mod traits {
     }
 
     pub(crate) trait CpuArchitecture {
-        const MAX_CPUS: usize;
-
         fn halt() -> !;
         fn notify_executor();
         fn wait_for_interrupt();
@@ -87,6 +85,10 @@ pub(crate) mod traits {
         const VM_ARENA_SIZE: usize;
         const VM_BASE: usize;
 
+        fn physical_address_limit() -> u64;
+        fn identity_mapped_limit() -> u64;
+        fn bootstrap_memory_start() -> u64;
+        fn map_boot_memory_region(start: usize, length: usize) -> bool;
         fn initialize_mmu();
         fn is_identity_mapped(address: usize) -> bool;
         fn protect_kernel_image_pages(address: usize, length: usize, permissions: i32) -> bool;
@@ -107,3 +109,13 @@ mod arch;
 mod arch;
 
 pub(crate) use arch::*;
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn start_secondary_cpus() -> usize {
+    arch::smp::start_secondary_cpus()
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn start_secondary_cpus() -> usize {
+    1
+}

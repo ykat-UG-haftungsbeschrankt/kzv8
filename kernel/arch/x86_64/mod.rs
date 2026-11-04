@@ -6,12 +6,14 @@
  */
 
 pub(crate) mod debug;
+mod acpi;
 mod entry;
 pub(crate) mod interrupts;
 mod multiboot;
 mod paging;
 pub(crate) mod pci;
 mod ram_map;
+pub(crate) mod smp;
 mod threads;
 pub(crate) mod timer;
 mod virtio;
@@ -23,8 +25,6 @@ compile_error!("select one of fpu-x87, fpu-sse, or fpu-avx");
 
 pub(crate) use threads::FpuContext;
 
-pub(crate) const MAX_CPUS: usize =
-    <super::CpuArchitecture as crate::kernel::arch::traits::CpuArchitecture>::MAX_CPUS;
 pub(crate) const VM_ARENA_SIZE: usize =
     <super::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
 pub(crate) const VM_BASE: usize =
@@ -78,16 +78,40 @@ pub(crate) fn current_thread_stack_bounds(_stack_size: usize) -> (*mut core::ffi
 }
 
 pub(crate) fn high_memory_smoke() -> bool {
-    let Some(address) = crate::kernel::memory::physical::PhysicalAllocator::allocate_contiguous(
-        4096,
-        4 * 1024 * 1024 * 1024,
-    ) else {
+    const PAGE_SIZE: usize = 4096;
+    const HIGH_MEMORY_ALIGNMENT: usize = 4 * 1024 * 1024 * 1024;
+    let Some(physical_address) =
+        crate::kernel::memory::physical::PhysicalAllocator::allocate_contiguous(
+            PAGE_SIZE,
+            HIGH_MEMORY_ALIGNMENT,
+        )
+    else {
         return false;
     };
-    unsafe { core::ptr::write_volatile(address as *mut u8, 0xa5) };
-    let mapped = unsafe { core::ptr::read_volatile(address as *const u8) == 0xa5 };
-    let released =
-        crate::kernel::memory::physical::PhysicalAllocator::deallocate_contiguous(address, 4096);
+    let Some(virtual_address) =
+        crate::kernel::memory::r#virtual::reserve(PAGE_SIZE, PAGE_SIZE, 2)
+    else {
+        let _released = crate::kernel::memory::physical::PhysicalAllocator::deallocate_contiguous(
+            physical_address,
+            PAGE_SIZE,
+        );
+        return false;
+    };
+    if !<super::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::map_page(
+        virtual_address,
+        physical_address,
+        2,
+    ) {
+        let _released = crate::kernel::memory::r#virtual::release(virtual_address, PAGE_SIZE);
+        let _released = crate::kernel::memory::physical::PhysicalAllocator::deallocate_contiguous(
+            physical_address,
+            PAGE_SIZE,
+        );
+        return false;
+    }
+    unsafe { core::ptr::write_volatile(virtual_address as *mut u8, 0xa5) };
+    let mapped = unsafe { core::ptr::read_volatile(virtual_address as *const u8) == 0xa5 };
+    let released = crate::kernel::memory::r#virtual::release(virtual_address, PAGE_SIZE);
     mapped && released
 }
 
@@ -122,13 +146,35 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
     const VM_ARENA_SIZE: usize = 1 << 36;
     const VM_BASE: usize = 0x10_0000_0000;
 
+    fn physical_address_limit() -> u64 {
+        let maximum_leaf = unsafe { core::arch::x86_64::__cpuid(0x8000_0000).eax };
+        let address_bits = if maximum_leaf >= 0x8000_0008 {
+            (unsafe { core::arch::x86_64::__cpuid(0x8000_0008).eax } & 0xff).clamp(32, 52)
+        } else {
+            36
+        };
+        1u64 << address_bits
+    }
+
+    fn identity_mapped_limit() -> u64 {
+        ram_map::IDENTITY_MAP_LIMIT as u64
+    }
+
+    fn bootstrap_memory_start() -> u64 {
+        0
+    }
+
+    fn map_boot_memory_region(_start: usize, _length: usize) -> bool {
+        true
+    }
+
     fn initialize_mmu() {
         paging::initialize();
         unsafe { ram_map::map_high_memory() };
     }
 
     fn is_identity_mapped(address: usize) -> bool {
-        address < crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS
+        ram_map::is_identity_mapped(address)
     }
 
     fn protect_kernel_image_pages(address: usize, length: usize, permissions: i32) -> bool {
@@ -262,8 +308,6 @@ impl crate::kernel::arch::traits::TimerArchitecture for super::TimerArchitecture
 }
 
 impl crate::kernel::arch::traits::CpuArchitecture for super::CpuArchitecture {
-    const MAX_CPUS: usize = 8;
-
     fn halt() -> ! {
         self::halt()
     }

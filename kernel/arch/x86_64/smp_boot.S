@@ -17,6 +17,8 @@
 
 ap_trampoline_start:
     cli
+    movb $'1', %al
+    outb %al, $0xe9
     cld
     xorw %ax, %ax
     movw %ax, %ds
@@ -34,6 +36,8 @@ ap_trampoline_start:
 
 .code32
 ap_trampoline_pm32:
+    movb $'2', %al
+    outb %al, $0xe9
     movw $0x10, %ax
     movw %ax, %ds
     movw %ax, %es
@@ -96,6 +100,8 @@ ap_trampoline_pm32:
 
 .code64
 ap_trampoline_long_mode:
+    movb $'3', %al
+    outb %al, $0xe9
     movw $0x10, %ax
     movw %ax, %ds
     movw %ax, %es
@@ -104,9 +110,15 @@ ap_trampoline_long_mode:
     movq (%rax), %rsp
     movabsq $(AP_TRAMPOLINE_BASE + (ap_trampoline_slot - ap_trampoline_start)), %rax
     movl (%rax), %edi
+    pushq %rax
+    popq %rax
+    movb $'5', %al
+    outb %al, $0xe9
     xorq %rbp, %rbp
-    movabsq $kz_secondary_main, %rax
-    call *%rax
+    movabsq $kz_secondary_main, %r11
+    movb $'4', %al
+    outb %al, $0xe9
+    call *%r11
 6:
     hlt
     jmp 6b

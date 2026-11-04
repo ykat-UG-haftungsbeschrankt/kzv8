@@ -1,5 +1,8 @@
 When working on files under `runtime/`, do not modify files under `kernel/`. If a runtime task appears to require a kernel change, explain why and ask for approval before editing `kernel/`.
 
+## Validation
+- Run code reformatting, compilation/builds, and smoke checks only when explicitly requested by the user.
+
 ## Kernel Errors
 - Define all kernel error codes in `kernel/error.rs`; do not define kernel error codes elsewhere.
 

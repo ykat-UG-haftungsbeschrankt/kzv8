@@ -49,7 +49,9 @@ impl VirtioRtc {
         let transport = candidate.initialize(Self::DEVICE_ID).ok()?;
         let mut request_queue = DmaQueue::new()?;
         let message_buffer = DmaArena::allocate(Self::MESSAGE_BUFFER_SIZE, 16)?;
-        request_queue.configure(&transport, 0).ok()?;
+        request_queue
+            .configure_with_min_size(&transport, 0, 2)
+            .ok()?;
         if !transport.activate() {
             return None;
         }

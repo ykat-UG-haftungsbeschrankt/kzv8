@@ -23,8 +23,7 @@ unsafe extern "C" {
 
 pub(crate) use threads::FpuContext;
 
-pub(crate) const MAX_CPUS: usize =
-    <super::CpuArchitecture as crate::kernel::arch::traits::CpuArchitecture>::MAX_CPUS;
+pub(crate) const MAX_CPUS: usize = 8;
 pub(crate) const VM_ARENA_SIZE: usize =
     <super::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
 pub(crate) const VM_BASE: usize =
@@ -109,18 +108,55 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
     const VM_ARENA_SIZE: usize = 64 << 30;
     const VM_BASE: usize = 448usize << 30;
 
+    fn physical_address_limit() -> u64 {
+        1u64 << 48
+    }
+
+    fn identity_mapped_limit() -> u64 {
+        ram_map::IDENTITY_MAP_LIMIT as u64
+    }
+
+    fn bootstrap_memory_start() -> u64 {
+        1 << 30
+    }
+
+    fn map_boot_memory_region(start: usize, length: usize) -> bool {
+        if length == 0 {
+            return true;
+        }
+        let Some(end) = start.checked_add(length) else {
+            return false;
+        };
+        let mapped_end = end.min(ram_map::IDENTITY_MAP_LIMIT);
+        if start >= mapped_end {
+            return true;
+        }
+        let region = crate::kernel::memory::memblock::MemoryRegion {
+            start,
+            length: mapped_end - start,
+        };
+        unsafe { ram_map::map_memory_regions(core::slice::from_ref(&region)) };
+        true
+    }
+
     fn initialize_mmu() {
         let memory_regions =
-            crate::kernel::memory::resources::MemoryRegionRegistry::memory_regions();
+            crate::kernel::memory::memblock::MemBlock::memory_regions();
         unsafe {
             paging::initialize();
             ram_map::map_memory_regions(memory_regions.as_slice());
+            if let Some(fdt_region) = device_tree::boot_info_region() {
+                ram_map::map_memory_regions(core::slice::from_ref(&fdt_region));
+            }
         }
     }
 
     fn is_identity_mapped(address: usize) -> bool {
+        if address >= 512 * 1024 * 1024 * 1024usize {
+            return false;
+        }
         let memory_regions =
-            crate::kernel::memory::resources::MemoryRegionRegistry::memory_regions();
+            crate::kernel::memory::memblock::MemBlock::memory_regions();
         address < 0x4000_0000
             || memory_regions.iter().any(|region| {
                 region
@@ -261,8 +297,6 @@ impl crate::kernel::arch::traits::TimerArchitecture for super::TimerArchitecture
 }
 
 impl crate::kernel::arch::traits::CpuArchitecture for super::CpuArchitecture {
-    const MAX_CPUS: usize = 8;
-
     fn halt() -> ! {
         self::halt()
     }

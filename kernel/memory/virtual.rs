@@ -484,14 +484,17 @@ impl VirtualAreas {
             return false;
         };
         let physical_address = frame.address();
-        if !MemoryArchitecture::set_page_permissions(physical_address, Self::PAGE_SIZE, 2) {
+        if !MemoryArchitecture::map_page(page_address, physical_address, 2) {
             let _released = PhysicalAllocator::deallocate(frame);
             return false;
         }
-        unsafe { core::ptr::write_bytes(physical_address as *mut u8, 0, Self::PAGE_SIZE) };
-        if MemoryArchitecture::map_page(page_address, physical_address, permissions) {
+        unsafe { core::ptr::write_bytes(page_address as *mut u8, 0, Self::PAGE_SIZE) };
+        if permissions == 2
+            || MemoryArchitecture::set_page_permissions(page_address, Self::PAGE_SIZE, permissions)
+        {
             return true;
         }
+        let _unmapped = MemoryArchitecture::unmap_page(page_address);
         let _released = PhysicalAllocator::deallocate(frame);
         false
     }
@@ -567,6 +570,10 @@ pub(crate) const PAGE_SIZE: usize = VirtualAreas::PAGE_SIZE;
 
 pub(crate) fn initialize() {
     VirtualAreasLock::initialize();
+}
+
+pub(crate) fn refresh_memory_map() {
+    MemoryArchitecture::initialize_mmu();
 }
 
 pub(crate) fn mmu_ready() -> bool {

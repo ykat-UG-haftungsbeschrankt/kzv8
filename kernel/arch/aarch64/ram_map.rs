@@ -12,6 +12,7 @@ use crate::kernel::scheduler::sync::IrqSpinLock;
 
 const TABLE_ENTRIES: usize = 512;
 const BLOCK_SIZE: u64 = 1 << 30;
+pub(crate) const IDENTITY_MAP_LIMIT: usize = TABLE_ENTRIES * BLOCK_SIZE as usize;
 const BLOCK_DESCRIPTOR: u64 = 0b01;
 const ACCESS_FLAG: u64 = 1 << 10;
 const PAGE_DESCRIPTOR: u64 = 0b11;
@@ -40,7 +41,7 @@ static NEXT_PAGE_TABLE: AtomicUsize = AtomicUsize::new(0);
 static PAGE_TABLE_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 
 pub(crate) unsafe fn map_memory_regions(
-    regions: &[crate::kernel::memory::resources::MemoryRegion],
+    regions: &[crate::kernel::memory::memblock::MemoryRegion],
 ) {
     let root: u64;
     unsafe {
@@ -57,6 +58,10 @@ pub(crate) unsafe fn map_memory_regions(
             continue;
         };
         if region.length == 0 {
+            continue;
+        }
+        let end = end.min(IDENTITY_MAP_LIMIT);
+        if region.start >= end {
             continue;
         }
         let mut block = (region.start as u64) & !(BLOCK_SIZE - 1);
@@ -191,7 +196,9 @@ pub(crate) fn map_page(virtual_address: usize, physical_address: usize, permissi
     let Some(physical_end) = physical_address.checked_add(PAGE_SIZE) else {
         return false;
     };
-    if physical_end > crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS {
+    if physical_end
+        > <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::physical_address_limit() as usize
+    {
         return false;
     }
     let Some(attributes) = page_attributes(permissions) else {

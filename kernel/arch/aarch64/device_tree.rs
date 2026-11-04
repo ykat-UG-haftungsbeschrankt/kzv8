@@ -24,6 +24,8 @@ impl CpuIdList {
 
 static AARCH64_CPU_IDS: IrqSpinLock<CpuIdList> = IrqSpinLock::new(CpuIdList::EMPTY);
 static PSCI_METHOD: AtomicUsize = AtomicUsize::new(0);
+static FDT_ADDRESS: AtomicUsize = AtomicUsize::new(0);
+static FDT_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PsciConduit {
@@ -58,6 +60,15 @@ pub(crate) fn psci_conduit() -> Option<PsciConduit> {
         2 => Some(PsciConduit::Hvc),
         _ => None,
     }
+}
+
+pub(crate) fn boot_info_region() -> Option<crate::kernel::memory::memblock::MemoryRegion> {
+    let address = FDT_ADDRESS.load(Ordering::Acquire);
+    let length = FDT_SIZE.load(Ordering::Acquire);
+    (address != 0 && length != 0).then_some(crate::kernel::memory::memblock::MemoryRegion {
+        start: address,
+        length,
+    })
 }
 
 fn fdt_u32(fdt: &[u8], total_size: usize, offset: usize) -> Option<u32> {
@@ -151,6 +162,8 @@ pub(crate) unsafe fn initialize(fdt_address: usize) -> bool {
     if total_size < 40 || total_size > 1024 * 1024 {
         return false;
     }
+    FDT_ADDRESS.store(fdt_address, Ordering::Release);
+    FDT_SIZE.store(total_size, Ordering::Release);
     let fdt = unsafe { core::slice::from_raw_parts(fdt_address as *const u8, total_size) };
     let Some(structure_offset) = fdt_u32(fdt, total_size, 8).map(|value| value as usize) else {
         return false;
@@ -174,7 +187,10 @@ pub(crate) unsafe fn initialize(fdt_address: usize) -> bool {
         return false;
     }
 
-    crate::kernel::memory::resources::MemoryRegionRegistry::reset_memory_regions();
+    crate::kernel::memory::memblock::MemBlock::reset();
+    if !crate::kernel::memory::memblock::MemBlock::reserve_region(fdt_address, total_size) {
+        return false;
+    }
     reset_cpu_info();
     let mut address_cells = 2usize;
     let mut size_cells = 1usize;
@@ -344,7 +360,7 @@ pub(crate) unsafe fn initialize(fdt_address: usize) -> bool {
                         let (Some(address), Some(size)) = (address, size) else {
                             return false;
                         };
-                        if !crate::kernel::memory::resources::MemoryRegionRegistry::add_memory_region(address, size) {
+                        if !crate::kernel::memory::memblock::MemBlock::add_memory_region(address, size) {
                             return false;
                         }
                         reg_offset += tuple_size;
@@ -360,5 +376,5 @@ pub(crate) unsafe fn initialize(fdt_address: usize) -> bool {
             _ => return false,
         }
     }
-    !crate::kernel::memory::resources::MemoryRegionRegistry::memory_regions().is_empty()
+    crate::kernel::memory::memblock::MemBlock::has_memory_regions()
 }

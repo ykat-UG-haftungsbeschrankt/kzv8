@@ -72,7 +72,9 @@ impl VirtioScsi {
         let mut request_queue = DmaQueue::new()?;
         control_queue.configure(&transport, 0).ok()?;
         event_queue.configure(&transport, 1).ok()?;
-        request_queue.configure(&transport, 2).ok()?;
+        request_queue
+            .configure_with_min_size(&transport, 2, 3)
+            .ok()?;
         if !transport.activate() {
             return None;
         }

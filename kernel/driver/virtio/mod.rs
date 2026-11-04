@@ -1,3 +1,4 @@
+pub(crate) mod balloon;
 pub(crate) mod block;
 pub(crate) mod console;
 pub(crate) mod fs;

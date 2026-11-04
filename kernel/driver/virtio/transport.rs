@@ -167,6 +167,10 @@ impl MmioRegion {
         self.read_u32(0x100usize.checked_add(offset)?)
     }
 
+    fn write_config(&self, offset: usize, value: u32) -> Option<()> {
+        self.write_u32(0x100usize.checked_add(offset)?, value)
+    }
+
     fn read_config_u8(&self, offset: usize) -> Option<u8> {
         self.read_u8(0x100usize.checked_add(offset)?)
     }
@@ -185,6 +189,7 @@ impl VirtioTransport {
     const MAGIC: u32 = 0x7472_6976;
     const VERSION_MODERN: u32 = 2;
     const FEATURE_VERSION_1: u32 = 1;
+    const FEATURE_NET_MTU: u64 = 1 << 3;
     const FEATURE_NET_MAC: u64 = 1 << 5;
 
     pub(crate) fn from_base(base: usize) -> Option<Self> {
@@ -264,6 +269,16 @@ impl VirtioTransport {
         device_id: u32,
         requested_features: u64,
     ) -> Result<Self, Error> {
+        self.initialize_with_optional_features(device_id, requested_features, 0)
+            .map(|(transport, _)| transport)
+    }
+
+    pub(crate) fn initialize_with_optional_features(
+        self,
+        device_id: u32,
+        required_features: u64,
+        optional_features: u64,
+    ) -> Result<(Self, u64), Error> {
         let region = self.region;
         if region.read_register(Register::Magic) != Self::MAGIC
             || region.read_register(Register::Version) != Self::VERSION_MODERN
@@ -284,12 +299,14 @@ impl VirtioTransport {
             region.write_register(Register::Status, 0x80);
             return Err(Error::OpNotSupp);
         }
-        let requested_low = requested_features as u32;
-        let requested_high = (requested_features >> 32) as u32 | Self::FEATURE_VERSION_1;
-        if requested_low & !offered_low != 0 || requested_high & !offered_high != 0 {
+        let offered_features = u64::from(offered_low) | (u64::from(offered_high) << 32);
+        if required_features & !offered_features != 0 {
             region.write_register(Register::Status, 0x80);
             return Err(Error::OpNotSupp);
         }
+        let negotiated_features = required_features | (optional_features & offered_features);
+        let requested_low = negotiated_features as u32;
+        let requested_high = (negotiated_features >> 32) as u32 | Self::FEATURE_VERSION_1;
         region.write_register(Register::DriverFeaturesSelect, 0);
         region.write_register(Register::DriverFeatures, requested_low);
         region.write_register(Register::DriverFeaturesSelect, 1);
@@ -299,22 +316,31 @@ impl VirtioTransport {
             region.write_register(Register::Status, 0x80);
             return Err(Error::Proto);
         }
-        Ok(self)
+        Ok((self, negotiated_features))
     }
 
     pub(crate) fn configure_queue(
         &self,
         index: u32,
-        size: u32,
+        maximum_size: u32,
+        minimum_size: u32,
         descriptors: u64,
         available: u64,
         used: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         self.region.write_register(Register::QueueSelect, index);
         if self.region.read_register(Register::QueueReady) != 0 {
             return Err(Error::Busy);
         }
-        if self.region.read_register(Register::QueueSizeMax) < size {
+        let maximum_size = self
+            .region
+            .read_register(Register::QueueSizeMax)
+            .min(maximum_size);
+        if maximum_size == 0 || minimum_size == 0 {
+            return Err(Error::Inval);
+        }
+        let size = 1u32 << (31 - maximum_size.leading_zeros());
+        if size < minimum_size {
             return Err(Error::Inval);
         }
         self.region.write_register(Register::QueueSize, size);
@@ -325,7 +351,7 @@ impl VirtioTransport {
         self.region.write_address(AddressRegister::QueueUsed, used);
         DmaArena::sync_for_device();
         self.region.write_register(Register::QueueReady, 1);
-        Ok(())
+        Ok(size)
     }
 
     pub(crate) fn activate(&self) -> bool {
@@ -339,6 +365,16 @@ impl VirtioTransport {
 
     pub(crate) fn read_device_config(&self, offset: usize) -> Option<u32> {
         self.region.read_config(offset)
+    }
+
+    pub(crate) fn read_device_config_u16(&self, offset: usize) -> Option<u16> {
+        let low = self.region.read_config_u8(offset)?;
+        let high = self.region.read_config_u8(offset.checked_add(1)?)?;
+        Some(u16::from_le_bytes([low, high]))
+    }
+
+    pub(crate) fn write_device_config(&self, offset: usize, value: u32) -> Option<()> {
+        self.region.write_config(offset, value)
     }
 
     pub(crate) fn read_device_config_byte(&self, offset: usize) -> Option<u8> {
@@ -359,6 +395,10 @@ impl VirtioTransport {
 
     pub(crate) const fn net_mac_feature() -> u64 {
         Self::FEATURE_NET_MAC
+    }
+
+    pub(crate) const fn net_mtu_feature() -> u64 {
+        Self::FEATURE_NET_MTU
     }
 }
 

@@ -117,7 +117,8 @@ pub(crate) fn map_page(virtual_address: usize, physical_address: usize, permissi
     let Some(physical_end) = physical_address.checked_add(PAGE_SIZE) else {
         return false;
     };
-    if physical_end > crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS
+    if physical_end
+        > <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::physical_address_limit() as usize
         || (matches!(permissions, 1 | 2) && !NX_ENABLED.load(Ordering::Acquire))
     {
         return false;

@@ -92,7 +92,7 @@ impl VirtioFs {
             .configure(&transport, Self::HIPRIO_QUEUE)
             .ok()?;
         request_queue
-            .configure(&transport, Self::REQUEST_QUEUE)
+            .configure_with_min_size(&transport, Self::REQUEST_QUEUE, 2)
             .ok()?;
         if !transport.activate() {
             return None;

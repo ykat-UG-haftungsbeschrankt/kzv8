@@ -65,7 +65,7 @@ test: all
 	python3 tests/qemu/smoke.py
 
 doc: app-build
-	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) doc --manifest-path Cargo.toml
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_PLATFORM_OUT="$(V8_PLATFORM_OUT)" $(CARGO) doc --manifest-path Cargo.toml
 
 v8-host-test:
 	ninja -C "$(V8_OUT)" v8_hello_world d8

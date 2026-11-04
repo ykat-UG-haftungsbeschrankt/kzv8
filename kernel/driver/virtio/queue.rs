@@ -65,6 +65,7 @@ pub(crate) struct VirtQueue<const N: usize> {
     used: UsedRing<N>,
     next_descriptor: u16,
     last_used: u16,
+    queue_size: usize,
     in_flight: bool,
 }
 
@@ -94,6 +95,7 @@ impl<const N: usize> VirtQueue<N> {
             },
             next_descriptor: 0,
             last_used: 0,
+            queue_size: 0,
             in_flight: false,
         }
     }
@@ -103,26 +105,42 @@ impl<const N: usize> VirtQueue<N> {
         transport: &VirtioTransport,
         index: u32,
     ) -> Result<(), Error> {
-        transport.configure_queue(
+        self.configure_with_min_size(transport, index, 1)
+    }
+
+    pub(crate) fn configure_with_min_size(
+        &mut self,
+        transport: &VirtioTransport,
+        index: u32,
+        minimum_size: usize,
+    ) -> Result<(), Error> {
+        if minimum_size == 0 || minimum_size > N {
+            return Err(Error::Inval);
+        }
+        let queue_size = transport.configure_queue(
             index,
             N as u32,
+            minimum_size as u32,
             core::ptr::addr_of_mut!(self.descriptors.0) as u64,
             core::ptr::addr_of_mut!(self.available) as u64,
             core::ptr::addr_of_mut!(self.used) as u64,
-        )
+        )?;
+        self.queue_size = queue_size as usize;
+        Ok(())
     }
 
     pub(crate) fn submit(&mut self, chain: &[Descriptor]) -> Option<u16> {
-        if self.in_flight || chain.is_empty() || chain.len() > N {
+        let queue_size = self.queue_size;
+        if queue_size == 0 || self.in_flight || chain.is_empty() || chain.len() > queue_size {
             return None;
         }
         let head = self.next_descriptor;
         for (offset, descriptor) in chain.iter().copied().enumerate() {
-            let slot = (usize::from(head) + offset) % N;
+            let slot = (usize::from(head) + offset) % queue_size;
             let mut descriptor = descriptor;
             if offset + 1 < chain.len() {
                 descriptor.flags |= DESC_NEXT;
-                descriptor.next = ((slot + 1) % N) as u16;
+                descriptor.next = ((slot + 1) % queue_size) as u16;
             } else {
                 descriptor.flags &= !DESC_NEXT;
                 descriptor.next = 0;
@@ -134,11 +152,11 @@ impl<const N: usize> VirtQueue<N> {
                 );
             }
         }
-        self.next_descriptor = ((usize::from(head) + chain.len()) % N) as u16;
+        self.next_descriptor = ((usize::from(head) + chain.len()) % queue_size) as u16;
 
         let available_index =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.available.index)) };
-        let ring_slot = usize::from(available_index) % N;
+        let ring_slot = usize::from(available_index) % queue_size;
         unsafe {
             core::ptr::write_volatile(
                 core::ptr::addr_of_mut!(self.available.ring[ring_slot]),
@@ -157,12 +175,16 @@ impl<const N: usize> VirtQueue<N> {
     }
 
     pub(crate) fn poll_used(&mut self) -> Option<UsedElement> {
+        let queue_size = self.queue_size;
+        if queue_size == 0 {
+            return None;
+        }
         let used_index = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.used.index)) };
         if self.last_used == used_index {
             return None;
         }
         DmaArena::sync_for_cpu();
-        let slot = usize::from(self.last_used) % N;
+        let slot = usize::from(self.last_used) % queue_size;
         let element =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.used.ring[slot])) };
         self.last_used = self.last_used.wrapping_add(1);
@@ -217,6 +239,15 @@ impl<const N: usize> DmaQueue<N> {
         index: u32,
     ) -> Result<(), Error> {
         self.with_queue(|queue| queue.configure(transport, index))
+    }
+
+    pub(crate) fn configure_with_min_size(
+        &mut self,
+        transport: &VirtioTransport,
+        index: u32,
+        minimum_size: usize,
+    ) -> Result<(), Error> {
+        self.with_queue(|queue| queue.configure_with_min_size(transport, index, minimum_size))
     }
 
     pub(crate) fn submit(&mut self, chain: &[Descriptor]) -> Option<u16> {

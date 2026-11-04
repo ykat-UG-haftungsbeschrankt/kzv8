@@ -24,6 +24,7 @@ pub(crate) unsafe fn initialize(boot_info: usize, boot_magic: usize) -> bool {
         return false;
     }
 
+    let boot_info_address = boot_info;
     let boot_info = unsafe { core::slice::from_raw_parts(boot_info as *const u8, 52) };
     let Some(flags) = read_u32(boot_info, 0) else {
         return false;
@@ -42,7 +43,12 @@ pub(crate) unsafe fn initialize(boot_info: usize, boot_magic: usize) -> bool {
     }
     let map = unsafe { core::slice::from_raw_parts(map_start as *const u8, map_length) };
 
-    crate::kernel::memory::resources::MemoryRegionRegistry::reset_memory_regions();
+    crate::kernel::memory::memblock::MemBlock::reset();
+    if !crate::kernel::memory::memblock::MemBlock::reserve_region(boot_info_address, 52)
+        || !crate::kernel::memory::memblock::MemBlock::reserve_region(map_start, map_length)
+    {
+        return false;
+    }
     let mut entry = 0;
     while entry < map.len() {
         let remaining = map.len() - entry;
@@ -66,13 +72,11 @@ pub(crate) unsafe fn initialize(boot_info: usize, boot_magic: usize) -> bool {
             return false;
         };
         if kind == 1
-            && !crate::kernel::memory::resources::MemoryRegionRegistry::add_memory_region(
-                start, length,
-            )
+            && !crate::kernel::memory::memblock::MemBlock::add_memory_region(start, length)
         {
             return false;
         }
         entry += entry_length;
     }
-    !crate::kernel::memory::resources::MemoryRegionRegistry::memory_regions().is_empty()
+    crate::kernel::memory::memblock::MemBlock::has_memory_regions()
 }

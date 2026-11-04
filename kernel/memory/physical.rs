@@ -5,7 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::mem::{align_of, size_of};
 
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
@@ -27,34 +27,109 @@ impl Frame {
 }
 
 pub(crate) struct PhysicalAllocator {
-    bitmap: [AtomicU64; PhysicalAllocator::BITMAP_WORDS],
-    usable: [AtomicU64; PhysicalAllocator::BITMAP_WORDS],
-    initialized: AtomicBool,
-    frame_count: AtomicUsize,
-    next_hint: AtomicUsize,
-    memory_bytes: AtomicUsize,
-    lock: IrqSpinLock<()>,
+    state: IrqSpinLock<AllocatorState>,
 }
 
-impl PhysicalAllocator {
-    const PAGE_SIZE: usize = 4096;
-    const MAX_FRAMES: usize = crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS / Self::PAGE_SIZE;
-    const BITMAP_WORDS: usize = Self::MAX_FRAMES / u64::BITS as usize;
+#[derive(Clone, Copy)]
+struct AllocatorRegion {
+    start_frame: usize,
+    frame_count: usize,
+    bitmap_start: usize,
+}
 
+struct AllocatorState {
+    initialized: bool,
+    regions: usize,
+    region_count: usize,
+    bitmap_address: usize,
+    bitmap_words: usize,
+    frame_count: usize,
+    next_hint: usize,
+    memory_bytes: usize,
+}
+
+impl AllocatorState {
     const fn new() -> Self {
         Self {
-            bitmap: [const { AtomicU64::new(u64::MAX) }; Self::BITMAP_WORDS],
-            usable: [const { AtomicU64::new(0) }; Self::BITMAP_WORDS],
-            initialized: AtomicBool::new(false),
-            frame_count: AtomicUsize::new(0),
-            next_hint: AtomicUsize::new(0),
-            memory_bytes: AtomicUsize::new(0),
-            lock: IrqSpinLock::new(()),
+            initialized: false,
+            regions: 0,
+            region_count: 0,
+            bitmap_address: 0,
+            bitmap_words: 0,
+            frame_count: 0,
+            next_hint: 0,
+            memory_bytes: 0,
         }
+    }
+
+    fn regions(&self) -> &[AllocatorRegion] {
+        if self.region_count == 0 {
+            return &[];
+        }
+        // SAFETY: the boot allocator keeps this initialized region table allocated permanently.
+        unsafe {
+            core::slice::from_raw_parts(self.regions as *const AllocatorRegion, self.region_count)
+        }
+    }
+
+    fn is_allocated(&self, index: usize) -> bool {
+        let word = (self.bitmap_address as *const u64).wrapping_add(index / u64::BITS as usize);
+        let mask = 1u64 << (index % u64::BITS as usize);
+        // SAFETY: the bitmap is initialized in mapped RAM, and callers hold the allocator lock.
+        unsafe { word.read() & mask != 0 }
+    }
+
+    fn set_allocated(&mut self, index: usize, allocated: bool) {
+        let word = (self.bitmap_address as *mut u64).wrapping_add(index / u64::BITS as usize);
+        let mask = 1u64 << (index % u64::BITS as usize);
+        // SAFETY: the bitmap is initialized in mapped RAM, and callers hold the allocator lock.
+        unsafe {
+            let current = word.read();
+            word.write(if allocated {
+                current | mask
+            } else {
+                current & !mask
+            });
+        }
+    }
+
+    fn address_for_index(&self, index: usize) -> Option<usize> {
+        for region in self.regions() {
+            let end = region.bitmap_start.checked_add(region.frame_count)?;
+            if (region.bitmap_start..end).contains(&index) {
+                return region
+                    .start_frame
+                    .checked_add(index - region.bitmap_start)?
+                    .checked_mul(PhysicalAllocator::PAGE_SIZE);
+            }
+        }
+        None
+    }
+
+    fn index_for_address(&self, address: usize) -> Option<usize> {
+        if address % PhysicalAllocator::PAGE_SIZE != 0 {
+            return None;
+        }
+        let frame = address / PhysicalAllocator::PAGE_SIZE;
+        for region in self.regions() {
+            let end = region.start_frame.checked_add(region.frame_count)?;
+            if (region.start_frame..end).contains(&frame) {
+                return region.bitmap_start.checked_add(frame - region.start_frame);
+            }
+        }
+        None
     }
 }
 
 impl PhysicalAllocator {
+    const PAGE_SIZE: usize = 4096;
+
+    const fn new() -> Self {
+        Self {
+            state: IrqSpinLock::new(AllocatorState::new()),
+        }
+    }
+
     fn get_instance() -> &'static Self {
         static ALLOCATOR: PhysicalAllocator = PhysicalAllocator::new();
         &ALLOCATOR
@@ -62,20 +137,29 @@ impl PhysicalAllocator {
 
     pub(crate) fn initialize() -> bool {
         let allocator = Self::get_instance();
-        let _guard = allocator.lock.lock();
         let image_end = core::ptr::addr_of!(__bss_end) as usize;
-        for word in &allocator.bitmap {
-            word.store(u64::MAX, Ordering::Relaxed);
-        }
-        for word in &allocator.usable {
-            word.store(0, Ordering::Relaxed);
-        }
+        let memory_regions = crate::kernel::memory::memblock::MemBlock::memory_regions();
+        let Some(region_bytes) = memory_regions
+            .as_slice()
+            .len()
+            .checked_mul(size_of::<AllocatorRegion>())
+        else {
+            return false;
+        };
+        let Some(regions_address) =
+            crate::kernel::memory::memblock::MemBlock::allocate_early(
+                region_bytes,
+                align_of::<AllocatorRegion>(),
+            )
+        else {
+            return false;
+        };
+        let regions = regions_address as *mut AllocatorRegion;
+        let mut region_count = 0;
+        let mut total_frames = 0usize;
+        let mut memory_bytes = 0usize;
+        let physical_limit = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::physical_address_limit() as usize;
 
-        let mut frame_count = 0;
-        let mut total_frames = 0;
-        let mut next_hint = None;
-        let memory_regions =
-            crate::kernel::memory::resources::MemoryRegionRegistry::memory_regions();
         for region in memory_regions.iter() {
             let Some(region_end) = region.start.checked_add(region.length) else {
                 continue;
@@ -87,80 +171,131 @@ impl PhysicalAllocator {
             else {
                 continue;
             };
-            let end_address = region_end
-                .min(crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS)
-                & !(Self::PAGE_SIZE - 1);
+            let end_address = region_end.min(physical_limit) & !(Self::PAGE_SIZE - 1);
             if start_address >= end_address {
                 continue;
             }
 
             let start_frame = start_address / Self::PAGE_SIZE;
-            let end_frame = end_address / Self::PAGE_SIZE;
-            frame_count = frame_count.max(end_frame);
-            next_hint = Some(next_hint.map_or(start_frame, |hint: usize| hint.min(start_frame)));
-            for frame in start_frame..end_frame {
-                let word_index = frame / u64::BITS as usize;
-                let mask = 1u64 << (frame % u64::BITS as usize);
-                let previous = allocator.usable[word_index].fetch_or(mask, Ordering::Relaxed);
-                if previous & mask == 0 {
-                    allocator.bitmap[word_index].fetch_and(!mask, Ordering::Relaxed);
-                    total_frames += 1;
-                }
+            let frame_count = (end_address - start_address) / Self::PAGE_SIZE;
+            // SAFETY: `regions_address` reserves space for every memory region.
+            unsafe {
+                regions.add(region_count).write(AllocatorRegion {
+                    start_frame,
+                    frame_count,
+                    bitmap_start: total_frames,
+                });
             }
+            region_count += 1;
+            let Some(new_total_frames) = total_frames.checked_add(frame_count) else {
+                return false;
+            };
+            total_frames = new_total_frames;
+            let Some(region_bytes) = frame_count.checked_mul(Self::PAGE_SIZE) else {
+                return false;
+            };
+            let Some(new_memory_bytes) = memory_bytes.checked_add(region_bytes)
+            else {
+                return false;
+            };
+            memory_bytes = new_memory_bytes;
         }
         if total_frames == 0 {
             return false;
         }
 
-        allocator.frame_count.store(frame_count, Ordering::Relaxed);
-        allocator
-            .next_hint
-            .store(next_hint.unwrap_or(0), Ordering::Relaxed);
-        allocator
-            .memory_bytes
-            .store(total_frames * Self::PAGE_SIZE, Ordering::Relaxed);
-        allocator.initialized.store(true, Ordering::Release);
+        let Some(bitmap_words) = total_frames.checked_add(u64::BITS as usize - 1)
+            .map(|frames| frames / u64::BITS as usize)
+        else {
+            return false;
+        };
+        let Some(bitmap_bytes) = bitmap_words.checked_mul(size_of::<u64>()) else {
+            return false;
+        };
+        let Some(bitmap_length) = bitmap_bytes
+            .checked_add(Self::PAGE_SIZE - 1)
+            .map(|length| length & !(Self::PAGE_SIZE - 1))
+        else {
+            return false;
+        };
+        let Some(bitmap_address) =
+            crate::kernel::memory::memblock::MemBlock::allocate_early(bitmap_length, Self::PAGE_SIZE)
+        else {
+            return false;
+        };
+
+        // SAFETY: the selected bitmap range is page-aligned, lies in usable RAM, and is identity-mapped.
+        let bitmap = unsafe {
+            core::slice::from_raw_parts_mut(bitmap_address as *mut u64, bitmap_words)
+        };
+        bitmap.fill(0);
+        let remaining_bits = total_frames % u64::BITS as usize;
+        if remaining_bits != 0 {
+            bitmap[bitmap_words - 1] = u64::MAX << remaining_bits;
+        }
+
+        // Reserve boot-data ranges and all early metadata allocations.
+        let region_table = unsafe { core::slice::from_raw_parts(regions, region_count) };
+        crate::kernel::memory::memblock::MemBlock::for_each_reserved_range(
+            |allocation_start, allocation_length| {
+                let Some(allocation_end) = allocation_start.checked_add(allocation_length) else {
+                    return;
+                };
+                let allocation_start_frame = allocation_start / Self::PAGE_SIZE;
+                let Some(allocation_end_frame) = allocation_end
+                    .checked_add(Self::PAGE_SIZE - 1)
+                    .map(|end| end / Self::PAGE_SIZE)
+                else {
+                    return;
+                };
+                for region in region_table {
+                    let Some(region_end_frame) = region.start_frame.checked_add(region.frame_count)
+                    else {
+                        continue;
+                    };
+                    let start_frame = allocation_start_frame.max(region.start_frame);
+                    let end_frame = allocation_end_frame.min(region_end_frame);
+                    for frame in start_frame..end_frame {
+                        let index = region.bitmap_start + (frame - region.start_frame);
+                        bitmap[index / u64::BITS as usize] |=
+                            1u64 << (index % u64::BITS as usize);
+                    }
+                }
+            },
+        );
+
+        let mut state = allocator.state.lock();
+        state.initialized = false;
+        state.regions = regions_address;
+        state.region_count = region_count;
+        state.bitmap_address = bitmap_address;
+        state.bitmap_words = bitmap_words;
+        state.frame_count = total_frames;
+        state.next_hint = 0;
+        state.memory_bytes = memory_bytes;
+        state.initialized = true;
         true
     }
 
     pub(crate) fn allocate() -> Option<Frame> {
         let allocator = Self::get_instance();
-        let _guard = allocator.lock.lock();
-        if !allocator.initialized.load(Ordering::Acquire) {
+        let mut state = allocator.state.lock();
+        if !state.initialized {
             return None;
         }
-        let count = allocator.frame_count.load(Ordering::Relaxed);
+        let count = state.frame_count;
         if count == 0 {
             return None;
         }
-        let hint = allocator.next_hint.load(Ordering::Relaxed).min(count - 1);
+        let hint = state.next_hint.min(count - 1);
 
         for offset in 0..count {
-            let frame = (hint + offset) % count;
-            let word = &allocator.bitmap[frame / u64::BITS as usize];
-            let mask = 1u64 << (frame % u64::BITS as usize);
-            let mut current = word.load(Ordering::Relaxed);
-            loop {
-                if current & mask != 0 {
-                    break;
-                }
-                match word.compare_exchange_weak(
-                    current,
-                    current | mask,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        allocator.next_hint.store(
-                            if frame + 1 == count { 0 } else { frame + 1 },
-                            Ordering::Relaxed,
-                        );
-                        return Some(Frame {
-                            address: frame * Self::PAGE_SIZE,
-                        });
-                    }
-                    Err(updated) => current = updated,
-                }
+            let frame = hint.wrapping_add(offset) % count;
+            if !state.is_allocated(frame) {
+                let address = state.address_for_index(frame)?;
+                state.set_allocated(frame, true);
+                state.next_hint = if frame + 1 == count { 0 } else { frame + 1 };
+                return Some(Frame { address });
             }
         }
         None
@@ -168,8 +303,8 @@ impl PhysicalAllocator {
 
     pub(crate) fn allocate_contiguous(length: usize, alignment: usize) -> Option<usize> {
         let allocator = Self::get_instance();
-        let _guard = allocator.lock.lock();
-        if !allocator.initialized.load(Ordering::Acquire)
+        let mut state = allocator.state.lock();
+        if !state.initialized
             || length == 0
             || length % Self::PAGE_SIZE != 0
             || alignment < Self::PAGE_SIZE
@@ -178,65 +313,32 @@ impl PhysicalAllocator {
             return None;
         }
 
-        let count = allocator.frame_count.load(Ordering::Relaxed);
         let pages = length / Self::PAGE_SIZE;
+        let count = state.frame_count;
         if count == 0 || pages > count {
             return None;
         }
 
-        let hint = allocator.next_hint.load(Ordering::Relaxed).min(count - 1);
-        for offset in 0..count {
-            let frame = (hint + offset) % count;
-            let Some(end_frame) = frame.checked_add(pages) else {
-                continue;
-            };
-            if end_frame > count {
+        for region_index in 0..state.region_count {
+            let region = state.regions()[region_index];
+            if pages > region.frame_count {
                 continue;
             }
-            let Some(address) = frame.checked_mul(Self::PAGE_SIZE) else {
-                continue;
-            };
-            if address & (alignment - 1) != 0 {
-                continue;
-            }
-
-            let range_is_free = (frame..end_frame).all(|candidate| {
-                let word_index = candidate / u64::BITS as usize;
-                let mask = 1u64 << (candidate % u64::BITS as usize);
-                allocator.usable[word_index].load(Ordering::Acquire) & mask != 0
-                    && allocator.bitmap[word_index].load(Ordering::Acquire) & mask == 0
-            });
-            if !range_is_free {
-                continue;
-            }
-
-            let mut reserved_end = frame;
-            let mut collision = false;
-            for candidate in frame..end_frame {
-                let mask = 1u64 << (candidate % u64::BITS as usize);
-                let previous = allocator.bitmap[candidate / u64::BITS as usize]
-                    .fetch_or(mask, Ordering::AcqRel);
-                if previous & mask != 0 {
-                    collision = true;
-                    break;
+            let last_start = region.bitmap_start + region.frame_count - pages;
+            for start in region.bitmap_start..=last_start {
+                let address = (region.start_frame + start - region.bitmap_start)
+                    .checked_mul(Self::PAGE_SIZE)?;
+                if address & (alignment - 1) != 0
+                    || (start..start + pages).any(|frame| state.is_allocated(frame))
+                {
+                    continue;
                 }
-                reserved_end = candidate + 1;
-            }
-
-            if collision {
-                for candidate in frame..reserved_end {
-                    let mask = 1u64 << (candidate % u64::BITS as usize);
-                    allocator.bitmap[candidate / u64::BITS as usize]
-                        .fetch_and(!mask, Ordering::Release);
+                for frame in start..start + pages {
+                    state.set_allocated(frame, true);
                 }
-                continue;
+                state.next_hint = (start + pages) % count;
+                return Some(address);
             }
-
-            allocator.next_hint.store(
-                if end_frame == count { 0 } else { end_frame },
-                Ordering::Relaxed,
-            );
-            return Some(address);
         }
 
         None
@@ -244,80 +346,88 @@ impl PhysicalAllocator {
 
     pub(crate) fn deallocate_contiguous(address: usize, length: usize) -> bool {
         let allocator = Self::get_instance();
-        let _guard = allocator.lock.lock();
+        let mut state = allocator.state.lock();
         if length == 0 || length % Self::PAGE_SIZE != 0 || address % Self::PAGE_SIZE != 0 {
             return false;
         }
 
-        let count = allocator.frame_count.load(Ordering::Relaxed);
-        let start_frame = address / Self::PAGE_SIZE;
+        if !state.initialized {
+            return false;
+        }
+        let Some(start_frame) = state.index_for_address(address) else {
+            return false;
+        };
         let pages = length / Self::PAGE_SIZE;
         let Some(end_frame) = start_frame.checked_add(pages) else {
             return false;
         };
-        if end_frame > count {
+        let Some(region) = state.regions().iter().find(|region| {
+            let end = region.bitmap_start + region.frame_count;
+            start_frame >= region.bitmap_start && end_frame <= end
+        }) else {
             return false;
-        }
+        };
+        let _ = region;
 
-        let range_is_allocated = (start_frame..end_frame).all(|frame| {
-            let word_index = frame / u64::BITS as usize;
-            let mask = 1u64 << (frame % u64::BITS as usize);
-            allocator.usable[word_index].load(Ordering::Acquire) & mask != 0
-                && allocator.bitmap[word_index].load(Ordering::Acquire) & mask != 0
-        });
+        let range_is_allocated = (start_frame..end_frame).all(|frame| state.is_allocated(frame));
         if !range_is_allocated {
             return false;
         }
 
         for frame in start_frame..end_frame {
-            let mask = 1u64 << (frame % u64::BITS as usize);
-            allocator.bitmap[frame / u64::BITS as usize].fetch_and(!mask, Ordering::Release);
+            state.set_allocated(frame, false);
         }
-        allocator.next_hint.store(start_frame, Ordering::Relaxed);
+        state.next_hint = start_frame;
         true
     }
 
     pub(crate) fn deallocate(frame: Frame) -> bool {
         let allocator = Self::get_instance();
-        let _guard = allocator.lock.lock();
-        if frame.address % Self::PAGE_SIZE != 0
-            || frame.address >= crate::kernel::memory::resources::MAX_PHYSICAL_ADDRESS
-        {
+        let mut state = allocator.state.lock();
+        if !state.initialized {
             return false;
         }
-        let index = frame.address / Self::PAGE_SIZE;
-        let count = allocator.frame_count.load(Ordering::Relaxed);
-        if index >= count {
+        let Some(index) = state.index_for_address(frame.address) else {
+            return false;
+        };
+        if !state.is_allocated(index) {
             return false;
         }
-        let mask = 1u64 << (index % u64::BITS as usize);
-        let word_index = index / u64::BITS as usize;
-        if allocator.usable[word_index].load(Ordering::Acquire) & mask == 0 {
-            return false;
-        }
-        let previous = allocator.bitmap[word_index].fetch_and(!mask, Ordering::AcqRel);
-        if previous & mask == 0 {
-            return false;
-        }
-        allocator.next_hint.store(index, Ordering::Relaxed);
+        state.set_allocated(index, false);
+        state.next_hint = index;
         true
     }
 
     pub(crate) fn free_frames() -> usize {
         let allocator = Self::get_instance();
-        let _guard = allocator.lock.lock();
-        let count = allocator.frame_count.load(Ordering::Relaxed);
-        (0..count)
-            .filter(|frame| {
-                allocator.bitmap[*frame / u64::BITS as usize].load(Ordering::Relaxed)
-                    & (1u64 << (*frame % u64::BITS as usize))
-                    == 0
-            })
-            .count()
+        let state = allocator.state.lock();
+        if !state.initialized {
+            return 0;
+        }
+        let mut free = 0usize;
+        for word_index in 0..state.bitmap_words {
+            let valid_bits = (state.frame_count - word_index * u64::BITS as usize)
+                .min(u64::BITS as usize);
+            let valid_mask = if valid_bits == u64::BITS as usize {
+                u64::MAX
+            } else {
+                (1u64 << valid_bits) - 1
+            };
+            let word = (state.bitmap_address as *const u64).wrapping_add(word_index);
+            // SAFETY: the bitmap is initialized in mapped RAM, and this lock protects access.
+            let allocated = unsafe { word.read() };
+            free += ((!allocated) & valid_mask).count_ones() as usize;
+        }
+        free
     }
 
     pub(crate) fn memory_bytes() -> usize {
         let allocator = Self::get_instance();
-        allocator.memory_bytes.load(Ordering::Acquire)
+        let state = allocator.state.lock();
+        if state.initialized {
+            state.memory_bytes
+        } else {
+            0
+        }
     }
 }
