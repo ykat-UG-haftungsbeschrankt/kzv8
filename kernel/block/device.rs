@@ -29,7 +29,7 @@ impl BlockDevice {
     }
 
     pub(crate) fn submit<'a>(
-        &'a mut self,
+        &'a self,
         request: Request<'a>,
     ) -> Result<block::BlockTransfer<'a>, Error> {
         match request.operation {

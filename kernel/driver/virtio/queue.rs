@@ -63,10 +63,10 @@ pub(crate) struct VirtQueue<const N: usize> {
     descriptors: DescriptorTable<N>,
     available: AvailableRing<N>,
     used: UsedRing<N>,
-    next_descriptor: u16,
+    free_descriptors: [bool; N],
+    pending_heads: [bool; N],
     last_used: u16,
     queue_size: usize,
-    in_flight: bool,
 }
 
 impl<const N: usize> VirtQueue<N> {
@@ -89,14 +89,14 @@ impl<const N: usize> VirtQueue<N> {
             },
             used: UsedRing {
                 flags: 0,
-                index: 0,
                 ring: [UsedElement { id: 0, length: 0 }; N],
                 available_event: 0,
             },
-            next_descriptor: 0,
+            free_descriptors: [false; N],
+            pending_heads: [false; N],
+            in_flight_count: 0,
             last_used: 0,
             queue_size: 0,
-            in_flight: false,
         }
     }
 
@@ -126,21 +126,44 @@ impl<const N: usize> VirtQueue<N> {
             core::ptr::addr_of_mut!(self.used) as u64,
         )?;
         self.queue_size = queue_size as usize;
+        self.free_descriptors = [false; N];
+        self.free_descriptors[..self.queue_size].fill(true);
+        self.pending_heads = [false; N];
+        self.last_used = 0;
         Ok(())
     }
 
     pub(crate) fn submit(&mut self, chain: &[Descriptor]) -> Option<u16> {
         let queue_size = self.queue_size;
-        if queue_size == 0 || self.in_flight || chain.is_empty() || chain.len() > queue_size {
+        if queue_size == 0 || chain.is_empty() || chain.len() > queue_size {
             return None;
         }
-        let head = self.next_descriptor;
+
+        let mut slots = [0; N];
+        let mut slot_count = 0;
+        for (slot, free) in self.free_descriptors[..queue_size].iter().enumerate() {
+            if *free {
+                slots[slot_count] = slot as u16;
+                slot_count += 1;
+                if slot_count == chain.len() {
+                    break;
+                }
+            }
+        }
+        if slot_count != chain.len() {
+            return None;
+        }
+
+        for slot in slots[..chain.len()].iter().copied() {
+            self.free_descriptors[usize::from(slot)] = false;
+        }
+        let head = slots[0];
         for (offset, descriptor) in chain.iter().copied().enumerate() {
-            let slot = (usize::from(head) + offset) % queue_size;
+            let slot = usize::from(slots[offset]);
             let mut descriptor = descriptor;
             if offset + 1 < chain.len() {
                 descriptor.flags |= DESC_NEXT;
-                descriptor.next = ((slot + 1) % queue_size) as u16;
+                descriptor.next = slots[offset + 1];
             } else {
                 descriptor.flags &= !DESC_NEXT;
                 descriptor.next = 0;
@@ -152,7 +175,6 @@ impl<const N: usize> VirtQueue<N> {
                 );
             }
         }
-        self.next_descriptor = ((usize::from(head) + chain.len()) % queue_size) as u16;
 
         let available_index =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.available.index)) };
@@ -170,7 +192,7 @@ impl<const N: usize> VirtQueue<N> {
                 available_index.wrapping_add(1),
             );
         }
-        self.in_flight = true;
+        self.pending_heads[usize::from(head)] = true;
         Some(head)
     }
 
@@ -188,13 +210,33 @@ impl<const N: usize> VirtQueue<N> {
         let element =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.used.ring[slot])) };
         self.last_used = self.last_used.wrapping_add(1);
-        self.in_flight = false;
+        let head = element.id as usize;
+        if head < queue_size && self.pending_heads[head] {
+            self.pending_heads[head] = false;
+            let mut descriptor_slot = head;
+            for _ in 0..queue_size {
+                if self.free_descriptors[descriptor_slot] {
+                    break;
+                }
+                let descriptor = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(
+                        self.descriptors.0[descriptor_slot]
+                    ))
+                };
+                self.free_descriptors[descriptor_slot] = true;
+                if descriptor.flags & DESC_NEXT == 0 {
+                    break;
+                }
+                let next = usize::from(descriptor.next);
+                if next >= queue_size {
+                    break;
+                }
+                descriptor_slot = next;
+            }
+        }
         Some(element)
     }
 
-    pub(crate) const fn is_in_flight(&self) -> bool {
-        self.in_flight
-    }
 }
 
 pub(crate) fn wait_used(
@@ -261,9 +303,6 @@ impl<const N: usize> DmaQueue<N> {
         self.with_queue(VirtQueue::poll_used)
     }
 
-    pub(crate) fn is_in_flight(&mut self) -> bool {
-        self.with_queue(|queue| queue.is_in_flight())
-    }
 }
 
 pub(crate) struct QueueCell<const N: usize> {

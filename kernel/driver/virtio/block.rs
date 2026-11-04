@@ -5,10 +5,13 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::vec::Vec;
+
 use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
+use crate::kernel::scheduler::sync::IrqSpinLock;
 
 #[repr(C)]
 struct RequestHeader {
@@ -19,12 +22,22 @@ struct RequestHeader {
 
 pub(crate) struct BlockDevice {
     transport: VirtioTransport,
-    queue: DmaQueue<{ Self::QUEUE_SIZE }>,
     capacity_sectors: u64,
-    request_header: RequestHeader,
-    request_status: u8,
+    state: IrqSpinLock<BlockState>,
+}
+
+struct BlockState {
+    queue: DmaQueue<{ BlockDevice::QUEUE_SIZE }>,
+    requests: Vec<BlockRequest>,
+}
+
+struct BlockRequest {
+    header: RequestHeader,
+    status: u8,
     dma_buffer: DmaBuffer,
-    in_flight_head: Option<u16>,
+    head: Option<u16>,
+    used_length: Option<u32>,
+    abandoned: bool,
 }
 
 impl BlockDevice {
@@ -41,21 +54,29 @@ impl BlockDevice {
         if !transport.activate() {
             return None;
         }
-        let dma_buffer = DmaArena::allocate(Self::MAX_TRANSFER_SIZE, 16)?;
         let capacity_sectors = u64::from(transport.read_device_config(0)?)
             | (u64::from(transport.read_device_config(4)?) << 32);
+        let mut requests = Vec::new();
+        let request_count = Self::QUEUE_SIZE / 3;
+        requests.try_reserve_exact(request_count).ok()?;
+        for _ in 0..request_count {
+            requests.push(BlockRequest {
+                header: RequestHeader {
+                    request_type: 0,
+                    reserved: 0,
+                    sector: 0,
+                },
+                status: 0xff,
+                dma_buffer: DmaArena::allocate(Self::MAX_TRANSFER_SIZE, 16)?,
+                head: None,
+                used_length: None,
+                abandoned: false,
+            });
+        }
         Some(Self {
             transport,
-            queue,
             capacity_sectors,
-            request_header: RequestHeader {
-                request_type: 0,
-                reserved: 0,
-                sector: 0,
-            },
-            request_status: 0xff,
-            dma_buffer,
-            in_flight_head: None,
+            state: IrqSpinLock::new(BlockState { queue, requests }),
         })
     }
 
@@ -64,7 +85,7 @@ impl BlockDevice {
     }
 
     pub(crate) fn submit_read<'a>(
-        &'a mut self,
+        &'a self,
         sector: u64,
         output: &'a mut [u8],
     ) -> Result<BlockTransfer<'a>, Error> {
@@ -73,7 +94,7 @@ impl BlockDevice {
     }
 
     pub(crate) fn submit_write<'a>(
-        &'a mut self,
+        &'a self,
         sector: u64,
         input: &[u8],
     ) -> Result<BlockTransfer<'a>, Error> {
@@ -95,60 +116,78 @@ impl BlockDevice {
     }
 
     fn submit<'a>(
-        &'a mut self,
+        &'a self,
         request_type: u32,
         sector: u64,
         length: usize,
         output: Option<&'a mut [u8]>,
         input: Option<&[u8]>,
     ) -> Result<BlockTransfer<'a>, Error> {
-        self.reap_abandoned_request()?;
+        let mut state = self.state.lock();
+        Self::reap_completions(&mut state)?;
+        let Some(request_index) = state
+            .requests
+            .iter()
+            .position(|request| request.head.is_none() && request.used_length.is_none())
+        else {
+            return Err(Error::Busy);
+        };
+        let request = &mut state.requests[request_index];
         if let Some(input) = input {
-            self.dma_buffer.as_mut_slice()[..length].copy_from_slice(input);
+            request.dma_buffer.as_mut_slice()[..length].copy_from_slice(input);
         }
-        self.request_header = RequestHeader {
+        request.header = RequestHeader {
             request_type,
             reserved: 0,
             sector,
         };
-        self.request_status = 0xff;
+        request.status = 0xff;
         let descriptors = [
             Descriptor::new(
-                &self.request_header as *const _ as u64,
+                &request.header as *const _ as u64,
                 core::mem::size_of::<RequestHeader>() as u32,
                 false,
             ),
             Descriptor::new(
-                self.dma_buffer.bus_address(),
+                request.dma_buffer.bus_address(),
                 length as u32,
                 request_type == 0,
             ),
-            Descriptor::new(&mut self.request_status as *mut u8 as u64, 1, true),
+            Descriptor::new(&mut request.status as *mut u8 as u64, 1, true),
         ];
-        let head = self.queue.submit(&descriptors).ok_or(Error::Busy)?;
-        self.in_flight_head = Some(head);
+        let head = state.queue.submit(&descriptors).ok_or(Error::Busy)?;
+        let request = &mut state.requests[request_index];
+        request.head = Some(head);
+        request.abandoned = false;
+        drop(state);
         DmaArena::sync_for_device();
         self.transport.notify(0);
         Ok(BlockTransfer {
             device: self,
             output,
             length,
+            request_index,
             head,
             complete: false,
         })
     }
 
-    fn reap_abandoned_request(&mut self) -> Result<(), Error> {
-        let Some(expected) = self.in_flight_head else {
-            return Ok(());
-        };
-        let Some(used) = self.queue.poll_used() else {
-            return Err(Error::Busy);
-        };
-        self.in_flight_head = None;
-        DmaArena::sync_for_cpu();
-        if used.id != u32::from(expected) {
-            return Err(Error::Proto);
+    fn reap_completions(state: &mut BlockState) -> Result<(), Error> {
+        while let Some(used) = state.queue.poll_used() {
+            let Some(request) = state
+                .requests
+                .iter_mut()
+                .find(|request| request.head.is_some_and(|head| u32::from(head) == used.id))
+            else {
+                return Err(Error::Proto);
+            };
+            if request.abandoned {
+                request.head = None;
+                request.used_length = None;
+                request.abandoned = false;
+            } else {
+                request.used_length = Some(used.length);
+            }
         }
         Ok(())
     }
@@ -159,9 +198,10 @@ impl BlockDevice {
 }
 
 pub(crate) struct BlockTransfer<'a> {
-    device: &'a mut BlockDevice,
+    device: &'a BlockDevice,
     output: Option<&'a mut [u8]>,
     length: usize,
+    request_index: usize,
     head: u16,
     complete: bool,
 }
@@ -171,25 +211,55 @@ impl BlockTransfer<'_> {
         if self.complete {
             return Ok(true);
         }
-        let Some(used) = self.device.queue.poll_used() else {
-            return Ok(false);
-        };
-        self.device.in_flight_head = None;
-        DmaArena::sync_for_cpu();
-        self.complete = true;
-        if used.id != u32::from(self.head) {
+        let mut state = self.device.state.lock();
+        BlockDevice::reap_completions(&mut state)?;
+        let request = state
+            .requests
+            .get_mut(self.request_index)
+            .ok_or(Error::Proto)?;
+        if request.head != Some(self.head) {
             return Err(Error::Proto);
         }
-        match self.device.request_status {
+        let Some(used_length) = request.used_length.take() else {
+            return Ok(false);
+        };
+        DmaArena::sync_for_cpu();
+        self.complete = true;
+        request.head = None;
+        request.abandoned = false;
+        match request.status {
             0 => {}
             1 => return Err(Error::Io),
             2 => return Err(Error::OpNotSupp),
             _ => return Err(Error::Proto),
         }
+        if used_length < 1 {
+            return Err(Error::Proto);
+        }
         if let Some(output) = self.output.as_mut() {
-            let source = &self.device.dma_buffer.as_mut_slice()[..self.length];
+            let source = &request.dma_buffer.as_mut_slice()[..self.length];
             (**output).copy_from_slice(source);
         }
         Ok(true)
+    }
+}
+
+impl Drop for BlockTransfer<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        let mut state = self.device.state.lock();
+        let Some(request) = state.requests.get_mut(self.request_index) else {
+            return;
+        };
+        if request.head == Some(self.head) {
+            request.abandoned = true;
+            if request.used_length.is_some() {
+                request.head = None;
+                request.used_length = None;
+                request.abandoned = false;
+            }
+        }
     }
 }
