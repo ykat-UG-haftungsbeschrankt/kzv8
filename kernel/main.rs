@@ -20,6 +20,7 @@ pub(crate) mod block;
 pub(crate) mod driver;
 pub(crate) mod error;
 pub(crate) mod event;
+pub(crate) mod lib;
 pub(crate) mod memory;
 pub(crate) mod net;
 #[path = "../runtime/run.rs"]
@@ -29,7 +30,7 @@ pub(crate) mod vfs;
 
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
-    pub(crate) use crate::{arch, block, driver, error, event, memory, net, runtime, scheduler, vfs};
+    pub(crate) use crate::{arch, block, driver, error, event, lib, memory, net, runtime, scheduler, vfs};
 }
 
 pub(crate) struct KernelContext<'a> {
@@ -85,7 +86,10 @@ impl Kernel {
             "unable to initialize physical memory"
         );
         memory::heap::Heap::initialize();
-        scheduler::thread::ThreadManager::initialize();
+        assert!(
+            scheduler::thread::ThreadManager::initialize(),
+            "unable to initialize the thread scheduler"
+        );
         assert!(
             arch::ThreadArchitecture::initialize_thread_local_storage(0),
             "unable to initialize thread-local storage"
