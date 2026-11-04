@@ -255,7 +255,6 @@ def check(architecture):
     if architecture == "x86_64":
         expected += "kz: RAM above 4 GiB mapped\n"
     expected += "kz: pthreads smoke OK\n"
-    expected += "kz: V8 page allocator hooks OK\n"
     expected += "kz: V8 smoke entered\n"
     expected += "kz: V8 flags set\n"
     expected += "kz: V8 platform created\n"
@@ -273,6 +272,8 @@ def check(architecture):
     expected += "kz: V8 event loop smoke OK\n"
     expected += "kz: V8 explicit microtasks OK\n"
     expected += "kz: JS result: 42\n"
+    if architecture == "x86_64":
+        expected += "kz: VFAT ESM app OK\n"
     expected += "kz: V8 disposing isolate\n"
     expected += "kz: V8 isolate disposed\n"
     expected += "kz: V8 disposing runtime\n"

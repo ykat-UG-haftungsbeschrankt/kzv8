@@ -11,8 +11,8 @@
 extern crate alloc;
 
 use crate::arch::traits::{
-    BootArchitecture as _, CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
-    TimerArchitecture as _,
+    BootArchitecture as _, CpuArchitecture as _, InterruptArchitecture as _,
+    ThreadArchitecture as _, TimerArchitecture as _,
 };
 
 pub(crate) mod arch;
@@ -29,7 +29,9 @@ pub(crate) mod vfs;
 
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
-    pub(crate) use crate::{arch, block, driver, error, event, memory, net, runtime, scheduler, vfs};
+    pub(crate) use crate::{
+        arch, block, driver, error, event, memory, net, runtime, scheduler, vfs,
+    };
 }
 
 pub(crate) struct KernelContext<'a> {
@@ -46,9 +48,10 @@ impl Kernel {
         let pending = driver::virtio::transport::dispatch_interrupts();
         event::r#loop::EventLoop::<16>::record_device_interrupts(pending);
         driver::virtio::console::Console::handle_interrupt(pending);
+        driver::virtio::input::VirtioInput::handle_interrupt(pending);
     }
 
-    fn main(boot_info: usize, boot_magic: usize) -> !{
+    fn main(boot_info: usize, boot_magic: usize) -> ! {
         let _interrupt_state = arch::InterruptArchitecture::disable_interrupts();
         unsafe {
             arch::InterruptArchitecture::initialize_interrupts();
@@ -93,7 +96,12 @@ impl Kernel {
             let _event = events.wait(now_ns);
         }
         let console_ready = driver::virtio::console::Console::initialize();
-        vfs::mount_virtio_devices();
+        let _input_ready = driver::virtio::input::VirtioInput::initialize();
+        let _vga_device = driver::virtio::vga::VirtioGpu::initialize();
+        let _scsi_device = driver::virtio::scsi::VirtioScsi::initialize();
+        let _rtc_device = driver::virtio::rtc::VirtioRtc::initialize();
+        let virtio_fs = driver::virtio::fs::VirtioFs::initialize();
+        vfs::mount_virtio_devices(virtio_fs.as_ref().map(|filesystem| filesystem.root()));
         arch::InterruptArchitecture::enable_interrupts();
         if console_ready {
             if driver::virtio::console::Console::write(arch::BootArchitecture::BOOT_MESSAGE)

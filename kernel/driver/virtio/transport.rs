@@ -124,6 +124,27 @@ impl MmioRegion {
         Some(())
     }
 
+    fn read_u8(&self, offset: usize) -> Option<u8> {
+        if offset >= self.stride {
+            return None;
+        }
+        let address = self.base.checked_add(offset)?;
+        // SAFETY: regions come from the architecture's mapped VirtIO window, and the checked
+        // offset is contained within the region.
+        Some(unsafe { core::ptr::read_volatile(address as *const u8) })
+    }
+
+    fn write_u8(&self, offset: usize, value: u8) -> Option<()> {
+        if offset >= self.stride {
+            return None;
+        }
+        let address = self.base.checked_add(offset)?;
+        // SAFETY: regions come from the architecture's mapped VirtIO window, and the checked
+        // offset is contained within the region.
+        unsafe { core::ptr::write_volatile(address as *mut u8, value) };
+        Some(())
+    }
+
     fn read_register(&self, register: Register) -> u32 {
         self.read_u32(register as usize)
             .expect("typed VirtIO register must fit the region")
@@ -144,6 +165,14 @@ impl MmioRegion {
 
     fn read_config(&self, offset: usize) -> Option<u32> {
         self.read_u32(0x100usize.checked_add(offset)?)
+    }
+
+    fn read_config_u8(&self, offset: usize) -> Option<u8> {
+        self.read_u8(0x100usize.checked_add(offset)?)
+    }
+
+    fn write_config_u8(&self, offset: usize, value: u8) -> Option<()> {
+        self.write_u8(0x100usize.checked_add(offset)?, value)
     }
 }
 
@@ -310,6 +339,14 @@ impl VirtioTransport {
 
     pub(crate) fn read_device_config(&self, offset: usize) -> Option<u32> {
         self.region.read_config(offset)
+    }
+
+    pub(crate) fn read_device_config_byte(&self, offset: usize) -> Option<u8> {
+        self.region.read_config_u8(offset)
+    }
+
+    pub(crate) fn write_device_config_byte(&self, offset: usize, value: u8) -> Option<()> {
+        self.region.write_config_u8(offset, value)
     }
 
     pub(crate) fn slot(&self) -> usize {

@@ -226,6 +226,10 @@ impl<const N: usize> DmaQueue<N> {
     pub(crate) fn poll_used(&mut self) -> Option<UsedElement> {
         self.with_queue(VirtQueue::poll_used)
     }
+
+    pub(crate) fn is_in_flight(&mut self) -> bool {
+        self.with_queue(|queue| queue.is_in_flight())
+    }
 }
 
 pub(crate) struct QueueCell<const N: usize> {

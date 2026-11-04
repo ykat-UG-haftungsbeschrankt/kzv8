@@ -167,7 +167,7 @@ const context = {
     },
   },
 };
-const sourcePath = path.join(__dirname, "../../app/vfat.js");
+const sourcePath = path.join(__dirname, "../../app/dist/vfat.js");
 vm.runInNewContext(fs.readFileSync(sourcePath, "utf8"), context);
 
 async function run() {

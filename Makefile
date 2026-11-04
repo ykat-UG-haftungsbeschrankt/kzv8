@@ -32,11 +32,11 @@ $(error AARCH64_FPU_STATE must be on or off)
 endif
 
 .PHONY: all test app-build doc run-x86_64 run-aarch64 debug-x86_64 debug-aarch64 v8-host-test v8-platform-test clean force
-all: build/x86_64/kernel.elf build/aarch64/kernel.bin
+all: app-build build/x86_64/kernel.elf build/aarch64/kernel.bin
 
 force:
 
-build/x86_64/kernel64.elf: force
+build/x86_64/kernel64.elf: app-build force
 	mkdir -p $(@D)
 	cd runtime/v8/src && buildtools/linux64/gn gen out.gn/x64.platform --args="$$(cat ../args-platform.gn)"
 	ninja -C "$(V8_PLATFORM_OUT)" v8_monolith
@@ -46,7 +46,7 @@ build/x86_64/kernel64.elf: force
 build/x86_64/kernel.elf: build/x86_64/kernel64.elf
 	$(OBJCOPY) -O elf32-i386 $< $@
 
-build/aarch64/kernel.elf: force
+build/aarch64/kernel.elf: app-build force
 	mkdir -p $(@D)
 	cd runtime/v8/src && buildtools/linux64/gn gen out.gn/arm64.platform --args="$$(cat ../args-platform-aarch64.gn)"
 	ninja -C "$(V8_AARCH64_PLATFORM_OUT)" v8_monolith libc++
@@ -60,12 +60,11 @@ app-build:
 	npm --prefix app ci --no-audit --no-fund
 	npm --prefix app run build
 
-test: app-build
-	$(MAKE) all
+test: all
 	node tests/v8/vfat-smoke.js
 	python3 tests/qemu/smoke.py
 
-doc:
+doc: app-build
 	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) doc --manifest-path Cargo.toml
 
 v8-host-test:

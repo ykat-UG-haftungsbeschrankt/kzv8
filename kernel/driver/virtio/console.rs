@@ -6,43 +6,17 @@
  */
 
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::kernel::driver::virtio::queue::{Descriptor, QueueCell};
+use crate::kernel::driver::virtio::serial::VirtioSerial;
 use crate::kernel::driver::virtio::transport::VirtioTransport;
-use crate::kernel::memory::dma::DmaArena;
-use crate::kernel::scheduler::sync::IrqSpinLock;
 
-struct OutputQueue {
-    bytes: [u8; Console::OUTPUT_CAPACITY],
-    head: usize,
-    length: usize,
-    active_length: usize,
-    active_head: Option<u16>,
-}
-
-impl OutputQueue {
-    const EMPTY: Self = Self {
-        bytes: [0; Console::OUTPUT_CAPACITY],
-        head: 0,
-        length: 0,
-        active_length: 0,
-        active_head: None,
-    };
-}
-
-pub(crate) struct Console {
-    queue: QueueCell<{ Self::QUEUE_SIZE }>,
-    base: AtomicUsize,
-    slot: AtomicUsize,
-    output: IrqSpinLock<OutputQueue>,
-}
+pub(crate) struct Console;
 
 struct ConsoleWriter;
 
 impl core::fmt::Write for ConsoleWriter {
     fn write_str(&mut self, message: &str) -> core::fmt::Result {
-        if Console::write(message.as_bytes()) {
+        if VirtioSerial::write(message.as_bytes()) {
             Ok(())
         } else {
             Err(core::fmt::Error)
@@ -51,40 +25,8 @@ impl core::fmt::Write for ConsoleWriter {
 }
 
 impl Console {
-    const QUEUE_SIZE: usize = 8;
-    const OUTPUT_CAPACITY: usize = 16 * 1024;
-    const MAX_CHUNK_SIZE: usize = 512;
-    const VIRTIO_CONSOLE_DEVICE_ID: u32 = 3;
-
-    const fn new() -> Self {
-        Self {
-            queue: QueueCell::new(),
-            base: AtomicUsize::new(0),
-            slot: AtomicUsize::new(usize::MAX),
-            output: IrqSpinLock::new(OutputQueue::EMPTY),
-        }
-    }
-
-    fn get_instance() -> &'static Self {
-        static CONSOLE: Console = Console::new();
-        &CONSOLE
-    }
-
     pub(crate) fn initialize() -> bool {
-        let console = Self::get_instance();
-        let Some(candidate) = VirtioTransport::find(Self::VIRTIO_CONSOLE_DEVICE_ID) else {
-            return false;
-        };
-        let Ok(transport) = candidate.initialize(Self::VIRTIO_CONSOLE_DEVICE_ID) else {
-            return false;
-        };
-        let base = transport.base();
-        if console.queue.lock().configure(&transport, 1).is_err() || !transport.activate() {
-            return false;
-        }
-        console.base.store(base, Ordering::Release);
-        console.slot.store(transport.slot(), Ordering::Release);
-        true
+        VirtioSerial::initialize()
     }
 
     pub(crate) fn write_device_list() {
@@ -100,85 +42,10 @@ impl Console {
     }
 
     pub(crate) fn write(message: &[u8]) -> bool {
-        let console = Self::get_instance();
-        if message.len() > Self::MAX_CHUNK_SIZE {
-            return false;
-        }
-        if message.is_empty() {
-            return true;
-        }
-        let base = console.base.load(Ordering::Acquire);
-        if base == 0 {
-            return false;
-        }
-        let mut output = console.output.lock();
-        if message.len() > Self::OUTPUT_CAPACITY - output.length {
-            return false;
-        }
-        let tail = (output.head + output.length) % Self::OUTPUT_CAPACITY;
-        let first_length = message.len().min(Self::OUTPUT_CAPACITY - tail);
-        output.bytes[tail..tail + first_length].copy_from_slice(&message[..first_length]);
-        output.bytes[..message.len() - first_length].copy_from_slice(&message[first_length..]);
-        output.length += message.len();
-        let notify = console.submit_next(&mut output);
-        drop(output);
-        if notify {
-            if let Some(transport) = VirtioTransport::from_base(base) {
-                transport.notify(1);
-            }
-        }
-        true
+        VirtioSerial::write(message)
     }
 
     pub(crate) fn handle_interrupt(pending: u64) {
-        let console = Self::get_instance();
-        let slot = console.slot.load(Ordering::Acquire);
-        if slot >= 64 || pending & (1u64 << slot) == 0 {
-            return;
-        }
-        let base = console.base.load(Ordering::Acquire);
-        let mut output = console.output.lock();
-        let Some(expected) = output.active_head else {
-            return;
-        };
-        let Some(used) = console.queue.lock().poll_used() else {
-            return;
-        };
-        if used.id != u32::from(expected) {
-            return;
-        }
-        output.head = (output.head + output.active_length) % Self::OUTPUT_CAPACITY;
-        output.length -= output.active_length;
-        output.active_length = 0;
-        output.active_head = None;
-        let notify = console.submit_next(&mut output);
-        drop(output);
-        if notify {
-            if let Some(transport) = VirtioTransport::from_base(base) {
-                transport.notify(1);
-            }
-        }
-    }
-
-    fn submit_next(&self, output: &mut OutputQueue) -> bool {
-        if output.active_head.is_some() || output.length == 0 {
-            return false;
-        }
-        let length = output
-            .length
-            .min(Self::MAX_CHUNK_SIZE)
-            .min(Self::OUTPUT_CAPACITY - output.head);
-        let descriptor = Descriptor::new(
-            output.bytes[output.head..output.head + length].as_ptr() as u64,
-            length as u32,
-            false,
-        );
-        let Some(head) = self.queue.lock().submit(&[descriptor]) else {
-            return false;
-        };
-        output.active_head = Some(head);
-        output.active_length = length;
-        DmaArena::sync_for_device();
-        true
+        VirtioSerial::handle_interrupt(pending)
     }
 }

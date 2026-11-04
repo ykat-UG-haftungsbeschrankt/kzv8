@@ -25,6 +25,10 @@ pub(crate) struct DmaBuffer {
     length: usize,
 }
 
+// SAFETY: Each buffer owns a disjoint arena allocation. Moving its handle does not create
+// aliases, and access through a mutable slice still requires `&mut self`.
+unsafe impl Send for DmaBuffer {}
+
 impl DmaBuffer {
     pub(crate) const fn len(&self) -> usize {
         self.length

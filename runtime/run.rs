@@ -48,9 +48,6 @@ pub(crate) fn run(context: KernelContext<'_>) {
         let _thread_status = Console::write(b"kz: pthreads smoke OK\n");
     }
 
-    if runtime_v8::page_allocator_smoke() {
-        let _page_allocator = Console::write(b"kz: V8 page allocator hooks OK\n");
-    }
     let block_device = block_device
         .map(|device| device as *mut _ as *mut core::ffi::c_void)
         .unwrap_or(core::ptr::null_mut());

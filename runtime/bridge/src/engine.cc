@@ -785,7 +785,8 @@ bool compile_module_response(v8::Local<v8::Context> context,
 		return false;
 	}
 	v8::Local<v8::String> url_string = url_value.As<v8::String>();
-	v8::ScriptOrigin origin(url_string);
+	v8::ScriptOrigin origin(url_string, 0, 0, false, -1,
+								v8::Local<v8::Value>(), false, false, true);
 	v8::ScriptCompiler::Source module_source(source_string, origin);
 	v8::Local<v8::Module> module;
 	if (!v8::ScriptCompiler::CompileModule(isolate, &module_source)
@@ -1056,7 +1057,8 @@ bool run_vfat_esm_smoke(v8::Local<v8::Context> context,
 	auto source = v8::String::NewFromUtf8Literal(isolate, trampoline_source);
 	auto resource_name = v8::String::NewFromUtf8Literal(isolate,
 														"kz:///boot.mjs");
-	v8::ScriptOrigin origin(resource_name);
+	v8::ScriptOrigin origin(resource_name, 0, 0, false, -1,
+								v8::Local<v8::Value>(), false, false, true);
 	v8::ScriptCompiler::Source module_source(source, origin);
 	v8::Local<v8::Module> trampoline;
 	if (!v8::ScriptCompiler::CompileModule(isolate, &module_source)
@@ -1140,7 +1142,9 @@ bool pump_timer_callbacks(v8::Isolate* isolate,
 }  // namespace
 
 extern "C" int kz_v8_run_smoke(void* event_loop, void* block_device,
-								  void* tcp_context) {
+								  void* tcp_context,
+								  const uint8_t* bootstrap_source,
+								  size_t bootstrap_length) {
 	if (event_loop == nullptr) return -6;
 	report("kz: V8 smoke entered\n", sizeof("kz: V8 smoke entered\n") - 1);
 #if !defined(KZ_FREESTANDING)
@@ -1182,6 +1186,10 @@ extern "C" int kz_v8_run_smoke(void* event_loop, void* block_device,
 	}
 	report("kz: V8 isolate created\n", sizeof("kz: V8 isolate created\n") - 1);
 	isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+	ModuleLoader modules{};
+	isolate->SetData(kModuleLoaderDataSlot, &modules);
+	isolate->SetHostImportModuleDynamicallyCallback(
+			host_import_module_dynamically);
 	DeviceBindings devices{block_device, tcp_context};
 	TimerBindings timers{};
 	timers.event_loop = event_loop;
@@ -1291,9 +1299,16 @@ extern "C" int kz_v8_run_smoke(void* event_loop, void* block_device,
 								 sizeof("kz: V8 explicit microtasks OK\n") - 1);
 					}
 					report_result(script_result);
+					if (succeeded && block_device != nullptr) {
+						succeeded = run_vfat_esm_smoke(
+								context, isolate, &modules, bootstrap_source,
+								bootstrap_length);
+					}
 				}
 			}
 		}
+		reset_module_loader(&modules);
+		isolate->SetData(kModuleLoaderDataSlot, nullptr);
 	}
 
 	for (TimerSlot& slot : timers.slots) {

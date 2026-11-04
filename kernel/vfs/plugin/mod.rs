@@ -85,16 +85,18 @@ fn named_directory(entries: Vec<(&'static str, Node)>) -> Node {
     )
 }
 
-pub(crate) fn build_virtio_tree() -> (Node, usize) {
+pub(crate) fn build_virtio_tree(virtio_fs_root: Option<Node>) -> (Node, usize) {
     let mut block_devices = Vec::new();
     let mut network_devices = Vec::new();
     let mut console_devices = Vec::new();
+    let mut file_system_devices = Vec::new();
 
     transport::for_each_device(|device| {
         let (prefix, entries) = match device.device_id {
             1 => ("eth", &mut network_devices),
             2 => ("vd", &mut block_devices),
             3 => ("tty", &mut console_devices),
+            26 => ("virtiofs", &mut file_system_devices),
             _ => return,
         };
         let ordinal = entries.len() + 1;
@@ -104,11 +106,19 @@ pub(crate) fn build_virtio_tree() -> (Node, usize) {
         });
     });
 
-    let device_count = block_devices.len() + network_devices.len() + console_devices.len();
+    let device_count = block_devices.len()
+        + network_devices.len()
+        + console_devices.len()
+        + file_system_devices.len();
     let devices = named_directory(vec![
         ("console", directory(console_devices)),
         ("net", directory(network_devices)),
         ("block", directory(block_devices)),
+        ("fs", directory(file_system_devices)),
     ]);
-    (named_directory(vec![("dev", devices)]), device_count)
+    let mut root_entries = vec![("dev", devices)];
+    if let Some(filesystem) = virtio_fs_root {
+        root_entries.push(("fs", filesystem));
+    }
+    (named_directory(root_entries), device_count)
 }

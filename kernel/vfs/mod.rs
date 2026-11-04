@@ -155,10 +155,9 @@ impl FileHandle {
     pub(crate) fn seek(&mut self, from: SeekFrom) -> VfsResult<u64> {
         let offset = match from {
             SeekFrom::Start(offset) => offset,
-            SeekFrom::Current(delta) if delta >= 0 => self
-                .offset
-                .checked_add(delta as u64)
-                .ok_or(Error::Inval)?,
+            SeekFrom::Current(delta) if delta >= 0 => {
+                self.offset.checked_add(delta as u64).ok_or(Error::Inval)?
+            }
             SeekFrom::Current(delta) => self
                 .offset
                 .checked_sub(delta.unsigned_abs())
@@ -229,8 +228,8 @@ impl Vfs {
     }
 }
 
-pub(crate) fn mount_virtio_devices() -> usize {
-    let (root, device_count) = plugin::build_virtio_tree();
+pub(crate) fn mount_virtio_devices(virtio_fs_root: Option<Node>) -> usize {
+    let (root, device_count) = plugin::build_virtio_tree(virtio_fs_root);
     *MOUNTED_VFS.lock() = Some(Vfs::new(root));
     device_count
 }

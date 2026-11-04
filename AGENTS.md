@@ -3,6 +3,10 @@ When working on files under `runtime/`, do not modify files under `kernel/`. If 
 ## Kernel Errors
 - Define all kernel error codes in `kernel/error.rs`; do not define kernel error codes elsewhere.
 
+## Application TypeScript
+- Use TypeScript for application source files under `app/`; do not add JavaScript source files there.
+- This rule does not apply under `app/build/` or `app/node_modules/`.
+
 ## Rust Safety
 - Prefer safe Rust and avoid `unsafe` whenever a safe API can express the operation.
 - When `unsafe` is necessary, keep the block minimal and document its safety invariants.
