@@ -55,6 +55,11 @@ impl<T> ListNode<T> {
             owned_next: None,
         }
     }
+
+    pub(crate) fn into_value(self: Box<Self>) -> T {
+        debug_assert!(self.previous.is_none() && self.next.is_none() && self.owned_next.is_none());
+        self.value
+    }
 }
 
 impl<T> Deref for ListNode<T> {

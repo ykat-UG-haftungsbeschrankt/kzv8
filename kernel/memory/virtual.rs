@@ -5,10 +5,12 @@
  * free of charge, without warranty of any kind.
  */
 
+use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::kernel::arch::traits::{DebugArchitecture as _, MemoryArchitecture as _};
 use crate::kernel::arch::MemoryArchitecture;
+use crate::kernel::lib::interval::IntervalTree;
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
@@ -20,30 +22,9 @@ pub(crate) enum FaultAccess {
 }
 
 #[derive(Clone, Copy)]
-struct VmArea {
-    start_page: usize,
-    page_count: usize,
-    active: bool,
-}
-
-impl VmArea {
-    const EMPTY: Self = Self {
-        start_page: 0,
-        page_count: 0,
-        active: false,
-    };
-}
-
-#[derive(Clone, Copy)]
 struct PageRange {
     start_page: usize,
     end_page: usize,
-}
-
-impl PageRange {
-    fn page_count(self) -> usize {
-        self.end_page - self.start_page
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -58,7 +39,7 @@ enum PageRangeError {
 pub(crate) struct VirtualAreas {
     page_state: [AtomicU8; VirtualAreas::MAX_VM_PAGES],
     mmu_ready: AtomicBool,
-    areas: [VmArea; VirtualAreas::MAX_VM_AREAS],
+    area_index: IntervalTree<(), VirtualAreas::MAX_VM_AREAS>,
 }
 
 impl VirtualAreas {
@@ -76,7 +57,7 @@ impl VirtualAreas {
     const EMPTY: Self = Self {
         page_state: [const { AtomicU8::new(0) }; Self::MAX_VM_PAGES],
         mmu_ready: AtomicBool::new(false),
-        areas: [VmArea::EMPTY; Self::MAX_VM_AREAS],
+        area_index: IntervalTree::new(),
     };
 
     fn initialize(&mut self) {
@@ -140,26 +121,32 @@ impl VirtualAreas {
         })
     }
 
-    fn exact_area_slot(&self, range: PageRange) -> Option<usize> {
-        self.areas.iter().position(|area| {
-            area.active
-                && area.start_page == range.start_page
-                && area.page_count == range.page_count()
-        })
+    fn address_range(range: PageRange) -> Option<Range<usize>> {
+        let start_offset = range.start_page.checked_mul(Self::PAGE_SIZE)?;
+        let end_offset = range.end_page.checked_mul(Self::PAGE_SIZE)?;
+        Some(
+            Self::VM_BASE.checked_add(start_offset)?
+                ..Self::VM_BASE.checked_add(end_offset)?,
+        )
     }
 
-    fn containing_area_slot(&self, range: PageRange) -> Option<usize> {
-        self.areas.iter().position(|area| {
-            area.active
-                && range.start_page >= area.start_page
-                && range.end_page <= area.start_page.saturating_add(area.page_count)
-        })
+    fn exact_area(&self, range: PageRange) -> bool {
+        let Some(address_range) = Self::address_range(range) else {
+            return false;
+        };
+        self.area_index.get(&address_range).is_some()
     }
 
-    fn align_up(value: usize, alignment: usize) -> Option<usize> {
-        value
-            .checked_add(alignment - 1)
-            .map(|value| value & !(alignment - 1))
+    fn containing_area(&self, range: PageRange) -> Option<PageRange> {
+        let address_range = Self::address_range(range)?;
+        let (area_range, _) = self.area_index.find_point(address_range.start)?;
+        if address_range.end > area_range.end {
+            return None;
+        }
+        Some(PageRange {
+            start_page: Self::page_start(area_range.start).ok()?,
+            end_page: Self::page_start(area_range.end).ok()?,
+        })
     }
 
     fn reserve(&mut self, length: usize, alignment: usize, permissions: i32) -> Option<usize> {
@@ -187,72 +174,65 @@ impl VirtualAreas {
         }
         let alignment = alignment.max(Self::PAGE_SIZE);
 
-        let area_slot = self.areas.iter().position(|area| !area.active)?;
-
-        let mut candidate_page = if let Some(address) = hint {
+        if self.area_index.is_full() {
+            return None;
+        }
+        let address_range = if let Some(address) = hint {
             if address < Self::VM_BASE || address % alignment != 0 {
                 return None;
             }
-            address.checked_sub(Self::VM_BASE)? / Self::PAGE_SIZE
-        } else {
-            0
-        };
-        loop {
-            let candidate_address = Self::VM_BASE.checked_add(candidate_page.checked_mul(Self::PAGE_SIZE)?)?;
-            let address = if hint.is_some() {
-                candidate_address
-            } else {
-                Self::align_up(candidate_address, alignment)?
-            };
-            let start_page = address.checked_sub(Self::VM_BASE)? / Self::PAGE_SIZE;
-            let end_page = start_page.checked_add(page_count)?;
-            if end_page > Self::MAX_VM_PAGES {
+            let range = Self::checked_page_range(address, length).ok()?;
+            let address_range = Self::address_range(range)?;
+            if self.area_index.find_overlap(address_range.clone()).is_some() {
                 return None;
             }
+            address_range
+        } else {
+            let arena_end = Self::VM_BASE.checked_add(Self::VM_ARENA_SIZE)?;
+            self.area_index
+                .first_fit(Self::VM_BASE..arena_end, length, alignment)?
+        };
 
-            let occupied = (start_page..end_page)
-                .find(|page| self.page_state[*page].load(Ordering::Acquire) & Self::VM_RESERVED != 0);
-            if let Some(occupied_page) = occupied {
-                if hint.is_some() {
-                    return None;
-                }
-                candidate_page = occupied_page + 1;
-                continue;
-            }
-
-            let state_permissions = if permissions == 5 {
-                0
-            } else {
-                permissions as u8
-            };
-            let state = Self::VM_RESERVED | state_permissions;
-            for page in start_page..end_page {
-                self.page_state[page].store(state, Ordering::Release);
-            }
-            self.areas[area_slot] = VmArea {
-                start_page,
-                page_count,
-                active: true,
-            };
-            return Some(address);
+        let range = Self::checked_page_range(address_range.start, length).ok()?;
+        let start_page = range.start_page;
+        let end_page = range.end_page;
+        let address = address_range.start;
+        if self.area_index.insert(address_range, ()).is_err() {
+            return None;
         }
+
+        let state_permissions = if permissions == 5 {
+            0
+        } else {
+            permissions as u8
+        };
+        let state = Self::VM_RESERVED | state_permissions;
+        for page in start_page..end_page {
+            self.page_state[page].store(state, Ordering::Release);
+        }
+        Some(address)
     }
 
     fn release(&mut self, address: usize, length: usize) -> bool {
         let Ok(range) = Self::checked_page_range(address, length) else {
             return false;
         };
-        let Some(area_slot) = self.exact_area_slot(range) else {
+        let Some(address_range) = Self::address_range(range) else {
             return false;
         };
+        if !self.exact_area(range) {
+            return false;
+        }
         if (range.start_page..range.end_page)
             .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             return false;
         }
 
+        if self.area_index.remove(&address_range).is_none() {
+            return false;
+        }
         let released = self.release_pages(range.start_page, range.end_page);
-        self.areas[area_slot] = VmArea::EMPTY;
         released
     }
 
@@ -260,59 +240,67 @@ impl VirtualAreas {
         let Ok(range) = Self::checked_page_range(address, length) else {
             return false;
         };
-        let Some(area_slot) = self.containing_area_slot(range) else {
+        let Some(area) = self.containing_area(range) else {
             return false;
         };
-        let area = self.areas[area_slot];
         if (range.start_page..range.end_page)
             .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             return false;
         }
 
-        let area_end = area.start_page + area.page_count;
+        let area_address_range = Self::address_range(area).expect("valid VM area range");
         let prefix_page_count = range.start_page - area.start_page;
+        let area_end = area.end_page;
         let suffix_page_count = area_end - range.end_page;
-        let split_slot = if prefix_page_count != 0 && suffix_page_count != 0 {
-            let Some(slot) = self.areas.iter().position(|area| !area.active) else {
-                return false;
-            };
-            Some(slot)
-        } else {
-            None
-        };
+        if prefix_page_count != 0 && suffix_page_count != 0 && self.area_index.is_full() {
+            return false;
+        }
 
-        let released = self.release_pages(range.start_page, range.end_page);
+        if self.area_index.remove(&area_address_range).is_none() {
+            return false;
+        }
         match (prefix_page_count, suffix_page_count) {
-            (0, 0) => self.areas[area_slot] = VmArea::EMPTY,
-            (0, suffix_page_count) => {
-                self.areas[area_slot] = VmArea {
+            (0, 0) => {}
+            (0, _) => {
+                let suffix = PageRange {
                     start_page: range.end_page,
-                    page_count: suffix_page_count,
-                    active: true,
-                }
-            }
-            (prefix_page_count, 0) => {
-                self.areas[area_slot] = VmArea {
-                    start_page: area.start_page,
-                    page_count: prefix_page_count,
-                    active: true,
-                }
-            }
-            (prefix_page_count, suffix_page_count) => {
-                self.areas[area_slot] = VmArea {
-                    start_page: area.start_page,
-                    page_count: prefix_page_count,
-                    active: true,
+                    end_page: area_end,
                 };
-                self.areas[split_slot.unwrap()] = VmArea {
+                let address_range = Self::address_range(suffix).expect("valid VM suffix range");
+                let inserted = self.area_index.insert(address_range, ());
+                debug_assert!(matches!(inserted, Ok(None)));
+            }
+            (_, 0) => {
+                let prefix = PageRange {
+                    start_page: area.start_page,
+                    end_page: range.start_page,
+                };
+                let address_range = Self::address_range(prefix).expect("valid VM prefix range");
+                let inserted = self.area_index.insert(address_range, ());
+                debug_assert!(matches!(inserted, Ok(None)));
+            }
+            (_, _) => {
+                let prefix = PageRange {
+                    start_page: area.start_page,
+                    end_page: range.start_page,
+                };
+                let prefix_address_range =
+                    Self::address_range(prefix).expect("valid VM prefix range");
+                let prefix_inserted = self.area_index.insert(prefix_address_range, ());
+                debug_assert!(matches!(prefix_inserted, Ok(None)));
+
+                let suffix = PageRange {
                     start_page: range.end_page,
-                    page_count: suffix_page_count,
-                    active: true,
+                    end_page: area.end_page,
                 };
+                let suffix_address_range =
+                    Self::address_range(suffix).expect("valid VM suffix range");
+                let suffix_inserted = self.area_index.insert(suffix_address_range, ());
+                debug_assert!(matches!(suffix_inserted, Ok(None)));
             }
         }
-        released
+        self.release_pages(range.start_page, range.end_page)
     }
 
     fn decommit_debug(code: u8) {
@@ -341,7 +329,7 @@ impl VirtualAreas {
             }
         };
 
-        if self.containing_area_slot(range).is_none() {
+        if self.containing_area(range).is_none() {
             Self::decommit_debug(b'e');
             return false;
         }
@@ -396,21 +384,32 @@ impl VirtualAreas {
             return false;
         };
         let release_end = range.end_page;
-        let Some(slot) = self.exact_area_slot(range) else {
+        if !self.exact_area(range) {
             return false;
-        };
+        }
         if (release_start..release_end)
             .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             return false;
         }
 
-        let released = self.release_pages(release_start, release_end);
-        if new_page_count == 0 {
-            self.areas[slot] = VmArea::EMPTY;
-        } else {
-            self.areas[slot].page_count = new_page_count;
+        let Some(address_range) = Self::address_range(range) else {
+            return false;
+        };
+        if self.area_index.remove(&address_range).is_none() {
+            return false;
         }
+        if new_page_count != 0 {
+            let shortened = PageRange {
+                start_page,
+                end_page: release_start,
+            };
+            let shortened_range = Self::address_range(shortened).expect("valid shortened range");
+            let inserted = self.area_index.insert(shortened_range, ());
+            debug_assert!(matches!(inserted, Ok(None)));
+        }
+
+        let released = self.release_pages(release_start, release_end);
         released
     }
 
@@ -421,7 +420,7 @@ impl VirtualAreas {
         let Ok(range) = Self::checked_page_range(address, length) else {
             return false;
         };
-        if self.containing_area_slot(range).is_none() {
+        if self.containing_area(range).is_none() {
             return false;
         }
 
