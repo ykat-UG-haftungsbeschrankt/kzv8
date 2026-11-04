@@ -25,6 +25,20 @@ fn collect_rlibs(directory: &Path, output: &mut Vec<PathBuf>) {
     }
 }
 
+fn emit_header_dependencies(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            emit_header_dependencies(&path);
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
 fn main() {
     let package_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let repository_dir = package_dir.clone();
@@ -136,8 +150,19 @@ fn main() {
     }
 
     let include_dir = repository_dir.join("runtime/bridge/linux/include");
+    let posix_include_dir = repository_dir.join("runtime/bridge/posix/include");
     let c_sources = [
         ("runtime/bridge/linux/variadic.c", "variadic.o"),
+        ("runtime/bridge/posix/monetary.c", "posix_monetary.o"),
+        ("runtime/bridge/posix/math.c", "posix_math.o"),
+        ("runtime/bridge/posix/mqueue.c", "posix_mqueue.o"),
+        ("runtime/bridge/posix/semaphore.c", "posix_semaphore.o"),
+        ("runtime/bridge/posix/stdio.c", "posix_stdio.o"),
+        ("runtime/bridge/posix/stdlib.c", "posix_stdlib.o"),
+        ("runtime/bridge/posix/syslog.c", "posix_syslog.o"),
+        ("runtime/bridge/posix/sys/sem.c", "posix_sys_sem.o"),
+        ("runtime/bridge/posix/unistd.c", "posix_unistd.o"),
+        ("runtime/bridge/posix/wchar.c", "posix_wchar.o"),
     ];
 
     for header in [
@@ -159,6 +184,7 @@ fn main() {
             include_dir.join(header).display()
         );
     }
+    emit_header_dependencies(&posix_include_dir);
     for (source, object) in c_sources {
         let source = repository_dir.join(source);
         let object = output_dir.join(object);
@@ -181,6 +207,8 @@ fn main() {
             command.arg("-mno-red-zone");
         }
         let status = command
+            .arg("-I")
+            .arg(&posix_include_dir)
             .arg("-I")
             .arg(&include_dir)
             .arg("-c")

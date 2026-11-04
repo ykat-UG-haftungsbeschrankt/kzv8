@@ -1,6 +1,7 @@
 #include "os_platform.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -8,10 +9,18 @@
 #include <new>
 #include <utility>
 
+#if !defined(KZ_FREESTANDING)
+#include <pthread.h>
+#include <time.h>
+#endif
+
+#include "libplatform/libplatform.h"
+
 extern "C" {
 uint64_t kz_host_time_ns();
 int64_t kz_host_wall_time_ms();
 #if defined(KZ_FREESTANDING)
+void kz_host_wait_for_interrupt();
 void* kz_host_v8_random_mmap_addr();
 void* kz_host_v8_allocate_pages(void* hint, size_t length, size_t alignment,
 																int permissions);
@@ -23,6 +32,100 @@ int kz_host_v8_set_page_permissions(void* address, size_t length,
 #endif
 }
 
+#if defined(KZ_FREESTANDING)
+struct RuntimeWorkerMutex {
+	uintptr_t owner;
+};
+
+struct RuntimeWorkerCondition {
+	uintptr_t generation;
+};
+
+using RuntimeWorkerThread = uintptr_t;
+
+extern "C" {
+int kz_worker_mutex_init(void*, const void*) __asm__("pthread_mutex_init");
+int kz_worker_mutex_destroy(void*) __asm__("pthread_mutex_destroy");
+int kz_worker_mutex_lock(void*) __asm__("pthread_mutex_lock");
+int kz_worker_mutex_unlock(void*) __asm__("pthread_mutex_unlock");
+int kz_worker_condition_init(void*, const void*) __asm__("pthread_cond_init");
+int kz_worker_condition_destroy(void*) __asm__("pthread_cond_destroy");
+int kz_worker_condition_signal(void*) __asm__("pthread_cond_signal");
+int kz_worker_condition_broadcast(void*) __asm__("pthread_cond_broadcast");
+int kz_worker_thread_create(uintptr_t*, const void*, void* (*)(void*), void*)
+		__asm__("pthread_create");
+int kz_worker_thread_join(uintptr_t, void**) __asm__("pthread_join");
+}
+
+inline int runtime_worker_mutex_init(RuntimeWorkerMutex* mutex) {
+	return kz_worker_mutex_init(mutex, nullptr);
+}
+inline int runtime_worker_mutex_destroy(RuntimeWorkerMutex* mutex) {
+	return kz_worker_mutex_destroy(mutex);
+}
+inline int runtime_worker_mutex_lock(RuntimeWorkerMutex* mutex) {
+	return kz_worker_mutex_lock(mutex);
+}
+inline int runtime_worker_mutex_unlock(RuntimeWorkerMutex* mutex) {
+	return kz_worker_mutex_unlock(mutex);
+}
+inline int runtime_worker_condition_init(RuntimeWorkerCondition* condition) {
+	return kz_worker_condition_init(condition, nullptr);
+}
+inline int runtime_worker_condition_destroy(RuntimeWorkerCondition* condition) {
+	return kz_worker_condition_destroy(condition);
+}
+inline int runtime_worker_condition_signal(RuntimeWorkerCondition* condition) {
+	return kz_worker_condition_signal(condition);
+}
+inline int runtime_worker_condition_broadcast(RuntimeWorkerCondition* condition) {
+	return kz_worker_condition_broadcast(condition);
+}
+inline int runtime_worker_thread_create(RuntimeWorkerThread* thread,
+													 void* (*entry)(void*), void* context) {
+	return kz_worker_thread_create(thread, nullptr, entry, context);
+}
+inline int runtime_worker_thread_join(RuntimeWorkerThread thread) {
+	return kz_worker_thread_join(thread, nullptr);
+}
+#else
+using RuntimeWorkerMutex = pthread_mutex_t;
+using RuntimeWorkerCondition = pthread_cond_t;
+using RuntimeWorkerThread = pthread_t;
+
+inline int runtime_worker_mutex_init(RuntimeWorkerMutex* mutex) {
+	return pthread_mutex_init(mutex, nullptr);
+}
+inline int runtime_worker_mutex_destroy(RuntimeWorkerMutex* mutex) {
+	return pthread_mutex_destroy(mutex);
+}
+inline int runtime_worker_mutex_lock(RuntimeWorkerMutex* mutex) {
+	return pthread_mutex_lock(mutex);
+}
+inline int runtime_worker_mutex_unlock(RuntimeWorkerMutex* mutex) {
+	return pthread_mutex_unlock(mutex);
+}
+inline int runtime_worker_condition_init(RuntimeWorkerCondition* condition) {
+	return pthread_cond_init(condition, nullptr);
+}
+inline int runtime_worker_condition_destroy(RuntimeWorkerCondition* condition) {
+	return pthread_cond_destroy(condition);
+}
+inline int runtime_worker_condition_signal(RuntimeWorkerCondition* condition) {
+	return pthread_cond_signal(condition);
+}
+inline int runtime_worker_condition_broadcast(RuntimeWorkerCondition* condition) {
+	return pthread_cond_broadcast(condition);
+}
+inline int runtime_worker_thread_create(RuntimeWorkerThread* thread,
+													 void* (*entry)(void*), void* context) {
+	return pthread_create(thread, nullptr, entry, context);
+}
+inline int runtime_worker_thread_join(RuntimeWorkerThread thread) {
+	return pthread_join(thread, nullptr);
+}
+#endif
+
 namespace {
 
 constexpr size_t kTaskCapacity = 128;
@@ -32,6 +135,27 @@ constexpr double kNanosecondsPerSecond = 1'000'000'000.0;
 [[noreturn]] void task_queue_overflow() {
 	__builtin_trap();
 }
+
+class MutexLock {
+ public:
+	explicit MutexLock(RuntimeWorkerMutex& mutex) : mutex_(mutex) {
+		if (runtime_worker_mutex_lock(&mutex_) != 0) {
+			task_queue_overflow();
+		}
+	}
+
+	~MutexLock() {
+		if (runtime_worker_mutex_unlock(&mutex_) != 0) {
+			task_queue_overflow();
+		}
+	}
+
+	MutexLock(const MutexLock&) = delete;
+	MutexLock& operator=(const MutexLock&) = delete;
+
+ private:
+	RuntimeWorkerMutex& mutex_;
+};
 
 uint64_t deadline_from_delay(uint64_t now_ns, double delay_seconds) {
 	if (!(delay_seconds > 0.0)) {
@@ -84,7 +208,20 @@ class KernelPageAllocator final : public v8::PageAllocator {
 
 class CooperativeTaskRunner final : public v8::TaskRunner {
  public:
+	CooperativeTaskRunner() {
+		if (runtime_worker_mutex_init(&mutex_) != 0) {
+			task_queue_overflow();
+		}
+	}
+
+	~CooperativeTaskRunner() override {
+		if (runtime_worker_mutex_destroy(&mutex_) != 0) {
+			task_queue_overflow();
+		}
+	}
+
 	bool Enqueue(std::unique_ptr<v8::Task> task, uint64_t deadline_ns) {
+		MutexLock lock(mutex_);
 		for (PendingTask& pending : tasks_) {
 			if (pending.task) {
 				continue;
@@ -98,33 +235,39 @@ class CooperativeTaskRunner final : public v8::TaskRunner {
 	}
 
 	bool PumpOne() {
-		const uint64_t now_ns = kz_host_time_ns();
-		size_t selected = tasks_.size();
-		for (size_t index = 0; index < tasks_.size(); index++) {
-			const PendingTask& candidate = tasks_[index];
-			if (!candidate.task || candidate.deadline_ns > now_ns) {
-				continue;
+		std::unique_ptr<v8::Task> task;
+		{
+			MutexLock lock(mutex_);
+			const uint64_t now_ns = kz_host_time_ns();
+			size_t selected = tasks_.size();
+			for (size_t index = 0; index < tasks_.size(); index++) {
+				const PendingTask& candidate = tasks_[index];
+				if (!candidate.task || candidate.deadline_ns > now_ns) {
+					continue;
+				}
+				if (selected == tasks_.size() ||
+						candidate.deadline_ns < tasks_[selected].deadline_ns ||
+						(candidate.deadline_ns == tasks_[selected].deadline_ns &&
+						 candidate.sequence < tasks_[selected].sequence)) {
+					selected = index;
+				}
 			}
-			if (selected == tasks_.size() ||
-					candidate.deadline_ns < tasks_[selected].deadline_ns ||
-					(candidate.deadline_ns == tasks_[selected].deadline_ns &&
-					 candidate.sequence < tasks_[selected].sequence)) {
-				selected = index;
+
+			if (selected == tasks_.size()) {
+				return false;
 			}
+
+			task = std::move(tasks_[selected].task);
+			tasks_[selected].deadline_ns = kNoDeadline;
+			tasks_[selected].sequence = 0;
 		}
 
-		if (selected == tasks_.size()) {
-			return false;
-		}
-
-		std::unique_ptr<v8::Task> task = std::move(tasks_[selected].task);
-		tasks_[selected].deadline_ns = kNoDeadline;
-		tasks_[selected].sequence = 0;
 		task->Run();
 		return true;
 	}
 
 	uint64_t NextDeadlineNs() const {
+		MutexLock lock(mutex_);
 		uint64_t deadline_ns = kNoDeadline;
 		for (const PendingTask& task : tasks_) {
 			if (task.task && task.deadline_ns < deadline_ns) {
@@ -170,143 +313,206 @@ class CooperativeTaskRunner final : public v8::TaskRunner {
 		uint64_t sequence = 0;
 	};
 
+	mutable RuntimeWorkerMutex mutex_{};
 	std::array<PendingTask, kTaskCapacity> tasks_{};
 	uint64_t next_sequence_ = 0;
 };
 
-struct JobState {
-	explicit JobState(std::unique_ptr<v8::JobTask> job_task)
-			: task(std::move(job_task)) {}
-
-	std::unique_ptr<v8::JobTask> task;
-	bool valid = true;
-	bool cancelled = false;
-	bool running = false;
-	bool scheduled = false;
-	bool schedule_again = false;
-	bool joining = false;
-};
-
-bool job_is_active(const JobState& state) {
-	return state.valid && !state.cancelled && state.task &&
-				 state.task->GetMaxConcurrency(state.running ? 1 : 0) != 0;
-}
-
-class JobInvocation;
-void schedule_job(const std::shared_ptr<JobState>& state,
-									CooperativeTaskRunner* runner);
-void run_job(const std::shared_ptr<JobState>& state,
-						 CooperativeTaskRunner* runner);
-
-class CooperativeJobDelegate final : public v8::JobDelegate {
+class WorkerPool {
  public:
-	CooperativeJobDelegate(std::shared_ptr<JobState> state,
-												 CooperativeTaskRunner* runner)
-			: state_(std::move(state)), runner_(runner) {}
+	~WorkerPool() { Shutdown(); }
 
-	bool ShouldYield() override {
-		return state_->cancelled || !state_->task ||
-					 state_->task->GetMaxConcurrency(1) == 0;
-	}
-
-	void NotifyConcurrencyIncrease() override {
-		schedule_job(state_, runner_);
-	}
-
-	uint8_t GetTaskId() override { return 0; }
-	bool IsJoiningThread() const override { return state_->joining; }
-
- private:
-	std::shared_ptr<JobState> state_;
-	CooperativeTaskRunner* runner_;
-};
-
-class JobInvocation final : public v8::Task {
- public:
-	JobInvocation(std::shared_ptr<JobState> state,
-								CooperativeTaskRunner* runner)
-			: state_(std::move(state)), runner_(runner) {}
-
-	void Run() override { run_job(state_, runner_); }
-
- private:
-	std::shared_ptr<JobState> state_;
-	CooperativeTaskRunner* runner_;
-};
-
-void schedule_job(const std::shared_ptr<JobState>& state,
-									CooperativeTaskRunner* runner) {
-	if (!job_is_active(*state)) {
-		return;
-	}
-	if (state->running) {
-		state->schedule_again = true;
-		return;
-	}
-	if (state->scheduled) {
-		return;
-	}
-
-	state->scheduled = true;
-	runner->Enqueue(std::make_unique<JobInvocation>(state, runner),
-									kz_host_time_ns());
-}
-
-void run_job(const std::shared_ptr<JobState>& state,
-						 CooperativeTaskRunner* runner) {
-	state->scheduled = false;
-	if (!job_is_active(*state)) {
-		return;
-	}
-	if (state->running) {
-		state->schedule_again = true;
-		return;
-	}
-
-	state->running = true;
-	state->schedule_again = false;
-	CooperativeJobDelegate delegate(state, runner);
-	state->task->Run(&delegate);
-	state->running = false;
-
-	if (state->schedule_again || job_is_active(*state)) {
-		state->schedule_again = false;
-		schedule_job(state, runner);
-	}
-}
-
-class CooperativeJobHandle final : public v8::JobHandle {
- public:
-	CooperativeJobHandle(CooperativeTaskRunner* runner,
-											 std::unique_ptr<v8::JobTask> task)
-			: runner_(runner), state_(std::make_shared<JobState>(std::move(task))) {}
-
-	void NotifyConcurrencyIncrease() override { schedule_job(state_, runner_); }
-
-	void Join() override {
-		state_->joining = true;
-		state_->scheduled = false;
-		while (job_is_active(*state_)) {
-			run_job(state_, runner_);
+	bool Start() {
+		if (runtime_worker_mutex_init(&mutex_) != 0) {
+			return false;
 		}
-		state_->joining = false;
-		state_->valid = false;
-		state_->task.reset();
+		mutex_initialized_ = true;
+		if (runtime_worker_condition_init(&condition_) != 0) {
+			DestroySynchronization();
+			return false;
+		}
+		condition_initialized_ = true;
+		if (runtime_worker_thread_create(&worker_, WorkerEntry, this) != 0) {
+			DestroySynchronization();
+			return false;
+		}
+		worker_started_ = true;
+		worker_count_.store(1, std::memory_order_release);
+		return true;
 	}
 
-	void Cancel() override {
-		state_->cancelled = true;
-		state_->valid = false;
-		state_->task.reset();
+	size_t WorkerCount() const {
+		return worker_count_.load(std::memory_order_acquire);
 	}
 
-	void CancelAndDetach() override { Cancel(); }
-	bool IsActive() override { return job_is_active(*state_); }
-	bool IsValid() override { return state_->valid; }
+	bool Enqueue(std::unique_ptr<v8::Task>&& task, uint64_t deadline_ns) {
+		if (WorkerCount() == 0) {
+			return false;
+		}
+		MutexLock lock(mutex_);
+		if (stopping_) {
+			return false;
+		}
+		for (PendingTask& pending : tasks_) {
+			if (pending.task) {
+				continue;
+			}
+			pending.task = std::move(task);
+			pending.deadline_ns = deadline_ns;
+			pending.sequence = next_sequence_++;
+			if (runtime_worker_condition_signal(&condition_) != 0) {
+				task_queue_overflow();
+			}
+			return true;
+		}
+		task_queue_overflow();
+	}
+
+	void Shutdown() {
+		if (!mutex_initialized_) {
+			return;
+		}
+		if (worker_started_) {
+			if (runtime_worker_mutex_lock(&mutex_) != 0) {
+				task_queue_overflow();
+			}
+			stopping_ = true;
+			if (runtime_worker_condition_broadcast(&condition_) != 0 ||
+					runtime_worker_mutex_unlock(&mutex_) != 0) {
+				task_queue_overflow();
+			}
+			if (runtime_worker_thread_join(worker_) != 0) {
+				task_queue_overflow();
+			}
+			worker_started_ = false;
+			worker_count_.store(0, std::memory_order_release);
+			for (PendingTask& pending : tasks_) {
+				pending.task.reset();
+			}
+		}
+		DestroySynchronization();
+	}
 
  private:
-	CooperativeTaskRunner* runner_;
-	std::shared_ptr<JobState> state_;
+	struct PendingTask {
+		std::unique_ptr<v8::Task> task;
+		uint64_t deadline_ns = kNoDeadline;
+		uint64_t sequence = 0;
+	};
+
+	static void* WorkerEntry(void* context) {
+		static_cast<WorkerPool*>(context)->WorkerLoop();
+		return nullptr;
+	}
+
+	void WorkerLoop() {
+		for (;;) {
+			if (runtime_worker_mutex_lock(&mutex_) != 0) {
+				task_queue_overflow();
+			}
+			if (stopping_) {
+				if (runtime_worker_mutex_unlock(&mutex_) != 0) {
+					task_queue_overflow();
+				}
+				return;
+			}
+
+			const uint64_t now_ns = kz_host_time_ns();
+			size_t selected = tasks_.size();
+			for (size_t index = 0; index < tasks_.size(); index++) {
+				const PendingTask& candidate = tasks_[index];
+				if (!candidate.task || candidate.deadline_ns > now_ns) {
+					continue;
+				}
+				if (selected == tasks_.size() ||
+						candidate.deadline_ns < tasks_[selected].deadline_ns ||
+						(candidate.deadline_ns == tasks_[selected].deadline_ns &&
+						 candidate.sequence < tasks_[selected].sequence)) {
+					selected = index;
+				}
+			}
+
+			if (selected == tasks_.size()) {
+				const uint64_t deadline_ns = NextDeadlineNsLocked();
+#if defined(KZ_FREESTANDING)
+				if (runtime_worker_mutex_unlock(&mutex_) != 0) {
+					task_queue_overflow();
+				}
+				if (deadline_ns == kNoDeadline || kz_host_time_ns() < deadline_ns) {
+					kz_host_wait_for_interrupt();
+				}
+#else
+				if (deadline_ns == kNoDeadline) {
+					static_cast<void>(pthread_cond_wait(&condition_, &mutex_));
+				} else {
+					timespec wake_time{};
+					if (clock_gettime(CLOCK_REALTIME, &wake_time) == 0) {
+						const uint64_t remaining_ns =
+								deadline_ns > now_ns ? deadline_ns - now_ns : 0;
+						const uint64_t absolute_ns =
+								static_cast<uint64_t>(wake_time.tv_nsec) + remaining_ns;
+						wake_time.tv_sec +=
+								static_cast<time_t>(absolute_ns / 1'000'000'000);
+						wake_time.tv_nsec =
+								static_cast<long>(absolute_ns % 1'000'000'000);
+						static_cast<void>(pthread_cond_timedwait(
+								&condition_, &mutex_, &wake_time));
+					} else {
+						static_cast<void>(pthread_cond_wait(&condition_, &mutex_));
+					}
+				}
+				if (runtime_worker_mutex_unlock(&mutex_) != 0) {
+					task_queue_overflow();
+				}
+#endif
+				continue;
+			}
+
+			std::unique_ptr<v8::Task> task = std::move(tasks_[selected].task);
+			tasks_[selected].deadline_ns = kNoDeadline;
+			tasks_[selected].sequence = 0;
+			if (runtime_worker_mutex_unlock(&mutex_) != 0) {
+				task_queue_overflow();
+			}
+			task->Run();
+		}
+	}
+
+	uint64_t NextDeadlineNsLocked() const {
+		uint64_t deadline_ns = kNoDeadline;
+		for (const PendingTask& task : tasks_) {
+			if (task.task && task.deadline_ns < deadline_ns) {
+				deadline_ns = task.deadline_ns;
+			}
+		}
+		return deadline_ns;
+	}
+
+	void DestroySynchronization() {
+		if (condition_initialized_) {
+			if (runtime_worker_condition_destroy(&condition_) != 0) {
+				task_queue_overflow();
+			}
+			condition_initialized_ = false;
+		}
+		if (mutex_initialized_) {
+			if (runtime_worker_mutex_destroy(&mutex_) != 0) {
+				task_queue_overflow();
+			}
+			mutex_initialized_ = false;
+		}
+	}
+
+	RuntimeWorkerMutex mutex_{};
+	RuntimeWorkerCondition condition_{};
+	RuntimeWorkerThread worker_{};
+	std::array<PendingTask, kTaskCapacity> tasks_{};
+	std::atomic<size_t> worker_count_{0};
+	uint64_t next_sequence_ = 0;
+	bool mutex_initialized_ = false;
+	bool condition_initialized_ = false;
+	bool worker_started_ = false;
+	bool stopping_ = false;
 };
 
 class NoOpTracingController final : public v8::TracingController {};
@@ -316,7 +522,11 @@ class OsPlatform final : public v8::Platform {
 	OsPlatform(v8::PageAllocator* page_allocator, bool use_kernel_allocator)
 			: use_kernel_allocator_(use_kernel_allocator),
 				external_page_allocator_(page_allocator),
-				task_runner_(std::make_shared<CooperativeTaskRunner>()) {}
+				task_runner_(std::make_shared<CooperativeTaskRunner>()) {
+		static_cast<void>(worker_pool_.Start());
+	}
+
+	~OsPlatform() override { ShutdownWorkers(); }
 
 	v8::PageAllocator* GetPageAllocator() override {
 		if (external_page_allocator_ != nullptr) {
@@ -329,7 +539,9 @@ class OsPlatform final : public v8::Platform {
 		return nullptr;
 #endif
 	}
-	int NumberOfWorkerThreads() override { return 0; }
+	int NumberOfWorkerThreads() override {
+		return static_cast<int>(worker_pool_.WorkerCount());
+	}
 
 	std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner(
 			v8::Isolate*, v8::TaskPriority) override {
@@ -347,28 +559,33 @@ class OsPlatform final : public v8::Platform {
 	v8::TracingController* GetTracingController() override { return &tracing_; }
 
 	std::unique_ptr<v8::JobHandle> CreateJobImpl(
-			v8::TaskPriority, std::unique_ptr<v8::JobTask> task,
+			v8::TaskPriority priority, std::unique_ptr<v8::JobTask> task,
 			const v8::SourceLocation&) override {
-		return std::make_unique<CooperativeJobHandle>(task_runner_.get(),
-																									 std::move(task));
+		return v8::platform::NewDefaultJobHandle(
+				this, priority, std::move(task), worker_pool_.WorkerCount());
 	}
 
 	bool PumpOne() { return task_runner_->PumpOne(); }
 	uint64_t NextDeadlineNs() const { return task_runner_->NextDeadlineNs(); }
+	void ShutdownWorkers() { worker_pool_.Shutdown(); }
 
  protected:
 	void PostTaskOnWorkerThreadImpl(v8::TaskPriority,
 																	std::unique_ptr<v8::Task> task,
 																	const v8::SourceLocation&) override {
-		task_runner_->Enqueue(std::move(task), kz_host_time_ns());
+		if (!worker_pool_.Enqueue(std::move(task), kz_host_time_ns())) {
+			task_runner_->Enqueue(std::move(task), kz_host_time_ns());
+		}
 	}
 
 	void PostDelayedTaskOnWorkerThreadImpl(
 			v8::TaskPriority, std::unique_ptr<v8::Task> task,
 			double delay_in_seconds, const v8::SourceLocation&) override {
-		task_runner_->Enqueue(
-				std::move(task),
-				deadline_from_delay(kz_host_time_ns(), delay_in_seconds));
+		const uint64_t deadline_ns =
+				deadline_from_delay(kz_host_time_ns(), delay_in_seconds);
+		if (!worker_pool_.Enqueue(std::move(task), deadline_ns)) {
+			task_runner_->Enqueue(std::move(task), deadline_ns);
+		}
 	}
 
  private:
@@ -378,6 +595,7 @@ class OsPlatform final : public v8::Platform {
 #endif
 	v8::PageAllocator* external_page_allocator_;
 	std::shared_ptr<CooperativeTaskRunner> task_runner_;
+	WorkerPool worker_pool_;
 	NoOpTracingController tracing_;
 };
 
@@ -394,6 +612,12 @@ extern "C" v8::Platform* kz_os_platform_create_for_kernel() {
 
 extern "C" void kz_os_platform_destroy(v8::Platform* platform) {
 	delete static_cast<OsPlatform*>(platform);
+}
+
+extern "C" void kz_os_platform_shutdown_workers(v8::Platform* platform) {
+	if (platform != nullptr) {
+		static_cast<OsPlatform*>(platform)->ShutdownWorkers();
+	}
 }
 
 extern "C" int kz_os_platform_pump_one(v8::Platform* platform) {

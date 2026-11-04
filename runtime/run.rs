@@ -2,6 +2,8 @@
 mod runtime_ffi;
 #[path = "libc/mod.rs"]
 mod runtime_libc;
+#[path = "bridge/posix/mod.rs"]
+pub(crate) mod runtime_posix;
 #[path = "v8.rs"]
 mod runtime_v8;
 

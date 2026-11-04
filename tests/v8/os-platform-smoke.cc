@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cerrno>
+#include <atomic>
 #include <memory>
 #include <sys/mman.h>
 #include <time.h>
@@ -161,22 +162,39 @@ class IncrementTask final : public v8::Task {
   int* count_;
 };
 
+class WorkerIncrementTask final : public v8::Task {
+ public:
+  explicit WorkerIncrementTask(std::atomic<int>* count) : count_(count) {}
+  void Run() override { count_->fetch_add(1, std::memory_order_release); }
+
+ private:
+  std::atomic<int>* count_;
+};
+
 class CountingJob final : public v8::JobTask {
  public:
-  CountingJob(int* count, size_t work) : count_(count), remaining_(work) {}
+  CountingJob(std::atomic<int>* count, size_t work)
+      : count_(count), remaining_(work) {}
 
   void Run(v8::JobDelegate* delegate) override {
-    while (remaining_ != 0 && !delegate->ShouldYield()) {
-      ++*count_;
-      --remaining_;
+    while (!delegate->ShouldYield()) {
+      size_t remaining = remaining_.load(std::memory_order_relaxed);
+      while (remaining != 0 &&
+             !remaining_.compare_exchange_weak(remaining, remaining - 1,
+                                               std::memory_order_relaxed)) {
+      }
+      if (remaining == 0) return;
+      count_->fetch_add(1, std::memory_order_relaxed);
     }
   }
 
-  size_t GetMaxConcurrency(size_t) const override { return remaining_; }
+  size_t GetMaxConcurrency(size_t) const override {
+    return remaining_.load(std::memory_order_relaxed);
+  }
 
  private:
-  int* count_;
-  size_t remaining_;
+  std::atomic<int>* count_;
+  std::atomic<size_t> remaining_;
 };
 
 int fail(const char* message) {
@@ -188,7 +206,6 @@ int fail(const char* message) {
 
 int main() {
   std::fprintf(stderr, "phase: flags\n");
-  v8::V8::SetFlagsFromString("--single-threaded");
   HostPageAllocator host_page_allocator;
   v8::Platform* platform = kz_os_platform_create(&host_page_allocator);
   if (platform == nullptr) return fail("platform allocation");
@@ -199,6 +216,9 @@ int main() {
   v8::V8::InitializePlatform(platform);
   std::fprintf(stderr, "phase: initialize\n");
   if (!v8::V8::Initialize()) return fail("V8 initialization");
+  if (platform->NumberOfWorkerThreads() == 0) {
+    return fail("worker thread startup");
+  }
 
   std::fprintf(stderr, "phase: isolate\n");
   v8::ArrayBuffer::Allocator* allocator =
@@ -239,6 +259,19 @@ int main() {
   }
   std::fprintf(stderr, "phase: foreground\n");
 
+  std::atomic<int> worker_task_count{0};
+  platform->PostTaskOnWorkerThread(
+      v8::TaskPriority::kUserVisible,
+      std::make_unique<WorkerIncrementTask>(&worker_task_count));
+  const uint64_t worker_deadline = kz_host_time_ns() + 1'000'000'000;
+  while (worker_task_count.load(std::memory_order_acquire) == 0 &&
+         kz_host_time_ns() < worker_deadline) {
+  }
+  if (worker_task_count.load(std::memory_order_acquire) != 1) {
+    return fail("preemptive worker task execution");
+  }
+  std::fprintf(stderr, "phase: worker\n");
+
   runner->PostDelayedTask(std::make_unique<IncrementTask>(&task_count), 0.001);
   const uint64_t deadline = kz_os_platform_next_deadline_ns(platform);
   if (deadline == UINT64_MAX || kz_os_platform_pump_one(platform)) {
@@ -251,11 +284,11 @@ int main() {
   }
   std::fprintf(stderr, "phase: delayed\n");
 
-  int job_count = 0;
+  std::atomic<int> job_count{0};
   auto job = platform->PostJob(v8::TaskPriority::kUserVisible,
                                std::make_unique<CountingJob>(&job_count, 4));
   job->Join();
-  if (job_count != 4 || job->IsValid()) {
+  if (job_count.load(std::memory_order_relaxed) != 4 || job->IsValid()) {
     return fail("cooperative job execution");
   }
   std::fprintf(stderr, "phase: jobs\n");

@@ -51,6 +51,8 @@ static mut SMOKE_CONDITION: PthreadCondition = PthreadCondition { generation: 0 
 static SMOKE_READY: AtomicBool = AtomicBool::new(false);
 static SMOKE_FINISHED: AtomicUsize = AtomicUsize::new(0);
 static SMOKE_PREEMPTION_STAGE: AtomicUsize = AtomicUsize::new(0);
+static SMOKE_CAPACITY_GATE: AtomicBool = AtomicBool::new(false);
+static SMOKE_CAPACITY_FINISHED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
@@ -70,12 +72,14 @@ unsafe extern "C" {
     fn pthread_attr_init(attributes: *mut PthreadAttributes) -> i32;
     fn pthread_attr_destroy(attributes: *mut PthreadAttributes) -> i32;
     fn pthread_attr_setdetachstate(attributes: *mut PthreadAttributes, state: i32) -> i32;
+    fn pthread_attr_setstacksize(attributes: *mut PthreadAttributes, stack_size: usize) -> i32;
     fn pthread_create(
         thread: *mut usize,
         attributes: *const PthreadAttributes,
         start: Option<StartRoutine>,
         argument: *mut c_void,
     ) -> i32;
+    fn pthread_getattr_np(thread: usize, attributes: *mut PthreadAttributes) -> i32;
     fn pthread_join(thread: usize, result: *mut *mut c_void) -> i32;
     fn pthread_detach(thread: usize) -> i32;
     fn pthread_mutex_lock(mutex: *mut PthreadMutex) -> i32;
@@ -258,8 +262,19 @@ fn wait_for_preemption_stage(stage: usize) -> bool {
     false
 }
 
+unsafe extern "C" fn smoke_capacity_worker(argument: *mut c_void) -> *mut c_void {
+    while !SMOKE_CAPACITY_GATE.load(Ordering::Acquire) {
+        unsafe { pthread_yield() };
+    }
+    SMOKE_CAPACITY_FINISHED.fetch_add(1, Ordering::Release);
+    argument
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
+    const CUSTOM_STACK_SIZE: usize = 32 * 1024;
+    const CAPACITY_THREADS: usize = 8;
+
     let mut attributes = PthreadAttributes {
         stack_size: 0,
         detach_state: 0,
@@ -267,6 +282,7 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
     };
     if unsafe { pthread_attr_init(&mut attributes) } != 0
         || unsafe { pthread_attr_setdetachstate(&mut attributes, 0) } != 0
+        || unsafe { pthread_attr_setstacksize(&mut attributes, CUSTOM_STACK_SIZE) } != 0
     {
         return -1;
     }
@@ -284,6 +300,16 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
     {
         return -1;
     }
+    let mut preemption_attributes = PthreadAttributes {
+        stack_size: 0,
+        detach_state: 0,
+        stack_address: core::ptr::null_mut(),
+    };
+    if unsafe { pthread_getattr_np(preemption_thread, &mut preemption_attributes) } != 0
+        || preemption_attributes.stack_size != CUSTOM_STACK_SIZE
+    {
+        return -1;
+    }
     SMOKE_PREEMPTION_STAGE.store(2, Ordering::Release);
     if !wait_for_preemption_stage(3) {
         return -1;
@@ -292,6 +318,42 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
     if unsafe { pthread_join(preemption_thread, &mut preemption_result) } != 0
         || !preemption_result.is_null()
     {
+        return -1;
+    }
+
+    SMOKE_CAPACITY_GATE.store(false, Ordering::Release);
+    SMOKE_CAPACITY_FINISHED.store(0, Ordering::Release);
+    let mut capacity_threads = [0usize; CAPACITY_THREADS];
+    let mut created_threads = 0;
+    while created_threads < CAPACITY_THREADS {
+        let argument = (created_threads + 1) as *mut c_void;
+        let create_status = unsafe {
+            pthread_create(
+                &mut capacity_threads[created_threads],
+                &attributes,
+                Some(smoke_capacity_worker),
+                argument,
+            )
+        };
+        if create_status != 0 {
+            SMOKE_CAPACITY_GATE.store(true, Ordering::Release);
+            for thread in capacity_threads.iter().take(created_threads) {
+                unsafe { pthread_join(*thread, core::ptr::null_mut()) };
+            }
+            return -1;
+        }
+        created_threads += 1;
+    }
+    SMOKE_CAPACITY_GATE.store(true, Ordering::Release);
+    for (index, thread) in capacity_threads.iter().copied().enumerate() {
+        let mut result = core::ptr::null_mut();
+        if unsafe { pthread_join(thread, &mut result) } != 0
+            || result != (index + 1) as *mut c_void
+        {
+            return -1;
+        }
+    }
+    if SMOKE_CAPACITY_FINISHED.load(Ordering::Acquire) != CAPACITY_THREADS {
         return -1;
     }
 

@@ -1117,18 +1117,25 @@ bool dispatch_timer_event(v8::Isolate* isolate,
 bool pump_timer_callbacks(v8::Isolate* isolate,
 						  v8::Local<v8::Context> context,
 						  TimerBindings* timers,
-						  void* event_loop) {
+						  void* event_loop,
+						  v8::Platform* platform) {
 	const uint64_t started = kz_host_time_ns();
 	for (size_t iteration = 0;
 		 iteration < 1'000'000 && timers_pending(*timers); ++iteration) {
+		const bool platform_task_ran = kz_os_platform_pump_one(platform);
 		KzRawEvent event{};
 		const int has_event = kz_host_event_loop_poll(event_loop, &event);
 		if (has_event) {
 			if (!dispatch_timer_event(isolate, context, timers, event)) return false;
-		} else {
+		} else if (!platform_task_ran) {
 			uint64_t deadline_ns = 0;
 			if (!kz_host_event_loop_next_deadline(event_loop, &deadline_ns)) {
 				return false;
+			}
+			const uint64_t platform_deadline_ns =
+					kz_os_platform_next_deadline_ns(platform);
+			if (platform_deadline_ns < deadline_ns) {
+				deadline_ns = platform_deadline_ns;
 			}
 			if (kz_host_time_ns() < deadline_ns) {
 				kz_host_wait_for_interrupt();
@@ -1278,7 +1285,7 @@ extern "C" int kz_v8_run_smoke(void* event_loop, void* block_device,
 					const bool promise_done =
 							global_boolean(isolate, context, "__kzPromiseDone");
 					const bool timer_done = pump_timer_callbacks(
-							isolate, context, &timers, event_loop);
+							isolate, context, &timers, event_loop, platform);
 					const bool block_done =
 							global_boolean(isolate, context, "__kzBlockDone");
 					const bool tcp_done =
@@ -1326,6 +1333,7 @@ extern "C" int kz_v8_run_smoke(void* event_loop, void* block_device,
 	report("kz: V8 disposing runtime\n", sizeof("kz: V8 disposing runtime\n") - 1);
 	v8::V8::Dispose();
 	report("kz: V8 runtime disposed\n", sizeof("kz: V8 runtime disposed\n") - 1);
+	kz_os_platform_shutdown_workers(platform);
 	v8::V8::DisposePlatform();
 	report("kz: V8 platform disposed\n", sizeof("kz: V8 platform disposed\n") - 1);
 	kz_os_platform_destroy(platform);

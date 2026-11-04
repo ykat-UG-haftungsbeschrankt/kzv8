@@ -1,12 +1,11 @@
 use core::ffi::c_void;
-use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
 
-use super::errno::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOSYS, EPERM, ESRCH};
+use super::errno::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOMEM, ENOSYS, EPERM, ESRCH};
 use crate::kernel::arch::traits::{InterruptArchitecture as _, ThreadArchitecture as _};
 use crate::kernel::scheduler::thread::{
-    PthreadCondition, PthreadMutex, StartRoutine, Thread, ThreadAttributes, ThreadManager,
-    ThreadStack, ThreadState, TlsKey,
+    JoinError, PthreadCondition, PthreadMutex, StartRoutine, ThreadAttributes, ThreadCreateError,
+    ThreadManager, ThreadStack, ThreadState,
 };
 
 const JOINABLE: i32 = 0;
@@ -55,87 +54,34 @@ pub unsafe extern "C" fn pthread_key_create(
     if key.is_null() {
         return EINVAL;
     }
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let manager = ThreadManager::get_instance();
-    let keys = unsafe { addr_of_mut!((*manager).tls_keys).cast::<TlsKey>() };
-    for index in 0..ThreadManager::MAX_TLS_KEYS {
-        let slot = unsafe { &mut *keys.add(index) };
-        if !slot.active {
-            *slot = TlsKey {
-                active: true,
-                destructor,
-            };
-            unsafe { key.write((index + 1) as u32) };
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return 0;
-        }
-    }
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-    EAGAIN
+    let Some(created_key) = ThreadManager::create_tls_key(destructor) else {
+        return EAGAIN;
+    };
+    unsafe { key.write(created_key) };
+    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_key_delete(key: u32) -> i32 {
-    if key == 0 || key as usize > ThreadManager::MAX_TLS_KEYS {
-        return EINVAL;
+    if ThreadManager::delete_tls_key(key) {
+        0
+    } else {
+        EINVAL
     }
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let manager = ThreadManager::get_instance();
-    let index = key as usize - 1;
-    let keys = unsafe { addr_of_mut!((*manager).tls_keys).cast::<TlsKey>() };
-    let slot = unsafe { &mut *keys.add(index) };
-    if !slot.active {
-        crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-        return EINVAL;
-    }
-    *slot = TlsKey::EMPTY;
-    let threads = unsafe { addr_of_mut!((*manager).threads).cast::<Thread>() };
-    for thread_index in 0..ThreadManager::MAX_THREADS {
-        unsafe { (*threads.add(thread_index)).tls[index] = core::ptr::null_mut() };
-    }
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_getspecific(key: u32) -> *mut c_void {
-    if key == 0 || key as usize > ThreadManager::MAX_TLS_KEYS {
-        return core::ptr::null_mut();
-    }
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let manager = ThreadManager::get_instance();
-    let index = key as usize - 1;
-    let value = unsafe {
-        let keys = addr_of_mut!((*manager).tls_keys).cast::<TlsKey>();
-        let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-        if !(*manager).initialized || !(*keys.add(index)).active {
-            core::ptr::null_mut()
-        } else {
-            (*threads.add((*manager).current_slot)).tls[index]
-        }
-    };
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-    value
+    ThreadManager::get_specific(key).unwrap_or(core::ptr::null_mut())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_setspecific(key: u32, value: *const c_void) -> i32 {
-    if key == 0 || key as usize > ThreadManager::MAX_TLS_KEYS {
-        return EINVAL;
+    if ThreadManager::set_specific(key, value) {
+        0
+    } else {
+        EINVAL
     }
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let manager = ThreadManager::get_instance();
-    let index = key as usize - 1;
-    let keys = unsafe { addr_of_mut!((*manager).tls_keys).cast::<TlsKey>() };
-    let key_active = unsafe { (*manager).initialized && (*keys.add(index)).active };
-    if !key_active {
-        crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-        return EINVAL;
-    }
-    let threads = unsafe { addr_of_mut!((*manager).threads).cast::<Thread>() };
-    unsafe { (*threads.add((*manager).current_slot)).tls[index] = value.cast_mut() };
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-    0
 }
 
 #[no_mangle]
@@ -178,16 +124,13 @@ pub unsafe extern "C" fn pthread_getschedparam(
     if policy.is_null() || parameters.is_null() {
         return EINVAL;
     }
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    if unsafe { ThreadManager::find_thread(thread_id) }.is_none() {
-        crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+    if !ThreadManager::contains_thread(thread_id) {
         return ESRCH;
     }
     unsafe {
         policy.write(0);
         parameters.cast::<i32>().write(0);
     }
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
     0
 }
 
@@ -251,7 +194,7 @@ pub unsafe extern "C" fn pthread_attr_getdetachstate(
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_attr_setstacksize(attributes: *mut c_void, stack_size: usize) -> i32 {
-    if attributes.is_null() || stack_size != ThreadStack::STACK_SIZE {
+    if attributes.is_null() || stack_size < ThreadStack::MIN_SIZE {
         return EINVAL;
     }
     unsafe { (*attributes.cast::<ThreadAttributes>()).stack_size = stack_size };
@@ -269,7 +212,7 @@ pub unsafe extern "C" fn pthread_attr_getstacksize(
     let stored_size = unsafe { (*attributes.cast::<ThreadAttributes>()).stack_size };
     unsafe {
         stack_size.write(if stored_size == 0 {
-            ThreadStack::STACK_SIZE
+            ThreadStack::DEFAULT_SIZE
         } else {
             stored_size
         })
@@ -290,7 +233,7 @@ pub unsafe extern "C" fn pthread_attr_getstack(
     unsafe {
         stack_address.write(attributes.stack_address);
         stack_size.write(if attributes.stack_size == 0 {
-            ThreadStack::STACK_SIZE
+            ThreadStack::DEFAULT_SIZE
         } else {
             attributes.stack_size
         });
@@ -303,34 +246,26 @@ pub unsafe extern "C" fn pthread_getattr_np(thread_id: usize, attributes: *mut c
     if attributes.is_null() {
         return EINVAL;
     }
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let manager = ThreadManager::get_instance();
-    let Some(slot) = (unsafe { ThreadManager::find_thread(thread_id) }) else {
-        crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+    let Some((stack_address, stack_size, detached)) =
+        ThreadManager::thread_attributes(thread_id)
+    else {
         return ESRCH;
     };
-    let threads = unsafe { addr_of_mut!((*manager).threads).cast::<Thread>() };
-    let thread = unsafe { *threads.add(slot) };
-    let (stack_address, stack_size) = ThreadStack::bounds(slot);
     unsafe {
         attributes
             .cast::<ThreadAttributes>()
             .write(ThreadAttributes {
                 stack_size,
-                detach_state: if thread.detached { DETACHED } else { JOINABLE },
+                detach_state: if detached { DETACHED } else { JOINABLE },
                 stack_address,
             });
     }
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_kill(thread_id: usize, signal_number: i32) -> i32 {
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let exists = unsafe { ThreadManager::find_thread(thread_id) }.is_some();
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-    if !exists {
+    if !ThreadManager::contains_thread(thread_id) {
         return ESRCH;
     }
     if signal_number == 0 {
@@ -357,162 +292,74 @@ pub unsafe extern "C" fn pthread_create(
         let attributes = unsafe { &*attributes.cast::<ThreadAttributes>() };
         (attributes.stack_size, attributes.detach_state)
     };
-    if !matches!(stack_size, 0 | ThreadStack::STACK_SIZE) || !matches!(detach_state, JOINABLE | DETACHED) {
+    let stack_size = if stack_size == 0 {
+        ThreadStack::DEFAULT_SIZE
+    } else {
+        stack_size
+    };
+    if stack_size < ThreadStack::MIN_SIZE || !matches!(detach_state, JOINABLE | DETACHED) {
         return EINVAL;
     }
 
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let manager = ThreadManager::get_instance();
-    let id = unsafe {
-        if !(*manager).initialized || (*manager).next_thread_id == usize::MAX {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return EAGAIN;
-        }
-        let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-        let mut available = None;
-        for index in 1..ThreadManager::MAX_THREADS {
-            let thread = threads.add(index);
-            if (*thread).state == ThreadState::Unused
-                || ((*thread).state == ThreadState::Exited && (*thread).detached)
-            {
-                available = Some(index);
-                break;
-            }
-        }
-        let Some(slot) = available else {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return EAGAIN;
-        };
-
-        let id = (*manager).next_thread_id;
-        (*manager).next_thread_id += 1;
-        let stack_pointer = crate::kernel::arch::ThreadArchitecture::initialize_thread_stack(
-            ThreadStack::slice_at(slot),
-            ThreadManager::thread_trampoline,
-        );
-        threads.add(slot).write(Thread {
-            id,
-            stack_pointer,
-            state: ThreadState::Ready,
-            start_routine,
-            argument,
-            detached: detach_state == DETACHED,
-            ..Thread::EMPTY
-        });
-        id
+    let start_routine = start_routine.unwrap();
+    let id = match ThreadManager::create_thread(
+        stack_size,
+        start_routine,
+        argument,
+        detach_state == DETACHED,
+    ) {
+        Ok(id) => id,
+        Err(ThreadCreateError::Again) => return EAGAIN,
+        Err(ThreadCreateError::NoMemory) => return ENOMEM,
+        Err(ThreadCreateError::InvalidStackSize) => return EINVAL,
     };
     unsafe { thread_id.write(id) };
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_join(thread_id: usize, result: *mut *mut c_void) -> i32 {
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let manager = ThreadManager::get_instance();
-    let (current_id, target_slot, target_state) = unsafe {
-        if !(*manager).initialized {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return ESRCH;
+    match ThreadManager::begin_join(thread_id) {
+        Ok(Some(value)) => {
+            if !result.is_null() {
+                unsafe { result.write(value as *mut c_void) };
+            }
+            return 0;
         }
-        let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-        let current_id = (*threads.add((*manager).current_slot)).id;
-        if thread_id == current_id {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return EDEADLK;
-        }
-        let Some(target_slot) = (unsafe { ThreadManager::find_thread(thread_id) }) else {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return ESRCH;
-        };
-        let target = threads.add(target_slot);
-        if (*target).detached || (*target).joiner != 0 {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return EINVAL;
-        }
-        (current_id, target_slot, (*target).state)
-    };
-
-    if target_state == ThreadState::Exited {
-        let value = unsafe {
-            let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-            let target = threads.add(target_slot);
-            let value = (*target).result;
-            target.write(Thread::EMPTY);
-            value
-        };
-        crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-        if !result.is_null() {
-            unsafe { result.write(value) };
-        }
-        return 0;
+        Ok(None) => {}
+        Err(error) => return join_error_status(error),
     }
-
-    unsafe {
-        let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-        (*threads.add(target_slot)).joiner = current_id;
-    }
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
 
     if !ThreadManager::switch_current(ThreadState::Blocked) {
-        let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-        unsafe {
-            let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-            if let Some(target_slot) = ThreadManager::find_thread(thread_id) {
-                (*threads.add(target_slot)).joiner = 0;
-            }
-        }
-        crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+        ThreadManager::cancel_join(thread_id);
         return EDEADLK;
     }
 
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let value = unsafe {
-        let Some(target_slot) = ThreadManager::find_thread(thread_id) else {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return ESRCH;
-        };
-        let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-        let target = threads.add(target_slot);
-        if (*target).state != ThreadState::Exited {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return EDEADLK;
-        }
-        let value = (*target).result;
-        target.write(Thread::EMPTY);
-        value
+    let value = match ThreadManager::finish_join(thread_id) {
+        Ok(value) => value,
+        Err(error) => return join_error_status(error),
     };
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
     if !result.is_null() {
-        unsafe { result.write(value) };
+        unsafe { result.write(value as *mut c_void) };
     }
     0
 }
 
+fn join_error_status(error: JoinError) -> i32 {
+    match error {
+        JoinError::NoSuchThread => ESRCH,
+        JoinError::Deadlock | JoinError::NotExited => EDEADLK,
+        JoinError::Invalid => EINVAL,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pthread_detach(thread_id: usize) -> i32 {
-    let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-    let manager = ThreadManager::get_instance();
-    let result = unsafe {
-        let Some(slot) = ThreadManager::find_thread(thread_id) else {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return ESRCH;
-        };
-        let threads = addr_of_mut!((*manager).threads).cast::<Thread>();
-        let thread = threads.add(slot);
-        if (*thread).detached || (*thread).joiner != 0 {
-            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-            return EINVAL;
-        }
-        if (*thread).state == ThreadState::Exited {
-            thread.write(Thread::EMPTY);
-        } else {
-            (*thread).detached = true;
-        }
-        0
-    };
-    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-    result
+    match ThreadManager::detach(thread_id) {
+        Ok(()) => 0,
+        Err(JoinError::NoSuchThread) => ESRCH,
+        Err(_) => EINVAL,
+    }
 }
 
 pub(crate) fn yield_current() -> i32 {
