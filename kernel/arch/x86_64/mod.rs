@@ -164,7 +164,7 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
         0
     }
 
-    fn map_boot_memory_region(_start: usize, _length: usize) -> bool {
+    fn map_boot_memory_region(_region_start: usize, _length: usize) -> bool {
         true
     }
 

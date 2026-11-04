@@ -32,7 +32,7 @@ ap_trampoline_start:
     movl %cr0, %eax
     orl $1, %eax
     movl %eax, %cr0
-    ljmpl $0x08, $(AP_TRAMPOLINE_BASE + ap_trampoline_pm32 - ap_trampoline_start)
+    ljmpl $0x18, $(AP_TRAMPOLINE_BASE + ap_trampoline_pm32 - ap_trampoline_start)
 
 .code32
 ap_trampoline_pm32:
@@ -129,6 +129,7 @@ ap_trampoline_gdt:
     .quad 0
     .quad 0x00af9a000000ffff
     .quad 0x00cf92000000ffff
+    .quad 0x00cf9a000000ffff
 ap_trampoline_gdt_end:
 ap_trampoline_gdt_pointer:
     .word ap_trampoline_gdt_end-ap_trampoline_gdt-1

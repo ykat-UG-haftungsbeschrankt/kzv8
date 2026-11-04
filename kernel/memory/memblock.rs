@@ -465,17 +465,17 @@ fn allocate_from_region(
         if candidate_start < region_start {
             return None;
         }
-        let candidate_end = candidate_start.checked_add(allocation_length)?;
+        let candidate_allocation_end = candidate_start.checked_add(allocation_length)?;
         let mut overlap_start = None;
 
         let mut current = *allocations;
         while current != 0 {
             // SAFETY: allocation headers are in mapped RAM and are never freed or overwritten.
             let allocation = unsafe { (current as *const EarlyAllocation).read() };
-            let Some(allocation_end) = allocation.start.checked_add(allocation.length) else {
+            let Some(existing_end) = allocation.start.checked_add(allocation.length) else {
                 return None;
             };
-            if candidate_start < allocation_end && allocation.start < candidate_end {
+            if candidate_start < existing_end && allocation.start < candidate_allocation_end {
                 overlap_start = Some(allocation.start);
                 break;
             }
@@ -485,7 +485,7 @@ fn allocate_from_region(
             let Some(reserved_end) = range.start.checked_add(range.length) else {
                 continue;
             };
-            if candidate_start < reserved_end && range.start < candidate_end {
+            if candidate_start < reserved_end && range.start < candidate_allocation_end {
                 overlap_start = Some(overlap_start.map_or(range.start, |start: usize| {
                     start.min(range.start)
                 }));

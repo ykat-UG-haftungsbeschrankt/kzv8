@@ -106,6 +106,7 @@ impl Kernel {
                 0,
             )
             .ok();
+        if let Some(now_ns) = arch::TimerArchitecture::now_ns() {
             if let (Some(stack), Some(source)) = (network_stack.as_mut(), network_registration) {
                 stack.poll(now_ns, &mut events, source);
             }

@@ -137,12 +137,20 @@ pub(crate) fn start_secondary_cpus() -> usize {
 }
 
 pub(crate) fn initialize_secondary_cpu(cpu_id: usize) -> bool {
+    trace(b'B');
     if cpu_id == 0 || CPU_SLOTS.lock().get(cpu_id).is_none() {
         return false;
     }
     unsafe { crate::kernel::arch::interrupts::initialize_secondary() };
-    crate::kernel::arch::interrupts::initialize_local_controller()
-        && crate::kernel::arch::ThreadArchitecture::initialize_thread_local_storage(cpu_id)
+    trace(b'D');
+    if !crate::kernel::arch::interrupts::initialize_local_controller() {
+        return false;
+    }
+    trace(b'E');
+    let tls_initialized =
+        crate::kernel::arch::ThreadArchitecture::initialize_thread_local_storage(cpu_id);
+    trace(b'F');
+    tls_initialized
 }
 
 fn set_cpu_online(cpu_id: usize) -> bool {

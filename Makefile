@@ -77,14 +77,22 @@ v8-platform-test:
 	mkdir -p build/v8
 	cd runtime/v8/src && buildtools/linux64/gn gen out.gn/x64.platform --args="$$(cat ../args-platform.gn)"
 	ninja -C "$(V8_PLATFORM_OUT)" v8_monolith
-	"$(V8_CXX)" -std=c++20 -nostdlib++ -fPIC -pthread -fuse-ld=lld -Wall -Wextra -Wno-unused-parameter \
+	"$(V8_CXX)" -std=c++20 -nostdlib++ -nostdinc++ -fPIC -pthread -fuse-ld=lld -Wall -Wextra -Wno-unused-parameter \
 		-I runtime/bridge/include \
 		-I runtime/v8/src/include \
 		-I "$(V8_PLATFORM_OUT)/gen/include" \
 		-I "$(V8_PLATFORM_OUT)/gen" \
 		-I runtime/v8/src/buildtools/third_party/libc++ \
+		-isystem runtime/v8/src/third_party/libc++/src/include \
+		-isystem runtime/v8/src/third_party/libc++abi/src/include \
 		-I runtime/v8/src/third_party/abseil-cpp \
 		-DV8_HAVE_TARGET_OS -DV8_TARGET_OS_LINUX -DV8_TARGET_ARCH_X64 \
+		-DV8_ENABLE_SANDBOX -DV8_COMPRESS_POINTERS \
+		-DV8_COMPRESS_POINTERS_IN_SHARED_CAGE \
+		-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE \
+		-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS \
+		-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS \
+		-D_LIBCPP_INSTRUMENTED_WITH_ASAN=0 \
 		runtime/bridge/src/platform.cc tests/v8/os-platform-smoke.cc \
 		-Wl,--start-group \
 		"$(V8_PLATFORM_OUT)/obj/libv8_monolith.a" \
