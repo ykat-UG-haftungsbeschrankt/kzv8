@@ -324,19 +324,30 @@ impl PhysicalAllocator {
             if pages > region.frame_count {
                 continue;
             }
-            let last_start = region.bitmap_start + region.frame_count - pages;
-            for start in region.bitmap_start..=last_start {
-                let address = (region.start_frame + start - region.bitmap_start)
-                    .checked_mul(Self::PAGE_SIZE)?;
-                if address & (alignment - 1) != 0
-                    || (start..start + pages).any(|frame| state.is_allocated(frame))
-                {
+            let region_end = region.bitmap_start + region.frame_count;
+            let mut free_run = 0usize;
+            for end in region.bitmap_start..region_end {
+                if state.is_allocated(end) {
+                    free_run = 0;
                     continue;
                 }
-                for frame in start..start + pages {
+
+                free_run += 1;
+                if free_run < pages {
+                    continue;
+                }
+                let end_exclusive = end + 1;
+                let start = end_exclusive - pages;
+                let frame_address = region.start_frame + start - region.bitmap_start;
+                let address = frame_address.checked_mul(Self::PAGE_SIZE)?;
+                if address & (alignment - 1) != 0 {
+                    continue;
+                }
+
+                for frame in start..end_exclusive {
                     state.set_allocated(frame, true);
                 }
-                state.next_hint = (start + pages) % count;
+                state.next_hint = end_exclusive % count;
                 return Some(address);
             }
         }

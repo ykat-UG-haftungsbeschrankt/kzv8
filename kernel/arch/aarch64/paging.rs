@@ -34,6 +34,15 @@ pub(crate) unsafe fn initialize() {
     write_volatile(table, DEVICE_WINDOW);
     write_volatile(table.add(1), RAM_WINDOW);
 
+    unsafe { initialize_translation_table(table as u64) };
+}
+
+pub(crate) unsafe fn initialize_secondary() {
+    let table = addr_of_mut!(TTBR0_TABLE.0).cast::<u64>();
+    unsafe { initialize_translation_table(table as u64) };
+}
+
+unsafe fn initialize_translation_table(table: u64) {
     core::arch::asm!(
         "dsb sy",
         "msr mair_el1, {mair}",
@@ -51,7 +60,7 @@ pub(crate) unsafe fn initialize() {
         "isb",
         mair = in(reg) MAIR_EL1_VALUE,
         tcr = in(reg) TCR_EL1_VALUE,
-        ttbr = in(reg) table as u64,
+        ttbr = in(reg) table,
         sctlr = lateout(reg) _,
         options(nostack, preserves_flags),
     );

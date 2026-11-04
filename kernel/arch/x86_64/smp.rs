@@ -22,6 +22,10 @@ const CPU_STACK_SIZE: usize = 16 * 1024;
 const INIT_IPI: u32 = 0x0000_c500;
 const STARTUP_IPI_BASE: u32 = 0x0000_0600;
 const EXECUTOR_IPI_VECTOR: u8 = 0x41;
+const INIT_TO_SIPI_NS: u64 = 10_000_000;
+const SIPI_INTERVAL_NS: u64 = 200_000;
+const IPI_DELIVERY_TIMEOUT_NS: u64 = 10_000_000;
+const CPU_ONLINE_TIMEOUT_NS: u64 = 1_000_000_000;
 
 #[repr(C, align(16))]
 struct CpuStack([u8; CPU_STACK_SIZE]);
@@ -32,13 +36,21 @@ struct CpuSlot {
     online: AtomicBool,
 }
 
+#[repr(C)]
+struct ApBootRecord {
+    apic_id: u32,
+    slot: u32,
+    stack: u64,
+}
+
 static CPU_SLOTS: IrqSpinLock<Vec<CpuSlot>> = IrqSpinLock::new(Vec::new());
+static AP_BOOT_RECORDS: IrqSpinLock<Vec<ApBootRecord>> = IrqSpinLock::new(Vec::new());
 
 unsafe extern "C" {
     static ap_trampoline_start: u8;
     static ap_trampoline_end: u8;
-    static ap_trampoline_stack: u64;
-    static ap_trampoline_slot: u32;
+    static ap_trampoline_records_ptr: u64;
+    static ap_trampoline_records_len: u32;
 }
 
 pub(crate) fn start_secondary_cpus() -> usize {
@@ -68,6 +80,21 @@ pub(crate) fn start_secondary_cpus() -> usize {
     if cpu_count < 2 {
         return cpu_count;
     }
+    let Some(tsc_frequency) = super::timer::frequency_hz() else {
+        return online_cpu_count();
+    };
+    let Some(init_delay_ticks) = duration_ticks(tsc_frequency, INIT_TO_SIPI_NS) else {
+        return online_cpu_count();
+    };
+    let Some(sipi_interval_ticks) = duration_ticks(tsc_frequency, SIPI_INTERVAL_NS) else {
+        return online_cpu_count();
+    };
+    let Some(ipi_timeout_ticks) = duration_ticks(tsc_frequency, IPI_DELIVERY_TIMEOUT_NS) else {
+        return online_cpu_count();
+    };
+    let Some(online_timeout_ticks) = duration_ticks(tsc_frequency, CPU_ONLINE_TIMEOUT_NS) else {
+        return online_cpu_count();
+    };
 
     let start = addr_of!(ap_trampoline_start);
     let length = addr_of!(ap_trampoline_end) as usize - start as usize;
@@ -77,62 +104,119 @@ pub(crate) fn start_secondary_cpus() -> usize {
     // SAFETY: the low-memory trampoline page is identity mapped for real-mode AP startup.
     unsafe { copy_nonoverlapping(start, AP_TRAMPOLINE_ADDRESS as *mut u8, length) };
 
-    let stack_offset = addr_of!(ap_trampoline_stack) as usize - start as usize;
-    let slot_offset = addr_of!(ap_trampoline_slot) as usize - start as usize;
+    let boot_records = {
+        let cpus = CPU_SLOTS.lock();
+        cpus.iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(slot, cpu)| {
+                let slot = u32::try_from(slot).ok()?;
+                let stack = cpu.stack.as_ref()?;
+                Some(ApBootRecord {
+                    apic_id: cpu.apic_id,
+                    slot,
+                    stack: (stack.0.as_ptr() as usize + CPU_STACK_SIZE) as u64,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let Ok(records_len) = u32::try_from(boot_records.len()) else {
+        return online_cpu_count();
+    };
+    let records_ptr = {
+        let mut records = AP_BOOT_RECORDS.lock();
+        *records = boot_records;
+        records.as_ptr() as u64
+    };
+    let records_ptr_offset = addr_of!(ap_trampoline_records_ptr) as usize - start as usize;
+    let records_len_offset = addr_of!(ap_trampoline_records_len) as usize - start as usize;
+    unsafe {
+        write_volatile(
+            (AP_TRAMPOLINE_ADDRESS + records_ptr_offset) as *mut u64,
+            records_ptr,
+        );
+        write_volatile(
+            (AP_TRAMPOLINE_ADDRESS + records_len_offset) as *mut u32,
+            records_len,
+        );
+    }
+    fence(Ordering::SeqCst);
+
+    let mut initialized = Vec::with_capacity(cpu_count);
+    initialized.resize(cpu_count, false);
+    let mut init_delivery_ok = true;
     for slot in 1..cpu_count {
-        let Some(trampoline_slot) = u32::try_from(slot).ok() else {
+        let Some(apic_id) = CPU_SLOTS.lock().get(slot).map(|cpu| cpu.apic_id) else {
             continue;
         };
-        let (apic_id, stack) = {
-            let cpus = CPU_SLOTS.lock();
-            let Some(cpu) = cpus.get(slot) else {
-                continue;
-            };
-            let Some(stack) = cpu.stack.as_ref() else {
-                continue;
-            };
-            (cpu.apic_id, stack.0.as_ptr() as usize + CPU_STACK_SIZE)
-        };
-        unsafe {
-            write_volatile((AP_TRAMPOLINE_ADDRESS + stack_offset) as *mut u64, stack as u64);
-            write_volatile(
-                (AP_TRAMPOLINE_ADDRESS + slot_offset) as *mut u32,
-                trampoline_slot,
-            );
-        }
-        fence(Ordering::SeqCst);
-
         trace(b'd');
         if !crate::kernel::arch::interrupts::send_ipi(apic_id, INIT_IPI) {
             continue;
         }
-        wait_for_ipi_delivery();
-        delay(10_000_000);
-        trace(b'e');
+        if !wait_for_ipi_delivery(ipi_timeout_ticks) {
+            init_delivery_ok = false;
+            break;
+        }
+        initialized[slot] = true;
+    }
+    if !init_delivery_ok || !initialized.iter().any(|initialized| *initialized) {
+        return online_cpu_count();
+    }
+    wait_for_duration(init_delay_ticks);
+    trace(b'e');
+
+    let mut started = Vec::with_capacity(cpu_count);
+    started.resize(cpu_count, false);
+    let mut delivery_ok = true;
+    for slot in 1..cpu_count {
+        if !initialized[slot] {
+            continue;
+        }
+        let Some(apic_id) = CPU_SLOTS.lock().get(slot).map(|cpu| cpu.apic_id) else {
+            continue;
+        };
         if !crate::kernel::arch::interrupts::send_ipi(
             apic_id,
             STARTUP_IPI_BASE | (AP_TRAMPOLINE_ADDRESS as u32 >> 12),
         ) {
             continue;
         }
-        wait_for_ipi_delivery();
-        delay(200_000);
+        started[slot] = true;
+        if !wait_for_ipi_delivery(ipi_timeout_ticks) {
+            delivery_ok = false;
+            break;
+        }
+    }
+    if delivery_ok && started.iter().any(|started| *started) {
+        wait_for_duration(sipi_interval_ticks);
         trace(b'f');
-        let _ = crate::kernel::arch::interrupts::send_ipi(
-            apic_id,
-            STARTUP_IPI_BASE | (AP_TRAMPOLINE_ADDRESS as u32 >> 12),
-        );
-        wait_for_ipi_delivery();
-        trace(b'g');
-
-        for _ in 0..20_000_000 {
-            if cpu_is_online(slot) {
+        for slot in 1..cpu_count {
+            if !started[slot] {
+                continue;
+            }
+            let Some(apic_id) = CPU_SLOTS.lock().get(slot).map(|cpu| cpu.apic_id) else {
+                continue;
+            };
+            if !crate::kernel::arch::interrupts::send_ipi(
+                apic_id,
+                STARTUP_IPI_BASE | (AP_TRAMPOLINE_ADDRESS as u32 >> 12),
+            ) {
+                continue;
+            }
+            if !wait_for_ipi_delivery(ipi_timeout_ticks) {
                 break;
             }
-            core::hint::spin_loop();
         }
-        trace(b'h');
+        trace(b'g');
     }
+
+    let start = super::timer::ticks();
+    while super::timer::ticks().wrapping_sub(start) < online_timeout_ticks
+        && !all_started_cpus_online(&started)
+    {
+        core::hint::spin_loop();
+    }
+    trace(b'h');
     online_cpu_count()
 }
 
@@ -162,11 +246,14 @@ fn set_cpu_online(cpu_id: usize) -> bool {
     true
 }
 
-fn cpu_is_online(cpu_id: usize) -> bool {
-    CPU_SLOTS
-        .lock()
-        .get(cpu_id)
-        .is_some_and(|cpu| cpu.online.load(Ordering::Acquire))
+fn all_started_cpus_online(started: &[bool]) -> bool {
+    let cpus = CPU_SLOTS.lock();
+    started.iter().enumerate().all(|(slot, started)| {
+        !*started
+            || cpus
+                .get(slot)
+                .is_some_and(|cpu| cpu.online.load(Ordering::Acquire))
+    })
 }
 
 fn online_cpu_count() -> usize {
@@ -232,17 +319,25 @@ fn detected_cpu_count() -> usize {
     count.max(1)
 }
 
-fn wait_for_ipi_delivery() {
-    for _ in 0..1_000_000 {
-        if !crate::kernel::arch::interrupts::ipi_pending() {
-            return;
-        }
+fn duration_ticks(frequency_hz: u64, duration_ns: u64) -> Option<u64> {
+    let ticks = (u128::from(frequency_hz) * u128::from(duration_ns)).div_ceil(1_000_000_000);
+    u64::try_from(ticks.max(1)).ok()
+}
+
+fn wait_for_duration(duration_ticks: u64) {
+    let start = super::timer::ticks();
+    while super::timer::ticks().wrapping_sub(start) < duration_ticks {
         core::hint::spin_loop();
     }
 }
 
-fn delay(iterations: usize) {
-    for _ in 0..iterations {
+fn wait_for_ipi_delivery(timeout_ticks: u64) -> bool {
+    let start = super::timer::ticks();
+    while crate::kernel::arch::interrupts::ipi_pending() {
+        if super::timer::ticks().wrapping_sub(start) >= timeout_ticks {
+            return false;
+        }
         core::hint::spin_loop();
     }
+    true
 }

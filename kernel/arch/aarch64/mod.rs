@@ -10,6 +10,7 @@ mod entry;
 pub(crate) mod interrupts;
 mod paging;
 mod ram_map;
+pub(crate) mod smp;
 mod threads;
 pub(crate) mod timer;
 mod virtio;

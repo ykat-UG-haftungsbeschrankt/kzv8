@@ -117,5 +117,5 @@ pub(crate) fn start_secondary_cpus() -> usize {
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn start_secondary_cpus() -> usize {
-    1
+    arch::smp::start_secondary_cpus()
 }

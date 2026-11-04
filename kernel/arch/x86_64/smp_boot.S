@@ -10,8 +10,8 @@
 .set AP_TRAMPOLINE_BASE, 0x8000
 .global ap_trampoline_start
 .global ap_trampoline_end
-.global ap_trampoline_stack
-.global ap_trampoline_slot
+.global ap_trampoline_records_ptr
+.global ap_trampoline_records_len
 .extern pml4
 .extern kz_secondary_main
 
@@ -106,10 +106,43 @@ ap_trampoline_long_mode:
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %ss
-    movabsq $(AP_TRAMPOLINE_BASE + (ap_trampoline_stack - ap_trampoline_start)), %rax
-    movq (%rax), %rsp
-    movabsq $(AP_TRAMPOLINE_BASE + (ap_trampoline_slot - ap_trampoline_start)), %rax
-    movl (%rax), %edi
+    movl $0, %eax
+    cpuid
+    cmpl $0x0b, %eax
+    jb .Lap_trampoline_legacy_apic_id
+    movl $0x0b, %eax
+    xorl %ecx, %ecx
+    cpuid
+    testl %ebx, %ebx
+    jz .Lap_trampoline_legacy_apic_id
+    movl %edx, %r8d
+    jmp .Lap_trampoline_find_cpu
+.Lap_trampoline_legacy_apic_id:
+    movl $1, %eax
+    cpuid
+    shrl $24, %ebx
+    movl %ebx, %r8d
+.Lap_trampoline_find_cpu:
+    movabsq $(AP_TRAMPOLINE_BASE + (ap_trampoline_records_ptr - ap_trampoline_start)), %rax
+    movq (%rax), %rsi
+    movabsq $(AP_TRAMPOLINE_BASE + (ap_trampoline_records_len - ap_trampoline_start)), %rax
+    movl (%rax), %ecx
+    testl %ecx, %ecx
+    jz .Lap_trampoline_no_record
+.Lap_trampoline_record_loop:
+    cmpl %r8d, (%rsi)
+    je .Lap_trampoline_record_found
+    addq $16, %rsi
+    decl %ecx
+    jnz .Lap_trampoline_record_loop
+.Lap_trampoline_no_record:
+    cli
+.Lap_trampoline_halt:
+    hlt
+    jmp .Lap_trampoline_halt
+.Lap_trampoline_record_found:
+    movl 4(%rsi), %edi
+    movq 8(%rsi), %rsp
     pushq %rax
     popq %rax
     movb $'5', %al
@@ -135,10 +168,11 @@ ap_trampoline_gdt_pointer:
     .word ap_trampoline_gdt_end-ap_trampoline_gdt-1
     .long AP_TRAMPOLINE_BASE + (ap_trampoline_gdt - ap_trampoline_start)
 .balign 8
-ap_trampoline_stack:
+ap_trampoline_records_ptr:
     .quad 0
-ap_trampoline_slot:
+ap_trampoline_records_len:
     .long 0
+.balign 8
 ap_trampoline_end:
 
 .section .note.GNU-stack,"",@progbits
