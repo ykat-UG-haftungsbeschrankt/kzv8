@@ -12,7 +12,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
+use crate::kernel::driver::virtio::queue::{wait_used, Descriptor, DmaQueue};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
@@ -377,37 +377,37 @@ impl VirtioFs {
         DmaArena::sync_for_device();
         self.transport.notify(Self::REQUEST_QUEUE);
 
-        for _ in 0..Self::COMMAND_SPIN_LIMIT {
-            if let Some(used) = self.request_queue.lock().poll_used() {
-                if used.id != u32::from(head) || used.length < Self::FUSE_OUT_HEADER_SIZE as u32 {
-                    return Err(Error::Proto);
-                }
-                let response_offset = Self::MAX_REQUEST_SIZE;
-                let response_length = Self::read_u32(bytes, response_offset)? as usize;
-                let error = Self::read_i32(bytes, response_offset + 4)?;
-                let response_unique = Self::read_u64(bytes, response_offset + 8)?;
-                if response_unique != unique
-                    || response_length < Self::FUSE_OUT_HEADER_SIZE
-                    || response_length > used.length as usize
-                {
-                    return Err(Error::Proto);
-                }
-                if error != 0 {
-                    return Err(Self::map_fuse_error(error));
-                }
-                let body_length = response_length - Self::FUSE_OUT_HEADER_SIZE;
-                if body_length > response.len() {
-                    return Err(Error::MsgSize);
-                }
-                response[..body_length].copy_from_slice(
-                    &bytes[response_offset + Self::FUSE_OUT_HEADER_SIZE
-                        ..response_offset + response_length],
-                );
-                return Ok(body_length);
-            }
-            core::hint::spin_loop();
+        let Some(used) = wait_used(
+            || self.request_queue.lock().poll_used(),
+            Self::COMMAND_SPIN_LIMIT,
+        ) else {
+            return Err(Error::Io);
+        };
+        if used.id != u32::from(head) || used.length < Self::FUSE_OUT_HEADER_SIZE as u32 {
+            return Err(Error::Proto);
         }
-        Err(Error::Io)
+        let response_offset = Self::MAX_REQUEST_SIZE;
+        let response_length = Self::read_u32(bytes, response_offset)? as usize;
+        let error = Self::read_i32(bytes, response_offset + 4)?;
+        let response_unique = Self::read_u64(bytes, response_offset + 8)?;
+        if response_unique != unique
+            || response_length < Self::FUSE_OUT_HEADER_SIZE
+            || response_length > used.length as usize
+        {
+            return Err(Error::Proto);
+        }
+        if error != 0 {
+            return Err(Self::map_fuse_error(error));
+        }
+        let body_length = response_length - Self::FUSE_OUT_HEADER_SIZE;
+        if body_length > response.len() {
+            return Err(Error::MsgSize);
+        }
+        response[..body_length].copy_from_slice(
+            &bytes[response_offset + Self::FUSE_OUT_HEADER_SIZE
+                ..response_offset + response_length],
+        );
+        Ok(body_length)
     }
 
     fn map_fuse_error(error: i32) -> Error {

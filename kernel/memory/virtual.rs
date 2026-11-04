@@ -34,6 +34,27 @@ impl VmArea {
     };
 }
 
+#[derive(Clone, Copy)]
+struct PageRange {
+    start_page: usize,
+    end_page: usize,
+}
+
+impl PageRange {
+    fn page_count(self) -> usize {
+        self.end_page - self.start_page
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PageRangeError {
+    InvalidRange,
+    LengthOverflow,
+    OffsetUnderflow,
+    RangeOverflow,
+    OutOfBounds,
+}
+
 pub(crate) struct VirtualAreas {
     page_state: [AtomicU8; VirtualAreas::MAX_VM_PAGES],
     mmu_ready: AtomicBool,
@@ -75,6 +96,64 @@ impl VirtualAreas {
         length
             .checked_add(Self::PAGE_SIZE - 1)
             .map(|value| value & !(Self::PAGE_SIZE - 1))
+    }
+
+    fn checked_page_range(
+        address: usize,
+        length: usize,
+    ) -> Result<PageRange, PageRangeError> {
+        if length == 0 {
+            return Err(PageRangeError::InvalidRange);
+        }
+        let page_count = Self::rounded_page_count(length).ok_or(PageRangeError::LengthOverflow)?;
+        let start_page = Self::page_start(address)?;
+        Self::checked_page_range_from_start(start_page, page_count)
+    }
+
+    fn rounded_page_count(length: usize) -> Option<usize> {
+        Self::rounded_length(length).map(|length| length / Self::PAGE_SIZE)
+    }
+
+    fn page_start(address: usize) -> Result<usize, PageRangeError> {
+        if address < Self::VM_BASE || address % Self::PAGE_SIZE != 0 {
+            return Err(PageRangeError::InvalidRange);
+        }
+        let offset = address
+            .checked_sub(Self::VM_BASE)
+            .ok_or(PageRangeError::OffsetUnderflow)?;
+        Ok(offset / Self::PAGE_SIZE)
+    }
+
+    fn checked_page_range_from_start(
+        start_page: usize,
+        page_count: usize,
+    ) -> Result<PageRange, PageRangeError> {
+        let end_page = start_page
+            .checked_add(page_count)
+            .ok_or(PageRangeError::RangeOverflow)?;
+        if end_page > Self::MAX_VM_PAGES {
+            return Err(PageRangeError::OutOfBounds);
+        }
+        Ok(PageRange {
+            start_page,
+            end_page,
+        })
+    }
+
+    fn exact_area_slot(&self, range: PageRange) -> Option<usize> {
+        self.areas.iter().position(|area| {
+            area.active
+                && area.start_page == range.start_page
+                && area.page_count == range.page_count()
+        })
+    }
+
+    fn containing_area_slot(&self, range: PageRange) -> Option<usize> {
+        self.areas.iter().position(|area| {
+            area.active
+                && range.start_page >= area.start_page
+                && range.end_page <= area.start_page.saturating_add(area.page_count)
+        })
     }
 
     fn align_up(value: usize, alignment: usize) -> Option<usize> {
@@ -160,76 +239,40 @@ impl VirtualAreas {
     }
 
     fn release(&mut self, address: usize, length: usize) -> bool {
-        if address < Self::VM_BASE || address % Self::PAGE_SIZE != 0 || length == 0 {
-            return false;
-        }
-        let Some(length) = Self::rounded_length(length) else {
+        let Ok(range) = Self::checked_page_range(address, length) else {
             return false;
         };
-        let Some(offset) = address.checked_sub(Self::VM_BASE) else {
+        let Some(area_slot) = self.exact_area_slot(range) else {
             return false;
         };
-        let start_page = offset / Self::PAGE_SIZE;
-        let page_count = length / Self::PAGE_SIZE;
-        let Some(end_page) = start_page.checked_add(page_count) else {
-            return false;
-        };
-        if end_page > Self::MAX_VM_PAGES {
-            return false;
-        }
-
-        let Some(area_slot) = self.areas.iter().position(|area| {
-            area.active && area.start_page == start_page && area.page_count == page_count
-        }) else {
-            return false;
-        };
-        if (start_page..end_page)
+        if (range.start_page..range.end_page)
             .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             return false;
         }
 
-        let released = self.release_pages(start_page, end_page);
+        let released = self.release_pages(range.start_page, range.end_page);
         self.areas[area_slot] = VmArea::EMPTY;
         released
     }
 
     fn release_range(&mut self, address: usize, length: usize) -> bool {
-        if address < Self::VM_BASE || address % Self::PAGE_SIZE != 0 || length == 0 {
-            return false;
-        }
-        let Some(length) = Self::rounded_length(length) else {
+        let Ok(range) = Self::checked_page_range(address, length) else {
             return false;
         };
-        let Some(offset) = address.checked_sub(Self::VM_BASE) else {
-            return false;
-        };
-        let start_page = offset / Self::PAGE_SIZE;
-        let page_count = length / Self::PAGE_SIZE;
-        let Some(end_page) = start_page.checked_add(page_count) else {
-            return false;
-        };
-        if end_page > Self::MAX_VM_PAGES {
-            return false;
-        }
-
-        let Some(area_slot) = self.areas.iter().position(|area| {
-            area.active
-                && start_page >= area.start_page
-                && end_page <= area.start_page.saturating_add(area.page_count)
-        }) else {
+        let Some(area_slot) = self.containing_area_slot(range) else {
             return false;
         };
         let area = self.areas[area_slot];
-        if (start_page..end_page)
+        if (range.start_page..range.end_page)
             .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             return false;
         }
 
         let area_end = area.start_page + area.page_count;
-        let prefix_page_count = start_page - area.start_page;
-        let suffix_page_count = area_end - end_page;
+        let prefix_page_count = range.start_page - area.start_page;
+        let suffix_page_count = area_end - range.end_page;
         let split_slot = if prefix_page_count != 0 && suffix_page_count != 0 {
             let Some(slot) = self.areas.iter().position(|area| !area.active) else {
                 return false;
@@ -239,12 +282,12 @@ impl VirtualAreas {
             None
         };
 
-        let released = self.release_pages(start_page, end_page);
+        let released = self.release_pages(range.start_page, range.end_page);
         match (prefix_page_count, suffix_page_count) {
             (0, 0) => self.areas[area_slot] = VmArea::EMPTY,
             (0, suffix_page_count) => {
                 self.areas[area_slot] = VmArea {
-                    start_page: end_page,
+                    start_page: range.end_page,
                     page_count: suffix_page_count,
                     active: true,
                 }
@@ -263,7 +306,7 @@ impl VirtualAreas {
                     active: true,
                 };
                 self.areas[split_slot.unwrap()] = VmArea {
-                    start_page: end_page,
+                    start_page: range.end_page,
                     page_count: suffix_page_count,
                     active: true,
                 };
@@ -277,38 +320,32 @@ impl VirtualAreas {
     }
 
     fn decommit(&self, address: usize, length: usize) -> bool {
-        if address < Self::VM_BASE || address % Self::PAGE_SIZE != 0 || length == 0 {
-            Self::decommit_debug(b'a');
-            return false;
-        }
-        let Some(length) = Self::rounded_length(length) else {
-            Self::decommit_debug(b'b');
-            return false;
+        let range = match Self::checked_page_range(address, length) {
+            Ok(range) => range,
+            Err(PageRangeError::InvalidRange) => {
+                Self::decommit_debug(b'a');
+                return false;
+            }
+            Err(PageRangeError::LengthOverflow) => {
+                Self::decommit_debug(b'b');
+                return false;
+            }
+            Err(PageRangeError::OffsetUnderflow) => {
+                Self::decommit_debug(b'c');
+                return false;
+            }
+            Err(PageRangeError::RangeOverflow) => return false,
+            Err(PageRangeError::OutOfBounds) => {
+                Self::decommit_debug(b'd');
+                return false;
+            }
         };
-        let Some(offset) = address.checked_sub(Self::VM_BASE) else {
-            Self::decommit_debug(b'c');
-            return false;
-        };
-        let start_page = offset / Self::PAGE_SIZE;
-        let page_count = length / Self::PAGE_SIZE;
-        let Some(end_page) = start_page.checked_add(page_count) else {
-            return false;
-        };
-        if end_page > Self::MAX_VM_PAGES {
-            Self::decommit_debug(b'd');
-            return false;
-        }
 
-        let range_reserved = self.areas.iter().any(|area| {
-            area.active
-                && start_page >= area.start_page
-                && end_page <= area.start_page.saturating_add(area.page_count)
-        });
-        if !range_reserved {
+        if self.containing_area_slot(range).is_none() {
             Self::decommit_debug(b'e');
             return false;
         }
-        if (start_page..end_page)
+        if (range.start_page..range.end_page)
             .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             Self::decommit_debug(b'f');
@@ -316,7 +353,7 @@ impl VirtualAreas {
         }
 
         let mut decommitted = true;
-        for page in start_page..end_page {
+        for page in range.start_page..range.end_page {
             let virtual_address = Self::VM_BASE + page * Self::PAGE_SIZE;
             if let Some(physical_address) = MemoryArchitecture::unmap_page(virtual_address) {
                 if !PhysicalAllocator::deallocate_contiguous(physical_address, Self::PAGE_SIZE) {
@@ -333,41 +370,33 @@ impl VirtualAreas {
     }
 
     fn release_suffix(&mut self, address: usize, length: usize, new_length: usize) -> bool {
-        if address < Self::VM_BASE || address % Self::PAGE_SIZE != 0 || length == 0 || new_length > length {
+        if length == 0 || new_length > length {
             return false;
         }
-        let Some(length) = Self::rounded_length(length) else {
+        let Some(old_page_count) = Self::rounded_page_count(length) else {
             return false;
         };
-        let Some(new_length) = Self::rounded_length(new_length) else {
+        let Some(new_page_count) = Self::rounded_page_count(new_length) else {
             return false;
         };
-        if new_length > length {
+        if new_page_count > old_page_count {
             return false;
         }
-        if new_length == length {
+        let Ok(start_page) = Self::page_start(address) else {
+            return false;
+        };
+        if new_page_count == old_page_count {
             return true;
         }
 
-        let Some(offset) = address.checked_sub(Self::VM_BASE) else {
+        let Ok(range) = Self::checked_page_range_from_start(start_page, old_page_count) else {
             return false;
         };
-        let start_page = offset / Self::PAGE_SIZE;
-        let old_page_count = length / Self::PAGE_SIZE;
-        let new_page_count = new_length / Self::PAGE_SIZE;
         let Some(release_start) = start_page.checked_add(new_page_count) else {
             return false;
         };
-        let Some(release_end) = start_page.checked_add(old_page_count) else {
-            return false;
-        };
-        if release_end > Self::MAX_VM_PAGES {
-            return false;
-        }
-
-        let Some(slot) = self.areas.iter().position(|area| {
-            area.active && area.start_page == start_page && area.page_count == old_page_count
-        }) else {
+        let release_end = range.end_page;
+        let Some(slot) = self.exact_area_slot(range) else {
             return false;
         };
         if (release_start..release_end)
@@ -386,40 +415,17 @@ impl VirtualAreas {
     }
 
     fn set_permissions(&self, address: usize, length: usize, permissions: i32) -> bool {
-        if address < Self::VM_BASE
-            || address % Self::PAGE_SIZE != 0
-            || length == 0
-            || !(0..=4).contains(&permissions)
-        {
+        if !(0..=4).contains(&permissions) {
             return false;
         }
-        let Some(length) = Self::rounded_length(length) else {
+        let Ok(range) = Self::checked_page_range(address, length) else {
             return false;
         };
-        let Some(start_page) = address
-            .checked_sub(Self::VM_BASE)
-            .map(|offset| offset / Self::PAGE_SIZE)
-        else {
-            return false;
-        };
-        let page_count = length / Self::PAGE_SIZE;
-        let Some(end_page) = start_page.checked_add(page_count) else {
-            return false;
-        };
-        if end_page > Self::MAX_VM_PAGES {
+        if self.containing_area_slot(range).is_none() {
             return false;
         }
 
-        let range_reserved = self.areas.iter().any(|area| {
-            area.active
-                && start_page >= area.start_page
-                && end_page <= area.start_page.saturating_add(area.page_count)
-        });
-        if !range_reserved {
-            return false;
-        }
-
-        for page in start_page..end_page {
+        for page in range.start_page..range.end_page {
             let state = self.page_state[page].load(Ordering::Acquire);
             if state & Self::VM_RESERVED == 0 {
                 return false;

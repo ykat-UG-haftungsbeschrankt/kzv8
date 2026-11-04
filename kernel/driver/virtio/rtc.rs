@@ -5,7 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
+use crate::kernel::driver::virtio::queue::{wait_used, Descriptor, DmaQueue};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
@@ -150,26 +150,22 @@ impl VirtioRtc {
         DmaArena::sync_for_device();
         self.transport.notify(0);
 
-        for _ in 0..Self::REQUEST_SPIN_LIMIT {
-            if let Some(used) = self.request_queue.poll_used() {
-                if used.id != u32::from(head) || used.length < response.len() as u32 {
-                    return Err(Error::Proto);
-                }
-                let response_bytes =
-                    &buffer[Self::RESPONSE_OFFSET..Self::RESPONSE_OFFSET + response.len()];
-                match response_bytes[0] {
-                    Self::RESP_OK => {}
-                    Self::RESP_NOT_SUPPORTED => return Err(Error::OpNotSupp),
-                    Self::RESP_NO_DEVICE => return Err(Error::NoDev),
-                    Self::RESP_INVALID => return Err(Error::Inval),
-                    _ => return Err(Error::Io),
-                }
-                response.copy_from_slice(response_bytes);
-                return Ok(());
-            }
-            core::hint::spin_loop();
+        let used = wait_used(|| self.request_queue.poll_used(), Self::REQUEST_SPIN_LIMIT)
+            .ok_or(Error::Io)?;
+        if used.id != u32::from(head) || used.length < response.len() as u32 {
+            return Err(Error::Proto);
         }
-        Err(Error::Io)
+        let response_bytes =
+            &buffer[Self::RESPONSE_OFFSET..Self::RESPONSE_OFFSET + response.len()];
+        match response_bytes[0] {
+            Self::RESP_OK => {}
+            Self::RESP_NOT_SUPPORTED => return Err(Error::OpNotSupp),
+            Self::RESP_NO_DEVICE => return Err(Error::NoDev),
+            Self::RESP_INVALID => return Err(Error::Inval),
+            _ => return Err(Error::Io),
+        }
+        response.copy_from_slice(response_bytes);
+        Ok(())
     }
 
     fn write_message_type(buffer: &mut [u8], message_type: u16) {

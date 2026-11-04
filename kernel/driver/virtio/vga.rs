@@ -5,7 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
+use crate::kernel::driver::virtio::queue::{wait_used, Descriptor, DmaQueue};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
@@ -252,20 +252,16 @@ impl VirtioGpu {
         DmaArena::sync_for_device();
         self.transport.notify(0);
 
-        for _ in 0..Self::COMMAND_SPIN_LIMIT {
-            if let Some(used) = self.control_queue.poll_used() {
-                if used.id != u32::from(head) || used.length < Self::GPU_HEADER_SIZE as u32 {
-                    return Err(Error::Proto);
-                }
-                let response_type = Self::read_u32(buffer, Self::CONTROL_RESPONSE_OFFSET)?;
-                if response_type != expected_response {
-                    return Err(Error::OpNotSupp);
-                }
-                return Ok(used.length as usize);
-            }
-            core::hint::spin_loop();
+        let used = wait_used(|| self.control_queue.poll_used(), Self::COMMAND_SPIN_LIMIT)
+            .ok_or(Error::Io)?;
+        if used.id != u32::from(head) || used.length < Self::GPU_HEADER_SIZE as u32 {
+            return Err(Error::Proto);
         }
-        Err(Error::Io)
+        let response_type = Self::read_u32(buffer, Self::CONTROL_RESPONSE_OFFSET)?;
+        if response_type != expected_response {
+            return Err(Error::OpNotSupp);
+        }
+        Ok(used.length as usize)
     }
 
     fn write_header(buffer: &mut [u8], command: u32) {

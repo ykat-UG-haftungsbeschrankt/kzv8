@@ -192,19 +192,22 @@ impl<const N: usize> VirtQueue<N> {
         Some(element)
     }
 
-    pub(crate) fn wait_used(&mut self, expected: u16, spins: usize) -> Option<UsedElement> {
-        for _ in 0..spins {
-            if let Some(element) = self.poll_used() {
-                return (element.id == u32::from(expected)).then_some(element);
-            }
-            core::hint::spin_loop();
-        }
-        None
-    }
-
     pub(crate) const fn is_in_flight(&self) -> bool {
         self.in_flight
     }
+}
+
+pub(crate) fn wait_used(
+    mut poll: impl FnMut() -> Option<UsedElement>,
+    spins: usize,
+) -> Option<UsedElement> {
+    for _ in 0..spins {
+        if let Some(element) = poll() {
+            return Some(element);
+        }
+        core::hint::spin_loop();
+    }
+    None
 }
 
 pub(crate) struct DmaQueue<const N: usize> {
