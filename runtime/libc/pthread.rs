@@ -10,9 +10,10 @@ use core::sync::atomic::Ordering;
 
 use super::errno::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOMEM, ENOSYS, EPERM, ESRCH};
 use crate::kernel::arch::traits::{InterruptArchitecture as _, ThreadArchitecture as _};
+use crate::kernel::error::Error;
 use crate::kernel::scheduler::thread::{
-    JoinError, PthreadCondition, PthreadMutex, StartRoutine, ThreadAttributes, ThreadCreateError,
-    ThreadManager, ThreadStack, ThreadState,
+    PthreadCondition, PthreadMutex, StartRoutine, ThreadAttributes, ThreadManager, ThreadStack,
+    ThreadState,
 };
 
 const JOINABLE: i32 = 0;
@@ -316,9 +317,10 @@ pub unsafe extern "C" fn pthread_create(
         detach_state == DETACHED,
     ) {
         Ok(id) => id,
-        Err(ThreadCreateError::Again) => return EAGAIN,
-        Err(ThreadCreateError::NoMemory) => return ENOMEM,
-        Err(ThreadCreateError::InvalidStackSize) => return EINVAL,
+        Err(Error::Again) => return EAGAIN,
+        Err(Error::NoMem) => return ENOMEM,
+        Err(Error::Inval) => return EINVAL,
+        Err(_) => return EINVAL,
     };
     unsafe { thread_id.write(id) };
     0
@@ -352,11 +354,12 @@ pub unsafe extern "C" fn pthread_join(thread_id: usize, result: *mut *mut c_void
     0
 }
 
-fn join_error_status(error: JoinError) -> i32 {
+fn join_error_status(error: Error) -> i32 {
     match error {
-        JoinError::NoSuchThread => ESRCH,
-        JoinError::Deadlock | JoinError::NotExited => EDEADLK,
-        JoinError::Invalid => EINVAL,
+        Error::Srch => ESRCH,
+        Error::Deadlk => EDEADLK,
+        Error::Inval => EINVAL,
+        _ => EINVAL,
     }
 }
 
@@ -364,7 +367,7 @@ fn join_error_status(error: JoinError) -> i32 {
 pub unsafe extern "C" fn pthread_detach(thread_id: usize) -> i32 {
     match ThreadManager::detach_by_id(thread_id) {
         Ok(()) => 0,
-        Err(JoinError::NoSuchThread) => ESRCH,
+        Err(Error::Srch) => ESRCH,
         Err(_) => EINVAL,
     }
 }

@@ -5,6 +5,12 @@
  * free of charge, without warranty of any kind.
  */
 
+/*
+ * FnvHasher folds input bytes into a 64-bit hash state:
+ *
+ * state -- xor byte --> multiply --> state
+ */
+
 use core::hash::Hasher;
 
 pub(crate) struct FnvHasher(u64);

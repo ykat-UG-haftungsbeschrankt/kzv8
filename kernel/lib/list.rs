@@ -5,6 +5,16 @@
  * free of charge, without warranty of any kind.
  */
 
+/*
+ * Circular doubly linked list:
+ *
+ *       +-----------------------------+
+ *       v                             |
+ *     [head] <--> [node] <--> [tail] --+
+ *       ^                             |
+ *       +-----------------------------+
+ */
+
 use alloc::boxed::Box;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};

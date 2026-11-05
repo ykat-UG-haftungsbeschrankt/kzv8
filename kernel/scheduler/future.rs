@@ -18,7 +18,7 @@ use crate::kernel::arch::traits::{CpuArchitecture as _, InterruptArchitecture as
 use crate::kernel::error::Error;
 use crate::kernel::lib::list::{LinkedList, ListNode};
 
-use super::super::sync::IrqSpinLock;
+use super::sync::IrqSpinLock;
 
 type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 

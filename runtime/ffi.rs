@@ -11,9 +11,8 @@ use core::slice;
 use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::block::device::BlockDevice;
 use crate::kernel::block::request::Request;
-use crate::kernel::event::completion::Completion;
 use crate::kernel::event::r#loop::{
-    EventFlags, EventLoop, EventSourceId, EventSourceToken, RawEvent,
+    Completion, EventFlags, EventLoop, EventSourceId, EventSourceToken, RawEvent,
 };
 use crate::kernel::event::timers::TimerId;
 use crate::kernel::net::stack::NetStack;

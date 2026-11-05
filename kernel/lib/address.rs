@@ -5,6 +5,13 @@
  * free of charge, without warranty of any kind.
  */
 
+/*
+ * Translate between offsets and physical addresses within one bounded range:
+ *
+ * offset ---------> base + offset
+ * address - base -> offset
+ */
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PhysAddr(usize);

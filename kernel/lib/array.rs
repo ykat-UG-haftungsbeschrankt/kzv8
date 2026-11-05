@@ -5,6 +5,15 @@
  * free of charge, without warranty of any kind.
  */
 
+/*
+ * Fixed-capacity array: len marks the live prefix; the rest is spare.
+ *
+ *       +-----+--------------------------------------+
+ *       | len | entries[0 .. CAPACITY)               |
+ *       +-----+--------------------------------------+
+ *              <---- live ---><------ spare -------->
+ */
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Array<T: Copy, const CAPACITY: usize> {
@@ -22,7 +31,7 @@ impl<T: Copy, const CAPACITY: usize> Array<T, CAPACITY> {
     }
 
     pub(crate) const fn len(&self) -> usize {
-        self.len as usize
+    self.len as usize
     }
 
     pub(crate) const fn capacity(&self) -> usize {
@@ -40,6 +49,10 @@ impl<T: Copy, const CAPACITY: usize> Array<T, CAPACITY> {
     pub(crate) fn peek(&self) -> Option<T> {
         let last = self.len.checked_sub(1)?;
         self.entries.get(usize::from(last)).copied()
+    }
+
+    pub(crate) fn at(&self, index: usize) -> Option<T> {
+        self.entries.get(index).copied()
     }
 
     pub(crate) fn push(&mut self, value: T) -> Result<(), T> {

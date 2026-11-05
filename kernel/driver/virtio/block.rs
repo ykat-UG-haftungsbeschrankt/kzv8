@@ -243,27 +243,30 @@ impl BlockTransfer<'_> {
         if request.head != Some(self.head) {
             return Err(Error::Proto);
         }
-        let Some(used_length) = request.used_length.take() else {
-            return Ok(false);
+        let completion_result = {
+            let Some(used_length) = request.used_length.take() else {
+                return Ok(false);
+            };
+            DmaArena::sync_for_cpu();
+            self.complete = true;
+            request.head = None;
+            request.abandoned = false;
+            match request.status {
+                0 if used_length >= 1 => {
+                    if let Some(output) = self.output.as_mut() {
+                        let source = &request.dma_buffer.as_mut_slice()[..self.length];
+                        (**output).copy_from_slice(source);
+                    }
+                    Ok(())
+                }
+                0 => Err(Error::Proto),
+                1 => Err(Error::Io),
+                2 => Err(Error::OpNotSupp),
+                _ => Err(Error::Proto),
+            }
         };
-        DmaArena::sync_for_cpu();
-        self.complete = true;
-        request.head = None;
-        request.abandoned = false;
         state.free_requests.push(self.request_index);
-        match request.status {
-            0 => {}
-            1 => return Err(Error::Io),
-            2 => return Err(Error::OpNotSupp),
-            _ => return Err(Error::Proto),
-        }
-        if used_length < 1 {
-            return Err(Error::Proto);
-        }
-        if let Some(output) = self.output.as_mut() {
-            let source = &request.dma_buffer.as_mut_slice()[..self.length];
-            (**output).copy_from_slice(source);
-        }
+        completion_result?;
         Ok(true)
     }
 }

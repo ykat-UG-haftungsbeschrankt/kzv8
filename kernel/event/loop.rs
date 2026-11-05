@@ -5,6 +5,15 @@
  * free of charge, without warranty of any kind.
  */
 
+/*
+ * EventLoop: multiplex timers, completions, readiness, and device interrupts.
+ *
+ * Timers --------\
+ * Completions ----+--> event queue --\
+ * Readiness ----------> ready queue ---+--> fair poll --> Event / RawEvent
+ * Device IRQs -------> pending bits --/
+ */
+
 use alloc::boxed::Box;
 use core::ptr::NonNull;
 use crate::kernel::error::Error;

@@ -442,7 +442,7 @@ impl VirtioFs {
                 state.queue.poll_used()
             };
             let Some(used) = used else {
-                crate::kernel::scheduler::rust::future::yield_now().await;
+                crate::kernel::scheduler::future::yield_now().await;
                 continue;
             };
             let body_length = {

@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::ffi::{c_char, c_int, c_long, c_void};
 use super::errno::{EINVAL, ENOSYS};
 
@@ -175,7 +182,7 @@ pub unsafe extern "C" fn getdelim(
     let mut length = 0usize;
     loop {
         if length + 1 >= unsafe { *capacity } {
-            let Some(new_capacity) = unsafe { (*capacity).checked_mul(2) } else {
+            let Some(new_capacity) = (unsafe { (*capacity).checked_mul(2) }) else {
                 set_errno(EINVAL);
                 return -1;
             };

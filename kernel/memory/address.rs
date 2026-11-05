@@ -15,7 +15,7 @@ pub(crate) struct UserAddress {
 
 impl UserAddress {
 	pub(crate) const fn raw(self) -> u64 {
-		(u64::from(self.generation) << 32) | u64::from(self.index)
+		((self.generation as u64) << 32) | self.index as u64
 	}
 
 	pub(crate) const fn from_raw(raw: u64) -> Self {

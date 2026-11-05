@@ -91,6 +91,7 @@ impl<const N: usize> VirtQueue<N> {
             },
             used: UsedRing {
                 flags: 0,
+                index: 0,
                 ring: [UsedElement { id: 0, length: 0 }; N],
                 available_event: 0,
             },
@@ -98,7 +99,6 @@ impl<const N: usize> VirtQueue<N> {
             free_descriptor_stack: [0; N],
             free_descriptor_count: 0,
             pending_heads: [false; N],
-            in_flight_count: 0,
             last_used: 0,
             queue_size: 0,
         }

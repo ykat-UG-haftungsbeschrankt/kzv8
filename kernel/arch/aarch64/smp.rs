@@ -31,7 +31,7 @@ unsafe extern "C" {
 
 pub(crate) fn start_secondary_cpus() -> usize {
     CPU_ONLINE[0].store(true, Ordering::Release);
-    let Some(conduit) = crate::kernel::arch::device_tree::psci_conduit() else {
+    let Some(conduit) = super::device_tree::psci_conduit() else {
         return online_cpu_count();
     };
     let Some(frequency_hz) = super::timer::frequency_hz() else {
@@ -42,7 +42,7 @@ pub(crate) fn start_secondary_cpus() -> usize {
     };
     let boot_cpu = current_mpidr() & MPIDR_AFFINITY_MASK;
     let mut slot = 1usize;
-    let (cpu_ids, cpu_count) = crate::kernel::arch::device_tree::aarch64_cpu_ids();
+    let (cpu_ids, cpu_count) = super::device_tree::aarch64_cpu_ids();
     let mut started = [false; super::MAX_CPUS];
     for target in cpu_ids.iter().take(cpu_count) {
         if target & MPIDR_AFFINITY_MASK == boot_cpu {
@@ -125,12 +125,12 @@ fn duration_ticks(frequency_hz: u64, duration_ns: u64) -> Option<u64> {
     u64::try_from(ticks.max(1)).ok()
 }
 
-fn psci_cpu_on(conduit: crate::kernel::arch::device_tree::PsciConduit, target: u64, slot: usize) -> i64 {
+fn psci_cpu_on(conduit: super::device_tree::PsciConduit, target: u64, slot: usize) -> i64 {
     let entry = aarch64_secondary_entry as *const () as u64;
     let result: u64;
     unsafe {
         match conduit {
-            crate::kernel::arch::device_tree::PsciConduit::Smc => asm!(
+            super::device_tree::PsciConduit::Smc => asm!(
                 "smc #0",
                 inout("x0") PSCI_CPU_ON_64 => result,
                 inlateout("x1") target => _,
@@ -152,7 +152,7 @@ fn psci_cpu_on(conduit: crate::kernel::arch::device_tree::PsciConduit, target: u
                 lateout("x17") _,
                 options(nostack),
             ),
-            crate::kernel::arch::device_tree::PsciConduit::Hvc => asm!(
+            super::device_tree::PsciConduit::Hvc => asm!(
                 "hvc #0",
                 inout("x0") PSCI_CPU_ON_64 => result,
                 inlateout("x1") target => _,

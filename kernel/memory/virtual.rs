@@ -39,7 +39,7 @@ enum PageRangeError {
 pub(crate) struct VirtualAreas {
     page_state: [AtomicU8; VirtualAreas::MAX_VM_PAGES],
     mmu_ready: AtomicBool,
-    area_index: IntervalTree<(), VirtualAreas::MAX_VM_AREAS>,
+    area_index: IntervalTree<(), { VirtualAreas::MAX_VM_AREAS }>,
 }
 
 impl VirtualAreas {

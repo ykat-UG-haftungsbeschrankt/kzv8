@@ -5,6 +5,12 @@
  * free of charge, without warranty of any kind.
  */
 
+/*
+ * Kernel data-structure toolbox:
+ *
+ * [addresses] [arrays] [bitfields] [trees] [hashing] [lists]
+ */
+
 pub(crate) mod address;
 pub(crate) mod bitfield;
 pub(crate) mod btree;

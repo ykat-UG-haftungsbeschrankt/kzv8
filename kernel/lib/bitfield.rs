@@ -5,6 +5,13 @@
  * free of charge, without warranty of any kind.
  */
 
+/*
+ * BitField packs fixed bits into u64 words:
+ *
+ * bit:     0 .. 63 | 64 .. 127 | ...
+ * storage: word 0  | word 1    | ...
+ */
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BitField<const WORDS: usize> {

@@ -1093,7 +1093,6 @@ impl Heap {
         if slab.bitmap[word] & mask == 0 {
             return;
         }
-        let class_index = slab.class_index;
         let was_full = slab.used == slot_count;
         let unused = {
             let slab = &mut heap.slabs[index];
@@ -1173,9 +1172,10 @@ impl Heap {
         heap.slabs.fill(Slab::EMPTY);
         heap.free_slab_head = Self::NO_INDEX;
         for index in (0..Self::MAX_SLABS).rev() {
+            let free_slab_head = heap.free_slab_head;
             heap.slabs[index]
                 .links
-                .set_next(heap.free_slab_head);
+                .set_next(free_slab_head);
             heap.free_slab_head = index;
         }
         heap.class_heads.fill(Self::NO_INDEX);

@@ -14,6 +14,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::kernel::arch::traits::{
     CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
 };
+use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
 
@@ -140,14 +141,14 @@ impl ThreadStack {
     pub(crate) const DEFAULT_SIZE: usize = 16 * 1024;
     pub(crate) const MIN_SIZE: usize = 16 * 1024;
 
-    fn try_new(size: usize) -> Result<Self, ThreadCreateError> {
+    fn try_new(size: usize) -> Result<Self, Error> {
         if size < Self::MIN_SIZE {
-            return Err(ThreadCreateError::InvalidStackSize);
+            return Err(Error::Inval);
         }
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(size)
-            .map_err(|_| ThreadCreateError::NoMemory)?;
+            .map_err(|_| Error::NoMem)?;
         bytes.resize(size, 0);
         Ok(Self { bytes })
     }
@@ -159,21 +160,6 @@ impl ThreadStack {
     fn bounds(&self) -> (*mut c_void, usize) {
         (self.bytes.as_ptr().cast_mut().cast(), self.bytes.len())
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThreadCreateError {
-    Again,
-    NoMemory,
-    InvalidStackSize,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JoinError {
-    NoSuchThread,
-    Deadlock,
-    Invalid,
-    NotExited,
 }
 
 struct SwitchContext {
@@ -333,7 +319,10 @@ impl ThreadManager {
             return false;
         }
         manager.tls_keys[index] = TlsKey::EMPTY;
-        for thread in manager.ready.iter_mut().chain(manager.busy.iter_mut()) {
+        for thread in manager.ready.iter_mut() {
+            thread.tls[index] = 0;
+        }
+        for thread in manager.busy.iter_mut() {
             thread.tls[index] = 0;
         }
         true
@@ -375,7 +364,7 @@ impl ThreadManager {
         start_routine: StartRoutine,
         argument: *mut c_void,
         detached: bool,
-    ) -> Result<usize, ThreadCreateError> {
+    ) -> Result<usize, Error> {
         let mut stack = ThreadStack::try_new(stack_size)?;
         let stack_pointer = crate::kernel::arch::ThreadArchitecture::initialize_thread_stack(
             stack.as_mut_slice(),
@@ -394,15 +383,15 @@ impl ThreadManager {
 
         let mut manager = THREAD_MANAGER.lock();
         if !manager.initialized {
-            return Err(ThreadCreateError::Again);
+            return Err(Error::Again);
         }
         match manager.thread_nodes.insert(id, node_address) {
             Ok(None) => {}
             Ok(Some(previous)) => {
                 let _ = manager.thread_nodes.insert(id, previous);
-                return Err(ThreadCreateError::Again);
+                return Err(Error::Again);
             }
-            Err(_) => return Err(ThreadCreateError::NoMemory),
+            Err(_) => return Err(Error::NoMem),
         }
         manager.ready.push_back(thread);
         Ok(id)
@@ -501,7 +490,7 @@ impl ThreadManager {
     fn begin_join(
         &mut self,
         thread: NonNull<Thread>,
-    ) -> Result<Option<usize>, JoinError> {
+    ) -> Result<Option<usize>, Error> {
         let current_id = self.busy.front().map_or(0, |thread| thread.id);
         let (id, state, detached, joiner, result) = {
             let thread = self.thread_ref_from_pointer(thread);
@@ -514,10 +503,10 @@ impl ThreadManager {
             )
         };
         if id == current_id {
-            return Err(JoinError::Deadlock);
+            return Err(Error::Deadlk);
         }
         if detached || joiner != 0 {
-            return Err(JoinError::Invalid);
+            return Err(Error::Inval);
         }
         if state == ThreadState::Exited {
             Ok(Some(result))
@@ -527,14 +516,14 @@ impl ThreadManager {
         }
     }
 
-    pub(crate) fn begin_join_by_id(id: usize) -> Result<Option<usize>, JoinError> {
+    pub(crate) fn begin_join_by_id(id: usize) -> Result<Option<usize>, Error> {
         let (result, removed) = {
             let mut manager = THREAD_MANAGER.lock();
             if !manager.initialized {
-                return Err(JoinError::NoSuchThread);
+                return Err(Error::Srch);
             }
             let Some(list_node) = manager.thread_node_by_id(id) else {
-                return Err(JoinError::NoSuchThread);
+                return Err(Error::Srch);
             };
             let thread = manager.thread_pointer(list_node);
             let result = manager.begin_join(thread)?;
@@ -542,7 +531,7 @@ impl ThreadManager {
                 Some(
                     manager
                         .remove_thread(list_node)
-                        .ok_or(JoinError::NoSuchThread)?,
+                        .ok_or(Error::Srch)?,
                 )
             } else {
                 None
@@ -570,42 +559,42 @@ impl ThreadManager {
         manager.cancel_join(thread);
     }
 
-    fn finish_join(&self, thread: NonNull<Thread>) -> Result<usize, JoinError> {
+    fn finish_join(&self, thread: NonNull<Thread>) -> Result<usize, Error> {
         let current_id = self.busy.front().map_or(0, |thread| thread.id);
         let thread = self.thread_ref_from_pointer(thread);
         if thread.state != ThreadState::Exited {
-            return Err(JoinError::NotExited);
+            return Err(Error::Deadlk);
         }
         if thread.joiner != current_id {
-            return Err(JoinError::Invalid);
+            return Err(Error::Inval);
         }
         Ok(thread.result)
     }
 
-    pub(crate) fn finish_join_by_id(id: usize) -> Result<usize, JoinError> {
+    pub(crate) fn finish_join_by_id(id: usize) -> Result<usize, Error> {
         let (result, removed) = {
             let mut manager = THREAD_MANAGER.lock();
             let Some(node) = manager.thread_node_by_id(id) else {
-                return Err(JoinError::NoSuchThread);
+                return Err(Error::Srch);
             };
             let thread = manager.thread_pointer(node);
             let result = manager.finish_join(thread)?;
             let removed = manager
                 .remove_thread(node)
-                .ok_or(JoinError::NoSuchThread)?;
+                .ok_or(Error::Srch)?;
             (result, removed)
         };
         drop(removed);
         Ok(result)
     }
 
-    fn detach(&mut self, thread: NonNull<Thread>) -> Result<bool, JoinError> {
+    fn detach(&mut self, thread: NonNull<Thread>) -> Result<bool, Error> {
         let (state, detached, joiner) = {
             let thread = self.thread_ref_from_pointer(thread);
             (thread.state, thread.detached, thread.joiner)
         };
         if detached || joiner != 0 {
-            return Err(JoinError::Invalid);
+            return Err(Error::Inval);
         }
         if state == ThreadState::Exited {
             Ok(true)
@@ -615,18 +604,18 @@ impl ThreadManager {
         }
     }
 
-    pub(crate) fn detach_by_id(id: usize) -> Result<(), JoinError> {
+    pub(crate) fn detach_by_id(id: usize) -> Result<(), Error> {
         let removed = {
             let mut manager = THREAD_MANAGER.lock();
             let Some(node) = manager.thread_node_by_id(id) else {
-                return Err(JoinError::NoSuchThread);
+                return Err(Error::Srch);
             };
             let thread = manager.thread_pointer(node);
             if manager.detach(thread)? {
                 Some(
                     manager
                         .remove_thread(node)
-                        .ok_or(JoinError::NoSuchThread)?,
+                        .ok_or(Error::Srch)?,
                 )
             } else {
                 None

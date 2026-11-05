@@ -5,6 +5,14 @@
  * free of charge, without warranty of any kind.
  */
 
+/*
+ * Fixed-capacity AVL index for half-open intervals; max_end prunes searches:
+ *
+ *          [start, end)
+ *           /      \
+ *       [lower]  [higher]
+ */
+
 use core::cmp::Ordering;
 use core::ops::Range;
 

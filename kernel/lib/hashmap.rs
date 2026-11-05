@@ -21,27 +21,26 @@ struct Entry<K, V> {
 
 type Bucket<K, V> = LinkedList<Entry<K, V>>;
 
-pub(crate) struct HashMap<K, V> {
+pub(crate) struct HashMap<K, V, const INITIAL_CAPACITY: usize = 8> {
 	address: usize,
 	allocation_length: usize,
 	capacity: usize,
 	length: usize,
-	avg_length: usize,
-	avg_count: u8,
+	static_buckets: [Bucket<K, V>; INITIAL_CAPACITY],
+	is_static: bool,
 	marker: PhantomData<(K, V)>,
 }
 
-impl<K, V> HashMap<K, V> {
-	const INITIAL_CAPACITY: usize = 8;
-
+impl<K, V, const INITIAL_CAPACITY: usize> HashMap<K, V, INITIAL_CAPACITY> {
 	pub(crate) const fn new() -> Self {
+		assert!(INITIAL_CAPACITY > 0 && INITIAL_CAPACITY.is_power_of_two());
 		Self {
 			address: 0,
 			allocation_length: 0,
-			capacity: 0,
+			capacity: INITIAL_CAPACITY,
 			length: 0,
-			avg_length: 0,
-			avg_count: 0,
+			static_buckets: [const { LinkedList::new() }; INITIAL_CAPACITY],
+			is_static: true,
 			marker: PhantomData,
 		}
 	}
@@ -58,27 +57,11 @@ impl<K, V> HashMap<K, V> {
 		self.capacity
 	}
 
-	pub(crate) fn average_len(&self) -> usize {
-		self.length.max(self.avg_length)
-	}
-
-	fn record_length(&mut self) {
-		if self.avg_count == u8::MAX {
-			self.avg_length /= usize::from(u8::MAX);
-			self.avg_count = 0;
-		}
-		self.avg_length += self.length;
-	}
-
 	pub(crate) fn clear(&mut self) {
-		let had_entries = self.length != 0;
 		for index in 0..self.capacity {
 			self.bucket_mut(index).clear();
 		}
 		self.length = 0;
-		if had_entries {
-			self.record_length();
-		}
 	}
 
 	fn allocate_buckets(capacity: usize) -> Option<(usize, usize)> {
@@ -98,37 +81,40 @@ impl<K, V> HashMap<K, V> {
 
 	fn bucket(&self, index: usize) -> &Bucket<K, V> {
 		debug_assert!(index < self.capacity);
+		if self.is_static {
+			return &self.static_buckets[index];
+		}
 		// SAFETY: a nonzero capacity means the reserved table is initialized and index is bounded.
 		unsafe { &*((self.address as *const Bucket<K, V>).add(index)) }
 	}
 
 	fn bucket_mut(&mut self, index: usize) -> &mut Bucket<K, V> {
 		debug_assert!(index < self.capacity);
+		if self.is_static {
+			return &mut self.static_buckets[index];
+		}
 		// SAFETY: a nonzero capacity means the reserved table is initialized and index is bounded.
 		unsafe { &mut *((self.address as *mut Bucket<K, V>).add(index)) }
 	}
 
-	fn release_buckets(&mut self) {
-		if self.address == 0 {
-			return;
-		}
-
-		let buckets = self.address as *mut Bucket<K, V>;
-		for index in 0..self.capacity {
-			// SAFETY: each slot was initialized by allocate_buckets and is dropped exactly once.
+	fn release_table(address: usize, capacity: usize, allocation_length: usize) {
+		let buckets = address as *mut Bucket<K, V>;
+		for index in 0..capacity {
+			// SAFETY: every bucket was initialized by allocate_buckets and is dropped exactly once.
 			unsafe { ptr::drop_in_place(buckets.add(index)) };
 		}
-		let address = self.address;
-		let allocation_length = self.allocation_length;
-		self.address = 0;
-		self.allocation_length = 0;
-		self.capacity = 0;
-		self.length = 0;
 		let _released = crate::kernel::memory::r#virtual::release(address, allocation_length);
+	}
+
+	fn release_buckets(&mut self) {
+		if self.is_static {
+			return;
+		}
+		Self::release_table(self.address, self.capacity, self.allocation_length);
 	}
 }
 
-impl<K: Eq + Hash, V> HashMap<K, V> {
+impl<K: Eq + Hash, V, const INITIAL_CAPACITY: usize> HashMap<K, V, INITIAL_CAPACITY> {
 	fn bucket_index(key: &K, capacity: usize) -> usize {
 		let mut hasher = FnvHasher::new();
 		key.hash(&mut hasher);
@@ -136,13 +122,44 @@ impl<K: Eq + Hash, V> HashMap<K, V> {
 	}
 
 	fn resize(&mut self, new_capacity: usize) -> bool {
+		let new_capacity = new_capacity.max(INITIAL_CAPACITY);
 		if new_capacity == self.capacity {
+			return true;
+		}
+		if !new_capacity.is_power_of_two() {
+			return false;
+		}
+		if new_capacity == INITIAL_CAPACITY {
+			if self.is_static {
+				return true;
+			}
+			let old_address = self.address;
+			let old_capacity = self.capacity;
+			let old_allocation_length = self.allocation_length;
+			for old_index in 0..old_capacity {
+				loop {
+					let Some(node) = self.bucket_mut(old_index).pop_front() else {
+						break;
+					};
+					let new_index = {
+						let entry: &Entry<K, V> = &**node;
+						Self::bucket_index(&entry.key, INITIAL_CAPACITY)
+					};
+					self.static_buckets[new_index].push_back(node);
+				}
+			}
+			Self::release_table(old_address, old_capacity, old_allocation_length);
+			self.address = 0;
+			self.allocation_length = 0;
+			self.capacity = INITIAL_CAPACITY;
+			self.is_static = true;
 			return true;
 		}
 		let Some((new_address, new_allocation_length)) = Self::allocate_buckets(new_capacity) else {
 			return false;
 		};
 		let new_buckets = new_address as *mut Bucket<K, V>;
+		let old_is_static = self.is_static;
 		let old_address = self.address;
 		let old_capacity = self.capacity;
 		let old_allocation_length = self.allocation_length;
@@ -161,39 +178,57 @@ impl<K: Eq + Hash, V> HashMap<K, V> {
 			}
 		}
 
-		if old_address != 0 {
-			let old_buckets = old_address as *mut Bucket<K, V>;
-			for index in 0..old_capacity {
-				// SAFETY: all entries were moved out, and each old bucket is dropped exactly once.
-				unsafe { ptr::drop_in_place(old_buckets.add(index)) };
-			}
-			let _released =
-				crate::kernel::memory::r#virtual::release(old_address, old_allocation_length);
+		if !old_is_static {
+			Self::release_table(old_address, old_capacity, old_allocation_length);
 		}
 
 		self.address = new_address;
 		self.allocation_length = new_allocation_length;
 		self.capacity = new_capacity;
+		self.is_static = false;
 		true
 	}
 
-	pub(crate) fn insert(&mut self, key: K, value: V) -> Option<(K, V)> {
-		if self.capacity != 0 {
-			let index = Self::bucket_index(&key, self.capacity);
-			for entry in self.bucket_mut(index).iter_mut() {
-				if entry.key == key {
-					return Some((key, core::mem::replace(&mut entry.value, value)));
-				}
+	fn prepare_insert(&mut self) -> bool {
+		let load_limit = self.capacity - self.capacity / 4;
+		if self.length < load_limit {
+			return true;
+		}
+		let Some(new_capacity) = self.capacity.checked_mul(2) else {
+			return false;
+		};
+		self.resize(new_capacity)
+	}
+
+	fn maybe_shrink(&mut self) {
+		if self.is_static {
+			return;
+		}
+		let mut new_capacity = self.capacity;
+		while new_capacity > INITIAL_CAPACITY && self.length < new_capacity / 4 {
+			new_capacity /= 2;
+		}
+		if new_capacity < self.capacity {
+			let _resized = self.resize(new_capacity);
+		}
+	}
+
+	pub(crate) fn insert(&mut self, key: K, value: V) -> Result<Option<V>, (K, V)> {
+		let index = Self::bucket_index(&key, self.capacity);
+		for entry in self.bucket_mut(index).iter_mut() {
+			if entry.key == key {
+				return Ok(Some(core::mem::replace(&mut entry.value, value)));
 			}
 		}
 
+		if !self.prepare_insert() {
+			return Err((key, value));
+		}
 		let index = Self::bucket_index(&key, self.capacity);
 		self.bucket_mut(index)
 			.push_back(Box::new(ListNode::new(Entry { key, value })));
 		self.length += 1;
-		self.record_length();
-		self.resize(self.average_len());
-		None
+		Ok(None)
 	}
 
 	pub(crate) fn get(&self, key: &K) -> Option<&V> {
@@ -235,13 +270,12 @@ impl<K: Eq + Hash, V> HashMap<K, V> {
 		// SAFETY: node was found in this bucket and has not been unlinked.
 		let entry = unsafe { ListNode::remove(self.bucket_mut(index), node) }?.into_value();
 		self.length -= 1;
-		self.record_length();
-		self.resize(self.average_len());
+		self.maybe_shrink();
 		Some(entry.value)
 	}
 }
 
-impl<K, V> Drop for HashMap<K, V> {
+impl<K, V, const INITIAL_CAPACITY: usize> Drop for HashMap<K, V, INITIAL_CAPACITY> {
 	fn drop(&mut self) {
 		self.release_buckets();
 	}

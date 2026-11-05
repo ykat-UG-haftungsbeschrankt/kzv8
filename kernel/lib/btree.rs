@@ -5,6 +5,14 @@
  * free of charge, without warranty of any kind.
  */
 
+/*
+ * Ordered map; red-black balancing keeps each key path shallow:
+ *
+ *             [key]
+ *            /     \
+ *       [lower]   [higher]
+ */
+
 use alloc::boxed::Box;
 use core::cmp::Ordering;
 
