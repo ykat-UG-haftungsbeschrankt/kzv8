@@ -9,6 +9,7 @@ use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 
 use super::errno::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOMEM, ENOSYS, EPERM, ESRCH};
+#[allow(unused_imports)]
 use crate::kernel::arch::traits::{InterruptArchitecture as _, ThreadArchitecture as _};
 use crate::kernel::error::Error;
 use crate::kernel::scheduler::thread::{
@@ -45,6 +46,7 @@ pub extern "C" fn pthread_exit(result: *mut c_void) -> ! {
     ThreadManager::exit_current(result)
 }
 
+#[allow(unused_macros)]
 macro_rules! export_pthread {
     ($name:ident($($argument:ident: $argument_type:ty),* $(,)?) -> $result:ty) => {
         #[no_mangle]

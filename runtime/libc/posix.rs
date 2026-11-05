@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+#[allow(unused_imports)]
 use core::ffi::{c_char, c_int, c_long, c_void};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -36,13 +37,13 @@ const SC_NPROCESSORS_ONLN: i32 = 84;
 const SC_CLK_TCK: i32 = 2;
 
 #[repr(C)]
-struct Timespec {
+pub struct Timespec {
     seconds: c_long,
     nanoseconds: c_long,
 }
 
 #[repr(C)]
-struct Tm {
+pub struct Tm {
     seconds: i32,
     minutes: i32,
     hours: i32,
@@ -338,7 +339,7 @@ pub unsafe extern "C" fn sem_wait(semaphore: *mut c_void) -> i32 {
     }
     let count = unsafe { &*semaphore.cast::<AtomicU32>() };
     loop {
-        let mut current = count.load(Ordering::Acquire);
+        let current = count.load(Ordering::Acquire);
         if current != 0
             && count
                 .compare_exchange_weak(current, current - 1, Ordering::Acquire, Ordering::Relaxed)

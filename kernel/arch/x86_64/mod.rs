@@ -11,6 +11,7 @@ mod entry;
 pub(crate) mod interrupts;
 mod multiboot;
 mod paging;
+#[allow(dead_code)]
 pub(crate) mod pci;
 mod ram_map;
 pub(crate) mod smp;
@@ -25,12 +26,16 @@ compile_error!("select one of fpu-x87, fpu-sse, or fpu-avx");
 
 pub(crate) use threads::FpuContext;
 
+#[allow(dead_code)]
 pub(crate) const VM_ARENA_SIZE: usize =
     <super::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
+#[allow(dead_code)]
 pub(crate) const VM_BASE: usize =
     <super::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_BASE;
+#[allow(dead_code)]
 pub(crate) const BOOT_MESSAGE: &[u8] =
     <super::BootArchitecture as crate::kernel::arch::traits::BootArchitecture>::BOOT_MESSAGE;
+#[allow(dead_code)]
 pub(crate) const BOOT_INFO_ERROR: &str =
     <super::BootArchitecture as crate::kernel::arch::traits::BootArchitecture>::BOOT_INFO_ERROR;
 
@@ -124,6 +129,7 @@ pub(crate) fn switch_thread(
     unsafe { threads::switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
 }
 
+#[allow(dead_code)]
 pub(crate) fn initialize_interrupt_controller() -> bool {
     interrupts::initialize_controller()
 }
@@ -147,9 +153,9 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
     const VM_BASE: usize = 0x10_0000_0000;
 
     fn physical_address_limit() -> u64 {
-        let maximum_leaf = unsafe { core::arch::x86_64::__cpuid(0x8000_0000).eax };
+        let maximum_leaf = core::arch::x86_64::__cpuid(0x8000_0000).eax;
         let address_bits = if maximum_leaf >= 0x8000_0008 {
-            (unsafe { core::arch::x86_64::__cpuid(0x8000_0008).eax } & 0xff).clamp(32, 52)
+            (core::arch::x86_64::__cpuid(0x8000_0008).eax & 0xff).clamp(32, 52)
         } else {
             36
         };
@@ -185,12 +191,8 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
         let Some(end) = address.checked_add(length) else {
             return false;
         };
-        let (image_start, image_end) = unsafe {
-            (
-                core::ptr::addr_of!(_start) as usize,
-                core::ptr::addr_of!(__bss_end) as usize,
-            )
-        };
+        let image_start = core::ptr::addr_of!(_start) as usize;
+        let image_end = core::ptr::addr_of!(__bss_end) as usize;
         address >= image_start
             && end <= image_end
             && paging::set_page_permissions(address, length, permissions)

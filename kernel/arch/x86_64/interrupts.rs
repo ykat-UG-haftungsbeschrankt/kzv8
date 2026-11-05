@@ -291,7 +291,7 @@ pub(crate) fn initialize_controller() -> bool {
 
 pub(crate) fn initialize_local_controller() -> bool {
     let mut apic_base = read_msr(APIC_BASE_MSR);
-    let supports_x2apic = unsafe { core::arch::x86_64::__cpuid(1).ecx & (1 << 21) != 0 };
+    let supports_x2apic = core::arch::x86_64::__cpuid(1).ecx & (1 << 21) != 0;
     if supports_x2apic {
         apic_base |= APIC_ENABLE | X2APIC_ENABLE;
     } else if apic_base & X2APIC_ENABLE != 0 {

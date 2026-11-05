@@ -20,8 +20,9 @@ pub(crate) mod block;
 pub(crate) mod driver;
 pub(crate) mod error;
 pub(crate) mod event;
-#[allow(special_module_name)]
-pub(crate) mod lib;
+#[path = "lib/mod.rs"]
+pub(crate) mod kernel_lib;
+pub(crate) use kernel_lib as lib;
 pub(crate) mod memory;
 pub(crate) mod net;
 #[path = "../runtime/run.rs"]

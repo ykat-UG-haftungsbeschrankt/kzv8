@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #[path = "ffi.rs"]
 mod runtime_ffi;
 #[path = "libc/mod.rs"]
@@ -9,10 +16,13 @@ mod runtime_v8;
 
 use crate::kernel::arch::traits::MemoryArchitecture as _;
 use crate::kernel::arch::MemoryArchitecture;
+#[allow(unused_imports)]
 use crate::kernel::block::device::BlockDevice;
 use crate::kernel::driver::virtio::console::Console;
+#[allow(unused_imports)]
 use crate::kernel::event::r#loop::{EventLoop, EventSourceToken};
 use crate::kernel::memory::physical::PhysicalAllocator;
+#[allow(unused_imports)]
 use crate::kernel::net::stack::NetStack;
 use crate::KernelContext;
 

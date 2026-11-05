@@ -21,6 +21,7 @@ const PAGE_SIZE: usize = 4096;
 const CPU_STACK_SIZE: usize = 16 * 1024;
 const INIT_IPI: u32 = 0x0000_c500;
 const STARTUP_IPI_BASE: u32 = 0x0000_0600;
+#[allow(dead_code)]
 const EXECUTOR_IPI_VECTOR: u8 = 0x41;
 const INIT_TO_SIPI_NS: u64 = 10_000_000;
 const SIPI_INTERVAL_NS: u64 = 200_000;
@@ -280,6 +281,7 @@ fn trace(code: u8) {
     crate::kernel::arch::DebugArchitecture::decommit_debug(code);
 }
 
+#[allow(dead_code)]
 pub(crate) fn notify_executor() {
     for cpu in CPU_SLOTS.lock().iter() {
         if cpu.online.load(Ordering::Acquire) {
@@ -302,11 +304,11 @@ fn detected_cpu_ids() -> Vec<u32> {
 }
 
 fn detected_cpu_count() -> usize {
-    let maximum_leaf = unsafe { __cpuid(0).eax };
+    let maximum_leaf = __cpuid(0).eax;
     let mut count = 1usize;
     if maximum_leaf >= 0x0b {
         for level in 0..8 {
-            let topology = unsafe { __cpuid_count(0x0b, level) };
+            let topology = __cpuid_count(0x0b, level);
             if (topology.ecx >> 8) & 0xff == 0 {
                 break;
             }
@@ -314,7 +316,7 @@ fn detected_cpu_count() -> usize {
         }
     }
     if count == 1 {
-        count = ((unsafe { __cpuid(1).ebx } >> 16) & 0xff) as usize;
+        count = ((__cpuid(1).ebx >> 16) & 0xff) as usize;
     }
     count.max(1)
 }

@@ -6,6 +6,7 @@
  */
 
 use core::alloc::{GlobalAlloc, Layout};
+#[allow(unused_imports)]
 use core::ffi::c_void;
 use core::ptr::null_mut;
 

@@ -512,8 +512,6 @@ pub unsafe extern "C" fn kz_c_filesystem_smoke() -> i32 {
         }
         return -1;
     }
-    file_descriptor = -1;
-
     stream = unsafe { super::stdio::fopen64(path.as_ptr().cast(), b"a+\0".as_ptr().cast()) };
     if stream.is_null()
         || unsafe { super::format::fwrite(b"!".as_ptr().cast(), 1, 1, stream) } != 1
@@ -592,8 +590,6 @@ pub unsafe extern "C" fn kz_c_filesystem_smoke() -> i32 {
         }
         return -1;
     }
-    file_descriptor = -1;
-
     stream = unsafe { super::stdio::tmpfile64() };
     if stream.is_null()
         || unsafe { super::stdio::fputs(b"tmp\0".as_ptr().cast(), stream) } == -1
@@ -613,7 +609,6 @@ pub unsafe extern "C" fn kz_c_filesystem_smoke() -> i32 {
         return -1;
     }
     let temporary_stream = stream;
-    stream = core::ptr::null_mut();
     if unsafe { super::stdio::fclose(temporary_stream) } != 0
         || unsafe { super::filesystem::unlink(path.as_ptr().cast()) } != 0
     {

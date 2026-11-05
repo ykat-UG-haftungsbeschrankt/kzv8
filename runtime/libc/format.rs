@@ -10,6 +10,7 @@ use core::ffi::{c_char, c_int, c_void};
 use core::ptr::{read_volatile, write_volatile};
 
 use super::stdio::KzFile;
+#[allow(unused_imports)]
 use super::variadic::{
     self, VA_INT, VA_LLONG, VA_POINTER, VA_PTRDIFF, VA_SIZE, VA_ULLONG, VA_ULONG,
 };

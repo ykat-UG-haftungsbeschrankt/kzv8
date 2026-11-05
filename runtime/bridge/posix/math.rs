@@ -58,6 +58,7 @@ macro_rules! unsupported_binary {
     };
 }
 
+#[allow(unused_macros)]
 macro_rules! unsupported_rounding {
     ($name:ident, $namef:ident, $name_long:ident) => {
         #[no_mangle]

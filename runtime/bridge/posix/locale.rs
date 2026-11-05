@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr::read_volatile;
 use super::errno::EINVAL;
@@ -5,7 +12,7 @@ use super::errno::EINVAL;
 const CHAR_MAX: i8 = 127;
 
 #[repr(C)]
-struct LocaleConv {
+pub struct LocaleConv {
     decimal_point: *mut c_char,
     thousands_sep: *mut c_char,
     grouping: *mut c_char,
