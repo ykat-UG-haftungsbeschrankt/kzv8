@@ -26,6 +26,8 @@ pub(crate) struct HashMap<K, V> {
 	allocation_length: usize,
 	capacity: usize,
 	length: usize,
+	avg_length: usize,
+	avg_count: u8,
 	marker: PhantomData<(K, V)>,
 }
 
@@ -38,6 +40,8 @@ impl<K, V> HashMap<K, V> {
 			allocation_length: 0,
 			capacity: 0,
 			length: 0,
+			avg_length: 0,
+			avg_count: 0,
 			marker: PhantomData,
 		}
 	}
@@ -54,11 +58,27 @@ impl<K, V> HashMap<K, V> {
 		self.capacity
 	}
 
+	pub(crate) fn average_len(&self) -> usize {
+		self.length.max(self.avg_length)
+	}
+
+	fn record_length(&mut self) {
+		if self.avg_count == u8::MAX {
+			self.avg_length /= usize::from(u8::MAX);
+			self.avg_count = 0;
+		}
+		self.avg_length += self.length;
+	}
+
 	pub(crate) fn clear(&mut self) {
+		let had_entries = self.length != 0;
 		for index in 0..self.capacity {
 			self.bucket_mut(index).clear();
 		}
 		self.length = 0;
+		if had_entries {
+			self.record_length();
+		}
 	}
 
 	fn allocate_buckets(capacity: usize) -> Option<(usize, usize)> {
@@ -116,6 +136,9 @@ impl<K: Eq + Hash, V> HashMap<K, V> {
 	}
 
 	fn resize(&mut self, new_capacity: usize) -> bool {
+		if new_capacity == self.capacity {
+			return true;
+		}
 		let Some((new_address, new_allocation_length)) = Self::allocate_buckets(new_capacity) else {
 			return false;
 		};
@@ -154,38 +177,23 @@ impl<K: Eq + Hash, V> HashMap<K, V> {
 		true
 	}
 
-	fn prepare_insert(&mut self) -> bool {
-		if self.capacity == 0 {
-			return self.resize(Self::INITIAL_CAPACITY);
-		}
-		let load_limit = self.capacity - self.capacity / 4;
-		if self.length < load_limit {
-			return true;
-		}
-		let Some(new_capacity) = self.capacity.checked_mul(2) else {
-			return false;
-		};
-		self.resize(new_capacity)
-	}
-
-	pub(crate) fn insert(&mut self, key: K, value: V) -> Result<Option<V>, (K, V)> {
+	pub(crate) fn insert(&mut self, key: K, value: V) -> Option<(K, V)> {
 		if self.capacity != 0 {
 			let index = Self::bucket_index(&key, self.capacity);
 			for entry in self.bucket_mut(index).iter_mut() {
 				if entry.key == key {
-					return Ok(Some(core::mem::replace(&mut entry.value, value)));
+					return Some((key, core::mem::replace(&mut entry.value, value)));
 				}
 			}
 		}
 
-		if !self.prepare_insert() {
-			return Err((key, value));
-		}
 		let index = Self::bucket_index(&key, self.capacity);
 		self.bucket_mut(index)
 			.push_back(Box::new(ListNode::new(Entry { key, value })));
 		self.length += 1;
-		Ok(None)
+		self.record_length();
+		self.resize(self.average_len());
+		None
 	}
 
 	pub(crate) fn get(&self, key: &K) -> Option<&V> {
@@ -227,6 +235,8 @@ impl<K: Eq + Hash, V> HashMap<K, V> {
 		// SAFETY: node was found in this bucket and has not been unlinked.
 		let entry = unsafe { ListNode::remove(self.bucket_mut(index), node) }?.into_value();
 		self.length -= 1;
+		self.record_length();
+		self.resize(self.average_len());
 		Some(entry.value)
 	}
 }
@@ -236,4 +246,3 @@ impl<K, V> Drop for HashMap<K, V> {
 		self.release_buckets();
 	}
 }
-

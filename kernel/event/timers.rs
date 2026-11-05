@@ -7,29 +7,25 @@
 
 use crate::kernel::lib::btree::BinaryTree;
 
+const NO_INDEX: usize = usize::MAX;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TimerId {
-    index: usize,
-    generation: u64,
+    address: u64,
 }
 
 impl TimerId {
-    const NO_INDEX: usize = usize::MAX;
     pub(crate) const fn raw(self) -> u64 {
-        (self.generation << 8) | self.index as u64
+        self.address
     }
 
     pub(crate) const fn from_raw(raw: u64) -> Self {
-        Self {
-            index: (raw & 0xff) as usize,
-            generation: raw >> 8,
-        }
+        Self { address: raw }
     }
 }
 
 #[derive(Clone, Copy)]
 struct Timer {
-    id: TimerId,
     deadline_ns: u64,
     active: bool,
     next_free: usize,
@@ -37,13 +33,9 @@ struct Timer {
 
 impl Timer {
     const EMPTY: Self = Self {
-        id: TimerId {
-            index: TimerId::NO_INDEX,
-            generation: 0,
-        },
         deadline_ns: 0,
         active: false,
-        next_free: TimerId::NO_INDEX,
+        next_free: NO_INDEX,
     };
 }
 
@@ -59,7 +51,7 @@ impl<const N: usize> TimerQueue<N> {
         let mut timers = [Timer::EMPTY; N];
         let mut index = 0;
         while index < N {
-            timers[index].next_free = if index + 1 < N { index + 1 } else { TimerId::NO_INDEX };
+            timers[index].next_free = if index + 1 < N { index + 1 } else { NO_INDEX };
             index += 1;
         }
         Self {
@@ -69,39 +61,56 @@ impl<const N: usize> TimerQueue<N> {
         }
     }
 
+    fn timer_id(&self, index: usize) -> TimerId {
+        TimerId {
+            address: (&self.timers[index] as *const Timer as usize) as u64,
+        }
+    }
+
+    fn timer_index(&self, id: TimerId) -> Option<usize> {
+        let address = usize::try_from(id.address).ok()?;
+        let base = self.timers.as_ptr() as usize;
+        let offset = address.checked_sub(base)?;
+        let timer_size = core::mem::size_of::<Timer>();
+        if offset % timer_size != 0 {
+            return None;
+        }
+        let index = offset / timer_size;
+        (index < N).then_some(index)
+    }
+
     pub(crate) fn schedule(&mut self, deadline_ns: u64) -> Option<TimerId> {
         let index = self.free_head;
-        if index == TimerId::NO_INDEX {
+        if index == NO_INDEX {
             return None;
         }
         self.free_head = self.timers[index].next_free;
 
-        let generation = self.timers[index].id.generation.wrapping_add(1).max(1);
-        let id = TimerId { index, generation };
         self.timers[index] = Timer {
-            id,
             deadline_ns,
             active: true,
-            next_free: TimerId::NO_INDEX,
+            next_free: NO_INDEX,
         };
+        let id = self.timer_id(index);
         let previous = self.deadlines.insert((deadline_ns, index), index);
         debug_assert!(previous.is_none());
         Some(id)
     }
 
     pub(crate) fn cancel(&mut self, id: TimerId) -> bool {
-        let Some(timer) = self.timers.get(id.index) else {
+        let Some(index) = self.timer_index(id) else {
             return false;
         };
-        if timer.id != id || !timer.active {
+        let timer = &self.timers[index];
+        if !timer.active {
             return false;
         }
 
         let deadline_ns = timer.deadline_ns;
-        if self.deadlines.remove(&(deadline_ns, id.index)).is_none() {
+        if self.deadlines.remove(&(deadline_ns, index)).is_none() {
             return false;
         }
-        self.release(id.index);
+        self.release(index);
         true
     }
 
@@ -112,7 +121,7 @@ impl<const N: usize> TimerQueue<N> {
         }
 
         let ((_, index), _) = self.deadlines.take_min()?;
-        let id = self.timers[index].id;
+        let id = self.timer_id(index);
         self.release(index);
         Some(id)
     }

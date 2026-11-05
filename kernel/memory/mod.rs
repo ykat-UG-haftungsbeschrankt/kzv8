@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+pub(crate) mod address;
 pub(crate) mod dma;
 pub(crate) mod heap;
 pub(crate) mod memblock;
