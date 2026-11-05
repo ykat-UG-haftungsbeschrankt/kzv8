@@ -135,7 +135,7 @@ impl Kernel {
                 });
             }
         }
-        scheduler::task::run_forever()
+        scheduler::rust::future::run_forever()
     }
 
     fn halt() -> ! {

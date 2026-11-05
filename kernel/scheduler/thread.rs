@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::kernel::arch::traits::{
     CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
 };
-use crate::kernel::lib::list::{CircularList, ListNode};
+use crate::kernel::lib::list::{LinkedList, ListNode};
 
 use super::sync::IrqSpinLock;
 
@@ -183,8 +183,8 @@ struct SwitchContext {
 }
 
 pub(crate) struct ThreadManager {
-    ready: CircularList<Thread>,
-    busy: CircularList<Thread>,
+    ready: LinkedList<Thread>,
+    busy: LinkedList<Thread>,
     pending_reap: Option<Box<ListNode<Thread>>>,
     tls_keys: [TlsKey; Self::MAX_TLS_KEYS],
     next_thread_id: usize,
@@ -201,8 +201,8 @@ impl ThreadManager {
 
     const fn new() -> Self {
         Self {
-            ready: CircularList::new(),
-            busy: CircularList::new(),
+            ready: LinkedList::new(),
+            busy: LinkedList::new(),
             pending_reap: None,
             tls_keys: [TlsKey::EMPTY; Self::MAX_TLS_KEYS],
             next_thread_id: Self::MAIN_THREAD_ID + 1,
@@ -233,21 +233,25 @@ impl ThreadManager {
     }
 
     fn remove_thread(&mut self, id: usize) -> Option<Box<ListNode<Thread>>> {
-        if let Some(index) = self.ready.position(|thread| thread.id == id) {
-            return self.ready.remove(index);
+        if let Some(node) = self.ready.find(|thread| thread.id == id) {
+            // SAFETY: node was found in ready and has not been unlinked.
+            return unsafe { ListNode::remove(&mut self.ready, node) };
         }
-        let index = self.busy.position(|thread| thread.id == id)?;
-        self.busy.remove(index)
+        let node = self.busy.find(|thread| thread.id == id)?;
+        // SAFETY: node was found in busy and has not been unlinked.
+        unsafe { ListNode::remove(&mut self.busy, node) }
     }
 
     fn wake_blocked(&mut self, id: usize) -> bool {
-        let Some(index) = self
+        let Some(node) = self
             .busy
-            .position(|thread| thread.id == id && thread.state == ThreadState::Blocked)
+            .find(|thread| thread.id == id && thread.state == ThreadState::Blocked)
         else {
             return false;
         };
-        let Some(mut thread) = self.busy.remove(index) else {
+        // SAFETY: node was found in busy and has not been unlinked.
+        let removed = unsafe { ListNode::remove(&mut self.busy, node) };
+        let Some(mut thread) = removed else {
             return false;
         };
         thread.state = ThreadState::Ready;

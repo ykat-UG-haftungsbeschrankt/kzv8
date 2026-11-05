@@ -14,7 +14,7 @@ use crate::kernel::arch::MemoryArchitecture;
 use crate::kernel::lib::address::{AddressTranslator, PhysAddr};
 use crate::kernel::lib::bitfield::BitField;
 use crate::kernel::lib::list::CircularListLinks;
-use crate::kernel::lib::stack::Stack;
+use crate::kernel::lib::array::Array;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 const PAGE_SIZE: usize = 4096;
@@ -40,7 +40,7 @@ struct PhysicalChunk {
     page_count: u16,
     virgin_cursor: u16,
     list: ChunkList,
-    free_stack: Stack<u16, MAX_FRAMES_PER_CHUNK>,
+    free_stack: Array<u16, MAX_FRAMES_PER_CHUNK>,
     allocated: BitField<BITMAP_WORDS>,
 }
 
@@ -53,7 +53,7 @@ impl PhysicalChunk {
             page_count,
             virgin_cursor: 0,
             list: ChunkList::Detached,
-            free_stack: Stack::new(0),
+            free_stack: Array::new(0),
             allocated: BitField::new(),
         }
     }

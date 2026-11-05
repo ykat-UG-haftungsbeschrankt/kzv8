@@ -5,4 +5,4 @@ pub(crate) mod hash;
 pub(crate) mod hashmap;
 pub(crate) mod interval;
 pub(crate) mod list;
-pub(crate) mod stack;
+pub(crate) mod array;

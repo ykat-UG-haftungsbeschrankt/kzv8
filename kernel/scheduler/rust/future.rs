@@ -16,7 +16,7 @@ use core::task::{Context, Poll, Waker};
 use crate::kernel::arch::traits::{CpuArchitecture as _, InterruptArchitecture as _};
 use crate::kernel::error::Error;
 
-use super::sync::IrqSpinLock;
+use super::super::sync::IrqSpinLock;
 
 type TaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 

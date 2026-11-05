@@ -43,7 +43,6 @@ pub(crate) struct ListNode<T> {
     value: T,
     previous: Option<NonNull<Self>>,
     next: Option<NonNull<Self>>,
-    owned_next: Option<Box<Self>>,
 }
 
 impl<T> ListNode<T> {
@@ -52,13 +51,59 @@ impl<T> ListNode<T> {
             value,
             previous: None,
             next: None,
-            owned_next: None,
         }
     }
 
+    pub(crate) const fn previous(&self) -> Option<NonNull<Self>> {
+        self.previous
+    }
+
+    pub(crate) const fn next(&self) -> Option<NonNull<Self>> {
+        self.next
+    }
+
     pub(crate) fn into_value(self: Box<Self>) -> T {
-        debug_assert!(self.previous.is_none() && self.next.is_none() && self.owned_next.is_none());
+        debug_assert!(self.previous.is_none() && self.next.is_none());
         self.value
+    }
+
+    /// # Safety
+    /// `node` must be a live node owned by `list`.
+    pub(crate) unsafe fn remove(list: &mut LinkedList<T>, node: NonNull<Self>) -> Option<Box<Self>> {
+        let head_pointer = NonNull::from(list.head.as_deref_mut()?);
+        let (previous, next) = unsafe {
+            let node = node.as_ref();
+            (node.previous?, node.next?)
+        };
+
+        if previous == node && next == node {
+            if node != head_pointer {
+                return None;
+            }
+            let mut removed = list.head.take()?;
+            removed.previous = None;
+            removed.next = None;
+            return Some(removed);
+        }
+
+        // SAFETY: the caller guarantees that node belongs to this live ring.
+        unsafe {
+            (*previous.as_ptr()).next = Some(next);
+            (*next.as_ptr()).previous = Some(previous);
+        }
+
+        let mut removed = if node == head_pointer {
+            let removed = list.head.take()?;
+            // SAFETY: every non-head node is owned by a raw Box pointer held in the ring.
+            list.head = Some(unsafe { Box::from_raw(next.as_ptr()) });
+            removed
+        } else {
+            // SAFETY: every non-head node is owned by a raw Box pointer held in the ring.
+            unsafe { Box::from_raw(node.as_ptr()) }
+        };
+        removed.previous = None;
+        removed.next = None;
+        Some(removed)
     }
 }
 
@@ -80,113 +125,89 @@ impl<T> DerefMut for ListNode<T> {
 // as a unit; detached nodes have their links cleared before being returned.
 unsafe impl<T: Send> Send for ListNode<T> {}
 
-/// A circular ring of caller-allocated nodes; list operations do not allocate.
-pub(crate) struct CircularList<T> {
+/// A circular doubly linked list; operations do not allocate.
+pub(crate) struct LinkedList<T> {
     head: Option<Box<ListNode<T>>>,
-    tail: Option<NonNull<ListNode<T>>>,
-    len: usize,
 }
 
 // SAFETY: nodes are owned by this list, and their addresses remain stable when
 // the list moves because each node is separately allocated by its caller.
-unsafe impl<T: Send> Send for CircularList<T> {}
+unsafe impl<T: Send> Send for LinkedList<T> {}
 
-impl<T> CircularList<T> {
+impl<T> LinkedList<T> {
     pub(crate) const fn new() -> Self {
-        Self {
-            head: None,
-            tail: None,
-            len: 0,
-        }
+        Self { head: None }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.iter().count()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
+        self.head.is_none()
     }
 
     pub(crate) fn push_back(&mut self, mut node: Box<ListNode<T>>) {
-        debug_assert!(node.previous.is_none() && node.next.is_none() && node.owned_next.is_none());
+        debug_assert!(node.previous.is_none() && node.next.is_none());
         let node_pointer = NonNull::from(node.as_mut());
 
-        if self.len == 0 {
+        if self.head.is_none() {
             node.previous = Some(node_pointer);
             node.next = Some(node_pointer);
             self.head = Some(node);
-            self.tail = Some(node_pointer);
-            self.len = 1;
             return;
         }
 
         let head_pointer = NonNull::from(self.head.as_deref_mut().expect("non-empty list"));
-        let tail_pointer = self.tail.expect("non-empty list");
+        // SAFETY: head_pointer refers to the first node in this ring.
+        let tail_pointer = unsafe {
+            (*head_pointer.as_ptr())
+                .previous
+                .expect("non-empty ring has a tail")
+        };
         node.previous = Some(tail_pointer);
         node.next = Some(head_pointer);
-        // SAFETY: the list exclusively owns these nodes, and node_pointer is a
-        // detached box that remains at a stable address when linked.
+        let _ = Box::into_raw(node);
+        // SAFETY: the ring owns both pointers and they are adjacent at the tail.
         unsafe {
             (*tail_pointer.as_ptr()).next = Some(node_pointer);
             (*head_pointer.as_ptr()).previous = Some(node_pointer);
-            (*tail_pointer.as_ptr()).owned_next = Some(node);
         }
-        self.tail = Some(node_pointer);
-        self.len += 1;
     }
 
     pub(crate) fn push_front(&mut self, mut node: Box<ListNode<T>>) {
-        debug_assert!(node.previous.is_none() && node.next.is_none() && node.owned_next.is_none());
+        debug_assert!(node.previous.is_none() && node.next.is_none());
         let node_pointer = NonNull::from(node.as_mut());
 
-        if self.len == 0 {
+        let Some(mut head) = self.head.take() else {
             node.previous = Some(node_pointer);
             node.next = Some(node_pointer);
             self.head = Some(node);
-            self.tail = Some(node_pointer);
-            self.len = 1;
             return;
-        }
+        };
 
-        let head_pointer = NonNull::from(self.head.as_deref_mut().expect("non-empty list"));
-        let tail_pointer = self.tail.expect("non-empty list");
+        let head_pointer = NonNull::from(head.as_mut());
+        // SAFETY: head_pointer refers to the first node in this ring.
+        let tail_pointer = unsafe {
+            (*head_pointer.as_ptr())
+                .previous
+                .expect("non-empty ring has a tail")
+        };
         node.previous = Some(tail_pointer);
         node.next = Some(head_pointer);
-        node.owned_next = self.head.take();
-        // SAFETY: the list exclusively owns these nodes, and node_pointer is a
-        // detached box that remains at a stable address when linked.
+        // SAFETY: these pointers refer to adjacent nodes in this ring.
         unsafe {
             (*tail_pointer.as_ptr()).next = Some(node_pointer);
             (*head_pointer.as_ptr()).previous = Some(node_pointer);
         }
+        let _ = Box::into_raw(head);
         self.head = Some(node);
-        self.len += 1;
     }
 
     pub(crate) fn pop_front(&mut self) -> Option<Box<ListNode<T>>> {
-        let mut head = self.head.take()?;
-        if self.len == 1 {
-            self.tail = None;
-            self.len = 0;
-            head.previous = None;
-            head.next = None;
-            return Some(head);
-        }
-
-        let mut new_head = head.owned_next.take().expect("non-empty list has successor");
-        let new_head_pointer = NonNull::from(new_head.as_mut());
-        let tail_pointer = self.tail.expect("non-empty list");
-        // SAFETY: both pointers refer to nodes still owned by this list.
-        unsafe {
-            (*tail_pointer.as_ptr()).next = Some(new_head_pointer);
-            (*new_head_pointer.as_ptr()).previous = Some(tail_pointer);
-        }
-        self.head = Some(new_head);
-        self.len -= 1;
-        head.previous = None;
-        head.next = None;
-        Some(head)
+        let head = NonNull::from(self.head.as_deref_mut()?);
+        // SAFETY: head is the first live node owned by this list.
+        unsafe { ListNode::remove(self, head) }
     }
 
     pub(crate) fn front(&self) -> Option<&T> {
@@ -198,89 +219,75 @@ impl<T> CircularList<T> {
     }
 
     pub(crate) fn iter(&self) -> Iter<'_, T> {
+        let head = self.head.as_deref().map(NonNull::from);
         Iter {
-            next: self.head.as_deref().map(NonNull::from),
-            remaining: self.len,
+            head,
+            next: head,
             marker: PhantomData,
         }
     }
 
     pub(crate) fn iter_mut(&mut self) -> IterMut<'_, T> {
+        let head = self.head.as_deref_mut().map(NonNull::from);
         IterMut {
-            next: self.head.as_deref_mut().map(NonNull::from),
-            remaining: self.len,
+            head,
+            next: head,
             marker: PhantomData,
         }
     }
 
-    pub(crate) fn position(&self, predicate: impl FnMut(&T) -> bool) -> Option<usize> {
-        self.iter().position(predicate)
-    }
-
-    pub(crate) fn remove(&mut self, index: usize) -> Option<Box<ListNode<T>>> {
-        if index >= self.len {
-            return None;
+    pub(crate) fn find(
+        &self,
+        mut predicate: impl FnMut(&T) -> bool,
+    ) -> Option<NonNull<ListNode<T>>> {
+        let head = NonNull::from(self.head.as_deref()?);
+        let mut current = head;
+        loop {
+            // SAFETY: current is a node in the live ring owned by this list.
+            let node = unsafe { current.as_ref() };
+            if predicate(&node.value) {
+                return Some(current);
+            }
+            let next = node.next.expect("linked node missing next pointer");
+            if next == head {
+                return None;
+            }
+            current = next;
         }
-        if index == 0 {
-            return self.pop_front();
-        }
-
-        let mut previous_pointer = self.node_at(index - 1)?;
-        // SAFETY: index is valid, so the predecessor owns the requested node
-        // through its forward ownership link.
-        let mut removed = unsafe { previous_pointer.as_mut().owned_next.take()? };
-        let next_pointer = removed.next.expect("linked node has successor");
-        let is_tail = self.tail == Some(NonNull::from(removed.as_mut()));
-        let owned_successor = removed.owned_next.take();
-        // SAFETY: these pointers are adjacent nodes in this exclusively
-        // borrowed ring; the removed node's box is detached from ownership.
-        unsafe {
-            previous_pointer.as_mut().owned_next = owned_successor;
-            previous_pointer.as_mut().next = Some(next_pointer);
-            (*next_pointer.as_ptr()).previous = Some(previous_pointer);
-        }
-        if is_tail {
-            self.tail = Some(previous_pointer);
-        }
-        self.len -= 1;
-        removed.previous = None;
-        removed.next = None;
-        Some(removed)
     }
 
     pub(crate) fn clear(&mut self) {
-        let mut next = self.head.take();
-        self.tail = None;
-        self.len = 0;
-        while let Some(mut node) = next {
-            next = node.owned_next.take();
-            node.previous = None;
-            node.next = None;
+        let Some(mut head) = self.head.take() else {
+            return;
+        };
+        let head_pointer = NonNull::from(head.as_mut());
+        let mut current = head.next.expect("linked head missing next pointer");
+        while current != head_pointer {
+            // SAFETY: current is a non-head node owned by this ring.
+            let next = unsafe {
+                current
+                    .as_ref()
+                    .next
+                    .expect("linked node missing next pointer")
+            };
+            // SAFETY: non-head nodes were converted from Box into raw pointers when linked.
+            unsafe { drop(Box::from_raw(current.as_ptr())) };
+            current = next;
         }
-    }
-
-    fn node_at(&self, index: usize) -> Option<NonNull<ListNode<T>>> {
-        if index >= self.len {
-            return None;
-        }
-        let mut current = NonNull::from(self.head.as_deref()?);
-        for _ in 0..index {
-            // SAFETY: current is a node in the live ring owned by self.
-            current = unsafe { current.as_ref().next? };
-        }
-        Some(current)
+        head.previous = None;
+        head.next = None;
     }
 }
 
-impl<T> Drop for CircularList<T> {
+impl<T> Drop for LinkedList<T> {
     fn drop(&mut self) {
         self.clear();
     }
 }
 
 pub(crate) struct Iter<'a, T> {
+    head: Option<NonNull<ListNode<T>>>,
     next: Option<NonNull<ListNode<T>>>,
-    remaining: usize,
     marker: PhantomData<&'a ListNode<T>>,
 }
 
@@ -288,28 +295,23 @@ impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
         let node_pointer = self.next?;
         // SAFETY: the iterator's shared borrow keeps all nodes alive, and the
-        // remaining count ensures each ring element is yielded only once.
+        // head pointer marks the end after one traversal of the ring.
         let node = unsafe { node_pointer.as_ref() };
-        self.next = node.next;
-        self.remaining -= 1;
+        let next = node.next.expect("linked node missing next pointer");
+        self.next = if Some(next) == self.head {
+            None
+        } else {
+            Some(next)
+        };
         Some(&node.value)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
     }
 }
 
-impl<T> ExactSizeIterator for Iter<'_, T> {}
-
 pub(crate) struct IterMut<'a, T> {
+    head: Option<NonNull<ListNode<T>>>,
     next: Option<NonNull<ListNode<T>>>,
-    remaining: usize,
     marker: PhantomData<&'a mut ListNode<T>>,
 }
 
@@ -317,21 +319,22 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
         let node_pointer = self.next?;
-        // SAFETY: the iterator exclusively borrows the list, and the remaining
-        // count visits each distinct node once before the ring wraps.
+        // SAFETY: the iterator's mutable list borrow keeps every ring node alive.
+        let next = unsafe {
+            node_pointer
+                .as_ref()
+                .next
+                .expect("linked node missing next pointer")
+        };
+        self.next = if Some(next) == self.head {
+            None
+        } else {
+            Some(next)
+        };
+        // SAFETY: the iterator exclusively borrows the list, and the head
+        // pointer ensures each distinct node is visited once.
         let node = unsafe { &mut *node_pointer.as_ptr() };
-        self.next = node.next;
-        self.remaining -= 1;
         Some(&mut node.value)
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
 }
-
-impl<T> ExactSizeIterator for IterMut<'_, T> {}

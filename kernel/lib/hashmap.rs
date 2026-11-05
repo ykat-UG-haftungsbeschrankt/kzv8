@@ -5,14 +5,14 @@ use core::mem::{align_of, size_of};
 use core::ptr;
 
 use crate::kernel::lib::hash::FnvHasher;
-use crate::kernel::lib::list::{CircularList, ListNode};
+use crate::kernel::lib::list::{LinkedList, ListNode};
 
 struct Entry<K, V> {
 	key: K,
 	value: V,
 }
 
-type Bucket<K, V> = CircularList<Entry<K, V>>;
+type Bucket<K, V> = LinkedList<Entry<K, V>>;
 
 pub(crate) struct HashMap<K, V> {
 	address: usize,
@@ -64,7 +64,7 @@ impl<K, V> HashMap<K, V> {
 		let buckets = address as *mut Bucket<K, V>;
 		for index in 0..capacity {
 			// SAFETY: the reservation covers every bucket slot, and each slot is initialized once.
-			unsafe { buckets.add(index).write(CircularList::new()) };
+			unsafe { buckets.add(index).write(LinkedList::new()) };
 		}
 		Some((address, allocation_length))
 	}
@@ -216,8 +216,9 @@ impl<K: Eq + Hash, V> HashMap<K, V> {
 			return None;
 		}
 		let index = Self::bucket_index(key, self.capacity);
-		let position = self.bucket(index).position(|entry| entry.key == *key)?;
-		let entry = self.bucket_mut(index).remove(position)?.into_value();
+		let node = self.bucket(index).find(|entry| entry.key == *key)?;
+		// SAFETY: node was found in this bucket and has not been unlinked.
+		let entry = unsafe { ListNode::remove(self.bucket_mut(index), node) }?.into_value();
 		self.length -= 1;
 		Some(entry.value)
 	}

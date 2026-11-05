@@ -1,11 +1,11 @@
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Stack<T: Copy, const CAPACITY: usize> {
+pub(crate) struct Array<T: Copy, const CAPACITY: usize> {
     len: u16,
     entries: [T; CAPACITY],
 }
 
-impl<T: Copy, const CAPACITY: usize> Stack<T, CAPACITY> {
+impl<T: Copy, const CAPACITY: usize> Array<T, CAPACITY> {
     pub(crate) const fn new(empty_value: T) -> Self {
         assert!(CAPACITY > 0 && CAPACITY <= u16::MAX as usize);
         Self {
