@@ -1,5 +1,17 @@
 When working on files under `runtime/`, do not modify files under `kernel/`. If a runtime task appears to require a kernel change, explain why and ask for approval before editing `kernel/`.
 
+## Copyright Headers
+- Add the following notice to every new or modified first-party text source file. Preserve its wording and use the file's native comment syntax.
+```c
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+```
+- Do not add comments to formats that do not support them, or to generated, vendored, or binary files.
+
 ## Validation
 - Run code reformatting, compilation/builds, and smoke checks only when explicitly requested by the user.
 

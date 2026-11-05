@@ -212,7 +212,7 @@ impl ThreadManager {
         }
     }
 
-    fn thread_node(&self, id: usize) -> Option<NonNull<ListNode<Thread>>> {
+    fn thread_node_by_id(&self, id: usize) -> Option<NonNull<ListNode<Thread>>> {
         NonNull::new((*self.thread_nodes.get(&id)?) as *mut ListNode<Thread>)
     }
 
@@ -221,19 +221,23 @@ impl ThreadManager {
         unsafe { &**node.as_ptr() }
     }
 
+    fn thread_pointer(&self, node: NonNull<ListNode<Thread>>) -> NonNull<Thread> {
+        NonNull::from(self.thread_ref(node))
+    }
+
     fn thread_mut(&mut self, mut node: NonNull<ListNode<Thread>>) -> &mut Thread {
         // SAFETY: callers pass live registry nodes while holding exclusive manager access.
         unsafe { &mut **node.as_mut() }
     }
 
-    fn find_thread(&self, id: usize) -> Option<&Thread> {
-        let node = self.thread_node(id)?;
-        Some(self.thread_ref(node))
+    fn thread_ref_from_pointer(&self, thread: NonNull<Thread>) -> &Thread {
+        // SAFETY: callers resolve this pointer from the registry while holding the manager lock.
+        unsafe { thread.as_ref() }
     }
 
-    fn find_thread_mut(&mut self, id: usize) -> Option<&mut Thread> {
-        let node = self.thread_node(id)?;
-        Some(self.thread_mut(node))
+    fn thread_mut_from_pointer(&mut self, mut thread: NonNull<Thread>) -> &mut Thread {
+        // SAFETY: callers resolve this pointer from the registry while holding exclusive manager access.
+        unsafe { thread.as_mut() }
     }
 
     fn remove_thread(&mut self, node: NonNull<ListNode<Thread>>) -> Option<Box<ListNode<Thread>>> {
@@ -478,115 +482,156 @@ impl ThreadManager {
         }
     }
 
-    pub(crate) fn contains_thread(id: usize) -> bool {
-        THREAD_MANAGER.lock().find_thread(id).is_some()
+    pub(crate) fn contains_thread_by_id(id: usize) -> bool {
+        THREAD_MANAGER.lock().thread_node_by_id(id).is_some()
     }
 
-    pub(crate) fn thread_attributes(id: usize) -> Option<(*mut c_void, usize, bool)> {
-        let manager = THREAD_MANAGER.lock();
-        let thread = manager.find_thread(id)?;
+    fn thread_attributes(&self, thread: NonNull<Thread>) -> (*mut c_void, usize, bool) {
+        let thread = self.thread_ref_from_pointer(thread);
         let (stack_address, stack_size) = thread.stack_bounds();
-        Some((stack_address, stack_size, thread.detached))
+        (stack_address, stack_size, thread.detached)
     }
 
-    pub(crate) fn begin_join(id: usize) -> Result<Option<usize>, JoinError> {
-        let mut removed = None;
-        let result = {
+    pub(crate) fn thread_attributes_by_id(id: usize) -> Option<(*mut c_void, usize, bool)> {
+        let manager = THREAD_MANAGER.lock();
+        let node = manager.thread_node_by_id(id)?;
+        Some(manager.thread_attributes(manager.thread_pointer(node)))
+    }
+
+    fn begin_join(
+        &mut self,
+        thread: NonNull<Thread>,
+    ) -> Result<Option<usize>, JoinError> {
+        let current_id = self.busy.front().map_or(0, |thread| thread.id);
+        let (id, state, detached, joiner, result) = {
+            let thread = self.thread_ref_from_pointer(thread);
+            (
+                thread.id,
+                thread.state,
+                thread.detached,
+                thread.joiner,
+                thread.result,
+            )
+        };
+        if id == current_id {
+            return Err(JoinError::Deadlock);
+        }
+        if detached || joiner != 0 {
+            return Err(JoinError::Invalid);
+        }
+        if state == ThreadState::Exited {
+            Ok(Some(result))
+        } else {
+            self.thread_mut_from_pointer(thread).joiner = current_id;
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn begin_join_by_id(id: usize) -> Result<Option<usize>, JoinError> {
+        let (result, removed) = {
             let mut manager = THREAD_MANAGER.lock();
-            let current_id = manager.busy.front().map_or(0, |thread| thread.id);
             if !manager.initialized {
                 return Err(JoinError::NoSuchThread);
             }
-            if id == current_id {
-                return Err(JoinError::Deadlock);
-            }
-            let Some(node) = manager.thread_node(id) else {
+            let Some(list_node) = manager.thread_node_by_id(id) else {
                 return Err(JoinError::NoSuchThread);
             };
-            let (state, detached, joiner) = {
-                let thread = manager.thread_ref(node);
-                (thread.state, thread.detached, thread.joiner)
-            };
-            if detached || joiner != 0 {
-                return Err(JoinError::Invalid);
-            }
-            if state == ThreadState::Exited {
-                let Some(thread) = manager.remove_thread(node) else {
-                    return Err(JoinError::NoSuchThread);
-                };
-                let result = thread.result;
-                removed = Some(thread);
-                Some(result)
+            let thread = manager.thread_pointer(list_node);
+            let result = manager.begin_join(thread)?;
+            let removed = if result.is_some() {
+                Some(
+                    manager
+                        .remove_thread(list_node)
+                        .ok_or(JoinError::NoSuchThread)?,
+                )
             } else {
-                let thread = manager.thread_mut(node);
-                thread.joiner = current_id;
+                None
+            };
+            (result, removed)
+        };
+        drop(removed);
+        Ok(result)
+    }
+
+    fn cancel_join(&mut self, thread: NonNull<Thread>) {
+        let current_id = self.busy.front().map_or(0, |thread| thread.id);
+        let thread = self.thread_mut_from_pointer(thread);
+        if thread.joiner == current_id {
+            thread.joiner = 0;
+        }
+    }
+
+    pub(crate) fn cancel_join_by_id(id: usize) {
+        let mut manager = THREAD_MANAGER.lock();
+        let Some(node) = manager.thread_node_by_id(id) else {
+            return;
+        };
+        let thread = manager.thread_pointer(node);
+        manager.cancel_join(thread);
+    }
+
+    fn finish_join(&self, thread: NonNull<Thread>) -> Result<usize, JoinError> {
+        let current_id = self.busy.front().map_or(0, |thread| thread.id);
+        let thread = self.thread_ref_from_pointer(thread);
+        if thread.state != ThreadState::Exited {
+            return Err(JoinError::NotExited);
+        }
+        if thread.joiner != current_id {
+            return Err(JoinError::Invalid);
+        }
+        Ok(thread.result)
+    }
+
+    pub(crate) fn finish_join_by_id(id: usize) -> Result<usize, JoinError> {
+        let (result, removed) = {
+            let mut manager = THREAD_MANAGER.lock();
+            let Some(node) = manager.thread_node_by_id(id) else {
+                return Err(JoinError::NoSuchThread);
+            };
+            let thread = manager.thread_pointer(node);
+            let result = manager.finish_join(thread)?;
+            let removed = manager
+                .remove_thread(node)
+                .ok_or(JoinError::NoSuchThread)?;
+            (result, removed)
+        };
+        drop(removed);
+        Ok(result)
+    }
+
+    fn detach(&mut self, thread: NonNull<Thread>) -> Result<bool, JoinError> {
+        let (state, detached, joiner) = {
+            let thread = self.thread_ref_from_pointer(thread);
+            (thread.state, thread.detached, thread.joiner)
+        };
+        if detached || joiner != 0 {
+            return Err(JoinError::Invalid);
+        }
+        if state == ThreadState::Exited {
+            Ok(true)
+        } else {
+            self.thread_mut_from_pointer(thread).detached = true;
+            Ok(false)
+        }
+    }
+
+    pub(crate) fn detach_by_id(id: usize) -> Result<(), JoinError> {
+        let removed = {
+            let mut manager = THREAD_MANAGER.lock();
+            let Some(node) = manager.thread_node_by_id(id) else {
+                return Err(JoinError::NoSuchThread);
+            };
+            let thread = manager.thread_pointer(node);
+            if manager.detach(thread)? {
+                Some(
+                    manager
+                        .remove_thread(node)
+                        .ok_or(JoinError::NoSuchThread)?,
+                )
+            } else {
                 None
             }
         };
-        drop(removed);
-        Ok(result)
-    }
-
-    pub(crate) fn cancel_join(id: usize) {
-        let mut manager = THREAD_MANAGER.lock();
-        let current_id = manager.busy.front().map_or(0, |thread| thread.id);
-        if let Some(thread) = manager.find_thread_mut(id) {
-            if thread.joiner == current_id {
-                thread.joiner = 0;
-            }
-        }
-    }
-
-    pub(crate) fn finish_join(id: usize) -> Result<usize, JoinError> {
-        let mut removed = None;
-        let result = {
-            let mut manager = THREAD_MANAGER.lock();
-            let current_id = manager.busy.front().map_or(0, |thread| thread.id);
-            let Some(node) = manager.thread_node(id) else {
-                return Err(JoinError::NoSuchThread);
-            };
-            let (state, joiner) = {
-                let thread = manager.thread_ref(node);
-                (thread.state, thread.joiner)
-            };
-            if state != ThreadState::Exited {
-                return Err(JoinError::NotExited);
-            }
-            if joiner != current_id {
-                return Err(JoinError::Invalid);
-            }
-            let Some(thread) = manager.remove_thread(node) else {
-                return Err(JoinError::NoSuchThread);
-            };
-            let result = thread.result;
-            removed = Some(thread);
-            result
-        };
-        drop(removed);
-        Ok(result)
-    }
-
-    pub(crate) fn detach(id: usize) -> Result<(), JoinError> {
-        let mut removed = None;
-        {
-            let mut manager = THREAD_MANAGER.lock();
-            let Some(node) = manager.thread_node(id) else {
-                return Err(JoinError::NoSuchThread);
-            };
-            let (state, detached, joiner) = {
-                let thread = manager.thread_ref(node);
-                (thread.state, thread.detached, thread.joiner)
-            };
-            if detached || joiner != 0 {
-                return Err(JoinError::Invalid);
-            }
-            if state == ThreadState::Exited {
-                removed = manager.remove_thread(node);
-            } else {
-                let thread = manager.thread_mut(node);
-                thread.detached = true;
-            }
-        }
         drop(removed);
         Ok(())
     }
@@ -605,7 +650,7 @@ impl ThreadManager {
                 current.result = result as usize;
                 current.state = ThreadState::Exited;
                 if current.joiner != 0 {
-                    if let Some(joiner) = manager.thread_node(current.joiner) {
+                    if let Some(joiner) = manager.thread_node_by_id(current.joiner) {
                         manager.wake_blocked(joiner);
                     }
                 }

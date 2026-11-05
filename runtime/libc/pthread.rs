@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 
@@ -124,7 +131,7 @@ pub unsafe extern "C" fn pthread_getschedparam(
     if policy.is_null() || parameters.is_null() {
         return EINVAL;
     }
-    if !ThreadManager::contains_thread(thread_id) {
+    if !ThreadManager::contains_thread_by_id(thread_id) {
         return ESRCH;
     }
     unsafe {
@@ -247,7 +254,7 @@ pub unsafe extern "C" fn pthread_getattr_np(thread_id: usize, attributes: *mut c
         return EINVAL;
     }
     let Some((stack_address, stack_size, detached)) =
-        ThreadManager::thread_attributes(thread_id)
+        ThreadManager::thread_attributes_by_id(thread_id)
     else {
         return ESRCH;
     };
@@ -265,7 +272,7 @@ pub unsafe extern "C" fn pthread_getattr_np(thread_id: usize, attributes: *mut c
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_kill(thread_id: usize, signal_number: i32) -> i32 {
-    if !ThreadManager::contains_thread(thread_id) {
+    if !ThreadManager::contains_thread_by_id(thread_id) {
         return ESRCH;
     }
     if signal_number == 0 {
@@ -319,7 +326,7 @@ pub unsafe extern "C" fn pthread_create(
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_join(thread_id: usize, result: *mut *mut c_void) -> i32 {
-    match ThreadManager::begin_join(thread_id) {
+    match ThreadManager::begin_join_by_id(thread_id) {
         Ok(Some(value)) => {
             if !result.is_null() {
                 unsafe { result.write(value as *mut c_void) };
@@ -331,11 +338,11 @@ pub unsafe extern "C" fn pthread_join(thread_id: usize, result: *mut *mut c_void
     }
 
     if !ThreadManager::switch_current(ThreadState::Blocked) {
-        ThreadManager::cancel_join(thread_id);
+        ThreadManager::cancel_join_by_id(thread_id);
         return EDEADLK;
     }
 
-    let value = match ThreadManager::finish_join(thread_id) {
+    let value = match ThreadManager::finish_join_by_id(thread_id) {
         Ok(value) => value,
         Err(error) => return join_error_status(error),
     };
@@ -355,7 +362,7 @@ fn join_error_status(error: JoinError) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_detach(thread_id: usize) -> i32 {
-    match ThreadManager::detach(thread_id) {
+    match ThreadManager::detach_by_id(thread_id) {
         Ok(()) => 0,
         Err(JoinError::NoSuchThread) => ESRCH,
         Err(_) => EINVAL,
