@@ -29,6 +29,8 @@ pub(crate) struct BlockDevice {
 struct BlockState {
     queue: DmaQueue<{ BlockDevice::QUEUE_SIZE }>,
     requests: Vec<BlockRequest>,
+    free_requests: Vec<usize>,
+    request_by_head: [Option<usize>; BlockDevice::QUEUE_SIZE],
 }
 
 struct BlockRequest {
@@ -57,9 +59,11 @@ impl BlockDevice {
         let capacity_sectors = u64::from(transport.read_device_config(0)?)
             | (u64::from(transport.read_device_config(4)?) << 32);
         let mut requests = Vec::new();
+        let mut free_requests = Vec::new();
         let request_count = Self::QUEUE_SIZE / 3;
         requests.try_reserve_exact(request_count).ok()?;
-        for _ in 0..request_count {
+        free_requests.try_reserve_exact(request_count).ok()?;
+        for request_index in 0..request_count {
             requests.push(BlockRequest {
                 header: RequestHeader {
                     request_type: 0,
@@ -72,11 +76,17 @@ impl BlockDevice {
                 used_length: None,
                 abandoned: false,
             });
+            free_requests.push(request_count - request_index - 1);
         }
         Some(Self {
             transport,
             capacity_sectors,
-            state: IrqSpinLock::new(BlockState { queue, requests }),
+            state: IrqSpinLock::new(BlockState {
+                queue,
+                requests,
+                free_requests,
+                request_by_head: [None; Self::QUEUE_SIZE],
+            }),
         })
     }
 
@@ -125,11 +135,7 @@ impl BlockDevice {
     ) -> Result<BlockTransfer<'a>, Error> {
         let mut state = self.state.lock();
         Self::reap_completions(&mut state)?;
-        let Some(request_index) = state
-            .requests
-            .iter()
-            .position(|request| request.head.is_none() && request.used_length.is_none())
-        else {
+        let Some(request_index) = state.free_requests.pop() else {
             return Err(Error::Busy);
         };
         let request = &mut state.requests[request_index];
@@ -155,7 +161,11 @@ impl BlockDevice {
             ),
             Descriptor::new(&mut request.status as *mut u8 as u64, 1, true),
         ];
-        let head = state.queue.submit(&descriptors).ok_or(Error::Busy)?;
+        let Some(head) = state.queue.submit(&descriptors) else {
+            state.free_requests.push(request_index);
+            return Err(Error::Busy);
+        };
+        state.request_by_head[usize::from(head)] = Some(request_index);
         let request = &mut state.requests[request_index];
         request.head = Some(head);
         request.abandoned = false;
@@ -174,19 +184,32 @@ impl BlockDevice {
 
     fn reap_completions(state: &mut BlockState) -> Result<(), Error> {
         while let Some(used) = state.queue.poll_used() {
-            let Some(request) = state
-                .requests
-                .iter_mut()
-                .find(|request| request.head.is_some_and(|head| u32::from(head) == used.id))
+            let Some(request_index) = state
+                .request_by_head
+                .get_mut(used.id as usize)
+                .and_then(Option::take)
             else {
                 return Err(Error::Proto);
             };
-            if request.abandoned {
-                request.head = None;
-                request.used_length = None;
-                request.abandoned = false;
-            } else {
-                request.used_length = Some(used.length);
+            let abandoned = {
+                let Some(request) = state.requests.get_mut(request_index) else {
+                    return Err(Error::Proto);
+                };
+                if request.head.map(u32::from) != Some(used.id) {
+                    return Err(Error::Proto);
+                }
+                if request.abandoned {
+                    request.head = None;
+                    request.used_length = None;
+                    request.abandoned = false;
+                    true
+                } else {
+                    request.used_length = Some(used.length);
+                    false
+                }
+            };
+            if abandoned {
+                state.free_requests.push(request_index);
             }
         }
         Ok(())
@@ -227,6 +250,7 @@ impl BlockTransfer<'_> {
         self.complete = true;
         request.head = None;
         request.abandoned = false;
+        state.free_requests.push(self.request_index);
         match request.status {
             0 => {}
             1 => return Err(Error::Io),
@@ -250,16 +274,26 @@ impl Drop for BlockTransfer<'_> {
             return;
         }
         let mut state = self.device.state.lock();
-        let Some(request) = state.requests.get_mut(self.request_index) else {
-            return;
-        };
-        if request.head == Some(self.head) {
-            request.abandoned = true;
-            if request.used_length.is_some() {
-                request.head = None;
-                request.used_length = None;
-                request.abandoned = false;
+        let release_request = {
+            let Some(request) = state.requests.get_mut(self.request_index) else {
+                return;
+            };
+            if request.head == Some(self.head) {
+                request.abandoned = true;
+                if request.used_length.is_some() {
+                    request.head = None;
+                    request.used_length = None;
+                    request.abandoned = false;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
+        };
+        if release_request {
+            state.free_requests.push(self.request_index);
         }
     }
 }

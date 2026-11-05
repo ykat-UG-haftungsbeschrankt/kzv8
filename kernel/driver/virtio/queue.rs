@@ -64,6 +64,8 @@ pub(crate) struct VirtQueue<const N: usize> {
     available: AvailableRing<N>,
     used: UsedRing<N>,
     free_descriptors: [bool; N],
+    free_descriptor_stack: [u16; N],
+    free_descriptor_count: usize,
     pending_heads: [bool; N],
     last_used: u16,
     queue_size: usize,
@@ -93,6 +95,8 @@ impl<const N: usize> VirtQueue<N> {
                 available_event: 0,
             },
             free_descriptors: [false; N],
+            free_descriptor_stack: [0; N],
+            free_descriptor_count: 0,
             pending_heads: [false; N],
             in_flight_count: 0,
             last_used: 0,
@@ -127,7 +131,11 @@ impl<const N: usize> VirtQueue<N> {
         )?;
         self.queue_size = queue_size as usize;
         self.free_descriptors = [false; N];
-        self.free_descriptors[..self.queue_size].fill(true);
+        for slot in 0..self.queue_size {
+            self.free_descriptors[slot] = true;
+            self.free_descriptor_stack[slot] = (self.queue_size - slot - 1) as u16;
+        }
+        self.free_descriptor_count = self.queue_size;
         self.pending_heads = [false; N];
         self.last_used = 0;
         Ok(())
@@ -138,21 +146,15 @@ impl<const N: usize> VirtQueue<N> {
         if queue_size == 0 || chain.is_empty() || chain.len() > queue_size {
             return None;
         }
-
-        let mut slots = [0; N];
-        let mut slot_count = 0;
-        for (slot, free) in self.free_descriptors[..queue_size].iter().enumerate() {
-            if *free {
-                slots[slot_count] = slot as u16;
-                slot_count += 1;
-                if slot_count == chain.len() {
-                    break;
-                }
-            }
-        }
-        if slot_count != chain.len() {
+        if self.free_descriptor_count < chain.len() {
             return None;
         }
+
+        let mut slots = [0; N];
+        for offset in 0..chain.len() {
+            slots[offset] = self.free_descriptor_stack[self.free_descriptor_count - offset - 1];
+        }
+        self.free_descriptor_count -= chain.len();
 
         for slot in slots[..chain.len()].iter().copied() {
             self.free_descriptors[usize::from(slot)] = false;
@@ -224,6 +226,8 @@ impl<const N: usize> VirtQueue<N> {
                     ))
                 };
                 self.free_descriptors[descriptor_slot] = true;
+                self.free_descriptor_stack[self.free_descriptor_count] = descriptor_slot as u16;
+                self.free_descriptor_count += 1;
                 if descriptor.flags & DESC_NEXT == 0 {
                     break;
                 }

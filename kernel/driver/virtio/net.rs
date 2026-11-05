@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
@@ -19,7 +20,12 @@ pub(crate) struct VirtioNet {
     receive_queue: DmaQueue<{Self::QUEUE_SIZE}>,
     transmit_queue: DmaQueue<{ Self::QUEUE_SIZE }>,
     receive_buffers: Vec<ReceiveBuffer>,
+    free_receive_buffers: Vec<usize>,
+    completed_receive_buffers: VecDeque<usize>,
+    receive_buffer_by_head: [Option<usize>; Self::QUEUE_SIZE],
     transmit_buffers: Vec<TransmitBuffer>,
+    free_transmit_buffers: Vec<usize>,
+    transmit_buffer_by_head: [Option<usize>; Self::QUEUE_SIZE],
     mtu: usize,
     frame_size: usize,
     mac_address: [u8; 6],
@@ -79,9 +85,15 @@ impl VirtioNet {
         let request_count = Self::QUEUE_SIZE / 2;
         let mut receive_buffers = Vec::new();
         receive_buffers.try_reserve_exact(request_count).ok()?;
+        let mut free_receive_buffers = Vec::new();
+        free_receive_buffers.try_reserve_exact(request_count).ok()?;
+        let mut completed_receive_buffers = VecDeque::new();
+        completed_receive_buffers.try_reserve_exact(request_count).ok()?;
         let mut transmit_buffers = Vec::new();
         transmit_buffers.try_reserve_exact(request_count).ok()?;
-        for _ in 0..request_count {
+        let mut free_transmit_buffers = Vec::new();
+        free_transmit_buffers.try_reserve_exact(request_count).ok()?;
+        for buffer_index in 0..request_count {
             receive_buffers.push(ReceiveBuffer {
                 buffer: DmaArena::allocate(buffer_size, 16)?,
                 head: None,
@@ -91,6 +103,8 @@ impl VirtioNet {
                 buffer: DmaArena::allocate(buffer_size, 16)?,
                 head: None,
             });
+            free_receive_buffers.push(request_count - buffer_index - 1);
+            free_transmit_buffers.push(request_count - buffer_index - 1);
         }
         let mac_low = transport.read_device_config(0)?;
         let mac_high = transport.read_device_config(4)?;
@@ -107,7 +121,12 @@ impl VirtioNet {
             receive_queue,
             transmit_queue,
             receive_buffers,
+            free_receive_buffers,
+            completed_receive_buffers,
+            receive_buffer_by_head: [None; Self::QUEUE_SIZE],
             transmit_buffers,
+            free_transmit_buffers,
+            transmit_buffer_by_head: [None; Self::QUEUE_SIZE],
             mtu,
             frame_size,
             mac_address,
@@ -135,11 +154,9 @@ impl VirtioNet {
             return Err(Error::MsgSize);
         }
         self.reap_transmit()?;
-        let buffer_index = self
-            .transmit_buffers
-            .iter()
-            .position(|buffer| buffer.head.is_none())
-            .ok_or(Error::Busy)?;
+        let Some(buffer_index) = self.free_transmit_buffers.pop() else {
+            return Err(Error::Busy);
+        };
         let buffer = self.transmit_buffers[buffer_index].buffer.as_mut_slice();
         buffer[..Self::HEADER_SIZE].fill(0);
         buffer[Self::HEADER_SIZE..Self::HEADER_SIZE + frame.len()].copy_from_slice(frame);
@@ -148,10 +165,11 @@ impl VirtioNet {
             Descriptor::new(base, Self::HEADER_SIZE as u32, false),
             Descriptor::new(base + Self::HEADER_SIZE as u64, frame.len() as u32, false),
         ];
-        let head = self
-            .transmit_queue
-            .submit(&descriptors)
-            .ok_or(Error::Busy)?;
+        let Some(head) = self.transmit_queue.submit(&descriptors) else {
+            self.free_transmit_buffers.push(buffer_index);
+            return Err(Error::Busy);
+        };
+        self.transmit_buffer_by_head[usize::from(head)] = Some(buffer_index);
         self.transmit_buffers[buffer_index].head = Some(head);
         DmaArena::sync_for_device();
         self.transport.notify(1);
@@ -160,7 +178,7 @@ impl VirtioNet {
 
     pub(crate) fn poll_transmit(&mut self) -> Result<bool, Error> {
         self.reap_transmit()?;
-        Ok(self.transmit_buffers.iter().all(|buffer| buffer.head.is_none()))
+        Ok(self.free_transmit_buffers.len() == self.transmit_buffers.len())
     }
 
     pub(crate) fn poll_receive(&mut self, output: &mut [u8]) -> Result<Option<usize>, Error> {
@@ -169,64 +187,74 @@ impl VirtioNet {
         }
         self.submit_receive_buffers();
         self.reap_receive()?;
-        let Some(buffer_index) = self
-            .receive_buffers
-            .iter()
-            .position(|buffer| buffer.used_length.is_some())
-        else {
+        let Some(buffer_index) = self.completed_receive_buffers.pop_front() else {
             return Ok(None);
         };
-        let used_length = self.receive_buffers[buffer_index]
-            .used_length
-            .take()
-            .ok_or(Error::Proto)?;
+        let Some(used_length) = self.receive_buffers[buffer_index].used_length.take() else {
+            self.free_receive_buffers.push(buffer_index);
+            self.submit_receive_buffers();
+            return Err(Error::Proto);
+        };
         let frame_length = used_length.saturating_sub(Self::HEADER_SIZE);
         if frame_length > output.len() || frame_length > self.frame_size {
+            self.free_receive_buffers.push(buffer_index);
             self.submit_receive_buffers();
             return Err(Error::MsgSize);
         }
         let buffer = self.receive_buffers[buffer_index].buffer.as_mut_slice();
         output[..frame_length].copy_from_slice(&buffer[Self::HEADER_SIZE..Self::HEADER_SIZE + frame_length]);
+        self.free_receive_buffers.push(buffer_index);
         self.submit_receive_buffers();
         Ok(Some(frame_length))
     }
 
     fn reap_transmit(&mut self) -> Result<(), Error> {
         while let Some(used) = self.transmit_queue.poll_used() {
-            let Some(buffer) = self
-                .transmit_buffers
-                .iter_mut()
-                .find(|buffer| buffer.head.is_some_and(|head| u32::from(head) == used.id))
+            let Some(buffer_index) = self
+                .transmit_buffer_by_head
+                .get_mut(used.id as usize)
+                .and_then(Option::take)
             else {
                 return Err(Error::Proto);
             };
+            let Some(buffer) = self.transmit_buffers.get_mut(buffer_index) else {
+                return Err(Error::Proto);
+            };
+            if buffer.head.map(u32::from) != Some(used.id) {
+                return Err(Error::Proto);
+            }
             buffer.head = None;
+            self.free_transmit_buffers.push(buffer_index);
         }
         Ok(())
     }
 
     fn reap_receive(&mut self) -> Result<(), Error> {
         while let Some(used) = self.receive_queue.poll_used() {
-            let Some(buffer) = self
-                .receive_buffers
-                .iter_mut()
-                .find(|buffer| buffer.head.is_some_and(|head| u32::from(head) == used.id))
+            let Some(buffer_index) = self
+                .receive_buffer_by_head
+                .get_mut(used.id as usize)
+                .and_then(Option::take)
             else {
                 return Err(Error::Proto);
             };
+            let Some(buffer) = self.receive_buffers.get_mut(buffer_index) else {
+                return Err(Error::Proto);
+            };
+            if buffer.head.map(u32::from) != Some(used.id) {
+                return Err(Error::Proto);
+            }
             buffer.head = None;
             buffer.used_length = Some(used.length as usize);
+            self.completed_receive_buffers.push_back(buffer_index);
         }
         Ok(())
     }
 
     fn submit_receive_buffers(&mut self) {
         let mut submitted = false;
-        for index in 0..self.receive_buffers.len() {
+        while let Some(index) = self.free_receive_buffers.pop() {
             let receive_buffer = &mut self.receive_buffers[index];
-            if receive_buffer.head.is_some() || receive_buffer.used_length.is_some() {
-                continue;
-            }
             let buffer = receive_buffer.buffer.as_mut_slice();
             buffer.fill(0);
             let base = receive_buffer.buffer.bus_address();
@@ -235,9 +263,11 @@ impl VirtioNet {
                 Descriptor::new(base + Self::HEADER_SIZE as u64, self.frame_size as u32, true),
             ];
             let Some(head) = self.receive_queue.submit(&descriptors) else {
+                self.free_receive_buffers.push(index);
                 break;
             };
             self.receive_buffers[index].head = Some(head);
+            self.receive_buffer_by_head[usize::from(head)] = Some(index);
             submitted = true;
         }
         if submitted {
