@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::ffi::{c_char, c_int, c_long, c_longlong};
 use super::errno::ENOSYS;
 
@@ -89,7 +96,16 @@ unsupported_unary!(log10, log10f);
 unsupported_unary!(log1p, log1pf);
 unsupported_unary!(log2, log2f);
 unsupported_unary!(logb, logbf);
-unsupported_unary!(nearbyint, nearbyintf);
+#[no_mangle]
+pub extern "C" fn nearbyint(value: f64) -> f64 {
+    crate::runtime::runtime_libc::math::nearbyint(value)
+}
+
+#[no_mangle]
+pub extern "C" fn nearbyintf(value: f32) -> f32 {
+    crate::runtime::runtime_libc::math::nearbyintf(value)
+}
+
 unsupported_unary!(rint, rintf);
 unsupported_unary!(sin, sinf);
 unsupported_unary!(sinh, sinhf);
@@ -102,48 +118,57 @@ unsupported_binary!(atan2, atan2f);
 unsupported_binary!(fdim, fdimf);
 unsupported_binary!(fmod, fmodf);
 unsupported_binary!(hypot, hypotf);
-unsupported_binary!(nextafter, nextafterf);
+#[no_mangle]
+pub extern "C" fn nextafter(value: f64, direction: f64) -> f64 {
+    crate::runtime::runtime_libc::math::nextafter(value, direction)
+}
+
+#[no_mangle]
+pub extern "C" fn nextafterf(value: f32, direction: f32) -> f32 {
+    crate::runtime::runtime_libc::math::nextafterf(value, direction)
+}
+
 unsupported_binary!(pow, powf);
 unsupported_binary!(remainder, remainderf);
 
 #[no_mangle]
 pub extern "C" fn ceil(value: f64) -> f64 {
-    value.ceil()
+    libm::ceil(value)
 }
 
 #[no_mangle]
 pub extern "C" fn ceilf(value: f32) -> f32 {
-    value.ceil()
+    libm::ceilf(value)
 }
 
 #[no_mangle]
 pub extern "C" fn floor(value: f64) -> f64 {
-    value.floor()
+    libm::floor(value)
 }
 
 #[no_mangle]
 pub extern "C" fn floorf(value: f32) -> f32 {
-    value.floor()
+    libm::floorf(value)
 }
 
 #[no_mangle]
 pub extern "C" fn trunc(value: f64) -> f64 {
-    value.trunc()
+    libm::trunc(value)
 }
 
 #[no_mangle]
 pub extern "C" fn truncf(value: f32) -> f32 {
-    value.trunc()
+    libm::truncf(value)
 }
 
 #[no_mangle]
 pub extern "C" fn round(value: f64) -> f64 {
-    value.round()
+    libm::round(value)
 }
 
 #[no_mangle]
 pub extern "C" fn roundf(value: f32) -> f32 {
-    value.round()
+    libm::roundf(value)
 }
 
 #[no_mangle]
@@ -188,12 +213,12 @@ pub extern "C" fn fminf(left: f32, right: f32) -> f32 {
 
 #[no_mangle]
 pub extern "C" fn sqrt(value: f64) -> f64 {
-    value.sqrt()
+    libm::sqrt(value)
 }
 
 #[no_mangle]
 pub extern "C" fn sqrtf(value: f32) -> f32 {
-    value.sqrt()
+    libm::sqrtf(value)
 }
 
 #[no_mangle]

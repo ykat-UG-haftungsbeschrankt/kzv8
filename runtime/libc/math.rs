@@ -5,8 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-#[no_mangle]
-pub extern "C" fn nearbyint(value: f64) -> f64 {
+pub(crate) fn nearbyint(value: f64) -> f64 {
     if value != value || value >= 4_503_599_627_370_496.0 || value <= -4_503_599_627_370_496.0 {
         return value;
     }
@@ -21,8 +20,7 @@ pub extern "C" fn nearbyint(value: f64) -> f64 {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn nearbyintf(value: f32) -> f32 {
+pub(crate) fn nearbyintf(value: f32) -> f32 {
     if value != value || value >= 8_388_608.0 || value <= -8_388_608.0 {
         return value;
     }
@@ -68,8 +66,7 @@ pub unsafe extern "C" fn modff(value: f32, integral_part: *mut f32) -> f32 {
     value - integral
 }
 
-#[no_mangle]
-pub extern "C" fn nextafter(value: f64, direction: f64) -> f64 {
+pub(crate) fn nextafter(value: f64, direction: f64) -> f64 {
     if value != value || direction != direction {
         return value + direction;
     }
@@ -89,8 +86,7 @@ pub extern "C" fn nextafter(value: f64, direction: f64) -> f64 {
     f64::from_bits(next)
 }
 
-#[no_mangle]
-pub extern "C" fn nextafterf(value: f32, direction: f32) -> f32 {
+pub(crate) fn nextafterf(value: f32, direction: f32) -> f32 {
     if value != value || direction != direction {
         return value + direction;
     }

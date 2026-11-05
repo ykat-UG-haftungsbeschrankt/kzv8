@@ -475,8 +475,7 @@ pub unsafe extern "C" fn __mbrlen(
     expected
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn wmemchr(memory: *const i32, value: i32, count: usize) -> *mut i32 {
+pub(crate) unsafe fn wmemchr(memory: *const i32, value: i32, count: usize) -> *mut i32 {
     if memory.is_null() {
         return core::ptr::null_mut();
     }
