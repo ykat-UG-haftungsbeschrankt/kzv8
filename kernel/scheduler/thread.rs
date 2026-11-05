@@ -8,12 +8,13 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of_mut, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::kernel::arch::traits::{
     CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
 };
+use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
 
 use super::sync::IrqSpinLock;
@@ -80,7 +81,7 @@ pub(crate) struct Thread {
 impl Thread {
     fn main(stack_address: usize, stack_size: usize) -> Self {
         Self {
-            id: ThreadManager::MAIN_THREAD_ID,
+            id: 0,
             stack_pointer: 0,
             state: ThreadState::Running,
             start_routine: None,
@@ -185,9 +186,9 @@ struct SwitchContext {
 pub(crate) struct ThreadManager {
     ready: LinkedList<Thread>,
     busy: LinkedList<Thread>,
+    thread_nodes: HashMap<usize, usize>,
     pending_reap: Option<Box<ListNode<Thread>>>,
     tls_keys: [TlsKey; Self::MAX_TLS_KEYS],
-    next_thread_id: usize,
     initialized: bool,
     fallback_errno: i32,
 }
@@ -203,53 +204,59 @@ impl ThreadManager {
         Self {
             ready: LinkedList::new(),
             busy: LinkedList::new(),
+            thread_nodes: HashMap::new(),
             pending_reap: None,
             tls_keys: [TlsKey::EMPTY; Self::MAX_TLS_KEYS],
-            next_thread_id: Self::MAIN_THREAD_ID + 1,
             initialized: false,
             fallback_errno: 0,
         }
     }
 
+    fn thread_node(&self, id: usize) -> Option<NonNull<ListNode<Thread>>> {
+        NonNull::new((*self.thread_nodes.get(&id)?) as *mut ListNode<Thread>)
+    }
+
+    fn thread_ref(&self, node: NonNull<ListNode<Thread>>) -> &Thread {
+        // SAFETY: callers pass nodes from the live thread registry.
+        unsafe { &**node.as_ptr() }
+    }
+
+    fn thread_mut(&mut self, mut node: NonNull<ListNode<Thread>>) -> &mut Thread {
+        // SAFETY: callers pass live registry nodes while holding exclusive manager access.
+        unsafe { &mut **node.as_mut() }
+    }
+
     fn find_thread(&self, id: usize) -> Option<&Thread> {
-        self.ready
-            .iter()
-            .chain(self.busy.iter())
-            .find(|thread| thread.id == id)
+        let node = self.thread_node(id)?;
+        Some(self.thread_ref(node))
     }
 
     fn find_thread_mut(&mut self, id: usize) -> Option<&mut Thread> {
-        for thread in self.ready.iter_mut() {
-            if thread.id == id {
-                return Some(thread);
-            }
-        }
-        for thread in self.busy.iter_mut() {
-            if thread.id == id {
-                return Some(thread);
-            }
-        }
-        None
+        let node = self.thread_node(id)?;
+        Some(self.thread_mut(node))
     }
 
-    fn remove_thread(&mut self, id: usize) -> Option<Box<ListNode<Thread>>> {
-        if let Some(node) = self.ready.find(|thread| thread.id == id) {
-            // SAFETY: node was found in ready and has not been unlinked.
-            return unsafe { ListNode::remove(&mut self.ready, node) };
-        }
-        let node = self.busy.find(|thread| thread.id == id)?;
-        // SAFETY: node was found in busy and has not been unlinked.
-        unsafe { ListNode::remove(&mut self.busy, node) }
-    }
-
-    fn wake_blocked(&mut self, id: usize) -> bool {
-        let Some(node) = self
-            .busy
-            .find(|thread| thread.id == id && thread.state == ThreadState::Blocked)
-        else {
-            return false;
+    fn remove_thread(&mut self, node: NonNull<ListNode<Thread>>) -> Option<Box<ListNode<Thread>>> {
+        let (id, state) = {
+            let thread = self.thread_ref(node);
+            (thread.id, thread.state)
         };
-        // SAFETY: node was found in busy and has not been unlinked.
+        let removed = if state == ThreadState::Ready {
+            // SAFETY: the registry points to this live node, and Ready threads are in ready.
+            unsafe { ListNode::remove(&mut self.ready, node) }
+        } else {
+            // SAFETY: the registry points to this live node, and non-Ready threads are in busy.
+            unsafe { ListNode::remove(&mut self.busy, node) }
+        }?;
+        self.thread_nodes.remove(&id);
+        Some(removed)
+    }
+
+    fn wake_blocked(&mut self, node: NonNull<ListNode<Thread>>) -> bool {
+        if self.thread_ref(node).state != ThreadState::Blocked {
+            return false;
+        }
+        // SAFETY: the registry points to this live node, and Blocked threads are in busy.
         let removed = unsafe { ListNode::remove(&mut self.busy, node) };
         let Some(mut thread) = removed else {
             return false;
@@ -264,18 +271,24 @@ impl ThreadManager {
             crate::kernel::arch::ThreadArchitecture::current_thread_stack_bounds(
                 ThreadStack::DEFAULT_SIZE,
             );
-        let main_thread = Box::new(ListNode::new(Thread::main(
+        let mut main_thread = Box::new(ListNode::new(Thread::main(
             stack_address as usize,
             stack_size,
         )));
+        let id = addr_of_mut!(**main_thread) as usize;
+        main_thread.id = id;
+        let node_address = main_thread.as_mut() as *mut ListNode<Thread> as usize;
         let mut manager = THREAD_MANAGER.lock();
         manager.ready.clear();
         manager.busy.clear();
+        manager.thread_nodes.clear();
         manager.pending_reap = None;
         manager.tls_keys.fill(TlsKey::EMPTY);
         manager.initialized = false;
+        if !matches!(manager.thread_nodes.insert(id, node_address), Ok(None)) {
+            return false;
+        }
         manager.busy.push_back(main_thread);
-        manager.next_thread_id = Self::MAIN_THREAD_ID + 1;
         manager.initialized = true;
         true
     }
@@ -371,14 +384,22 @@ impl ThreadManager {
             argument,
             detached,
         )));
+        let id = addr_of_mut!(**thread) as usize;
+        thread.id = id;
+        let node_address = thread.as_mut() as *mut ListNode<Thread> as usize;
 
         let mut manager = THREAD_MANAGER.lock();
-        if !manager.initialized || manager.next_thread_id == usize::MAX {
+        if !manager.initialized {
             return Err(ThreadCreateError::Again);
         }
-        let id = manager.next_thread_id;
-        manager.next_thread_id += 1;
-        thread.id = id;
+        match manager.thread_nodes.insert(id, node_address) {
+            Ok(None) => {}
+            Ok(Some(previous)) => {
+                let _ = manager.thread_nodes.insert(id, previous);
+                return Err(ThreadCreateError::Again);
+            }
+            Err(_) => return Err(ThreadCreateError::NoMemory),
+        }
         manager.ready.push_back(thread);
         Ok(id)
     }
@@ -479,26 +500,25 @@ impl ThreadManager {
             if id == current_id {
                 return Err(JoinError::Deadlock);
             }
-            let Some((state, detached, joiner)) = manager
-                .find_thread(id)
-                .map(|thread| (thread.state, thread.detached, thread.joiner))
-            else {
+            let Some(node) = manager.thread_node(id) else {
                 return Err(JoinError::NoSuchThread);
+            };
+            let (state, detached, joiner) = {
+                let thread = manager.thread_ref(node);
+                (thread.state, thread.detached, thread.joiner)
             };
             if detached || joiner != 0 {
                 return Err(JoinError::Invalid);
             }
             if state == ThreadState::Exited {
-                let Some(thread) = manager.remove_thread(id) else {
+                let Some(thread) = manager.remove_thread(node) else {
                     return Err(JoinError::NoSuchThread);
                 };
                 let result = thread.result;
                 removed = Some(thread);
                 Some(result)
             } else {
-                let Some(thread) = manager.find_thread_mut(id) else {
-                    return Err(JoinError::NoSuchThread);
-                };
+                let thread = manager.thread_mut(node);
                 thread.joiner = current_id;
                 None
             }
@@ -522,11 +542,12 @@ impl ThreadManager {
         let result = {
             let mut manager = THREAD_MANAGER.lock();
             let current_id = manager.busy.front().map_or(0, |thread| thread.id);
-            let Some((state, joiner)) = manager
-                .find_thread(id)
-                .map(|thread| (thread.state, thread.joiner))
-            else {
+            let Some(node) = manager.thread_node(id) else {
                 return Err(JoinError::NoSuchThread);
+            };
+            let (state, joiner) = {
+                let thread = manager.thread_ref(node);
+                (thread.state, thread.joiner)
             };
             if state != ThreadState::Exited {
                 return Err(JoinError::NotExited);
@@ -534,7 +555,7 @@ impl ThreadManager {
             if joiner != current_id {
                 return Err(JoinError::Invalid);
             }
-            let Some(thread) = manager.remove_thread(id) else {
+            let Some(thread) = manager.remove_thread(node) else {
                 return Err(JoinError::NoSuchThread);
             };
             let result = thread.result;
@@ -549,18 +570,20 @@ impl ThreadManager {
         let mut removed = None;
         {
             let mut manager = THREAD_MANAGER.lock();
-            let Some((state, detached, joiner)) = manager
-                .find_thread(id)
-                .map(|thread| (thread.state, thread.detached, thread.joiner))
-            else {
+            let Some(node) = manager.thread_node(id) else {
                 return Err(JoinError::NoSuchThread);
+            };
+            let (state, detached, joiner) = {
+                let thread = manager.thread_ref(node);
+                (thread.state, thread.detached, thread.joiner)
             };
             if detached || joiner != 0 {
                 return Err(JoinError::Invalid);
             }
             if state == ThreadState::Exited {
-                removed = manager.remove_thread(id);
-            } else if let Some(thread) = manager.find_thread_mut(id) {
+                removed = manager.remove_thread(node);
+            } else {
+                let thread = manager.thread_mut(node);
                 thread.detached = true;
             }
         }
@@ -582,11 +605,14 @@ impl ThreadManager {
                 current.result = result as usize;
                 current.state = ThreadState::Exited;
                 if current.joiner != 0 {
-                    manager.wake_blocked(current.joiner);
+                    if let Some(joiner) = manager.thread_node(current.joiner) {
+                        manager.wake_blocked(joiner);
+                    }
                 }
                 let old_stack = addr_of_mut!((*current).stack_pointer);
                 let old_fpu_context = addr_of_mut!((*current).fpu_context);
                 if current.detached && manager.pending_reap.is_none() {
+                    manager.thread_nodes.remove(&current.id);
                     manager.pending_reap = Some(current);
                 } else {
                     manager.busy.push_back(current);
