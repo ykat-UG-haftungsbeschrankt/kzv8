@@ -5,6 +5,8 @@
  * free of charge, without warranty of any kind.
  */
 
+use crate::kernel::lib::btree::BinaryTree;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TimerId {
     index: usize,
@@ -29,7 +31,7 @@ impl TimerId {
 struct Timer {
     id: TimerId,
     deadline_ns: u64,
-    heap_index: usize,
+    active: bool,
     next_free: usize,
 }
 
@@ -40,15 +42,14 @@ impl Timer {
             generation: 0,
         },
         deadline_ns: 0,
-        heap_index: TimerId::NO_INDEX,
+        active: false,
         next_free: TimerId::NO_INDEX,
     };
 }
 
 pub(crate) struct TimerQueue<const N: usize> {
     timers: [Timer; N],
-    heap: [usize; N],
-    heap_len: usize,
+    deadlines: BinaryTree<(u64, usize), usize>,
     free_head: usize,
 }
 
@@ -63,8 +64,7 @@ impl<const N: usize> TimerQueue<N> {
         }
         Self {
             timers,
-            heap: [0; N],
-            heap_len: 0,
+            deadlines: BinaryTree::new(),
             free_head: 0,
         }
     }
@@ -81,12 +81,11 @@ impl<const N: usize> TimerQueue<N> {
         self.timers[index] = Timer {
             id,
             deadline_ns,
-            heap_index: self.heap_len,
+            active: true,
             next_free: TimerId::NO_INDEX,
         };
-        self.heap[self.heap_len] = index;
-        self.heap_len += 1;
-        self.sift_up(self.heap_len - 1);
+        let previous = self.deadlines.insert((deadline_ns, index), index);
+        debug_assert!(previous.is_none());
         Some(id)
     }
 
@@ -94,107 +93,37 @@ impl<const N: usize> TimerQueue<N> {
         let Some(timer) = self.timers.get(id.index) else {
             return false;
         };
-        if timer.id != id || timer.heap_index == TimerId::NO_INDEX {
+        if timer.id != id || !timer.active {
             return false;
         }
 
-        let heap_index = timer.heap_index;
-        self.remove_heap_entry(heap_index);
+        let deadline_ns = timer.deadline_ns;
+        if self.deadlines.remove(&(deadline_ns, id.index)).is_none() {
+            return false;
+        }
         self.release(id.index);
         true
     }
 
     pub(crate) fn pop_expired(&mut self, now_ns: u64) -> Option<TimerId> {
-        if self.heap_len == 0 {
-            return None;
-        }
-        let index = self.heap[0];
-        if self.timers[index].deadline_ns > now_ns {
+        let ((deadline_ns, _), _) = self.deadlines.first()?;
+        if *deadline_ns > now_ns {
             return None;
         }
 
+        let ((_, index), _) = self.deadlines.take_min()?;
         let id = self.timers[index].id;
-        self.remove_heap_entry(0);
         self.release(index);
         Some(id)
     }
 
     pub(crate) fn next_deadline(&self) -> Option<u64> {
-        (self.heap_len > 0).then(|| self.timers[self.heap[0]].deadline_ns)
+        self.deadlines.first().map(|((deadline_ns, _), _)| *deadline_ns)
     }
 
     fn release(&mut self, index: usize) {
-        self.timers[index].heap_index = TimerId::NO_INDEX;
+        self.timers[index].active = false;
         self.timers[index].next_free = self.free_head;
         self.free_head = index;
-    }
-
-    fn remove_heap_entry(&mut self, index: usize) {
-        let removed_slot = self.heap[index];
-        let last_index = self.heap_len - 1;
-        if index != last_index {
-            let replacement = self.heap[last_index];
-            self.heap[index] = replacement;
-            self.timers[replacement].heap_index = index;
-        }
-        self.heap_len = last_index;
-        self.timers[removed_slot].heap_index = TimerId::NO_INDEX;
-
-        if index < self.heap_len {
-            let parent = index.saturating_sub(1) / 2;
-            if index > 0 && self.precedes(self.heap[index], self.heap[parent]) {
-                self.sift_up(index);
-            } else {
-                self.sift_down(index);
-            }
-        }
-    }
-
-    fn sift_up(&mut self, mut index: usize) {
-        while index > 0 {
-            let parent = (index - 1) / 2;
-            let child_slot = self.heap[index];
-            let parent_slot = self.heap[parent];
-            if !self.precedes(child_slot, parent_slot) {
-                break;
-            }
-            self.heap.swap(index, parent);
-            self.timers[child_slot].heap_index = parent;
-            self.timers[parent_slot].heap_index = index;
-            index = parent;
-        }
-    }
-
-    fn sift_down(&mut self, mut index: usize) {
-        loop {
-            let left = index * 2 + 1;
-            if left >= self.heap_len {
-                break;
-            }
-            let right = left + 1;
-            let child = if right < self.heap_len && self.precedes(self.heap[right], self.heap[left])
-            {
-                right
-            } else {
-                left
-            };
-            if !self.precedes(self.heap[child], self.heap[index]) {
-                break;
-            }
-
-            let child_slot = self.heap[child];
-            let parent_slot = self.heap[index];
-            self.heap.swap(index, child);
-            self.timers[child_slot].heap_index = index;
-            self.timers[parent_slot].heap_index = child;
-            index = child;
-        }
-    }
-
-    fn precedes(&self, left: usize, right: usize) -> bool {
-        let left = &self.timers[left];
-        let right = &self.timers[right];
-        left.deadline_ns < right.deadline_ns
-            || (left.deadline_ns == right.deadline_ns && left.id.index < right.id.index)
     }
 }

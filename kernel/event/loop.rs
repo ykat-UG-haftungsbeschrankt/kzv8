@@ -5,10 +5,19 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::boxed::Box;
+use core::ptr::NonNull;
 use crate::kernel::error::Error;
-use crate::kernel::event::completion::{Completion, CompletionQueue};
 use crate::kernel::event::timers::{TimerId, TimerQueue};
+use crate::kernel::lib::hashmap::HashMap;
+use crate::kernel::lib::list::{LinkedList, ListNode};
 use core::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Completion {
+    pub(crate) id: u64,
+    pub(crate) status: i32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EventSourceId(u64);
@@ -101,7 +110,7 @@ struct SourceWatch {
     readiness: EventFlags,
     data: u64,
     generation: u64,
-    queued: bool,
+    ready_node: Option<NonNull<ListNode<usize>>>,
     active: bool,
 }
 
@@ -112,16 +121,19 @@ impl SourceWatch {
         readiness: EventFlags::NONE,
         data: 0,
         generation: 0,
-        queued: false,
+        ready_node: None,
         active: false,
     };
 }
 
 pub(crate) struct EventLoop<const N: usize> {
     timers: TimerQueue<N>,
-    events: CompletionQueue<Event, N>,
-    ready_sources: CompletionQueue<usize, N>,
+    events: LinkedList<Event>,
+    ready_sources: LinkedList<usize>,
     sources: [SourceWatch; N],
+    source_indices: HashMap<u64, usize>,
+    free_sources: [usize; N],
+    free_source_count: usize,
     pending_device_interrupts: u64,
     next_queue: usize,
 }
@@ -137,11 +149,20 @@ impl<const N: usize> EventLoop<N> {
     }
 
     pub(crate) const fn new() -> Self {
+        let mut free_sources = [0; N];
+        let mut index = 0;
+        while index < N {
+            free_sources[index] = index;
+            index += 1;
+        }
         Self {
             timers: TimerQueue::new(),
-            events: CompletionQueue::new(),
-            ready_sources: CompletionQueue::new(),
+            events: LinkedList::new(),
+            ready_sources: LinkedList::new(),
             sources: [SourceWatch::EMPTY; N],
+            source_indices: HashMap::new(),
+            free_sources,
+            free_source_count: N,
             pending_device_interrupts: 0,
             next_queue: 0,
         }
@@ -161,28 +182,30 @@ impl<const N: usize> EventLoop<N> {
         interest: EventFlags,
         data: u64,
     ) -> Result<EventSourceToken, Error> {
-        if self
-            .sources
-            .iter()
-            .any(|watch| watch.active && watch.source == source)
-        {
+        if self.source_indices.contains_key(&source.0) {
             return Err(Error::Exist);
         }
-        let Some(index) = self
-            .sources
-            .iter()
-            .position(|watch| !watch.active && !watch.queued)
-        else {
+        if self.free_source_count == 0 {
             return Err(Error::NoBufs);
-        };
+        }
+        let index = self.free_sources[self.free_source_count - 1];
         let generation = self.sources[index].generation.wrapping_add(1).max(1);
+        match self.source_indices.insert(source.0, index) {
+            Ok(None) => {}
+            Ok(Some(previous)) => {
+                let _ = self.source_indices.insert(source.0, previous);
+                return Err(Error::Exist);
+            }
+            Err(_) => return Err(Error::NoMem),
+        }
+        self.free_source_count -= 1;
         self.sources[index] = SourceWatch {
             source,
             interest,
             readiness: EventFlags::NONE,
             data,
             generation,
-            queued: false,
+            ready_node: None,
             active: true,
         };
         Ok(EventSourceToken { index, generation })
@@ -203,13 +226,21 @@ impl<const N: usize> EventLoop<N> {
 
     pub(crate) fn deregister(&mut self, token: EventSourceToken) -> Result<(), Error> {
         let index = self.source_index(token)?;
-        self.ready_sources
-            .retain(|ready_index| ready_index != index);
+        if let Some(node) = self.sources[index].ready_node.take() {
+            // SAFETY: this node is stored by its source watch while it is linked in ready_sources.
+            let removed = unsafe { ListNode::remove(&mut self.ready_sources, node) };
+            debug_assert!(removed.is_some());
+            drop(removed);
+        }
+        let source_id = self.sources[index].source.0;
         let generation = self.sources[index].generation;
         self.sources[index] = SourceWatch {
             generation,
             ..SourceWatch::EMPTY
         };
+        self.source_indices.remove(&source_id);
+        self.free_sources[self.free_source_count] = index;
+        self.free_source_count += 1;
         Ok(())
     }
 
@@ -226,13 +257,8 @@ impl<const N: usize> EventLoop<N> {
 
     pub(crate) fn complete(&mut self, completion: Completion) -> Result<(), Completion> {
         self.events
-            .push(Event::Completion(completion))
-            .map_err(|event| match event {
-                Event::Completion(completion) => completion,
-                Event::Timer(_) | Event::Readiness { .. } | Event::DeviceInterrupt { .. } => {
-                    unreachable!()
-                }
-            })
+            .push_back(Box::new(ListNode::new(Event::Completion(completion))));
+        Ok(())
     }
 
     pub(crate) fn next_deadline(&self) -> Option<u64> {
@@ -248,7 +274,7 @@ impl<const N: usize> EventLoop<N> {
             self.next_queue = (self.next_queue + 1) % 3;
             let event = match queue {
                 0 => self.next_readiness(),
-                1 => self.events.pop(),
+                1 => self.events.pop_front().map(|node| node.into_value()),
                 _ => self.next_device_interrupt(),
             };
             if event.is_some() {
@@ -310,34 +336,38 @@ impl<const N: usize> EventLoop<N> {
     }
 
     fn queue_expired_timers(&mut self, now_ns: u64) {
-        while self.events.len() < N {
-            let Some(timer) = self.timers.pop_expired(now_ns) else {
-                break;
-            };
-            if self.events.push(Event::Timer(timer)).is_err() {
-                break;
-            }
+        while let Some(timer) = self.timers.pop_expired(now_ns) {
+            self.events
+                .push_back(Box::new(ListNode::new(Event::Timer(timer))));
         }
     }
 
     fn queue_ready(&mut self, index: usize) {
         let watch = self.sources[index];
-        if !watch.active || watch.queued || watch.readiness.intersection(watch.interest).is_empty()
+        if !watch.active
+            || watch.ready_node.is_some()
+            || watch.readiness.intersection(watch.interest).is_empty()
         {
             return;
         }
-        if self.ready_sources.push(index).is_ok() {
-            self.sources[index].queued = true;
-        }
+        let mut node = Box::new(ListNode::new(index));
+        let node_pointer = NonNull::from(node.as_mut());
+        self.ready_sources.push_back(node);
+        self.sources[index].ready_node = Some(node_pointer);
     }
 
     fn next_readiness(&mut self) -> Option<Event> {
-        while let Some(index) = self.ready_sources.pop() {
+        while let Some(node) = self.ready_sources.pop_front() {
+            let index = node.into_value();
             let event = {
                 let watch = &mut self.sources[index];
-                watch.queued = false;
+                watch.ready_node = None;
                 if !watch.active {
-                    *watch = SourceWatch::EMPTY;
+                    let generation = watch.generation;
+                    *watch = SourceWatch {
+                        generation,
+                        ..SourceWatch::EMPTY
+                    };
                     continue;
                 }
                 let flags = watch.readiness.intersection(watch.interest);

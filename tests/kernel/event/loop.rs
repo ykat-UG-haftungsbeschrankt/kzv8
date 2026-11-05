@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #[cfg(test)]
 mod tests {
     use super::{Event, EventFlags, EventLoop, EventSourceId};
@@ -65,6 +72,49 @@ mod tests {
         assert_eq!(
             events.register(EventSourceId::new(1), EventFlags::NONE, 0),
             Err(Error::Exist)
+        );
+    }
+
+    #[test]
+    fn completion_queue_grows_beyond_source_capacity() {
+        let mut events = EventLoop::<1>::new();
+        let first = Completion { id: 1, status: 0 };
+        let second = Completion { id: 2, status: 0 };
+
+        assert_eq!(events.complete(first), Ok(()));
+        assert_eq!(events.complete(second), Ok(()));
+        assert_eq!(events.wait(0), Some(Event::Completion(first)));
+        assert_eq!(events.wait(0), Some(Event::Completion(second)));
+    }
+
+    #[test]
+    fn deregister_removes_queued_readiness_before_slot_reuse() {
+        let mut events = EventLoop::<1>::new();
+        let old_source = EventSourceId::new(1);
+        let old_token = events
+            .register(old_source, EventFlags::READABLE, 1)
+            .unwrap();
+        events
+            .set_readiness(old_token, EventFlags::READABLE)
+            .unwrap();
+        events.deregister(old_token).unwrap();
+
+        let new_source = EventSourceId::new(2);
+        let new_token = events
+            .register(new_source, EventFlags::READABLE, 2)
+            .unwrap();
+        events
+            .set_readiness(new_token, EventFlags::READABLE)
+            .unwrap();
+
+        assert_ne!(old_token, new_token);
+        assert_eq!(
+            events.wait(0),
+            Some(Event::Readiness {
+                source: new_source,
+                flags: EventFlags::READABLE,
+                data: 2,
+            })
         );
     }
 
