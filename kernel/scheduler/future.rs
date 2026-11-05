@@ -157,7 +157,7 @@ fn poll_ready() {
     loop {
         let task = {
             let mut executor = EXECUTOR.lock();
-            let Some(mut node) = executor.ready.pop_front() else {
+            let Some(node) = executor.ready.pop_front() else {
                 return;
             };
             let task = Arc::clone(&**node);

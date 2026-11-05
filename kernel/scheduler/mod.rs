@@ -6,5 +6,6 @@
  */
 
 pub(crate) mod sync;
+#[allow(dead_code)]
 pub(crate) mod future;
 pub(crate) mod thread;

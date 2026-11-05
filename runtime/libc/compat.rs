@@ -105,7 +105,7 @@ fn initialize_case_table(state: &AtomicU8, uppercase: bool) {
                 } else {
                     value as i32
                 };
-                unsafe { table.add(value + 128).write(converted) };
+                table.add(value + 128).write(converted);
             }
             if uppercase {
                 UPPER_POINTER = table.add(128);
@@ -475,6 +475,7 @@ pub unsafe extern "C" fn __mbrlen(
     expected
 }
 
+#[allow(dead_code)]
 pub(crate) unsafe fn wmemchr(memory: *const i32, value: i32, count: usize) -> *mut i32 {
     if memory.is_null() {
         return core::ptr::null_mut();

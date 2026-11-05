@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::{addr_of_mut, NonNull};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
 
 use crate::kernel::arch::traits::{
     CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
@@ -44,6 +44,7 @@ pub(crate) struct PthreadCondition {
 #[derive(Clone, Copy)]
 pub(crate) struct TlsKey {
     pub(crate) active: bool,
+    #[allow(dead_code)]
     pub(crate) destructor: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
@@ -184,6 +185,7 @@ static THREAD_MANAGER: IrqSpinLock<ThreadManager> =
 
 impl ThreadManager {
     pub(crate) const MAX_TLS_KEYS: usize = 64;
+    #[allow(dead_code)]
     pub(crate) const MAIN_THREAD_ID: usize = 1;
 
     const fn new() -> Self {
@@ -211,6 +213,7 @@ impl ThreadManager {
         NonNull::from(self.thread_ref(node))
     }
 
+    #[allow(dead_code)]
     fn thread_mut(&mut self, mut node: NonNull<ListNode<Thread>>) -> &mut Thread {
         // SAFETY: callers pass live registry nodes while holding exclusive manager access.
         unsafe { &mut **node.as_mut() }

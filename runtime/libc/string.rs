@@ -5,7 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use core::ffi::c_void;
+use core::ffi::{c_char, c_void};
 use core::ptr::{read_volatile, write_volatile};
 
 #[no_mangle]
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn memchr(memory: *const c_void, value: i32, count: usize)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn strlen(text: *const i8) -> usize {
+pub unsafe extern "C" fn strlen(text: *const c_char) -> usize {
     let text = text.cast::<u8>();
     let mut length = 0;
     while unsafe { read_volatile(text.add(length)) } != 0 {

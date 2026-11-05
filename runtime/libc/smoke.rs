@@ -75,19 +75,19 @@ unsafe extern "C" {
     fn pthread_attr_setstacksize(attributes: *mut PthreadAttributes, stack_size: usize) -> i32;
     fn pthread_create(
         thread: *mut usize,
-        attributes: *const PthreadAttributes,
+        attributes: *const c_void,
         start: Option<StartRoutine>,
         argument: *mut c_void,
     ) -> i32;
     fn pthread_getattr_np(thread: usize, attributes: *mut PthreadAttributes) -> i32;
     fn pthread_join(thread: usize, result: *mut *mut c_void) -> i32;
     fn pthread_detach(thread: usize) -> i32;
-    fn pthread_mutex_lock(mutex: *mut PthreadMutex) -> i32;
-    fn pthread_mutex_unlock(mutex: *mut PthreadMutex) -> i32;
-    fn pthread_mutex_destroy(mutex: *mut PthreadMutex) -> i32;
-    fn pthread_cond_signal(condition: *mut PthreadCondition) -> i32;
-    fn pthread_cond_wait(condition: *mut PthreadCondition, mutex: *mut PthreadMutex) -> i32;
-    fn pthread_cond_destroy(condition: *mut PthreadCondition) -> i32;
+    fn pthread_mutex_lock(mutex: *mut c_void) -> i32;
+    fn pthread_mutex_unlock(mutex: *mut c_void) -> i32;
+    fn pthread_mutex_destroy(mutex: *mut c_void) -> i32;
+    fn pthread_cond_signal(condition: *mut c_void) -> i32;
+    fn pthread_cond_wait(condition: *mut c_void, mutex: *mut c_void) -> i32;
+    fn pthread_cond_destroy(condition: *mut c_void) -> i32;
     fn pthread_yield() -> i32;
 }
 
@@ -217,12 +217,14 @@ pub unsafe extern "C" fn kz_c_mmap_smoke() -> i32 {
 }
 
 unsafe extern "C" fn smoke_worker(argument: *mut c_void) -> *mut c_void {
-    let mutex = core::ptr::addr_of_mut!(SMOKE_MUTEX);
+    let mutex = core::ptr::addr_of_mut!(SMOKE_MUTEX).cast();
     if unsafe { pthread_mutex_lock(mutex) } != 0 {
         return core::ptr::null_mut();
     }
     SMOKE_READY.store(true, Ordering::Release);
-    let signal_status = unsafe { pthread_cond_signal(core::ptr::addr_of_mut!(SMOKE_CONDITION)) };
+    let signal_status = unsafe {
+        pthread_cond_signal(core::ptr::addr_of_mut!(SMOKE_CONDITION).cast())
+    };
     let unlock_status = unsafe { pthread_mutex_unlock(mutex) };
     if signal_status == 0 && unlock_status == 0 {
         argument
@@ -291,7 +293,7 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
     if unsafe {
         pthread_create(
             &mut preemption_thread,
-            &attributes,
+            core::ptr::addr_of!(attributes).cast(),
             Some(smoke_preemption_worker),
             core::ptr::null_mut(),
         )
@@ -330,7 +332,7 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
         let create_status = unsafe {
             pthread_create(
                 &mut capacity_threads[created_threads],
-                &attributes,
+                core::ptr::addr_of!(attributes).cast(),
                 Some(smoke_capacity_worker),
                 argument,
             )
@@ -362,7 +364,7 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
     if unsafe {
         pthread_create(
             &mut thread,
-            &attributes,
+            core::ptr::addr_of!(attributes).cast(),
             Some(smoke_worker),
             42usize as *mut c_void,
         )
@@ -370,12 +372,15 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
     {
         return -1;
     }
-    let mutex = core::ptr::addr_of_mut!(SMOKE_MUTEX);
+    let mutex = core::ptr::addr_of_mut!(SMOKE_MUTEX).cast();
     if unsafe { pthread_mutex_lock(mutex) } != 0 {
         return -1;
     }
     while !SMOKE_READY.load(Ordering::Acquire) {
-        if unsafe { pthread_cond_wait(core::ptr::addr_of_mut!(SMOKE_CONDITION), mutex) } != 0 {
+        if unsafe {
+            pthread_cond_wait(core::ptr::addr_of_mut!(SMOKE_CONDITION).cast(), mutex)
+        } != 0
+        {
             return -1;
         }
     }
@@ -387,7 +392,7 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
         return -1;
     }
     if unsafe { pthread_mutex_destroy(mutex) } != 0
-        || unsafe { pthread_cond_destroy(core::ptr::addr_of_mut!(SMOKE_CONDITION)) } != 0
+        || unsafe { pthread_cond_destroy(core::ptr::addr_of_mut!(SMOKE_CONDITION).cast()) } != 0
     {
         return -1;
     }
@@ -397,7 +402,7 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
         || unsafe {
             pthread_create(
                 &mut thread,
-                &attributes,
+                core::ptr::addr_of!(attributes).cast(),
                 Some(smoke_completion_worker),
                 84usize as *mut c_void,
             )
@@ -412,7 +417,7 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
         || unsafe {
             pthread_create(
                 &mut thread,
-                &attributes,
+                core::ptr::addr_of!(attributes).cast(),
                 Some(smoke_completion_worker),
                 126usize as *mut c_void,
             )
@@ -427,7 +432,7 @@ pub unsafe extern "C" fn kz_c_pthread_smoke() -> i32 {
     if unsafe {
         pthread_create(
             &mut thread,
-            &attributes,
+            core::ptr::addr_of!(attributes).cast(),
             Some(smoke_completion_worker),
             168usize as *mut c_void,
         )

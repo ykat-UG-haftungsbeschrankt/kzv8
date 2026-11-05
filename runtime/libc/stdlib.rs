@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::alloc::Layout;
 use core::ffi::c_void;
 use core::mem::{align_of, size_of};
@@ -10,6 +17,7 @@ fn set_errno(error: i32) {
     unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
 }
 
+#[allow(dead_code)]
 pub(crate) fn remaining() -> usize {
     let heap = Heap::get_instance();
     heap.remaining(&heap.state.lock())

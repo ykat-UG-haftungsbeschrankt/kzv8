@@ -19,6 +19,7 @@ use super::errno::{
 const O_ACCMODE: i32 = 0o3;
 const O_RDONLY: i32 = 0o0;
 const O_WRONLY: i32 = 0o1;
+#[allow(dead_code)]
 const O_RDWR: i32 = 0o2;
 const O_CREAT: i32 = 0o100;
 const O_EXCL: i32 = 0o200;

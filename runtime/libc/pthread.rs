@@ -372,6 +372,7 @@ pub unsafe extern "C" fn pthread_detach(thread_id: usize) -> i32 {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn yield_current() -> i32 {
     let _ = ThreadManager::switch_current(ThreadState::Ready);
     0
