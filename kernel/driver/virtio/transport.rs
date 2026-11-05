@@ -134,6 +134,7 @@ impl MmioRegion {
         Some(unsafe { core::ptr::read_volatile(address as *const u8) })
     }
 
+    #[allow(dead_code)]
     fn write_u8(&self, offset: usize, value: u8) -> Option<()> {
         if offset >= self.stride {
             return None;
@@ -167,6 +168,7 @@ impl MmioRegion {
         self.read_u32(0x100usize.checked_add(offset)?)
     }
 
+    #[allow(dead_code)]
     fn write_config(&self, offset: usize, value: u32) -> Option<()> {
         self.write_u32(0x100usize.checked_add(offset)?, value)
     }
@@ -175,6 +177,7 @@ impl MmioRegion {
         self.read_u8(0x100usize.checked_add(offset)?)
     }
 
+    #[allow(dead_code)]
     fn write_config_u8(&self, offset: usize, value: u8) -> Option<()> {
         self.write_u8(0x100usize.checked_add(offset)?, value)
     }
@@ -373,14 +376,17 @@ impl VirtioTransport {
         Some(u16::from_le_bytes([low, high]))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn write_device_config(&self, offset: usize, value: u32) -> Option<()> {
         self.region.write_config(offset, value)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn read_device_config_byte(&self, offset: usize) -> Option<u8> {
         self.region.read_config_u8(offset)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn write_device_config_byte(&self, offset: usize, value: u8) -> Option<()> {
         self.region.write_config_u8(offset, value)
     }

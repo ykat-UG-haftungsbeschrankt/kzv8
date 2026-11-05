@@ -176,6 +176,7 @@ impl VirtioNet {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn poll_transmit(&mut self) -> Result<bool, Error> {
         self.reap_transmit()?;
         Ok(self.free_transmit_buffers.len() == self.transmit_buffers.len())

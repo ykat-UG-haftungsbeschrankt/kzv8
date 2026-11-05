@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use alloc::boxed::Box;
 use core::ffi::{c_int, c_void};
 
@@ -52,7 +59,10 @@ unsafe extern "C" {
     fn pthread_getspecific(key: u32) -> *mut c_void;
     fn pthread_setspecific(key: u32, value: *const c_void) -> c_int;
     fn sched_yield() -> c_int;
-    fn nanosleep(request: *const c_void, remaining: *mut c_void) -> c_int;
+    fn nanosleep(
+        request: *const super::time::Timespec,
+        remaining: *mut super::time::Timespec,
+    ) -> c_int;
 }
 
 fn status(error: c_int) -> c_int {
@@ -72,7 +82,7 @@ unsafe extern "C" fn start_trampoline(context: *mut c_void) -> *mut c_void {
 }
 
 #[repr(C)]
-struct Timespec {
+pub struct Timespec {
     seconds: i64,
     nanoseconds: i64,
 }

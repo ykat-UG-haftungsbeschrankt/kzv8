@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+#[allow(dead_code)]
 pub(crate) mod address;
 pub(crate) mod dma;
 pub(crate) mod heap;

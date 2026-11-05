@@ -358,6 +358,7 @@ pub(crate) fn restore(flags: u64) {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn enabled() -> bool {
     let flags: u64;
     unsafe {

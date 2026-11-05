@@ -20,12 +20,14 @@ pub(crate) mod block;
 pub(crate) mod driver;
 pub(crate) mod error;
 pub(crate) mod event;
+#[allow(special_module_name)]
 pub(crate) mod lib;
 pub(crate) mod memory;
 pub(crate) mod net;
 #[path = "../runtime/run.rs"]
 pub(crate) mod runtime;
 pub(crate) mod scheduler;
+#[allow(dead_code)]
 pub(crate) mod vfs;
 
 // Preserve existing internal paths while modules move to the crate root.

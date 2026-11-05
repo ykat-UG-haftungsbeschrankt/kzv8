@@ -62,6 +62,7 @@ pub(crate) mod traits {
         fn disable_interrupts() -> u64;
         fn enable_interrupts();
         fn restore_interrupts(flags: u64);
+        #[allow(dead_code)]
         fn interrupts_enabled() -> bool;
     }
 

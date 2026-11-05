@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::ffi::{c_char, c_int, c_long, c_longlong, c_void};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -252,6 +259,7 @@ unsafe extern "C" {
     fn __isoc23_strtol(text: *const c_char, end: *mut *mut c_char, base: c_int) -> isize;
     fn __isoc23_strtoll(text: *const c_char, end: *mut *mut c_char, base: c_int) -> i64;
     fn strtod(text: *const c_char, end: *mut *mut c_char) -> f64;
+    #[allow(dead_code)]
     fn strtof(text: *const c_char, end: *mut *mut c_char) -> f32;
 }
 

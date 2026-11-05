@@ -40,6 +40,7 @@ impl EthernetDevice {
         self.device.mac_address()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn interrupt_slot(&self) -> usize {
         self.device.interrupt_slot()
     }

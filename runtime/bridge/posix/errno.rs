@@ -11,6 +11,7 @@ const fn as_errno(error: Error) -> i32 {
     -(error as i32)
 }
 
+#[allow(dead_code)]
 pub(crate) const EAGAIN: i32 = as_errno(Error::Again);
 pub(crate) const E2BIG: i32 = as_errno(Error::TooBig);
 pub(crate) const EBADF: i32 = as_errno(Error::Badf);

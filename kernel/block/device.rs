@@ -24,6 +24,7 @@ impl BlockDevice {
         self.device.capacity_sectors()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn interrupt_slot(&self) -> usize {
         self.device.interrupt_slot()
     }

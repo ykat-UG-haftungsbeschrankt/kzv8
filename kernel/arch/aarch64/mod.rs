@@ -25,12 +25,16 @@ unsafe extern "C" {
 pub(crate) use threads::FpuContext;
 
 pub(crate) const MAX_CPUS: usize = 8;
+#[allow(dead_code)]
 pub(crate) const VM_ARENA_SIZE: usize =
     <super::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
+#[allow(dead_code)]
 pub(crate) const VM_BASE: usize =
     <super::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_BASE;
+#[allow(dead_code)]
 pub(crate) const BOOT_MESSAGE: &[u8] =
     <super::BootArchitecture as crate::kernel::arch::traits::BootArchitecture>::BOOT_MESSAGE;
+#[allow(dead_code)]
 pub(crate) const BOOT_INFO_ERROR: &str =
     <super::BootArchitecture as crate::kernel::arch::traits::BootArchitecture>::BOOT_INFO_ERROR;
 
@@ -40,6 +44,7 @@ pub(crate) unsafe fn initialize_boot_info(boot_info: usize, _boot_magic: usize) 
     unsafe { device_tree::initialize(boot_info) }
 }
 
+#[allow(dead_code)]
 pub(crate) const fn virtio_window() -> crate::kernel::arch::VirtioWindow {
     virtio::virtio_window()
 }
@@ -85,6 +90,7 @@ pub(crate) fn switch_thread(
     unsafe { threads::switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
 }
 
+#[allow(dead_code)]
 pub(crate) fn initialize_interrupt_controller() -> bool {
     interrupts::initialize_controller()
 }
@@ -175,12 +181,10 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
         let Some(end) = address.checked_add(length) else {
             return false;
         };
-        let (image_start, image_end) = unsafe {
-            (
-                core::ptr::addr_of!(_start) as usize,
-                core::ptr::addr_of!(__bss_end) as usize,
-            )
-        };
+        let (image_start, image_end) = (
+            core::ptr::addr_of!(_start) as usize,
+            core::ptr::addr_of!(__bss_end) as usize,
+        );
         address >= image_start
             && end <= image_end
             && ram_map::set_page_permissions(address, length, permissions)

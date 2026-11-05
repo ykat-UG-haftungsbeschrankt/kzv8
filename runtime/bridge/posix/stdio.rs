@@ -19,15 +19,16 @@ struct KzFile {
 }
 
 unsafe extern "C" {
-    fn fgetc(stream: *mut KzFile) -> c_int;
+    fn fgetc(stream: *mut c_void) -> c_int;
     fn getc(stream: *mut KzFile) -> c_int;
     fn getchar() -> c_int;
     fn fputc(character: c_int, stream: *mut KzFile) -> c_int;
     fn putchar(character: c_int) -> c_int;
-    fn fflush(stream: *mut KzFile) -> c_int;
+    fn fflush(stream: *mut c_void) -> c_int;
     fn fseek(stream: *mut KzFile, offset: isize, origin: c_int) -> c_int;
     fn fseeko64(stream: *mut KzFile, offset: i64, origin: c_int) -> c_int;
     fn ftello64(stream: *mut KzFile) -> i64;
+    #[allow(dead_code)]
     fn fileno(stream: *mut KzFile) -> c_int;
     fn unlink(path: *const c_char) -> c_int;
     fn rmdir(path: *const c_char) -> c_int;

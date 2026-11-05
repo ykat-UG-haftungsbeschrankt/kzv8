@@ -23,6 +23,7 @@ impl<const WORDS: usize> BitField<WORDS> {
         Self { words: [0; WORDS] }
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn bit_capacity(&self) -> usize {
         WORDS * u64::BITS as usize
     }
@@ -45,6 +46,7 @@ impl<const WORDS: usize> BitField<WORDS> {
         true
     }
 
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.words.fill(0);
     }

@@ -562,10 +562,12 @@ impl VirtualAreasLock {
         Self::get_instance().lock().resolve_page_fault(address, access)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_identity_mapped(address: usize) -> bool {
         MemoryArchitecture::is_identity_mapped(address)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn translate(address: usize) -> Option<usize> {
         Self::is_identity_mapped(address).then_some(address)
     }
@@ -626,10 +628,12 @@ pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
     VirtualAreasLock::resolve_page_fault(address, access)
 }
 
+#[allow(dead_code)]
 pub(crate) fn is_identity_mapped(address: usize) -> bool {
     VirtualAreasLock::is_identity_mapped(address)
 }
 
+#[allow(dead_code)]
 pub(crate) fn translate(address: usize) -> Option<usize> {
     VirtualAreasLock::translate(address)
 }

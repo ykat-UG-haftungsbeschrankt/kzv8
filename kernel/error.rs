@@ -7,6 +7,7 @@
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum Error {
     /// Minimum value of zrtos_error_t.
     Min = i32::MIN,

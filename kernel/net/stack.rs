@@ -66,10 +66,12 @@ impl NetStack {
         changed
     }
 
+    #[allow(dead_code)]
     pub(crate) fn device_mut(&mut self) -> &mut EthernetDevice {
         &mut self.device
     }
 
+    #[allow(dead_code)]
     pub(crate) fn interrupt_slot(&self) -> usize {
         self.device.interrupt_slot()
     }

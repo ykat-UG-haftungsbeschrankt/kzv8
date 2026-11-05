@@ -30,10 +30,12 @@ pub(crate) struct DmaBuffer {
 unsafe impl Send for DmaBuffer {}
 
 impl DmaBuffer {
+    #[allow(dead_code)]
     pub(crate) const fn len(&self) -> usize {
         self.length
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn is_empty(&self) -> bool {
         self.length == 0
     }

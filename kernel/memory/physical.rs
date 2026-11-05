@@ -353,6 +353,7 @@ impl PhysicalMemory {
         Some(frame)
     }
 
+    #[allow(dead_code)]
     fn allocate_contiguous(&mut self, page_count: u16, alignment: usize) -> Option<FrameRun> {
         if page_count == 0 || alignment < PAGE_SIZE || !alignment.is_power_of_two() {
             return None;
@@ -387,6 +388,7 @@ impl PhysicalMemory {
         None
     }
 
+    #[allow(dead_code)]
     fn allocate_from_virgin(
         &mut self,
         chunk_offset: usize,
@@ -470,6 +472,7 @@ impl PhysicalMemory {
         Some(run)
     }
 
+    #[allow(dead_code)]
     fn allocate_from_recycled(
         &mut self,
         chunk_offset: usize,
@@ -651,6 +654,7 @@ impl PhysicalMemory {
         old_list == new_list || self.move_chunk(chunk_offset, new_list)
     }
 
+    #[allow(dead_code)]
     fn align_up(address: usize, alignment: usize) -> Option<usize> {
         address
             .checked_add(alignment - 1)
@@ -790,6 +794,7 @@ impl PhysicalAllocator {
         Self::get_instance().state.lock().allocate()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn allocate_contiguous(length: usize, alignment: usize) -> Option<usize> {
         if length == 0 || length % PAGE_SIZE != 0 {
             return None;
@@ -819,6 +824,7 @@ impl PhysicalAllocator {
             .deallocate_contiguous(PhysAddr::new(address), page_count)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn free_frames() -> usize {
         Self::get_instance().state.lock().free_frames
     }
@@ -968,6 +974,7 @@ impl PhysicalAllocatorState {
         }
     }
 
+    #[allow(dead_code)]
     fn allocate_contiguous(&mut self, page_count: u16, alignment: usize) -> Option<FrameRun> {
         if !self.initialized || usize::from(page_count) > self.free_frames {
             return None;

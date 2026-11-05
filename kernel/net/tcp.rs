@@ -49,6 +49,7 @@ impl Tcp {
         Ok(stack.sockets.add(socket))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn listen(stack: &mut NetStack, local_port: u16) -> Result<SocketHandle, Error> {
         let mut socket = Self::open_socket(Self::DEFAULT_RX_CAPACITY, Self::DEFAULT_TX_CAPACITY)?;
         socket.listen(local_port).map_err(|_| Error::Io)?;

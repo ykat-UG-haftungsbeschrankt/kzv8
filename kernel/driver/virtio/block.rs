@@ -215,6 +215,7 @@ impl BlockDevice {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn interrupt_slot(&self) -> usize {
         self.transport.slot()
     }

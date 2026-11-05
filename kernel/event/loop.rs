@@ -62,10 +62,14 @@ pub(crate) struct EventFlags(u8);
 impl EventFlags {
     pub(crate) const NONE: Self = Self(0);
     pub(crate) const READABLE: Self = Self(1 << 0);
+    #[allow(dead_code)]
     pub(crate) const WRITABLE: Self = Self(1 << 1);
+    #[allow(dead_code)]
     pub(crate) const ERROR: Self = Self(1 << 2);
+    #[allow(dead_code)]
     pub(crate) const HANGUP: Self = Self(1 << 3);
 
+    #[allow(dead_code)]
     pub(crate) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }

@@ -13,9 +13,14 @@
 
 pub(crate) mod address;
 pub(crate) mod bitfield;
+#[allow(dead_code)]
 pub(crate) mod btree;
 pub(crate) mod hash;
+#[allow(dead_code)]
 pub(crate) mod hashmap;
+#[allow(dead_code)]
 pub(crate) mod interval;
+#[allow(dead_code)]
 pub(crate) mod list;
+#[allow(dead_code)]
 pub(crate) mod array;

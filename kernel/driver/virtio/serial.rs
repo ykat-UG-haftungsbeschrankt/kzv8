@@ -157,6 +157,7 @@ impl VirtioSerial {
         true
     }
 
+    #[allow(dead_code)]
     pub(crate) fn read(output: &mut [u8]) -> usize {
         let serial = Self::get_instance();
         let base = serial.base.load(Ordering::Acquire);

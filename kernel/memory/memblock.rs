@@ -414,6 +414,7 @@ impl MemBlock {
         state.memory.insert(start, end)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn allocate_early(length: usize, alignment: usize) -> Option<usize> {
         Self::get_instance()
             .lock()
