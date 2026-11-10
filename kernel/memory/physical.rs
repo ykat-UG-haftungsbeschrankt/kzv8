@@ -18,6 +18,7 @@ use core::mem::size_of;
 
 use crate::kernel::arch::traits::MemoryArchitecture as _;
 use crate::kernel::arch::MemoryArchitecture;
+use crate::kernel::lib::alignment::align_up;
 use crate::kernel::lib::address::{AddressTranslator, PhysAddr};
 use crate::kernel::lib::bitfield::BitField;
 use crate::kernel::lib::list::CircularListLinks;
@@ -1066,10 +1067,4 @@ fn with_mapped_page<R>(
         return None;
     }
     Some(result)
-}
-
-fn align_up(value: usize, alignment: usize) -> Option<usize> {
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
 }

@@ -44,6 +44,8 @@ fn main() {
     let repository_dir = package_dir.clone();
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let runtime_v8_enabled = env::var_os("CARGO_FEATURE_RUNTIME_V8").is_some();
+    let aarch64_stage2_enabled = env::var_os("CARGO_FEATURE_AARCH64_STAGE2").is_some();
     let v8_target = if target_arch == "aarch64" {
         "aarch64-unknown-linux-gnu"
     } else {
@@ -106,6 +108,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CLANG");
     println!("cargo:rerun-if-env-changed=OBJCOPY");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FPU_AVX");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RUNTIME_V8");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AARCH64_STAGE2");
     println!("cargo:rerun-if-env-changed=V8_CXX");
     println!("cargo:rerun-if-env-changed=V8_PLATFORM_OUT");
     println!("cargo:rerun-if-env-changed=V8_AARCH64_PLATFORM_OUT");
@@ -120,6 +124,9 @@ fn main() {
         command.arg(format!("--target={clang_target}"));
         if target_arch == "x86_64" && fpu_avx {
             command.arg("-DKZ_FPU_AVX");
+        }
+        if target_arch == "aarch64" && aarch64_stage2_enabled {
+            command.arg("-DKZ_AARCH64_STAGE2");
         }
         let status = command
             .arg("-c")
@@ -226,7 +233,7 @@ fn main() {
         println!("cargo:rustc-link-arg={}", object.display());
     }
 
-    if target_arch == "x86_64" || target_arch == "aarch64" {
+    if runtime_v8_enabled && (target_arch == "x86_64" || target_arch == "aarch64") {
         let v8_source = repository_dir.join("runtime/v8/src");
         let v8_archive = v8_platform_output.join("obj/libv8_monolith.a");
         let target_obj = v8_platform_output.join("obj");

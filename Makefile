@@ -1,3 +1,8 @@
+# Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+#
+# Permission for non-commercial use is hereby granted,
+# free of charge, without warranty of any kind.
+
 CARGO ?= cargo
 CLANG ?= clang
 OBJCOPY ?= llvm-objcopy
@@ -12,6 +17,17 @@ QEMU_GDB_PORT ?= 1234
 KERNEL_X86_RUSTFLAGS ?= -C relocation-model=static -C link-arg=-no-pie -C link-arg=--error-limit=0
 V8_RUST_LIBS ?= $(shell find "$(V8_PLATFORM_OUT)/obj/third_party/rust" -type f -name '*.rlib' -print) $(wildcard $(V8_PLATFORM_OUT)/local_rustc_sysroot/lib/rustlib/x86_64-unknown-linux-gnu/lib/*.rlib)
 V8_RUST_ALLOCATOR_LIBS ?= $(wildcard $(V8_PLATFORM_OUT)/obj/build/rust/allocator/*.rlib)
+RUNTIME_V8 ?= 1
+
+ifeq ($(RUNTIME_V8),1)
+RUNTIME_V8_BUILD_DEPENDENCY := app-build
+RUNTIME_V8_FEATURES := --features runtime-v8
+else ifeq ($(RUNTIME_V8),0)
+RUNTIME_V8_BUILD_DEPENDENCY :=
+RUNTIME_V8_FEATURES :=
+else
+$(error RUNTIME_V8 must be 0 or 1)
+endif
 
 ifeq ($(FPU_MODE),x87)
 KERNEL_FPU_FEATURES := --no-default-features --features fpu-x87
@@ -19,39 +35,50 @@ else ifeq ($(FPU_MODE),sse)
 KERNEL_FPU_FEATURES := --no-default-features --features fpu-sse
 else ifeq ($(FPU_MODE),avx)
 KERNEL_FPU_FEATURES := --no-default-features --features fpu-avx
+else ifeq ($(FPU_MODE),off)
+KERNEL_FPU_FEATURES := --no-default-features
+KERNEL_X86_FPU_RUSTFLAGS := -C target-feature=-x87,-mmx,-sse,-sse2
 else
-$(error FPU_MODE must be x87, sse, or avx)
+$(error FPU_MODE must be x87, sse, avx, or off)
 endif
 
 ifeq ($(AARCH64_FPU_STATE),on)
 AARCH64_FPU_FEATURES :=
+AARCH64_RUST_TARGET := aarch64-unknown-none
 else ifeq ($(AARCH64_FPU_STATE),off)
 AARCH64_FPU_FEATURES := --features aarch64-fpu-off
+AARCH64_RUST_TARGET := aarch64-unknown-none-softfloat
 else
 $(error AARCH64_FPU_STATE must be on or off)
 endif
 
 .PHONY: all test app-build doc run-x86_64 run-aarch64 debug-x86_64 debug-aarch64 v8-host-test v8-platform-test clean force
-all: app-build build/x86_64/kernel.elf build/aarch64/kernel.bin
+all: $(RUNTIME_V8_BUILD_DEPENDENCY) build/x86_64/kernel.elf build/aarch64/kernel.bin
 
 force:
 
-build/x86_64/kernel64.elf: app-build force
+build/x86_64/kernel64.elf: $(RUNTIME_V8_BUILD_DEPENDENCY) force
 	mkdir -p $(@D)
+
+ifeq ($(RUNTIME_V8),1)
 	cd runtime/v8/src && buildtools/linux64/gn gen out.gn/x64.platform --args="$$(cat ../args-platform.gn)"
 	ninja -C "$(V8_PLATFORM_OUT)" v8_monolith
-	RUSTFLAGS="$(KERNEL_X86_RUSTFLAGS) $${RUSTFLAGS}" CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_PLATFORM_OUT="$(V8_PLATFORM_OUT)" $(CARGO) build --manifest-path Cargo.toml --release --target x86_64-unknown-none $(KERNEL_FPU_FEATURES)
+endif
+	RUSTFLAGS="$(KERNEL_X86_RUSTFLAGS) $${RUSTFLAGS} $(KERNEL_X86_FPU_RUSTFLAGS)" CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_PLATFORM_OUT="$(V8_PLATFORM_OUT)" $(CARGO) build --manifest-path Cargo.toml --release --target x86_64-unknown-none $(KERNEL_FPU_FEATURES) $(RUNTIME_V8_FEATURES)
 	cp "$(CARGO_TARGET_DIR)/x86_64-unknown-none/release/kernel" $@
 
 build/x86_64/kernel.elf: build/x86_64/kernel64.elf
 	$(OBJCOPY) -O elf32-i386 $< $@
 
-build/aarch64/kernel.elf: app-build force
+build/aarch64/kernel.elf: $(RUNTIME_V8_BUILD_DEPENDENCY) force
 	mkdir -p $(@D)
+
+ifeq ($(RUNTIME_V8),1)
 	cd runtime/v8/src && buildtools/linux64/gn gen out.gn/arm64.platform --args="$$(cat ../args-platform-aarch64.gn)"
 	ninja -C "$(V8_AARCH64_PLATFORM_OUT)" v8_monolith libc++
-	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_AARCH64_PLATFORM_OUT="$(V8_AARCH64_PLATFORM_OUT)" $(CARGO) build --manifest-path Cargo.toml --release --target aarch64-unknown-none $(AARCH64_FPU_FEATURES)
-	cp "$(CARGO_TARGET_DIR)/aarch64-unknown-none/release/kernel" $@
+endif
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_AARCH64_PLATFORM_OUT="$(V8_AARCH64_PLATFORM_OUT)" $(CARGO) build --manifest-path Cargo.toml --release --target $(AARCH64_RUST_TARGET) $(AARCH64_FPU_FEATURES) $(RUNTIME_V8_FEATURES)
+	cp "$(CARGO_TARGET_DIR)/$(AARCH64_RUST_TARGET)/release/kernel" $@
 
 build/aarch64/kernel.bin: build/aarch64/kernel.elf
 	$(OBJCOPY) -O binary $< $@
@@ -64,8 +91,8 @@ test: all
 	node tests/v8/vfat-smoke.js
 	python3 tests/qemu/smoke.py
 
-doc: app-build
-	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_PLATFORM_OUT="$(V8_PLATFORM_OUT)" $(CARGO) doc --manifest-path Cargo.toml
+doc: $(RUNTIME_V8_BUILD_DEPENDENCY)
+	CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" CLANG="$(CLANG)" OBJCOPY="$(OBJCOPY)" V8_CXX="$(V8_CXX)" V8_PLATFORM_OUT="$(V8_PLATFORM_OUT)" $(CARGO) doc --manifest-path Cargo.toml $(RUNTIME_V8_FEATURES)
 
 v8-host-test:
 	ninja -C "$(V8_OUT)" v8_hello_world d8

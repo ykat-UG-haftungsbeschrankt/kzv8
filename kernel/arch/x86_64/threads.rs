@@ -15,6 +15,8 @@ use crate::kernel::scheduler::sync::IrqSpinLock;
 const FPU_CONTEXT_SIZE: usize = 108;
 #[cfg(all(feature = "fpu-sse", not(feature = "fpu-avx")))]
 const FPU_CONTEXT_SIZE: usize = 512;
+#[cfg(not(any(feature = "fpu-x87", feature = "fpu-sse", feature = "fpu-avx")))]
+const FPU_CONTEXT_SIZE: usize = 512;
 #[cfg(feature = "fpu-avx")]
 const FPU_CONTEXT_SIZE: usize = 832;
 
@@ -32,7 +34,7 @@ impl FpuContext {
             image[1] = 0x03;
             image[8] = 0xff;
             image[9] = 0xff;
-        } else if cfg!(all(feature = "fpu-sse", not(feature = "fpu-avx"))) {
+        } else if !cfg!(feature = "fpu-avx") {
             image[0] = 0x7f;
             image[1] = 0x03;
             image[24] = 0x80;
@@ -88,6 +90,9 @@ define_context_switch!(["fnsave [rdx]"], ["frstor [rcx]"]);
 #[cfg(all(feature = "fpu-sse", not(feature = "fpu-avx")))]
 define_context_switch!(["fxsave64 [rdx]"], ["fxrstor64 [rcx]"]);
 
+#[cfg(not(any(feature = "fpu-x87", feature = "fpu-sse", feature = "fpu-avx")))]
+define_context_switch!(["fxsave64 [rdx]"], ["fxrstor64 [rcx]"]);
+
 #[cfg(feature = "fpu-avx")]
 define_context_switch!(
     ["mov r8, rdx", "mov eax, 7", "xor edx, edx", "xsave64 [r8]"],
@@ -112,15 +117,14 @@ pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
         let tls_start = addr_of!(__tls_start) as usize;
         let tls_data_end = addr_of!(__tls_data_end) as usize;
         let tls_end = addr_of!(__tls_end) as usize;
-        let Some(tls_size) = tls_end.checked_sub(tls_start) else {
+        let Some((tls_size, tls_data_size)) = crate::kernel::lib::tls::template_sizes(
+            tls_start,
+            tls_data_end,
+            tls_end,
+            TLS_BLOCK_SIZE - 2 * size_of::<usize>(),
+        ) else {
             return false;
         };
-        let Some(tls_data_size) = tls_data_end.checked_sub(tls_start) else {
-            return false;
-        };
-        if tls_data_size > tls_size || tls_size > TLS_BLOCK_SIZE - 2 * size_of::<usize>() {
-            return false;
-        }
 
         write_bytes(tls_block, 0, TLS_BLOCK_SIZE);
         copy_nonoverlapping(tls_start as *const u8, tls_block, tls_data_size);

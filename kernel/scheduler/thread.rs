@@ -20,6 +20,15 @@ use crate::kernel::lib::list::{LinkedList, ListNode};
 
 use super::sync::IrqSpinLock;
 
+#[path = "thread/kernel.rs"]
+pub(crate) mod kernel;
+#[path = "thread/userspace.rs"]
+pub(crate) mod userspace;
+#[path = "thread/vm.rs"]
+pub(crate) mod vm;
+#[path = "thread/smoke.rs"]
+pub(crate) mod smoke;
+
 pub(crate) type StartRoutine = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 pub(crate) type FpuContext =
     <crate::kernel::arch::ThreadArchitecture as crate::kernel::arch::traits::ThreadArchitecture>::FpuContext;
@@ -63,9 +72,37 @@ pub(crate) enum ThreadState {
     Exited,
 }
 
+pub(crate) enum ExecutionContext {
+    Kernel(kernel::Context),
+    Userspace(userspace::Context),
+    #[cfg(feature = "virtualization")]
+    Vm(vm::VcpuContext),
+}
+
+impl ExecutionContext {
+    fn kernel(&self) -> &kernel::Context {
+        match self {
+            Self::Kernel(context) => context,
+            Self::Userspace(context) => context.kernel(),
+            #[cfg(feature = "virtualization")]
+            Self::Vm(context) => context.kernel(),
+        }
+    }
+
+    fn kernel_mut(&mut self) -> &mut kernel::Context {
+        match self {
+            Self::Kernel(context) => context,
+            Self::Userspace(context) => context.kernel_mut(),
+            #[cfg(feature = "virtualization")]
+            Self::Vm(context) => context.kernel_mut(),
+        }
+    }
+}
+
 pub(crate) struct Thread {
+    // Thread IDs intentionally use the stable address of the Thread inside its Box.
     pub(crate) id: usize,
-    pub(crate) stack_pointer: usize,
+    pub(crate) context: ExecutionContext,
     pub(crate) state: ThreadState,
     pub(crate) start_routine: Option<StartRoutine>,
     pub(crate) argument: usize,
@@ -74,7 +111,6 @@ pub(crate) struct Thread {
     pub(crate) detached: bool,
     pub(crate) errno: i32,
     pub(crate) tls: [usize; ThreadManager::MAX_TLS_KEYS],
-    pub(crate) fpu_context: FpuContext,
     stack: Option<ThreadStack>,
     external_stack_address: usize,
     external_stack_size: usize,
@@ -84,7 +120,7 @@ impl Thread {
     fn main(stack_address: usize, stack_size: usize) -> Self {
         Self {
             id: 0,
-            stack_pointer: 0,
+            context: ExecutionContext::Kernel(kernel::Context::main()),
             state: ThreadState::Running,
             start_routine: None,
             argument: 0,
@@ -93,7 +129,6 @@ impl Thread {
             detached: false,
             errno: 0,
             tls: [0; ThreadManager::MAX_TLS_KEYS],
-            fpu_context: FpuContext::INITIAL,
             stack: None,
             external_stack_address: stack_address,
             external_stack_size: stack_size,
@@ -102,14 +137,14 @@ impl Thread {
 
     fn new(
         stack: ThreadStack,
-        stack_pointer: usize,
+        context: kernel::Context,
         start_routine: StartRoutine,
         argument: *mut c_void,
         detached: bool,
     ) -> Self {
         Self {
             id: 0,
-            stack_pointer,
+            context: ExecutionContext::Kernel(context),
             state: ThreadState::Ready,
             start_routine: Some(start_routine),
             argument: argument as usize,
@@ -118,7 +153,47 @@ impl Thread {
             detached,
             errno: 0,
             tls: [0; ThreadManager::MAX_TLS_KEYS],
-            fpu_context: FpuContext::INITIAL,
+            stack: Some(stack),
+            external_stack_address: 0,
+            external_stack_size: 0,
+        }
+    }
+
+    fn new_userspace(
+        stack: ThreadStack,
+        context: userspace::Context,
+        detached: bool,
+    ) -> Self {
+        Self {
+            id: 0,
+            context: ExecutionContext::Userspace(context),
+            state: ThreadState::Ready,
+            start_routine: None,
+            argument: 0,
+            result: 0,
+            joiner: 0,
+            detached,
+            errno: 0,
+            tls: [0; ThreadManager::MAX_TLS_KEYS],
+            stack: Some(stack),
+            external_stack_address: 0,
+            external_stack_size: 0,
+        }
+    }
+
+    #[cfg(feature = "virtualization")]
+    fn new_vm(stack: ThreadStack, context: vm::VcpuContext, detached: bool) -> Self {
+        Self {
+            id: 0,
+            context: ExecutionContext::Vm(context),
+            state: ThreadState::Ready,
+            start_routine: None,
+            argument: 0,
+            result: 0,
+            joiner: 0,
+            detached,
+            errno: 0,
+            tls: [0; ThreadManager::MAX_TLS_KEYS],
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
@@ -164,10 +239,8 @@ impl ThreadStack {
 }
 
 struct SwitchContext {
-    old_stack: *mut usize,
-    new_stack: usize,
-    old_fpu_context: *mut FpuContext,
-    new_fpu_context: *const FpuContext,
+    old_context: *mut kernel::Context,
+    new_context: *const kernel::Context,
 }
 
 pub(crate) struct ThreadManager {
@@ -369,21 +442,62 @@ impl ThreadManager {
         detached: bool,
     ) -> Result<usize, Error> {
         let mut stack = ThreadStack::try_new(stack_size)?;
-        let stack_pointer = crate::kernel::arch::ThreadArchitecture::initialize_thread_stack(
-            stack.as_mut_slice(),
-            Self::thread_trampoline,
-        );
+        let context = kernel::Context::load(stack.as_mut_slice(), Self::thread_trampoline);
         let mut thread = Box::new(ListNode::new(Thread::new(
             stack,
-            stack_pointer,
+            context,
             start_routine,
             argument,
             detached,
         )));
+        Self::enqueue_thread(thread)
+    }
+
+    pub(crate) fn create_userspace_thread(
+        stack_size: usize,
+        entry: usize,
+        user_stack_pointer: usize,
+        detached: bool,
+    ) -> Result<usize, Error> {
+        let mut stack = ThreadStack::try_new(stack_size)?;
+        let context = userspace::Context::load(
+            stack.as_mut_slice(),
+            Self::thread_trampoline,
+            entry,
+            user_stack_pointer,
+        )?;
+        let thread = Box::new(ListNode::new(Thread::new_userspace(
+            stack, context, detached,
+        )));
+        Self::enqueue_thread(thread)
+    }
+
+    #[cfg(feature = "virtualization")]
+    pub(crate) fn create_vm_thread(
+        stack_size: usize,
+        image: &[u8],
+        detached: bool,
+    ) -> Result<usize, crate::kernel::arch::VirtualizationError> {
+        let mut stack = ThreadStack::try_new(stack_size).map_err(|error| match error {
+            Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
+            _ => crate::kernel::arch::VirtualizationError::InvalidGuestImage,
+        })?;
+        let context = vm::VcpuContext::load(
+            stack.as_mut_slice(),
+            Self::thread_trampoline,
+            image,
+        )?;
+        let thread = Box::new(ListNode::new(Thread::new_vm(stack, context, detached)));
+        Self::enqueue_thread(thread).map_err(|error| match error {
+            Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
+            _ => crate::kernel::arch::VirtualizationError::HostSetupFailed,
+        })
+    }
+
+    fn enqueue_thread(mut thread: Box<ListNode<Thread>>) -> Result<usize, Error> {
         let id = addr_of_mut!(**thread) as usize;
         thread.id = id;
         let node_address = thread.as_mut() as *mut ListNode<Thread> as usize;
-
         let mut manager = THREAD_MANAGER.lock();
         if !manager.initialized {
             return Err(Error::Again);
@@ -412,8 +526,7 @@ impl ThreadManager {
             if !manager.initialized || manager.ready.is_empty() {
                 None
             } else if let Some(mut current) = manager.busy.pop_front() {
-                let old_stack = addr_of_mut!((*current).stack_pointer);
-                let old_fpu_context = addr_of_mut!((*current).fpu_context);
+                let old_context = current.context.kernel_mut() as *mut kernel::Context;
                 current.state = next_state;
                 if next_state == ThreadState::Ready {
                     manager.ready.push_back(current);
@@ -424,10 +537,8 @@ impl ThreadManager {
                 if let Some(mut next) = manager.ready.pop_front() {
                     next.state = ThreadState::Running;
                     let context = SwitchContext {
-                        old_stack,
-                        new_stack: next.stack_pointer,
-                        old_fpu_context,
-                        new_fpu_context: addr_of_mut!((*next).fpu_context),
+                        old_context,
+                        new_context: next.context.kernel() as *const kernel::Context,
                     };
                     manager.busy.push_front(next);
                     Some(context)
@@ -452,12 +563,7 @@ impl ThreadManager {
 
     unsafe fn switch_threads(context: SwitchContext) {
         unsafe {
-            crate::kernel::arch::ThreadArchitecture::switch_thread(
-                &mut *context.old_stack,
-                context.new_stack,
-                &mut *context.old_fpu_context,
-                &*context.new_fpu_context,
-            );
+            (&mut *context.old_context).restore(&*context.new_context);
         }
     }
 
@@ -646,8 +752,7 @@ impl ThreadManager {
                         manager.wake_blocked(joiner);
                     }
                 }
-                let old_stack = addr_of_mut!((*current).stack_pointer);
-                let old_fpu_context = addr_of_mut!((*current).fpu_context);
+                let old_context = current.context.kernel_mut() as *mut kernel::Context;
                 if current.detached && manager.pending_reap.is_none() {
                     manager.thread_nodes.remove(&current.id);
                     manager.pending_reap = Some(current);
@@ -658,10 +763,8 @@ impl ThreadManager {
                 if let Some(mut next) = manager.ready.pop_front() {
                     next.state = ThreadState::Running;
                     let context = SwitchContext {
-                        old_stack,
-                        new_stack: next.stack_pointer,
-                        old_fpu_context,
-                        new_fpu_context: addr_of_mut!((*next).fpu_context),
+                        old_context,
+                        new_context: next.context.kernel() as *const kernel::Context,
                     };
                     manager.busy.push_front(next);
                     Some(context)
@@ -683,15 +786,41 @@ impl ThreadManager {
     pub(crate) extern "C" fn thread_trampoline() -> ! {
         let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
         Self::reap_pending();
+        #[derive(Clone, Copy)]
+        enum Start {
+            Kernel(StartRoutine, *mut c_void),
+            Userspace(NonNull<userspace::Context>),
+            #[cfg(feature = "virtualization")]
+            Vm(NonNull<vm::VcpuContext>),
+        }
         let start = {
             let manager = THREAD_MANAGER.lock();
-            manager.busy.front().and_then(|thread| {
-                thread
-                    .start_routine
-                    .map(|start_routine| (start_routine, thread.argument as *mut c_void))
+            manager.busy.front().and_then(|thread| match &thread.context {
+                ExecutionContext::Kernel(_) => thread.start_routine.map(|start_routine| {
+                    Start::Kernel(start_routine, thread.argument as *mut c_void)
+                }),
+                ExecutionContext::Userspace(context) => {
+                    Some(Start::Userspace(NonNull::from(context)))
+                }
+                #[cfg(feature = "virtualization")]
+                ExecutionContext::Vm(context) => Some(Start::Vm(NonNull::from(context))),
             })
         };
-        let Some((start_routine, argument)) = start else {
+        let Some(start) = start else {
+            crate::kernel::arch::CpuArchitecture::halt();
+        };
+        if let Start::Userspace(context) = start {
+            // SAFETY: the running thread stays owned by the busy queue while it enters userspace.
+            unsafe { context.as_ref().restore() };
+        }
+        #[cfg(feature = "virtualization")]
+        if let Start::Vm(context) = start {
+            // SAFETY: the running thread owns its vCPU context until it exits.
+            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+            crate::kernel::arch::InterruptArchitecture::enable_interrupts();
+            unsafe { vm::VcpuContext::run(context) };
+        }
+        let Start::Kernel(start_routine, argument) = start else {
             crate::kernel::arch::CpuArchitecture::halt();
         };
         crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);

@@ -22,6 +22,9 @@ aarch64_secondary_entry:
     b 1b
 
 aarch64_secondary_el2:
+#ifdef KZ_AARCH64_STAGE2
+    bl kz_aarch64_el2_initialize
+#endif
     mov x9, #(1 << 31)
     msr hcr_el2, x9
     msr cptr_el2, xzr
@@ -33,6 +36,7 @@ aarch64_secondary_el2:
 
 aarch64_secondary_el1:
     msr spsel, #1
+    msr tpidr_el1, x0
     mov x9, #(3 << 20)
     msr cpacr_el1, x9
     isb

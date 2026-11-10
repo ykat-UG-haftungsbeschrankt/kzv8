@@ -1,0 +1,143 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::kernel::arch::traits::InterruptArchitecture as _;
+use crate::kernel::dl::{AddressSpace, Error, Permissions};
+use super::vm::UserAddressSpace;
+use super::{ThreadManager, ThreadStack, ThreadState};
+
+static THREAD_SMOKE_RESULT: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn thread_smoke_worker(argument: *mut c_void) -> *mut c_void {
+    THREAD_SMOKE_RESULT.store(argument as usize, Ordering::Release);
+    argument
+}
+
+pub(crate) fn thread_smoke() -> bool {
+    const RESULT: usize = 0x4b5a;
+
+    THREAD_SMOKE_RESULT.store(0, Ordering::Release);
+    let Ok(thread_id) = ThreadManager::create_thread(
+        ThreadStack::MIN_SIZE,
+        thread_smoke_worker,
+        RESULT as *mut c_void,
+        false,
+    ) else {
+        return false;
+    };
+    let interrupt_state =
+        crate::kernel::arch::InterruptArchitecture::disable_interrupts();
+    let join_result = match ThreadManager::begin_join_by_id(thread_id) {
+        Ok(Some(result)) => Ok(result),
+        Ok(None) if ThreadManager::switch_current(ThreadState::Blocked) => {
+            ThreadManager::finish_join_by_id(thread_id)
+        }
+        Ok(None) => {
+            ThreadManager::cancel_join_by_id(thread_id);
+            Err(Error::Deadlk)
+        }
+        Err(error) => Err(error),
+    };
+    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+
+    matches!(join_result, Ok(RESULT))
+        && THREAD_SMOKE_RESULT.load(Ordering::Acquire) == RESULT
+        && !ThreadManager::contains_thread_by_id(thread_id)
+}
+
+pub(crate) fn vm_smoke() -> bool {
+    const PAGE_SIZE: usize = crate::kernel::memory::r#virtual::PAGE_SIZE;
+    const MAPPING_LENGTH: usize = PAGE_SIZE * 2;
+
+    let mut address_space = UserAddressSpace::new();
+    if !matches!(address_space.allocate_stack(0), Err(Error::NoExec)) {
+        return false;
+    }
+
+    let Ok((stack_address, stack_pointer)) = address_space.allocate_stack(PAGE_SIZE + 1) else {
+        return false;
+    };
+    let read_write = Permissions::from_bits(Permissions::READ.bits() | Permissions::WRITE.bits());
+    let stack_result = (|| -> Result<(), Error> {
+        if stack_address % PAGE_SIZE != 0
+            || stack_address.checked_add(MAPPING_LENGTH) != Some(stack_pointer)
+        {
+            return Err(Error::Inval);
+        }
+        address_space.protect(stack_address, MAPPING_LENGTH, read_write)?;
+        let mut bytes = [u8::MAX; 4];
+        address_space.read(stack_address, &mut bytes)?;
+        if bytes != [0; 4] {
+            return Err(Error::Inval);
+        }
+        Ok(())
+    })();
+    address_space.release(stack_address, MAPPING_LENGTH);
+    if stack_result.is_err() {
+        return false;
+    }
+    let Ok(reclaimed_stack) =
+        address_space.reserve(Some(stack_address), MAPPING_LENGTH, PAGE_SIZE, 0, true)
+    else {
+        return false;
+    };
+    address_space.release(reclaimed_stack, MAPPING_LENGTH);
+
+    let Ok(address) = address_space.reserve(
+        None,
+        PAGE_SIZE + 1,
+        MAPPING_LENGTH,
+        PAGE_SIZE,
+        false,
+    ) else {
+        return false;
+    };
+    if address % MAPPING_LENGTH != PAGE_SIZE {
+        address_space.release(address, MAPPING_LENGTH);
+        return false;
+    }
+
+    let mapping_result = (|| -> Result<(), Error> {
+        address_space.zero(address, MAPPING_LENGTH)?;
+        address_space.protect(address, MAPPING_LENGTH, read_write)?;
+        let mut bytes = [u8::MAX; 4];
+        address_space.read(address, &mut bytes)?;
+        if bytes != [0; 4] {
+            return Err(Error::Inval);
+        }
+
+        let expected = [0x5a, 0xa5, 0x3c, 0xc3];
+        address_space.write(address, &expected)?;
+        address_space.read(address, &mut bytes)?;
+        if bytes != expected {
+            return Err(Error::Inval);
+        }
+        address_space.protect(address, MAPPING_LENGTH, Permissions::READ)?;
+        if !matches!(address_space.write(address, &expected), Err(Error::NoMem)) {
+            return Err(Error::Inval);
+        }
+        address_space.read(address, &mut bytes)?;
+        if bytes != expected {
+            return Err(Error::Inval);
+        }
+        Ok(())
+    })();
+    address_space.release(address, MAPPING_LENGTH);
+    if mapping_result.is_err() {
+        return false;
+    }
+    let Ok(reclaimed_mapping) =
+        address_space.reserve(Some(address), MAPPING_LENGTH, PAGE_SIZE, 0, true)
+    else {
+        return false;
+    };
+    address_space.release(reclaimed_mapping, MAPPING_LENGTH);
+    true
+}

@@ -11,25 +11,22 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 
 use crate::kernel::lib::list::CircularListLinks;
+use crate::kernel::memory::slab::SlabPage;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 #[derive(Clone, Copy)]
 struct Slab {
-    page: usize,
+    allocation: SlabPage<4>,
     class_index: usize,
-    used: usize,
     links: CircularListLinks<usize>,
-    bitmap: [u64; 4],
     active: bool,
 }
 
 impl Slab {
     const EMPTY: Self = Self {
-        page: 0,
+        allocation: SlabPage::EMPTY,
         class_index: 0,
-        used: 0,
         links: CircularListLinks::new(Heap::NO_INDEX, Heap::NO_INDEX),
-        bitmap: [0; 4],
         active: false,
     };
 }
@@ -770,25 +767,16 @@ impl Heap {
 
         while slab_index != Self::NO_INDEX {
             let next = heap.slabs[slab_index].links.next();
-            if heap.slabs[slab_index].used >= slot_count {
+            if heap.slabs[slab_index].allocation.used() >= slot_count {
                 Self::unlink_slab(heap, slab_index);
                 slab_index = next;
                 continue;
             }
-            for slot in 0..slot_count {
-                let word = slot / u64::BITS as usize;
-                let mask = 1u64 << (slot % u64::BITS as usize);
-                let bitmap = heap.slabs[slab_index].bitmap[word];
-                if bitmap & mask == 0 {
-                    let slab = &mut heap.slabs[slab_index];
-                    slab.bitmap[word] = bitmap | mask;
-                    slab.used += 1;
-                    let address = slab.page + slot * class_size;
-                    if slab.used == slot_count {
-                        Self::unlink_slab(heap, slab_index);
-                    }
-                    return address as *mut u8;
+            if let Some(address) = heap.slabs[slab_index].allocation.allocate(class_size) {
+                if heap.slabs[slab_index].allocation.used() == slot_count {
+                    Self::unlink_slab(heap, slab_index);
                 }
+                return address as *mut u8;
             }
             slab_index = next;
         }
@@ -800,6 +788,11 @@ impl Heap {
         let Some(page) =
             crate::kernel::memory::r#virtual::reserve(Self::PAGE_SIZE, Self::PAGE_SIZE, 2)
         else {
+            return null_mut();
+        };
+        let mut allocation = SlabPage::new(page);
+        let Some(address) = allocation.allocate(class_size) else {
+            let _released = crate::kernel::memory::r#virtual::release(page, Self::PAGE_SIZE);
             return null_mut();
         };
         if !heap.address_index.insert(IndexEntry {
@@ -817,18 +810,16 @@ impl Heap {
         heap.free_slab_head = heap.slabs[metadata_slot].links.next();
         let head = heap.class_heads[class_index];
         heap.slabs[metadata_slot] = Slab {
-            page,
+            allocation,
             class_index,
-            used: 1,
             links: CircularListLinks::new(Self::NO_INDEX, head),
-            bitmap: [1, 0, 0, 0],
             active: true,
         };
         if head != Self::NO_INDEX {
             heap.slabs[head].links.set_previous(metadata_slot);
         }
         heap.class_heads[class_index] = metadata_slot;
-        page as *mut u8
+        address as *mut u8
     }
 
     fn link_slab(heap: &mut HeapState, index: usize) {
@@ -1076,40 +1067,29 @@ impl Heap {
         }
         let index = entry.value;
         let slab = heap.slabs[index];
-        if !slab.active || slab.page != page {
+        if !slab.active || slab.allocation.address() != page {
             return;
         }
         let class_size = Self::CLASS_SIZES[slab.class_index];
-        let offset = address - page;
-        if offset % class_size != 0 {
-            return;
-        }
-        let slot = offset / class_size;
         let slot_count = Self::PAGE_SIZE / class_size;
-        if slot >= slot_count {
+        let was_full = slab.allocation.used() == slot_count;
+        if !heap.slabs[index]
+            .allocation
+            .deallocate(address, class_size)
+        {
             return;
         }
-        let word = slot / u64::BITS as usize;
-        let mask = 1u64 << (slot % u64::BITS as usize);
-        if slab.bitmap[word] & mask == 0 {
-            return;
-        }
-        let was_full = slab.used == slot_count;
-        let unused = {
-            let slab = &mut heap.slabs[index];
-            slab.bitmap[word] &= !mask;
-            slab.used -= 1;
-            slab.used == 0
-        };
+        let unused = heap.slabs[index].allocation.used() == 0;
         if unused && crate::kernel::memory::r#virtual::release(page, Self::PAGE_SIZE) {
             Self::unlink_slab(heap, index);
             let _removed = heap.address_index.remove(page);
             heap.slabs[index] = Slab {
+                allocation: SlabPage::EMPTY,
                 links: CircularListLinks::new(Self::NO_INDEX, heap.free_slab_head),
                 ..Slab::EMPTY
             };
             heap.free_slab_head = index;
-        } else if !unused && was_full {
+        } else if was_full {
             Self::link_slab(heap, index);
         }
     }
@@ -1137,20 +1117,14 @@ impl Heap {
             return None;
         }
         let slab = &heap.slabs[entry.value];
-        if !slab.active || slab.page != page {
+        if !slab.active || slab.allocation.address() != page {
             return None;
         }
         let class_size = Self::CLASS_SIZES[slab.class_index];
-        let offset = address - page;
-        if offset % class_size != 0 {
-            return None;
-        }
-        let slot = offset / class_size;
-        if slot >= Self::PAGE_SIZE / class_size {
-            return None;
-        }
-        let mask = 1u64 << (slot % u64::BITS as usize);
-        (slab.bitmap[slot / u64::BITS as usize] & mask != 0).then_some(class_size)
+        slab
+            .allocation
+            .is_allocated(address, class_size)
+            .then_some(class_size)
     }
 
     pub(crate) fn remaining(&self, heap: &HeapState) -> usize {
@@ -1159,7 +1133,9 @@ impl Heap {
             if slab.active {
                 let class_size = Self::CLASS_SIZES[slab.class_index];
                 let slots = Self::PAGE_SIZE / class_size;
-                total = total.saturating_add((slots - slab.used) * class_size);
+                total = total.saturating_add(
+                    slots.saturating_sub(slab.allocation.used()) * class_size,
+                );
             }
         }
         total.saturating_add(heap.cached_large_bytes)

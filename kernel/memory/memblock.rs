@@ -7,6 +7,7 @@
 
 use core::mem::{align_of, size_of};
 
+use crate::kernel::lib::alignment::align_up;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 const INITIAL_REGION_CAPACITY: usize = 32;
@@ -440,12 +441,6 @@ impl MemBlock {
     pub(crate) fn memory_regions() -> MemoryRegions {
         Self::get_instance().lock().memory
     }
-}
-
-fn align_up(value: usize, alignment: usize) -> Option<usize> {
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
 }
 
 fn allocate_from_region(

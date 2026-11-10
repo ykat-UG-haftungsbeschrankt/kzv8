@@ -7,10 +7,159 @@
 
 use alloc::vec::Vec;
 
+use crate::kernel::lib::endian::{read_u16, read_u32, read_u64};
+
 const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
 const MAX_TABLE_SIZE: usize = 1024 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DmarInfo {
+    pub(crate) host_address_width: u8,
+    pub(crate) interrupt_remapping: bool,
+    pub(crate) x2apic_opt_out: bool,
+    pub(crate) units: Vec<DmarUnit>,
+    pub(crate) reserved_regions: Vec<DmarReservedRegion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DmarUnit {
+    pub(crate) segment: u16,
+    pub(crate) register_base: u64,
+    pub(crate) include_all: bool,
+    pub(crate) device_scopes: Vec<DmarDeviceScope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DmarReservedRegion {
+    pub(crate) segment: u16,
+    pub(crate) base: u64,
+    pub(crate) limit: u64,
+    pub(crate) device_scopes: Vec<DmarDeviceScope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DmarDeviceScope {
+    pub(crate) scope_type: u8,
+    pub(crate) enumeration_id: u8,
+    pub(crate) start_bus: u8,
+    pub(crate) path: Vec<DmarPathEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DmarPathEntry {
+    pub(crate) device: u8,
+    pub(crate) function: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct McfgAllocation {
+    pub(crate) base: u64,
+    pub(crate) segment: u16,
+    pub(crate) start_bus: u8,
+    pub(crate) end_bus: u8,
+}
+
 pub(crate) fn cpu_apic_ids() -> Option<Vec<u32>> {
+    parse_madt(find_acpi_table(b"APIC")?)
+}
+
+pub(crate) fn mcfg_allocations() -> Option<Vec<McfgAllocation>> {
+    let table = find_acpi_table(b"MCFG")?;
+    if table.len() < 44 || (table.len() - 44) % 16 != 0 {
+        return None;
+    }
+    let mut allocations = Vec::new();
+    for allocation in table[44..].chunks_exact(16) {
+        let base = read_u64(allocation, 0)?;
+        let segment = read_u16(allocation, 8)?;
+        let start_bus = allocation[10];
+        let end_bus = allocation[11];
+        if base == 0 || base % (1 << 20) != 0 || start_bus > end_bus {
+            return None;
+        }
+        let bus_count = u64::from(end_bus - start_bus) + 1;
+        let region_length = bus_count.checked_mul(1 << 20)?;
+        base.checked_add(region_length)?;
+        allocations.push(McfgAllocation {
+            base,
+            segment,
+            start_bus,
+            end_bus,
+        });
+    }
+    (!allocations.is_empty()).then_some(allocations)
+}
+
+pub(crate) fn dmar_info() -> Option<DmarInfo> {
+    let table = find_acpi_table(b"DMAR")?;
+    if table.len() < 48 {
+        return None;
+    }
+    let host_address_width = table[36].checked_add(1)?;
+    if !(32..=64).contains(&host_address_width) {
+        return None;
+    }
+    let flags = table[37];
+    let mut units = Vec::new();
+    let mut reserved_regions = Vec::new();
+    let mut offset = 48;
+    while offset < table.len() {
+        let remaining = table.len() - offset;
+        if remaining < 4 {
+            return None;
+        }
+        let structure_type = read_u16(table, offset)?;
+        let structure_length = usize::from(read_u16(table, offset + 2)?);
+        if structure_length < 4 || structure_length > remaining {
+            return None;
+        }
+        let structure = table.get(offset..offset + structure_length)?;
+        match structure_type {
+            0 => {
+                if structure_length < 16 {
+                    return None;
+                }
+                let register_base = read_u64(structure, 8)?;
+                if register_base == 0 || register_base % 4096 != 0 {
+                    return None;
+                }
+                units.push(DmarUnit {
+                    segment: read_u16(structure, 6)?,
+                    register_base,
+                    include_all: structure[4] & 1 != 0,
+                    device_scopes: parse_device_scopes(structure, 16)?,
+                });
+            }
+            1 => {
+                if structure_length < 24 {
+                    return None;
+                }
+                let base = read_u64(structure, 8)?;
+                let limit = read_u64(structure, 16)?;
+                if base > limit {
+                    return None;
+                }
+                reserved_regions.push(DmarReservedRegion {
+                    segment: read_u16(structure, 6)?,
+                    base,
+                    limit,
+                    device_scopes: parse_device_scopes(structure, 24)?,
+                });
+            }
+            _ => {}
+        }
+        offset += structure_length;
+    }
+    (!units.is_empty()).then_some(DmarInfo {
+        host_address_width,
+        interrupt_remapping: flags & 1 != 0,
+        x2apic_opt_out: flags & (1 << 1) != 0,
+        units,
+        reserved_regions,
+    })
+}
+
+fn find_acpi_table(signature: &[u8; 4]) -> Option<&'static [u8]> {
     let rsdp_address = find_rsdp()?;
     let rsdp = physical_bytes(rsdp_address as u64, 20)?;
     let revision = *rsdp.get(15)?;
@@ -43,11 +192,41 @@ pub(crate) fn cpu_apic_ids() -> Option<Vec<u32>> {
         let Some(table) = read_sdt(table_address) else {
             continue;
         };
-        if table.get(..4)? == b"APIC" {
-            return parse_madt(table);
+        if table.get(..4)? == signature.as_slice() {
+            return Some(table);
         }
     }
     None
+}
+
+fn parse_device_scopes(structure: &[u8], mut offset: usize) -> Option<Vec<DmarDeviceScope>> {
+    let mut scopes = Vec::new();
+    while offset < structure.len() {
+        let remaining = structure.len().checked_sub(offset)?;
+        if remaining < 6 {
+            return None;
+        }
+        let scope_length = usize::from(*structure.get(offset + 1)?);
+        if scope_length < 8 || scope_length > remaining || (scope_length - 6) % 2 != 0 {
+            return None;
+        }
+        let path_bytes = structure.get(offset + 6..offset + scope_length)?;
+        let mut path = Vec::new();
+        for entry in path_bytes.chunks_exact(2) {
+            path.push(DmarPathEntry {
+                device: entry[0],
+                function: entry[1],
+            });
+        }
+        scopes.push(DmarDeviceScope {
+            scope_type: structure[offset],
+            enumeration_id: structure[offset + 4],
+            start_bus: structure[offset + 5],
+            path,
+        });
+        offset = offset.checked_add(scope_length)?;
+    }
+    Some(scopes)
 }
 
 fn find_rsdp() -> Option<usize> {
@@ -160,19 +339,4 @@ fn checksum(bytes: &[u8]) -> u8 {
     bytes
         .iter()
         .fold(0, |sum, byte| sum.wrapping_add(*byte))
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    let end = offset.checked_add(2)?;
-    Some(u16::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    Some(u32::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    let end = offset.checked_add(8)?;
-    Some(u64::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?))
 }

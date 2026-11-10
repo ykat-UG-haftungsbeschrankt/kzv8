@@ -1,3 +1,8 @@
+# Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+#
+# Permission for non-commercial use is hereby granted,
+# free of charge, without warranty of any kind.
+
 import socket
 import struct
 import subprocess
@@ -247,6 +252,8 @@ def check(architecture):
         expected += "kz: first lazy page fault resolved\n"
     expected += f"kz: {architecture} Rust kernel booted\n"
     expected += "kz: virtio-console transmit OK\n"
+    expected += "kz: kernel thread smoke OK\n"
+    expected += "kz: user VM smoke OK\n"
     if architecture == "x86_64":
         expected += "kz: smp secondary cpus online\n"
     expected += "kz: virtio balloon ready\n"

@@ -28,6 +28,7 @@ const L2_ADDRESS_MASK: u64 = 0x0000_ffff_ffe0_0000;
 const PAGE_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 const AP_MASK: u64 = 0b11 << 6;
 const AP_READ_ONLY: u64 = 0b10 << 6;
+const AP_USER_READ_WRITE: u64 = 0b01 << 6;
 const RAM_ATTRIBUTES: u64 = BLOCK_DESCRIPTOR | ACCESS_FLAG | INNER_SHAREABLE | UXN;
 const TABLE_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
@@ -174,6 +175,14 @@ unsafe fn page_table_entry(address: usize, create: bool) -> Option<*mut u64> {
 }
 
 fn page_attributes(permissions: i32) -> Option<u64> {
+    page_attributes_for(permissions, false)
+}
+
+fn user_page_attributes(permissions: i32) -> Option<u64> {
+    page_attributes_for(permissions, true)
+}
+
+fn page_attributes_for(permissions: i32, user: bool) -> Option<u64> {
     if !matches!(permissions, 1..=4) {
         return None;
     }
@@ -181,15 +190,37 @@ fn page_attributes(permissions: i32) -> Option<u64> {
     let executable = matches!(permissions, 3 | 4);
     let mut attributes = ACCESS_FLAG | INNER_SHAREABLE | UXN;
     if read_only {
-        attributes |= AP_READ_ONLY;
+        attributes |= if user { AP_MASK } else { AP_READ_ONLY };
+    } else if user {
+        attributes |= AP_USER_READ_WRITE;
     }
-    if !executable {
+    if user || !executable {
         attributes |= PXN;
+    }
+    if executable {
+        attributes &= !UXN;
     }
     Some(attributes)
 }
 
 pub(crate) fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool {
+    map_page_inner(virtual_address, physical_address, permissions, false)
+}
+
+pub(crate) fn map_user_page(
+    virtual_address: usize,
+    physical_address: usize,
+    permissions: i32,
+) -> bool {
+    map_page_inner(virtual_address, physical_address, permissions, true)
+}
+
+fn map_page_inner(
+    virtual_address: usize,
+    physical_address: usize,
+    permissions: i32,
+    user: bool,
+) -> bool {
     if virtual_address % PAGE_SIZE != 0 || physical_address % PAGE_SIZE != 0 {
         return false;
     }
@@ -201,7 +232,12 @@ pub(crate) fn map_page(virtual_address: usize, physical_address: usize, permissi
     {
         return false;
     }
-    let Some(attributes) = page_attributes(permissions) else {
+    let attributes = if user {
+        user_page_attributes(permissions)
+    } else {
+        page_attributes(permissions)
+    };
+    let Some(attributes) = attributes else {
         return false;
     };
 
@@ -276,7 +312,97 @@ pub(crate) fn page_has_backing(virtual_address: usize) -> bool {
         || (descriptor & 0b11 == 0 && descriptor & PAGE_ADDRESS_MASK != 0)
 }
 
+pub(crate) fn user_range_accessible(address: usize, length: usize, write: bool) -> bool {
+    if length == 0 {
+        return address <= VIRTUAL_ADDRESS_LIMIT;
+    }
+    let Some(end) = address.checked_add(length) else {
+        return false;
+    };
+    if end > VIRTUAL_ADDRESS_LIMIT {
+        return false;
+    }
+    let first_page = address & !(PAGE_SIZE - 1);
+    let Some(last_byte) = end.checked_sub(1) else {
+        return false;
+    };
+    let last_page = last_byte & !(PAGE_SIZE - 1);
+    let _guard = PAGE_TABLE_LOCK.lock();
+    let mut page = first_page;
+    loop {
+        let Some(entry) = (unsafe { page_table_entry(page, false) }) else {
+            return false;
+        };
+        let descriptor = unsafe { read_volatile(entry) };
+        let access_permissions = (descriptor & AP_MASK) >> 6;
+        if descriptor & 0b11 != 0b11
+            || descriptor & (1 << 6) == 0
+            || (write && access_permissions != 0b01)
+        {
+            return false;
+        }
+        if page == last_page {
+            return true;
+        }
+        let Some(next_page) = page.checked_add(PAGE_SIZE) else {
+            return false;
+        };
+        page = next_page;
+    }
+}
+
+pub(crate) fn user_range_executable(address: usize, length: usize) -> bool {
+    if length == 0 {
+        return address <= VIRTUAL_ADDRESS_LIMIT;
+    }
+    let Some(end) = address.checked_add(length) else {
+        return false;
+    };
+    if end > VIRTUAL_ADDRESS_LIMIT {
+        return false;
+    }
+    let first_page = address & !(PAGE_SIZE - 1);
+    let Some(last_byte) = end.checked_sub(1) else {
+        return false;
+    };
+    let last_page = last_byte & !(PAGE_SIZE - 1);
+    let _guard = PAGE_TABLE_LOCK.lock();
+    let mut page = first_page;
+    loop {
+        let Some(entry) = (unsafe { page_table_entry(page, false) }) else {
+            return false;
+        };
+        let descriptor = unsafe { read_volatile(entry) };
+        if descriptor & 0b11 != 0b11
+            || descriptor & (1 << 6) == 0
+            || descriptor & UXN != 0
+        {
+            return false;
+        }
+        if page == last_page {
+            return true;
+        }
+        let Some(next_page) = page.checked_add(PAGE_SIZE) else {
+            return false;
+        };
+        page = next_page;
+    }
+}
+
 pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
+    set_page_permissions_inner(address, length, permissions, false)
+}
+
+pub(crate) fn set_user_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
+    set_page_permissions_inner(address, length, permissions, true)
+}
+
+fn set_page_permissions_inner(
+    address: usize,
+    length: usize,
+    permissions: i32,
+    user: bool,
+) -> bool {
     let Some(end) = address.checked_add(length) else {
         return false;
     };
@@ -306,7 +432,12 @@ pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i
             } else {
                 current_address
             };
-            let Some(page_attributes) = page_attributes(permissions) else {
+            let page_attributes = if user {
+                user_page_attributes(permissions)
+            } else {
+                page_attributes(permissions)
+            };
+            let Some(page_attributes) = page_attributes else {
                 return false;
             };
             let attributes =

@@ -9,7 +9,10 @@ mod device_tree;
 mod entry;
 pub(crate) mod interrupts;
 mod paging;
+#[cfg(feature = "virtualization")]
+mod stage2;
 mod ram_map;
+mod syscall;
 pub(crate) mod smp;
 mod threads;
 pub(crate) mod timer;
@@ -88,6 +91,58 @@ pub(crate) fn switch_thread(
     new_fpu_context: &FpuContext,
 ) {
     unsafe { threads::switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
+}
+
+pub(crate) unsafe fn enter_user(entry: usize, stack_pointer: usize) -> ! {
+    if entry >= (1usize << 39) || stack_pointer >= (1usize << 39) || stack_pointer % 16 != 0 {
+        halt();
+    }
+    unsafe {
+        core::arch::asm!(
+            "movi v0.16b, #0",
+            "movi v1.16b, #0",
+            "movi v2.16b, #0",
+            "movi v3.16b, #0",
+            "movi v4.16b, #0",
+            "movi v5.16b, #0",
+            "movi v6.16b, #0",
+            "movi v7.16b, #0",
+            "movi v8.16b, #0",
+            "movi v9.16b, #0",
+            "movi v10.16b, #0",
+            "movi v11.16b, #0",
+            "movi v12.16b, #0",
+            "movi v13.16b, #0",
+            "movi v14.16b, #0",
+            "movi v15.16b, #0",
+            "movi v16.16b, #0",
+            "movi v17.16b, #0",
+            "movi v18.16b, #0",
+            "movi v19.16b, #0",
+            "movi v20.16b, #0",
+            "movi v21.16b, #0",
+            "movi v22.16b, #0",
+            "movi v23.16b, #0",
+            "movi v24.16b, #0",
+            "movi v25.16b, #0",
+            "movi v26.16b, #0",
+            "movi v27.16b, #0",
+            "movi v28.16b, #0",
+            "movi v29.16b, #0",
+            "movi v30.16b, #0",
+            "movi v31.16b, #0",
+            "msr fpcr, xzr",
+            "msr fpsr, xzr",
+            "msr sp_el0, {stack_pointer}",
+            "msr elr_el1, {entry}",
+            "msr spsr_el1, xzr",
+            "isb",
+            "eret",
+            stack_pointer = in(reg) stack_pointer,
+            entry = in(reg) entry,
+            options(noreturn),
+        );
+    }
 }
 
 #[allow(dead_code)]
@@ -194,8 +249,16 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
         ram_map::set_page_permissions(address, length, permissions)
     }
 
+    fn set_user_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
+        ram_map::set_user_page_permissions(address, length, permissions)
+    }
+
     fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool {
         ram_map::map_page(virtual_address, physical_address, permissions)
+    }
+
+    fn map_user_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool {
+        ram_map::map_user_page(virtual_address, physical_address, permissions)
     }
 
     fn unmap_page(virtual_address: usize) -> Option<usize> {
@@ -208,6 +271,14 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
 
     fn page_has_backing(virtual_address: usize) -> bool {
         ram_map::page_has_backing(virtual_address)
+    }
+
+    fn user_range_accessible(address: usize, length: usize, write: bool) -> bool {
+        ram_map::user_range_accessible(address, length, write)
+    }
+
+    fn user_range_executable(address: usize, length: usize) -> bool {
+        ram_map::user_range_executable(address, length)
     }
 
     fn high_memory_smoke() -> bool {
@@ -249,6 +320,10 @@ impl crate::kernel::arch::traits::ThreadArchitecture for super::ThreadArchitectu
 
     fn current_thread_stack_bounds(stack_size: usize) -> (*mut core::ffi::c_void, usize) {
         self::current_thread_stack_bounds(stack_size)
+    }
+
+    unsafe fn enter_user(entry: usize, stack_pointer: usize) -> ! {
+        unsafe { self::enter_user(entry, stack_pointer) }
     }
 
     fn switch_thread(
@@ -318,5 +393,113 @@ impl crate::kernel::arch::traits::CpuArchitecture for super::CpuArchitecture {
 impl crate::kernel::arch::traits::DebugArchitecture for super::DebugArchitecture {
     fn decommit_debug(code: u8) {
         self::decommit_debug(code);
+    }
+}
+
+#[cfg(feature = "virtualization")]
+impl crate::kernel::arch::traits::VirtualizationArchitecture for super::VirtualizationArchitecture {
+    #[cfg(feature = "aarch64-stage2")]
+    type GuestContext = stage2::GuestContext;
+    #[cfg(not(feature = "aarch64-stage2"))]
+    type GuestContext = ();
+
+    const REQUESTED_FEATURES: super::VirtualizationFeatureSet<bool> = super::VirtualizationFeatureSet {
+        intel_vtx: cfg!(feature = "intel-vtx"),
+        intel_vtd: cfg!(feature = "intel-vtd"),
+        intel_vmdq: cfg!(feature = "intel-vmdq"),
+        intel_sriov: cfg!(feature = "intel-sriov"),
+        intel_ddio: cfg!(feature = "intel-ddio"),
+        amd_v: cfg!(feature = "amd-v"),
+        aarch64_vhe: cfg!(feature = "aarch64-vhe"),
+        aarch64_stage2: cfg!(feature = "aarch64-stage2"),
+    };
+
+    fn detect_features() -> super::VirtualizationFeatures {
+        let mmfr1_el1: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {value}, ID_AA64MMFR1_EL1",
+                value = out(reg) mmfr1_el1,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let aarch64_vhe = match (mmfr1_el1 >> 8) & 0xf {
+            0 => super::VirtualizationCapability::ReportedUnsupported,
+            1 => super::VirtualizationCapability::ReportedSupported,
+            _ => super::VirtualizationCapability::NotProbed,
+        };
+
+        super::VirtualizationFeatures {
+            host_profile: super::VirtualizationHostProfile::CONFIGURED,
+            requested: Self::REQUESTED_FEATURES,
+            hardware_report: super::VirtualizationFeatureSet {
+                intel_vtx: super::VirtualizationCapability::NotApplicable,
+                intel_vtd: super::VirtualizationCapability::NotApplicable,
+                intel_vmdq: super::VirtualizationCapability::NotApplicable,
+                intel_sriov: super::VirtualizationCapability::NotApplicable,
+                intel_ddio: super::VirtualizationCapability::NotApplicable,
+                amd_v: super::VirtualizationCapability::NotApplicable,
+                aarch64_vhe,
+                aarch64_stage2: if stage2::hardware_supported() {
+                    super::VirtualizationCapability::ReportedSupported
+                } else {
+                    super::VirtualizationCapability::ReportedUnsupported
+                },
+            },
+        }
+    }
+
+    fn load_guest_context(
+        image: &[u8],
+    ) -> Result<Self::GuestContext, super::VirtualizationError> {
+        #[cfg(feature = "aarch64-stage2")]
+        {
+            stage2::GuestContext::load(image)
+        }
+        #[cfg(not(feature = "aarch64-stage2"))]
+        {
+            let _ = image;
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    unsafe fn restore_guest_context(
+        context: &mut Self::GuestContext,
+    ) -> Result<super::VirtualMachineExit, super::VirtualizationError> {
+        #[cfg(feature = "aarch64-stage2")]
+        {
+            unsafe { context.restore() }
+        }
+        #[cfg(not(feature = "aarch64-stage2"))]
+        {
+            let _ = context;
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    fn initialize_host() -> Result<(), super::VirtualizationError> {
+        #[cfg(feature = "aarch64-stage2")]
+        {
+            stage2::initialize_host()
+        }
+        #[cfg(not(feature = "aarch64-stage2"))]
+        {
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    unsafe fn run_guest(
+        image: &[u8],
+    ) -> Result<super::VirtualMachineExit, super::VirtualizationError> {
+        #[cfg(feature = "aarch64-stage2")]
+        {
+            let mut context = stage2::GuestContext::load(image)?;
+            unsafe { context.restore() }
+        }
+        #[cfg(not(feature = "aarch64-stage2"))]
+        {
+            let _ = image;
+            Err(super::VirtualizationError::Unsupported)
+        }
     }
 }

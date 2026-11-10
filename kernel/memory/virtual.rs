@@ -49,6 +49,7 @@ impl VirtualAreas {
         <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
     const MAX_VM_PAGES: usize = Self::VM_ARENA_SIZE / Self::PAGE_SIZE;
     const MAX_VM_AREAS: usize = 16384;
+    const VM_USER: u8 = 1 << 6;
     const VM_RESERVED: u8 = 1 << 7;
     const VM_PERMISSION_MASK: u8 = 0x07;
     const VM_BASE: usize =
@@ -150,7 +151,16 @@ impl VirtualAreas {
     }
 
     fn reserve(&mut self, length: usize, alignment: usize, permissions: i32) -> Option<usize> {
-        self.reserve_with_hint(None, length, alignment, permissions)
+        self.reserve_with_hint_and_user(None, length, alignment, permissions, false)
+    }
+
+    fn reserve_user(
+        &mut self,
+        length: usize,
+        alignment: usize,
+        permissions: i32,
+    ) -> Option<usize> {
+        self.reserve_with_hint_and_user(None, length, alignment, permissions, true)
     }
 
     fn reserve_with_hint(
@@ -159,6 +169,27 @@ impl VirtualAreas {
         length: usize,
         alignment: usize,
         permissions: i32,
+    ) -> Option<usize> {
+        self.reserve_with_hint_and_user(hint, length, alignment, permissions, false)
+    }
+
+    fn reserve_user_with_hint(
+        &mut self,
+        hint: Option<usize>,
+        length: usize,
+        alignment: usize,
+        permissions: i32,
+    ) -> Option<usize> {
+        self.reserve_with_hint_and_user(hint, length, alignment, permissions, true)
+    }
+
+    fn reserve_with_hint_and_user(
+        &mut self,
+        hint: Option<usize>,
+        length: usize,
+        alignment: usize,
+        permissions: i32,
+        user: bool,
     ) -> Option<usize> {
         if length == 0
             || alignment == 0
@@ -206,7 +237,7 @@ impl VirtualAreas {
         } else {
             permissions as u8
         };
-        let state = Self::VM_RESERVED | state_permissions;
+        let state = Self::VM_RESERVED | state_permissions | if user { Self::VM_USER } else { 0 };
         for page in start_page..end_page {
             self.page_state[page].store(state, Ordering::Release);
         }
@@ -349,7 +380,8 @@ impl VirtualAreas {
                     Self::decommit_debug(b'g');
                 }
             }
-            self.page_state[page].store(Self::VM_RESERVED, Ordering::Release);
+            let user = self.page_state[page].load(Ordering::Acquire) & Self::VM_USER;
+            self.page_state[page].store(Self::VM_RESERVED | user, Ordering::Release);
         }
         if decommitted {
             Self::decommit_debug(b'.');
@@ -430,18 +462,66 @@ impl VirtualAreas {
                 return false;
             }
             let virtual_address = Self::VM_BASE + page * Self::PAGE_SIZE;
-            if MemoryArchitecture::page_has_backing(virtual_address)
-                && !MemoryArchitecture::set_page_permissions(
-                    virtual_address,
-                    Self::PAGE_SIZE,
-                    permissions,
-                )
-            {
-                return false;
+            if MemoryArchitecture::page_has_backing(virtual_address) {
+                let updated = if state & Self::VM_USER != 0 {
+                    MemoryArchitecture::set_user_page_permissions(
+                        virtual_address,
+                        Self::PAGE_SIZE,
+                        permissions,
+                    )
+                } else {
+                    MemoryArchitecture::set_page_permissions(
+                        virtual_address,
+                        Self::PAGE_SIZE,
+                        permissions,
+                    )
+                };
+                if !updated {
+                    return false;
+                }
             }
-            self.page_state[page].store(Self::VM_RESERVED | permissions as u8, Ordering::Release);
+            self.page_state[page].store(
+                Self::VM_RESERVED | (state & Self::VM_USER) | permissions as u8,
+                Ordering::Release,
+            );
         }
         true
+    }
+
+    fn set_user_permissions(&self, address: usize, length: usize, permissions: i32) -> bool {
+        let Ok(range) = Self::checked_page_range(address, length) else {
+            return false;
+        };
+        if (range.start_page..range.end_page).any(|page| {
+            self.page_state[page].load(Ordering::Acquire) & (Self::VM_RESERVED | Self::VM_USER)
+                != (Self::VM_RESERVED | Self::VM_USER)
+        }) {
+            return false;
+        }
+        self.set_permissions(address, length, permissions)
+    }
+
+    fn user_range_reserved(&self, address: usize, length: usize) -> bool {
+        if length == 0 {
+            return true;
+        }
+        let Some(end) = address.checked_add(length) else {
+            return false;
+        };
+        let start = address & !(Self::PAGE_SIZE - 1);
+        let Some(range_length) = end
+            .checked_sub(start)
+            .and_then(Self::rounded_length)
+        else {
+            return false;
+        };
+        let Ok(range) = Self::checked_page_range(start, range_length) else {
+            return false;
+        };
+        (range.start_page..range.end_page).all(|page| {
+            self.page_state[page].load(Ordering::Acquire) & (Self::VM_RESERVED | Self::VM_USER)
+                == (Self::VM_RESERVED | Self::VM_USER)
+        })
     }
 
     fn release_pages(&mut self, start_page: usize, end_page: usize) -> bool {
@@ -473,6 +553,7 @@ impl VirtualAreas {
             return false;
         }
         let permissions = (state & Self::VM_PERMISSION_MASK) as i32;
+        let user = state & Self::VM_USER != 0;
         let access_allowed = match access {
             FaultAccess::Read => (1..=4).contains(&permissions),
             FaultAccess::Write => matches!(permissions, 2 | 3),
@@ -489,13 +570,26 @@ impl VirtualAreas {
             return false;
         };
         let physical_address = frame.address();
-        if !MemoryArchitecture::map_page(page_address, physical_address, 2) {
+        let mapped = if user {
+            MemoryArchitecture::map_user_page(page_address, physical_address, 2)
+        } else {
+            MemoryArchitecture::map_page(page_address, physical_address, 2)
+        };
+        if !mapped {
             let _released = PhysicalAllocator::deallocate(frame);
             return false;
         }
         unsafe { core::ptr::write_bytes(page_address as *mut u8, 0, Self::PAGE_SIZE) };
         if permissions == 2
-            || MemoryArchitecture::set_page_permissions(page_address, Self::PAGE_SIZE, permissions)
+            || if user {
+                MemoryArchitecture::set_user_page_permissions(
+                    page_address,
+                    Self::PAGE_SIZE,
+                    permissions,
+                )
+            } else {
+                MemoryArchitecture::set_page_permissions(page_address, Self::PAGE_SIZE, permissions)
+            }
         {
             return true;
         }
@@ -525,6 +619,16 @@ impl VirtualAreasLock {
         Self::get_instance().lock().reserve(length, alignment, permissions)
     }
 
+    pub(crate) fn reserve_user(
+        length: usize,
+        alignment: usize,
+        permissions: i32,
+    ) -> Option<usize> {
+        Self::get_instance()
+            .lock()
+            .reserve_user(length, alignment, permissions)
+    }
+
     pub(crate) fn reserve_with_hint(
         hint: Option<usize>,
         length: usize,
@@ -534,6 +638,17 @@ impl VirtualAreasLock {
         Self::get_instance()
             .lock()
             .reserve_with_hint(hint, length, alignment, permissions)
+    }
+
+    pub(crate) fn reserve_user_with_hint(
+        hint: Option<usize>,
+        length: usize,
+        alignment: usize,
+        permissions: i32,
+    ) -> Option<usize> {
+        Self::get_instance()
+            .lock()
+            .reserve_user_with_hint(hint, length, alignment, permissions)
     }
 
     pub(crate) fn release(address: usize, length: usize) -> bool {
@@ -556,6 +671,18 @@ impl VirtualAreasLock {
         Self::get_instance()
             .lock()
             .set_permissions(address, length, permissions)
+    }
+
+    pub(crate) fn set_user_permissions(address: usize, length: usize, permissions: i32) -> bool {
+        Self::get_instance()
+            .lock()
+            .set_user_permissions(address, length, permissions)
+    }
+
+    pub(crate) fn user_range_reserved(address: usize, length: usize) -> bool {
+        Self::get_instance()
+            .lock()
+            .user_range_reserved(address, length)
     }
 
     pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
@@ -595,6 +722,14 @@ pub(crate) fn reserve(length: usize, alignment: usize, permissions: i32) -> Opti
     VirtualAreasLock::reserve(length, alignment, permissions)
 }
 
+pub(crate) fn reserve_user(
+    length: usize,
+    alignment: usize,
+    permissions: i32,
+) -> Option<usize> {
+    VirtualAreasLock::reserve_user(length, alignment, permissions)
+}
+
 pub(crate) fn reserve_with_hint(
     hint: Option<usize>,
     length: usize,
@@ -602,6 +737,15 @@ pub(crate) fn reserve_with_hint(
     permissions: i32,
 ) -> Option<usize> {
     VirtualAreasLock::reserve_with_hint(hint, length, alignment, permissions)
+}
+
+pub(crate) fn reserve_user_with_hint(
+    hint: Option<usize>,
+    length: usize,
+    alignment: usize,
+    permissions: i32,
+) -> Option<usize> {
+    VirtualAreasLock::reserve_user_with_hint(hint, length, alignment, permissions)
 }
 
 pub(crate) fn release(address: usize, length: usize) -> bool {
@@ -622,6 +766,61 @@ pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -
 
 pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -> bool {
     VirtualAreasLock::set_permissions(address, length, permissions)
+}
+
+pub(crate) fn set_user_permissions(address: usize, length: usize, permissions: i32) -> bool {
+    VirtualAreasLock::set_user_permissions(address, length, permissions)
+}
+
+pub(crate) fn user_range_accessible(address: usize, length: usize, write: bool) -> bool {
+    MemoryArchitecture::user_range_accessible(address, length, write)
+}
+
+pub(crate) fn user_range_executable(address: usize, length: usize) -> bool {
+    MemoryArchitecture::user_range_executable(address, length)
+}
+
+pub(crate) fn user_range_reserved(address: usize, length: usize) -> bool {
+    VirtualAreasLock::user_range_reserved(address, length)
+}
+
+pub(crate) fn reserve_user_mapping(
+    hint: Option<usize>,
+    length: usize,
+    permissions: i32,
+    fixed: bool,
+) -> Option<usize> {
+    if length == 0 || !(0..=4).contains(&permissions) {
+        return None;
+    }
+    if let Some(address) = hint {
+        if address % PAGE_SIZE != 0 {
+            return None;
+        }
+        if let Some(reserved) = reserve_user_with_hint(
+            Some(address),
+            length,
+            PAGE_SIZE,
+            permissions,
+        ) {
+            return Some(reserved);
+        }
+        if fixed {
+            return None;
+        }
+    } else if fixed {
+        return None;
+    }
+    reserve_user(length, PAGE_SIZE, permissions)
+}
+
+pub(crate) fn release_user_mapping(address: usize, length: usize) -> bool {
+    user_range_reserved(address, length) && release_range(address, length)
+}
+
+pub(crate) fn protect_user_mapping(address: usize, length: usize, permissions: i32) -> bool {
+    user_range_reserved(address, length)
+        && set_user_permissions(address, length, permissions)
 }
 
 pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {

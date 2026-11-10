@@ -535,10 +535,7 @@ impl VirtioFs {
     }
 
     fn read_i32(buffer: &[u8], offset: usize) -> VfsResult<i32> {
-        let bytes = buffer.get(offset..offset + 4).ok_or(Error::Proto)?;
-        Ok(i32::from_le_bytes(
-            bytes.try_into().map_err(|_| Error::Proto)?,
-        ))
+        Self::read_u32(buffer, offset).map(|value| value as i32)
     }
 
     fn read_u64(buffer: &[u8], offset: usize) -> VfsResult<u64> {

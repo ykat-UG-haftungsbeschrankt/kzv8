@@ -8,6 +8,7 @@
 use crate::kernel::driver::virtio::queue::{wait_used, Descriptor, DmaQueue};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
+use crate::kernel::lib::endian;
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +67,10 @@ impl VirtioRtc {
         Self::write_message_type(&mut request, Self::REQ_CFG);
         let mut response = [0; 16];
         rtc.exchange(&request, &mut response).ok()?;
-        rtc.num_clocks = Self::read_u16(&response, Self::MESSAGE_HEADER_SIZE).ok()?;
+        rtc.num_clocks = crate::kernel::lib::endian::read_u16(
+            &response,
+            Self::MESSAGE_HEADER_SIZE,
+        )?;
         (rtc.num_clocks != 0).then_some(rtc)
     }
 
@@ -98,7 +102,7 @@ impl VirtioRtc {
         Self::write_u16(&mut request, Self::MESSAGE_HEADER_SIZE, clock_id);
         let mut response = [0; 16];
         self.exchange(&request, &mut response)?;
-        Self::read_u64(&response, Self::MESSAGE_HEADER_SIZE)
+        endian::read_u64(&response, Self::MESSAGE_HEADER_SIZE).ok_or(Error::Proto)
     }
 
     pub(crate) fn read_cross(
@@ -117,8 +121,8 @@ impl VirtioRtc {
         let mut response = [0; 24];
         self.exchange(&request, &mut response)?;
         Ok((
-            Self::read_u64(&response, Self::MESSAGE_HEADER_SIZE)?,
-            Self::read_u64(&response, Self::MESSAGE_HEADER_SIZE + 8)?,
+            endian::read_u64(&response, Self::MESSAGE_HEADER_SIZE).ok_or(Error::Proto)?,
+            endian::read_u64(&response, Self::MESSAGE_HEADER_SIZE + 8).ok_or(Error::Proto)?,
         ))
     }
 
@@ -176,17 +180,4 @@ impl VirtioRtc {
         buffer[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn read_u16(buffer: &[u8], offset: usize) -> Result<u16, Error> {
-        let bytes = buffer.get(offset..offset + 2).ok_or(Error::Proto)?;
-        Ok(u16::from_le_bytes(
-            bytes.try_into().map_err(|_| Error::Proto)?,
-        ))
-    }
-
-    fn read_u64(buffer: &[u8], offset: usize) -> Result<u64, Error> {
-        let bytes = buffer.get(offset..offset + 8).ok_or(Error::Proto)?;
-        Ok(u64::from_le_bytes(
-            bytes.try_into().map_err(|_| Error::Proto)?,
-        ))
-    }
 }

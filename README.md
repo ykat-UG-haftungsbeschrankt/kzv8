@@ -1,3 +1,10 @@
+<!--
+Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+
+Permission for non-commercial use is hereby granted,
+free of charge, without warranty of any kind.
+-->
+
 # kz
 
 *A tiny kernel with big curiosity.*
@@ -9,13 +16,17 @@ interrupts, scheduling, VirtIO devices, a small VFS, and JavaScript with V8.
 ## What's inside
 
 - A `no_std` Rust kernel with architecture-specific boot, paging, interrupts,
-  timers, and thread switching.
+  timers, and kernel, userspace, and optional virtual-machine thread contexts.
+- User-address-space and ELF-loading primitives, plus an early syscall ABI for
+  process/thread exit, IDs, yielding, console writes, clocks, and memory mapping.
 - Physical and virtual memory management, a kernel heap, and a bounded DMA
   arena.
 - VirtIO device support for console, block, network, input, GPU, SCSI, RTC, and
   filesystem devices.
 - A bounded task executor, a timer-preemptive pthread subset, and an event loop
   for timers, readiness, completions, and device interrupts.
+- Feature-gated virtualization support with vCPU contexts integrated into the
+  thread scheduler.
 - A small internal VFS with a device metadata tree and VirtIO-FS mount support.
 - An embedded V8 runtime, a C/C++ bridge, and a small freestanding C library.
 - A TypeScript VFAT reader/writer for FAT16 and FAT32 volumes, used to load
@@ -37,7 +48,9 @@ make test
 This builds the TypeScript app and both kernel images, checks the VFAT module,
 then boots the x86_64 and AArch64 QEMU smoke tests. The x86_64 test also attaches
 a temporary disk and network device to check VFAT app loading, block I/O, and a
-TCP echo. The AArch64 smoke covers boot and the embedded runtime with a console.
+TCP echo. Both architectures also smoke-test kernel-thread scheduling and
+joining, plus user VM stack and mapping allocation, access protection, and
+release. The AArch64 smoke covers boot and the embedded runtime with a console.
 
 For an interactive QEMU run, use one target at a time:
 
@@ -59,6 +72,7 @@ To build an image without starting QEMU, use
 
 ## Scope
 
-This is a kernel lab, not a general-purpose OS: there is no user-process loader
-or syscall ABI yet. JavaScript runs inside the kernel's V8 embedder, and the
-QEMU smoke tests are the current way to exercise the system end to end.
+This is a kernel lab, not a general-purpose OS. It has user-mode, ELF, syscall,
+and optional guest-virtualization foundations, but not a general process manager
+or program-launch workflow. JavaScript runs inside the kernel's V8 embedder, and
+the QEMU smoke tests are the current way to exercise the system end to end.

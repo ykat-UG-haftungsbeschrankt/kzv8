@@ -20,6 +20,29 @@ fpu-x87 = []
 fpu-sse = []
 fpu-avx = ["fpu-sse"]
 aarch64-fpu-off = []
+runtime-v8 = []
+virtualization = []
+intel-vtx = ["virtualization"]
+intel-vtx-lock-feature-control = ["intel-vtx"]
+intel-vtd = ["virtualization"]
+intel-vmdq = ["virtualization"]
+intel-sriov = ["virtualization"]
+intel-ddio = ["virtualization"]
+amd-v = ["virtualization"]
+aarch64-stage2 = ["virtualization"]
+aarch64-vhe = ["aarch64-stage2"]
+virtualization-minimal = ["virtualization", "intel-vtx", "amd-v", "aarch64-vhe"]
+virtualization-full = [
+	"virtualization",
+	"intel-vtx",
+	"intel-vtd",
+	"intel-vmdq",
+	"intel-sriov",
+	"intel-ddio",
+	"amd-v",
+	"aarch64-vhe",
+]
+virtualization-both = ["virtualization-minimal", "virtualization-full"]
 
 [workspace]
 resolver = "2"

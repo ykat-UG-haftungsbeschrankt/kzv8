@@ -5,15 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    Some(u32::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    let end = offset.checked_add(8)?;
-    Some(u64::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?))
-}
+use crate::kernel::lib::endian::{read_u32, read_u64};
 
 /// # Safety
 /// `boot_info` must point to a readable Multiboot info structure and memory map.

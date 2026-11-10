@@ -21,6 +21,171 @@ pub(crate) struct CpuArchitecture;
 pub(crate) struct DebugArchitecture;
 pub(crate) struct MemoryArchitecture;
 
+#[cfg(feature = "virtualization")]
+#[allow(dead_code)]
+pub(crate) struct VirtualizationArchitecture;
+
+#[cfg(feature = "virtualization")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VirtualizationCapability {
+    ReportedSupported,
+    ReportedUnsupported,
+    NotProbed,
+    NotApplicable,
+}
+
+#[cfg(feature = "virtualization")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VirtualizationHostProfile {
+    Disabled,
+    Minimal,
+    Full,
+    Both,
+}
+
+#[cfg(feature = "virtualization")]
+impl VirtualizationHostProfile {
+    pub(crate) const CONFIGURED: Self = match (
+        cfg!(feature = "virtualization-minimal"),
+        cfg!(feature = "virtualization-full"),
+    ) {
+        (true, true) => Self::Both,
+        (true, false) => Self::Minimal,
+        (false, true) => Self::Full,
+        (false, false) => Self::Disabled,
+    };
+}
+
+#[cfg(feature = "virtualization")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VirtualizationFeatureSet<T> {
+    pub(crate) intel_vtx: T,
+    pub(crate) intel_vtd: T,
+    pub(crate) intel_vmdq: T,
+    pub(crate) intel_sriov: T,
+    pub(crate) intel_ddio: T,
+    pub(crate) amd_v: T,
+    pub(crate) aarch64_vhe: T,
+    pub(crate) aarch64_stage2: T,
+}
+
+#[cfg(feature = "virtualization")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VirtualizationFeatures {
+    pub(crate) host_profile: VirtualizationHostProfile,
+    pub(crate) requested: VirtualizationFeatureSet<bool>,
+    pub(crate) hardware_report: VirtualizationFeatureSet<VirtualizationCapability>,
+}
+
+#[cfg(feature = "virtualization")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VirtualizationError {
+    Unsupported,
+    InvalidGuestImage,
+    ResourceExhausted,
+    HostSetupFailed,
+    VmxDisabledByFirmware,
+    VmxInstructionFailed(u32),
+    GuestEntryFailed(u32),
+    VmcsSetupFailed,
+}
+
+#[cfg(feature = "virtualization")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VirtualMachineExitReason {
+    ExceptionOrNmi,
+    ExternalInterrupt,
+    Cpuid,
+    Rdtsc,
+    Halt,
+    Vmcall,
+    Io,
+    EptViolation,
+    PreemptionTimer,
+    Other(u32),
+}
+
+#[cfg(feature = "virtualization")]
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GuestRegisters {
+    pub(crate) rax: u64,
+    pub(crate) rbx: u64,
+    pub(crate) rcx: u64,
+    pub(crate) rdx: u64,
+    pub(crate) rsi: u64,
+    pub(crate) rdi: u64,
+    pub(crate) rbp: u64,
+    pub(crate) r8: u64,
+    pub(crate) r9: u64,
+    pub(crate) r10: u64,
+    pub(crate) r11: u64,
+    pub(crate) r12: u64,
+    pub(crate) r13: u64,
+    pub(crate) r14: u64,
+    pub(crate) r15: u64,
+}
+
+#[cfg(feature = "virtualization")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VirtualMachineExit {
+    pub(crate) reason: VirtualMachineExitReason,
+    pub(crate) qualification: u64,
+    pub(crate) instruction_length: u32,
+    pub(crate) guest_rip: u64,
+    pub(crate) guest_rsp: u64,
+    pub(crate) guest_rflags: u64,
+    pub(crate) guest_physical_address: Option<u64>,
+    pub(crate) interrupt_info: u32,
+    pub(crate) registers: GuestRegisters,
+}
+
+pub(crate) mod syscall {
+    pub(crate) trait SyscallNumbers {
+        const EXIT: u64;
+        const EXIT_GROUP: u64;
+        const GET_PID: u64;
+        const GET_TID: u64;
+        const SCHED_YIELD: u64;
+        const WRITE: u64;
+        const CLOCK_GET_TIME: u64;
+        const MMAP: u64;
+        const MUNMAP: u64;
+        const MPROTECT: u64;
+    }
+
+    pub(crate) struct Syscall;
+
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Exit: u64 = <Syscall as SyscallNumbers>::EXIT;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const ExitGroup: u64 = <Syscall as SyscallNumbers>::EXIT_GROUP;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const GetPid: u64 = <Syscall as SyscallNumbers>::GET_PID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const GetTid: u64 = <Syscall as SyscallNumbers>::GET_TID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const SchedYield: u64 = <Syscall as SyscallNumbers>::SCHED_YIELD;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Write: u64 = <Syscall as SyscallNumbers>::WRITE;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const ClockGetTime: u64 = <Syscall as SyscallNumbers>::CLOCK_GET_TIME;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Mmap: u64 = <Syscall as SyscallNumbers>::MMAP;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Munmap: u64 = <Syscall as SyscallNumbers>::MUNMAP;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Mprotect: u64 = <Syscall as SyscallNumbers>::MPROTECT;
+}
+
 pub(crate) mod traits {
     use super::VirtioWindow;
 
@@ -46,6 +211,11 @@ pub(crate) mod traits {
         fn initialize_thread_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize;
         fn initialize_thread_local_storage(cpu_id: usize) -> bool;
         fn current_thread_stack_bounds(stack_size: usize) -> (*mut core::ffi::c_void, usize);
+        /// Enter an already-mapped user image and do not return to the caller.
+        ///
+        /// # Safety
+        /// `entry` and `stack_pointer` must refer to executable and writable user mappings.
+        unsafe fn enter_user(entry: usize, stack_pointer: usize) -> !;
         fn switch_thread(
             old_stack: &mut usize,
             new_stack: usize,
@@ -82,6 +252,40 @@ pub(crate) mod traits {
         fn decommit_debug(code: u8);
     }
 
+    #[cfg(feature = "virtualization")]
+    #[allow(dead_code)]
+    pub(crate) trait VirtualizationArchitecture {
+        type GuestContext;
+
+        const REQUESTED_FEATURES: super::VirtualizationFeatureSet<bool>;
+
+        fn detect_features() -> super::VirtualizationFeatures;
+
+        fn initialize_host() -> Result<(), super::VirtualizationError>;
+
+        fn load_guest_context(
+            image: &[u8],
+        ) -> Result<Self::GuestContext, super::VirtualizationError>;
+
+        /// # Safety
+        /// Guest execution must be allowed by the caller; only trusted guest images may run.
+        unsafe fn restore_guest_context(
+            context: &mut Self::GuestContext,
+        ) -> Result<super::VirtualMachineExit, super::VirtualizationError>;
+
+        /// Run a single-vCPU, 2 MiB, 64-bit raw image for at most 100 ms.
+        /// The image starts at guest physical address `0x10000`; GPRs start zeroed
+        /// and the stack page is `0x1ff000` with initial RSP `0x200000`.
+        /// CPUID, RDTSC, debugcon, and basic COM1 byte I/O are emulated.
+        /// Other exits are returned. Firmware, Linux boot support, and VirtIO devices are absent.
+        ///
+        /// # Safety
+        /// The image executes with guest ring-0 privileges. Only trusted images may be run.
+        unsafe fn run_guest(
+            image: &[u8],
+        ) -> Result<super::VirtualMachineExit, super::VirtualizationError>;
+    }
+
     pub(crate) trait MemoryArchitecture {
         const VM_ARENA_SIZE: usize;
         const VM_BASE: usize;
@@ -94,11 +298,28 @@ pub(crate) mod traits {
         fn is_identity_mapped(address: usize) -> bool;
         fn protect_kernel_image_pages(address: usize, length: usize, permissions: i32) -> bool;
         fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool;
+        fn set_user_page_permissions(address: usize, length: usize, permissions: i32) -> bool;
         fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool;
+        fn map_user_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool;
         fn unmap_page(virtual_address: usize) -> Option<usize>;
         fn page_is_mapped(virtual_address: usize) -> bool;
         fn page_has_backing(virtual_address: usize) -> bool;
+        fn user_range_accessible(address: usize, length: usize, write: bool) -> bool;
+        fn user_range_executable(address: usize, length: usize) -> bool;
         fn high_memory_smoke() -> bool;
+    }
+
+    pub(crate) trait Syscall {
+        const EXIT: u64;
+        const EXIT_GROUP: u64;
+        const GET_PID: u64;
+        const GET_TID: u64;
+        const SCHED_YIELD: u64;
+        const WRITE: u64;
+        const CLOCK_GET_TIME: u64;
+        const MMAP: u64;
+        const MUNMAP: u64;
+        const MPROTECT: u64;
     }
 }
 

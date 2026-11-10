@@ -50,17 +50,14 @@ pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
         let tls_start = addr_of!(__tls_start) as usize;
         let tls_data_end = addr_of!(__tls_data_end) as usize;
         let tls_end = addr_of!(__tls_end) as usize;
-        let Some(tls_size) = tls_end.checked_sub(tls_start) else {
+        let Some((tls_size, tls_data_size)) = crate::kernel::lib::tls::template_sizes(
+            tls_start,
+            tls_data_end,
+            tls_end,
+            TLS_BLOCK_SIZE.saturating_sub(TLS_DATA_OFFSET),
+        ) else {
             return false;
         };
-        let Some(tls_data_size) = tls_data_end.checked_sub(tls_start) else {
-            return false;
-        };
-        if tls_data_size > tls_size
-            || tls_size > TLS_BLOCK_SIZE.saturating_sub(TLS_DATA_OFFSET)
-        {
-            return false;
-        }
 
         let blocks = addr_of_mut!(TLS_BLOCKS).cast::<u8>();
         let tls_block = blocks.add(cpu_id * TLS_BLOCK_SIZE);

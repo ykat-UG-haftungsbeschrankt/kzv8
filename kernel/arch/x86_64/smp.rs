@@ -14,6 +14,8 @@ use core::sync::atomic::{fence, AtomicBool, Ordering};
 use crate::kernel::arch::traits::{
     CpuArchitecture as _, DebugArchitecture as _, ThreadArchitecture as _,
 };
+#[cfg(feature = "virtualization")]
+use crate::kernel::arch::traits::VirtualizationArchitecture as _;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 const AP_TRAMPOLINE_ADDRESS: usize = 0x8000;
@@ -235,6 +237,8 @@ pub(crate) fn initialize_secondary_cpu(cpu_id: usize) -> bool {
     let tls_initialized =
         crate::kernel::arch::ThreadArchitecture::initialize_thread_local_storage(cpu_id);
     trace(b'F');
+    #[cfg(feature = "virtualization")]
+    let _host_virtualization = crate::kernel::arch::VirtualizationArchitecture::initialize_host();
     tls_initialized
 }
 

@@ -12,6 +12,14 @@ _start:
     mrs x9, CurrentEL
     cmp x9, #8
     b.ne el1_start
+#ifdef KZ_AARCH64_STAGE2
+    mov x20, x0
+    mov x21, x1
+    mov x0, xzr
+    bl kz_aarch64_el2_initialize
+    mov x0, x20
+    mov x1, x21
+#endif
     mov x9, #(1 << 31)
     msr hcr_el2, x9
     msr cptr_el2, xzr
@@ -22,6 +30,7 @@ _start:
     eret
 el1_start:
     msr spsel, #1
+    msr tpidr_el1, xzr
     mov x9, #(3 << 20)
     msr cpacr_el1, x9
     isb

@@ -247,6 +247,10 @@ pub(crate) unsafe fn initialize_secondary() {
     load_idt();
 }
 
+pub(crate) fn idt_base() -> u64 {
+    addr_of!(IDT) as u64
+}
+
 unsafe fn load_idt() {
     let pointer = IdtPointer {
         limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
@@ -350,6 +354,17 @@ pub(crate) fn send_ipi(destination: u32, command: u32) -> bool {
     } else {
         false
     }
+}
+
+pub(crate) fn handle_virtualization_exit(interrupt_info: u32) {
+    if interrupt_info & (1 << 31) == 0 {
+        return;
+    }
+    let vector = (interrupt_info & 0xff) as usize;
+    if vector == VIRTIO_VECTOR {
+        crate::kz_handle_virtio_interrupt();
+    }
+    write_local_apic(0xb0, 0);
 }
 
 pub(crate) fn ipi_pending() -> bool {
@@ -466,8 +481,12 @@ pub(crate) fn enabled() -> bool {
 
 #[no_mangle]
 extern "C" fn x86_page_fault_dispatch(address: usize, error_code: u64) -> u64 {
-    const REJECTED_FAULT_BITS: u64 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6);
+    const REJECTED_FAULT_BITS: u64 = (1 << 0) | (1 << 3) | (1 << 5) | (1 << 6);
+    let user_fault = error_code & (1 << 2) != 0;
     if error_code & REJECTED_FAULT_BITS != 0 {
+        if user_fault {
+            crate::kernel::scheduler::thread::ThreadManager::exit_current(core::ptr::null_mut());
+        }
         return 0;
     }
     let access = if error_code & (1 << 4) != 0 {
@@ -478,6 +497,9 @@ extern "C" fn x86_page_fault_dispatch(address: usize, error_code: u64) -> u64 {
         crate::kernel::memory::r#virtual::FaultAccess::Read
     };
     let resolved = crate::kernel::memory::r#virtual::resolve_page_fault(address, access);
+    if user_fault && !resolved {
+        crate::kernel::scheduler::thread::ThreadManager::exit_current(core::ptr::null_mut());
+    }
     if !PAGE_FAULT_DIAGNOSTIC.swap(true, Ordering::AcqRel) {
         let message = if resolved {
             b"kz: first lazy page fault resolved\n" as &[u8]

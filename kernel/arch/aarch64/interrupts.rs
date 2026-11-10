@@ -18,7 +18,15 @@ core::arch::global_asm!(
     ".balign 128",
     "b aarch64_irq_entry",
     ".balign 128",
-    ".rept 10",
+    "b aarch64_unhandled_vector",
+    ".balign 128",
+    "b aarch64_unhandled_vector",
+    ".balign 128",
+    "b aarch64_syscall_entry",
+    ".balign 128",
+    "b aarch64_irq_entry",
+    ".balign 128",
+    ".rept 6",
     "b aarch64_unhandled_vector",
     ".balign 128",
     ".endr",
@@ -27,6 +35,92 @@ core::arch::global_asm!(
     "1:",
     "wfi",
     "b 1b",
+    "aarch64_syscall_entry:",
+    "sub sp, sp, #800",
+    "stp x0, x1, [sp, #0]",
+    "stp x2, x3, [sp, #16]",
+    "stp x4, x5, [sp, #32]",
+    "stp x6, x7, [sp, #48]",
+    "stp x8, x9, [sp, #64]",
+    "stp x10, x11, [sp, #80]",
+    "stp x12, x13, [sp, #96]",
+    "stp x14, x15, [sp, #112]",
+    "stp x16, x17, [sp, #128]",
+    "stp x18, x19, [sp, #144]",
+    "stp x20, x21, [sp, #160]",
+    "stp x22, x23, [sp, #176]",
+    "stp x24, x25, [sp, #192]",
+    "stp x26, x27, [sp, #208]",
+    "stp x28, x29, [sp, #224]",
+    "str x30, [sp, #240]",
+    "mrs x0, elr_el1",
+    "str x0, [sp, #248]",
+    "mrs x0, spsr_el1",
+    "str x0, [sp, #256]",
+    "stp q0, q1, [sp, #272]",
+    "stp q2, q3, [sp, #304]",
+    "stp q4, q5, [sp, #336]",
+    "stp q6, q7, [sp, #368]",
+    "stp q8, q9, [sp, #400]",
+    "stp q10, q11, [sp, #432]",
+    "stp q12, q13, [sp, #464]",
+    "stp q14, q15, [sp, #496]",
+    "stp q16, q17, [sp, #528]",
+    "stp q18, q19, [sp, #560]",
+    "stp q20, q21, [sp, #592]",
+    "stp q22, q23, [sp, #624]",
+    "stp q24, q25, [sp, #656]",
+    "stp q26, q27, [sp, #688]",
+    "stp q28, q29, [sp, #720]",
+    "stp q30, q31, [sp, #752]",
+    "mrs x0, fpcr",
+    "str x0, [sp, #784]",
+    "mrs x0, fpsr",
+    "str x0, [sp, #792]",
+    "mov x0, sp",
+    "bl aarch64_syscall_dispatch",
+    "ldr x0, [sp, #784]",
+    "msr fpcr, x0",
+    "ldr x0, [sp, #792]",
+    "msr fpsr, x0",
+    "ldr x0, [sp, #248]",
+    "msr elr_el1, x0",
+    "ldr x0, [sp, #256]",
+    "msr spsr_el1, x0",
+    "ldp q30, q31, [sp, #752]",
+    "ldp q28, q29, [sp, #720]",
+    "ldp q26, q27, [sp, #688]",
+    "ldp q24, q25, [sp, #656]",
+    "ldp q22, q23, [sp, #624]",
+    "ldp q20, q21, [sp, #592]",
+    "ldp q18, q19, [sp, #560]",
+    "ldp q16, q17, [sp, #528]",
+    "ldp q14, q15, [sp, #496]",
+    "ldp q12, q13, [sp, #464]",
+    "ldp q10, q11, [sp, #432]",
+    "ldp q8, q9, [sp, #400]",
+    "ldp q6, q7, [sp, #368]",
+    "ldp q4, q5, [sp, #336]",
+    "ldp q2, q3, [sp, #304]",
+    "ldp q0, q1, [sp, #272]",
+    "ldr x30, [sp, #240]",
+    "ldp x28, x29, [sp, #224]",
+    "ldp x26, x27, [sp, #208]",
+    "ldp x24, x25, [sp, #192]",
+    "ldp x22, x23, [sp, #176]",
+    "ldp x20, x21, [sp, #160]",
+    "ldp x18, x19, [sp, #144]",
+    "ldp x16, x17, [sp, #128]",
+    "ldp x14, x15, [sp, #112]",
+    "ldp x12, x13, [sp, #96]",
+    "ldp x10, x11, [sp, #80]",
+    "ldp x8, x9, [sp, #64]",
+    "ldp x6, x7, [sp, #48]",
+    "ldp x4, x5, [sp, #32]",
+    "ldp x2, x3, [sp, #16]",
+    "ldp x0, x1, [sp, #0]",
+    "add sp, sp, #800",
+    "eret",
     "aarch64_irq_entry:",
     "sub sp, sp, #816",
     "stp x0, x1, [sp, #0]",
@@ -70,6 +164,7 @@ core::arch::global_asm!(
     "mrs x0, spsr_el1",
     "str x0, [sp, #792]",
     "bl aarch64_irq_dispatch",
+    "aarch64_restore_entry:",
     "ldr x0, [sp, #768]",
     "msr fpcr, x0",
     "ldr x0, [sp, #776]",
@@ -113,7 +208,7 @@ core::arch::global_asm!(
     "add sp, sp, #816",
     "eret",
     "aarch64_page_fault_entry:",
-    "sub sp, sp, #800",
+    "sub sp, sp, #816",
     "stp x0, x1, [sp, #0]",
     "stp x2, x3, [sp, #16]",
     "stp x4, x5, [sp, #32]",
@@ -150,46 +245,13 @@ core::arch::global_asm!(
     "str x0, [sp, #768]",
     "mrs x0, fpsr",
     "str x0, [sp, #776]",
+    "mrs x0, elr_el1",
+    "str x0, [sp, #784]",
+    "mrs x0, spsr_el1",
+    "str x0, [sp, #792]",
     "bl aarch64_page_fault_dispatch",
     "cbz x0, aarch64_unhandled_vector",
-    "ldr x0, [sp, #768]",
-    "msr fpcr, x0",
-    "ldr x0, [sp, #776]",
-    "msr fpsr, x0",
-    "ldp q30, q31, [sp, #736]",
-    "ldp q28, q29, [sp, #704]",
-    "ldp q26, q27, [sp, #672]",
-    "ldp q24, q25, [sp, #640]",
-    "ldp q22, q23, [sp, #608]",
-    "ldp q20, q21, [sp, #576]",
-    "ldp q18, q19, [sp, #544]",
-    "ldp q16, q17, [sp, #512]",
-    "ldp q14, q15, [sp, #480]",
-    "ldp q12, q13, [sp, #448]",
-    "ldp q10, q11, [sp, #416]",
-    "ldp q8, q9, [sp, #384]",
-    "ldp q6, q7, [sp, #352]",
-    "ldp q4, q5, [sp, #320]",
-    "ldp q2, q3, [sp, #288]",
-    "ldp q0, q1, [sp, #256]",
-    "ldr x30, [sp, #240]",
-    "ldp x28, x29, [sp, #224]",
-    "ldp x26, x27, [sp, #208]",
-    "ldp x24, x25, [sp, #192]",
-    "ldp x22, x23, [sp, #176]",
-    "ldp x20, x21, [sp, #160]",
-    "ldp x18, x19, [sp, #144]",
-    "ldp x16, x17, [sp, #128]",
-    "ldp x14, x15, [sp, #112]",
-    "ldp x12, x13, [sp, #96]",
-    "ldp x10, x11, [sp, #80]",
-    "ldp x8, x9, [sp, #64]",
-    "ldp x6, x7, [sp, #48]",
-    "ldp x4, x5, [sp, #32]",
-    "ldp x2, x3, [sp, #16]",
-    "ldp x0, x1, [sp, #0]",
-    "add sp, sp, #800",
-    "eret",
+    "b aarch64_restore_entry",
 );
 
 unsafe extern "C" {
@@ -221,6 +283,79 @@ pub(crate) unsafe fn initialize() {
         vectors = in(reg) vectors,
         options(nostack, preserves_flags),
     );
+}
+
+#[repr(C)]
+struct Aarch64SyscallRegisters {
+    x: [u64; 31],
+    elr: u64,
+    spsr: u64,
+}
+
+#[no_mangle]
+extern "C" fn aarch64_syscall_dispatch(registers: *mut Aarch64SyscallRegisters) {
+    let exception_syndrome: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {syndrome}, esr_el1",
+            syndrome = out(reg) exception_syndrome,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    let exception_class = exception_syndrome >> 26;
+    if matches!(exception_class, 0x20 | 0x24) {
+        let fault_address: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {address}, far_el1",
+                address = out(reg) fault_address,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        if !resolve_fault(exception_syndrome, fault_address) {
+            crate::kernel::scheduler::thread::ThreadManager::exit_current(core::ptr::null_mut());
+        }
+        return;
+    }
+    if exception_class != 0x15 {
+        crate::kernel::scheduler::thread::ThreadManager::exit_current(core::ptr::null_mut());
+    }
+    let registers = unsafe { &mut *registers };
+    let mut frame = crate::kernel::syscall::SyscallFrame {
+        number: registers.x[8],
+        arguments: [
+            registers.x[0],
+            registers.x[1],
+            registers.x[2],
+            registers.x[3],
+            registers.x[4],
+            registers.x[5],
+        ],
+        result: 0,
+    };
+    if exception_syndrome & 0xffff == 0 {
+        crate::kernel::syscall::dispatch(&mut frame);
+    } else {
+        frame.result = crate::kernel::error::Error::NoSys as i64;
+    }
+    registers.x[0] = frame.result as u64;
+}
+
+fn resolve_fault(syndrome: u64, address: u64) -> bool {
+    let fault_status = syndrome & 0x3f;
+    if !(0x4..=0x7).contains(&fault_status) {
+        return false;
+    }
+    let exception_class = syndrome >> 26;
+    let access = match exception_class {
+        0x20 => crate::kernel::memory::r#virtual::FaultAccess::Execute,
+        0x24 if syndrome & (1 << 6) != 0 => {
+            crate::kernel::memory::r#virtual::FaultAccess::Write
+        }
+        0x24 => crate::kernel::memory::r#virtual::FaultAccess::Read,
+        _ => return false,
+    };
+    crate::kernel::memory::r#virtual::resolve_page_fault(address as usize, access)
 }
 
 pub(crate) fn initialize_controller() -> bool {
@@ -294,6 +429,19 @@ pub(crate) fn initialize_controller() -> bool {
 
 pub(crate) fn initialize_secondary_controller() -> bool {
     initialize_cpu_interface(group_enable_value())
+}
+
+pub(crate) fn acknowledge_el2_irq() -> Option<u32> {
+    let acknowledge = unsafe { core::ptr::read_volatile((GICC_BASE + 0x0c) as *const u32) };
+    let interrupt_id = acknowledge & 0x3ff;
+    if interrupt_id >= 1020 {
+        return None;
+    }
+    unsafe {
+        core::ptr::write_volatile((GICC_BASE + 0x10) as *mut u32, acknowledge);
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    Some(interrupt_id)
 }
 
 fn initialize_cpu_interface(group_enable: u32) -> bool {

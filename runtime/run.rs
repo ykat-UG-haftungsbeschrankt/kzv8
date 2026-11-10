@@ -12,6 +12,7 @@ mod runtime_libc;
 #[path = "bridge/posix/mod.rs"]
 pub(crate) mod runtime_posix;
 #[path = "v8.rs"]
+#[cfg(feature = "runtime-v8")]
 mod runtime_v8;
 
 use crate::kernel::arch::traits::MemoryArchitecture as _;
@@ -36,12 +37,15 @@ extern "C" {
 
 
 pub(crate) fn run(context: KernelContext<'_>) {
+    #[cfg(feature = "runtime-v8")]
     let KernelContext {
         events,
         block_device,
         network_stack,
         network_registration,
     } = context;
+    #[cfg(not(feature = "runtime-v8"))]
+    let KernelContext { .. } = context;
 
     if PhysicalAllocator::memory_bytes() > 128 * 1024 * 1024 {
         let _memory_status = Console::write(b"kz: RAM above 128 MiB detected\n");
@@ -60,21 +64,30 @@ pub(crate) fn run(context: KernelContext<'_>) {
         let _thread_status = Console::write(b"kz: pthreads smoke OK\n");
     }
 
-    let block_device = block_device
-        .map(|device| device as *mut _ as *mut core::ffi::c_void)
-        .unwrap_or(core::ptr::null_mut());
-    let mut tcp_context = runtime_ffi::TcpContext::new(events, network_stack, network_registration);
-    match runtime_v8::run_smoke(
-        events,
-        block_device,
-        &mut tcp_context as *mut _ as *mut core::ffi::c_void,
-    ) {
-        Some(0) => {}
-        Some(_) => {
-            let _v8_error = Console::write(b"kz: V8 smoke failed\n");
+    #[cfg(feature = "runtime-v8")]
+    {
+        let block_device = block_device
+            .map(|device| device as *mut _ as *mut core::ffi::c_void)
+            .unwrap_or(core::ptr::null_mut());
+        let mut tcp_context =
+            runtime_ffi::TcpContext::new(events, network_stack, network_registration);
+        match runtime_v8::run_smoke(
+            events,
+            block_device,
+            &mut tcp_context as *mut _ as *mut core::ffi::c_void,
+        ) {
+            Some(0) => {}
+            Some(_) => {
+                let _v8_error = Console::write(b"kz: V8 smoke failed\n");
+            }
+            None => {
+                let _v8_status = Console::write(b"kz: V8 not integrated\n");
+            }
         }
-        None => {
-            let _v8_status = Console::write(b"kz: V8 not integrated\n");
-        }
+    }
+
+    #[cfg(not(feature = "runtime-v8"))]
+    {
+        let _v8_status = Console::write(b"kz: V8 runtime disabled\n");
     }
 }

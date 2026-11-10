@@ -14,10 +14,13 @@ use crate::arch::traits::{
     BootArchitecture as _, CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
     TimerArchitecture as _,
 };
+#[cfg(feature = "virtualization")]
+use crate::arch::traits::VirtualizationArchitecture as _;
 
 pub(crate) mod arch;
 pub(crate) mod block;
 pub(crate) mod driver;
+pub(crate) mod dl;
 pub(crate) mod error;
 pub(crate) mod event;
 #[path = "lib/mod.rs"]
@@ -25,6 +28,7 @@ pub(crate) mod kernel_lib;
 pub(crate) use kernel_lib as lib;
 pub(crate) mod memory;
 pub(crate) mod net;
+pub(crate) mod syscall;
 #[path = "../runtime/run.rs"]
 pub(crate) mod runtime;
 pub(crate) mod scheduler;
@@ -33,7 +37,7 @@ pub(crate) mod vfs;
 
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
-    pub(crate) use crate::{arch, block, driver, error, event, lib, memory, net, runtime, scheduler, vfs};
+    pub(crate) use crate::{arch, block, dl, driver, error, event, lib, memory, net, runtime, scheduler, syscall, vfs};
 }
 
 pub(crate) struct KernelContext<'a> {
@@ -89,6 +93,8 @@ impl Kernel {
             "unable to initialize physical memory"
         );
         memory::heap::Heap::initialize();
+        #[cfg(feature = "virtualization")]
+        let _host_virtualization = arch::VirtualizationArchitecture::initialize_host();
         assert!(
             scheduler::thread::ThreadManager::initialize(),
             "unable to initialize the thread scheduler"
@@ -126,6 +132,24 @@ impl Kernel {
                 && driver::virtio::console::Console::write(b"kz: virtio-console transmit OK\n")
             {
                 driver::virtio::console::Console::write_device_list();
+                if scheduler::thread::smoke::thread_smoke() {
+                    let _thread_smoke_status = driver::virtio::console::Console::write(
+                        b"kz: kernel thread smoke OK\n",
+                    );
+                } else {
+                    let _thread_smoke_status = driver::virtio::console::Console::write(
+                        b"kz: kernel thread smoke FAILED\n",
+                    );
+                }
+                if scheduler::thread::smoke::vm_smoke() {
+                    let _vm_smoke_status = driver::virtio::console::Console::write(
+                        b"kz: user VM smoke OK\n",
+                    );
+                } else {
+                    let _vm_smoke_status = driver::virtio::console::Console::write(
+                        b"kz: user VM smoke FAILED\n",
+                    );
+                }
                 if arch::start_secondary_cpus() > 1 {
                     let _smp_status =
                         driver::virtio::console::Console::write(b"kz: smp secondary cpus online\n");

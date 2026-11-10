@@ -11,4 +11,6 @@ pub(crate) mod dma;
 pub(crate) mod heap;
 pub(crate) mod memblock;
 pub(crate) mod physical;
+#[allow(dead_code)]
+pub(crate) mod slab;
 pub(crate) mod r#virtual;

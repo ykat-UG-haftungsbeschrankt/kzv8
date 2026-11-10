@@ -8,12 +8,22 @@
 pub(crate) mod debug;
 mod acpi;
 mod entry;
+#[cfg(feature = "intel-vtx")]
+pub(crate) mod guest_devices;
 pub(crate) mod interrupts;
 mod multiboot;
 mod paging;
 #[allow(dead_code)]
 pub(crate) mod pci;
 mod ram_map;
+mod segments;
+mod syscall;
+#[cfg(feature = "intel-vtd")]
+mod vtd;
+#[cfg(feature = "intel-vtx")]
+mod vmx;
+#[cfg(feature = "amd-v")]
+mod svm;
 pub(crate) mod smp;
 mod threads;
 pub(crate) mod timer;
@@ -21,8 +31,6 @@ mod virtio;
 
 #[cfg(all(feature = "fpu-x87", feature = "fpu-sse"))]
 compile_error!("select exactly one of fpu-x87, fpu-sse, or fpu-avx");
-#[cfg(not(any(feature = "fpu-x87", feature = "fpu-sse")))]
-compile_error!("select one of fpu-x87, fpu-sse, or fpu-avx");
 
 pub(crate) use threads::FpuContext;
 
@@ -129,6 +137,10 @@ pub(crate) fn switch_thread(
     unsafe { threads::switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
 }
 
+pub(crate) unsafe fn enter_user(entry: usize, stack_pointer: usize) -> ! {
+    unsafe { syscall::enter_user(entry, stack_pointer) }
+}
+
 #[allow(dead_code)]
 pub(crate) fn initialize_interrupt_controller() -> bool {
     interrupts::initialize_controller()
@@ -202,8 +214,16 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
         paging::set_page_permissions(address, length, permissions)
     }
 
+    fn set_user_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
+        paging::set_user_page_permissions(address, length, permissions)
+    }
+
     fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool {
         paging::map_page(virtual_address, physical_address, permissions)
+    }
+
+    fn map_user_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool {
+        paging::map_user_page(virtual_address, physical_address, permissions)
     }
 
     fn unmap_page(virtual_address: usize) -> Option<usize> {
@@ -216,6 +236,14 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
 
     fn page_has_backing(virtual_address: usize) -> bool {
         paging::page_has_backing(virtual_address)
+    }
+
+    fn user_range_accessible(address: usize, length: usize, write: bool) -> bool {
+        paging::user_range_accessible(address, length, write)
+    }
+
+    fn user_range_executable(address: usize, length: usize) -> bool {
+        paging::user_range_executable(address, length)
     }
 
     fn high_memory_smoke() -> bool {
@@ -257,6 +285,10 @@ impl crate::kernel::arch::traits::ThreadArchitecture for super::ThreadArchitectu
 
     fn current_thread_stack_bounds(stack_size: usize) -> (*mut core::ffi::c_void, usize) {
         self::current_thread_stack_bounds(stack_size)
+    }
+
+    unsafe fn enter_user(entry: usize, stack_pointer: usize) -> ! {
+        unsafe { self::enter_user(entry, stack_pointer) }
     }
 
     fn switch_thread(
@@ -326,5 +358,131 @@ impl crate::kernel::arch::traits::CpuArchitecture for super::CpuArchitecture {
 impl crate::kernel::arch::traits::DebugArchitecture for super::DebugArchitecture {
     fn decommit_debug(code: u8) {
         self::decommit_debug(code);
+    }
+}
+
+#[cfg(feature = "virtualization")]
+impl crate::kernel::arch::traits::VirtualizationArchitecture for super::VirtualizationArchitecture {
+    #[cfg(feature = "intel-vtx")]
+    type GuestContext = vmx::GuestContext;
+    #[cfg(not(feature = "intel-vtx"))]
+    type GuestContext = ();
+
+    const REQUESTED_FEATURES: super::VirtualizationFeatureSet<bool> = super::VirtualizationFeatureSet {
+        intel_vtx: cfg!(feature = "intel-vtx"),
+        intel_vtd: cfg!(feature = "intel-vtd"),
+        intel_vmdq: cfg!(feature = "intel-vmdq"),
+        intel_sriov: cfg!(feature = "intel-sriov"),
+        intel_ddio: cfg!(feature = "intel-ddio"),
+        amd_v: cfg!(feature = "amd-v"),
+        aarch64_vhe: cfg!(feature = "aarch64-vhe"),
+        aarch64_stage2: cfg!(feature = "aarch64-stage2"),
+    };
+
+    fn detect_features() -> super::VirtualizationFeatures {
+        use core::arch::x86_64::__cpuid;
+
+        let maximum_basic_leaf = __cpuid(0).eax;
+        let maximum_extended_leaf = __cpuid(0x8000_0000).eax;
+        let intel_vtx = if maximum_basic_leaf >= 1 {
+            if __cpuid(1).ecx & (1 << 5) != 0 {
+                super::VirtualizationCapability::ReportedSupported
+            } else {
+                super::VirtualizationCapability::ReportedUnsupported
+            }
+        } else {
+            super::VirtualizationCapability::ReportedUnsupported
+        };
+        let amd_v = if maximum_extended_leaf >= 0x8000_0001 {
+            if __cpuid(0x8000_0001).ecx & (1 << 2) != 0 {
+                super::VirtualizationCapability::ReportedSupported
+            } else {
+                super::VirtualizationCapability::ReportedUnsupported
+            }
+        } else {
+            super::VirtualizationCapability::ReportedUnsupported
+        };
+        #[cfg(feature = "intel-vtd")]
+        let intel_vtd = if vtd::probe_units().is_some() {
+            super::VirtualizationCapability::ReportedSupported
+        } else {
+            super::VirtualizationCapability::NotProbed
+        };
+        #[cfg(not(feature = "intel-vtd"))]
+        let intel_vtd = super::VirtualizationCapability::NotProbed;
+
+        super::VirtualizationFeatures {
+            host_profile: super::VirtualizationHostProfile::CONFIGURED,
+            requested: Self::REQUESTED_FEATURES,
+            hardware_report: super::VirtualizationFeatureSet {
+                intel_vtx,
+                intel_vtd,
+                intel_vmdq: super::VirtualizationCapability::NotProbed,
+                intel_sriov: super::VirtualizationCapability::NotProbed,
+                intel_ddio: super::VirtualizationCapability::NotProbed,
+                amd_v,
+                aarch64_vhe: super::VirtualizationCapability::NotApplicable,
+                aarch64_stage2: super::VirtualizationCapability::NotApplicable,
+            },
+        }
+    }
+
+    fn load_guest_context(
+        image: &[u8],
+    ) -> Result<Self::GuestContext, super::VirtualizationError> {
+        #[cfg(feature = "intel-vtx")]
+        {
+            vmx::GuestContext::load(image)
+        }
+        #[cfg(not(feature = "intel-vtx"))]
+        {
+            let _ = image;
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    unsafe fn restore_guest_context(
+        context: &mut Self::GuestContext,
+    ) -> Result<super::VirtualMachineExit, super::VirtualizationError> {
+        #[cfg(feature = "intel-vtx")]
+        {
+            unsafe { context.restore() }
+        }
+        #[cfg(not(feature = "intel-vtx"))]
+        {
+            let _ = context;
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    fn initialize_host() -> Result<(), super::VirtualizationError> {
+        #[cfg(feature = "amd-v")]
+        {
+            let vendor = core::arch::x86_64::__cpuid(0);
+            let amd_vendor = vendor.ebx == u32::from_le_bytes(*b"Auth")
+                && vendor.edx == u32::from_le_bytes(*b"enti")
+                && vendor.ecx == u32::from_le_bytes(*b"cAMD");
+            let hygon_vendor = vendor.ebx == u32::from_le_bytes(*b"Hygo")
+                && vendor.edx == u32::from_le_bytes(*b"nGen")
+                && vendor.ecx == u32::from_le_bytes(*b"uine");
+            if amd_vendor || hygon_vendor {
+                return svm::initialize_host();
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn run_guest(
+        image: &[u8],
+    ) -> Result<super::VirtualMachineExit, super::VirtualizationError> {
+        #[cfg(feature = "intel-vtx")]
+        {
+            unsafe { vmx::run_guest(image) }
+        }
+        #[cfg(not(feature = "intel-vtx"))]
+        {
+            let _ = image;
+            Err(super::VirtualizationError::Unsupported)
+        }
     }
 }
