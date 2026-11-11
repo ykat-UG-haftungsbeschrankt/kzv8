@@ -7,6 +7,7 @@
 
 use super::super::SyscallFrame;
 use crate::kernel::error::Error;
+use crate::kernel::scheduler::thread::ThreadManager;
 
 pub(crate) struct GetPid;
 
@@ -16,7 +17,7 @@ impl GetPid {
     pub(crate) const ID: u64 = crate::kernel::arch::syscall::GetPid;
 
     pub(crate) fn callback(_arguments: GetPidArguments) -> Result<i64, Error> {
-        Ok(1)
+        Ok(ThreadManager::current_process()?.id() as i64)
     }
 
     pub(crate) fn handle(_frame: SyscallFrame) -> Result<i64, Error> {

@@ -300,11 +300,12 @@ impl Process {
         credentials: Credentials,
     ) -> Result<Arc<Self>, Error> {
         let address_space = UserAddressSpace::new()?;
+        let capabilities = CapabilityTable::new()?;
         Ok(Arc::new(Self {
             namespace_set,
             address_space,
             credentials: IrqSpinLock::new(credentials),
-            capabilities: IrqSpinLock::new(CapabilityTable::new()?),
+            capabilities: IrqSpinLock::new(capabilities),
             kernel_objects: IrqSpinLock::new(KernelObjectTable::new()),
         }))
     }
@@ -556,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn process_id_is_its_arc_allocation_address() {
+    fn process_identity_is_its_arc_allocation_address() {
         let process = Process::new().unwrap();
         assert_eq!(process.id(), Arc::as_ptr(&process) as usize as u64);
     }

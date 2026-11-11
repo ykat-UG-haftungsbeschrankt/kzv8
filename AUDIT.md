@@ -13,6 +13,7 @@ The current trusted runtime intentionally exposes address-derived values as opaq
 
 - Timer IDs identify reusable timer slots and are returned to runtime code for cancellation.
 - Readiness event IDs derive from the address of their `EventSignal` allocation and are exposed as `event.id` by the V8 bridge.
+- `getpid` returns the address-derived identity of the current `Process` allocation.
 - `gettid` returns the address-derived identity of the current thread object.
 
 These values are correlation tokens only. They are not secrets, authorization credentials, or stable identities across object lifetimes. Consumers must not dereference them or rely on their numeric representation.
@@ -36,7 +37,7 @@ Work these items from top to bottom. Check an item off only after its behavior i
 
 ### P2: Kernel Interfaces and Lifecycle
 
-- [ ] **K-07: Process IDs at the syscall ABI.** `getpid` always returns `1`, so processes cannot be distinguished through the advertised syscall. Define namespace-aware numeric PID/TID values for the ABI; keep internal pointer identity separate. The address-derived `gettid` behavior is currently recorded above as an accepted trusted-runtime exception. See [getpid](kernel/syscall/fn/getpid.rs), [gettid](kernel/syscall/fn/gettid.rs), and [process identity](kernel/process.rs).
+- [x] **K-07: Process IDs at the syscall ABI.** `getpid` now returns the address-derived identity of the current `Process`, matching internal `Process::id()`. This is an opaque identity, not a namespace-local numeric PID, and follows the trusted-runtime address-ID policy above. **Fixed: 2026-11-11** (static checks only; build/QEMU/unit-test validation pending). See [getpid](kernel/syscall/fn/getpid.rs) and [process state](kernel/process.rs).
 - [ ] **K-08: Make namespaces enforce isolation.** Namespace objects currently provide identity/sharing checks, but VFS, network, IPC, and PID lookups do not select namespace-owned resource views. Either connect these subsystems to namespace state or document the namespace API as scaffolding rather than isolation. See [namespace sets](kernel/namespace.rs).
 - [ ] **K-09: Connect VFS objects to syscall descriptors.** `Process` has kernel-file-object storage, but no syscall open/read/close dispatch uses it; `write` is restricted to stdout/stderr. Add a per-process descriptor table and wire it to VFS `FileHandle` operations. See [syscall dispatch](kernel/syscall/mod.rs), [write syscall](kernel/syscall/fn/write.rs), [process file objects](kernel/process.rs), and [VFS open](kernel/vfs/mod.rs).
 - [ ] **K-10: Make timer IDs generation-safe.** Timer IDs identify reusable timer-slot addresses without a generation. A stale ID can cancel a later timer occupying the same slot. Use an index-plus-generation token at the API boundary. This is separate from the accepted opaque-ID exposure policy above. See [timer IDs and cancellation](kernel/event/timers.rs).
