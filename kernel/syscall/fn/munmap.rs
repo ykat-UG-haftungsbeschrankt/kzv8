@@ -29,7 +29,10 @@ impl Munmap {
         if address == 0 || address % PAGE_SIZE != 0 || length == 0 {
             return Err(Error::Inval);
         }
-        if crate::kernel::memory::r#virtual::release_user_mapping(address, length) {
+        if crate::kernel::scheduler::thread::ThreadManager::current_process()?
+            .address_space()
+            .release_user_mapping(address, length)
+        {
             Ok(0)
         } else {
             Err(Error::Inval)

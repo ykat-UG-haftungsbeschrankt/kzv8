@@ -16,6 +16,7 @@ use crate::kernel::ipc::{
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::namespace::NamespaceSet;
 use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::scheduler::thread::vm::UserAddressSpace;
 use crate::kernel::vfs::FileHandle;
 
 const INITIAL_CAPABILITY_SLOTS: usize = 32;
@@ -279,6 +280,7 @@ impl KernelObjectTable {
 
 pub(crate) struct Process {
     namespace_set: NamespaceSet,
+    address_space: UserAddressSpace,
     credentials: IrqSpinLock<Credentials>,
     capabilities: IrqSpinLock<CapabilityTable>,
     kernel_objects: IrqSpinLock<KernelObjectTable>,
@@ -297,8 +299,10 @@ impl Process {
         namespace_set: NamespaceSet,
         credentials: Credentials,
     ) -> Result<Arc<Self>, Error> {
+        let address_space = UserAddressSpace::new()?;
         Ok(Arc::new(Self {
             namespace_set,
+            address_space,
             credentials: IrqSpinLock::new(credentials),
             capabilities: IrqSpinLock::new(CapabilityTable::new()?),
             kernel_objects: IrqSpinLock::new(KernelObjectTable::new()),
@@ -311,6 +315,10 @@ impl Process {
 
     pub(crate) fn namespace_set(&self) -> NamespaceSet {
         self.namespace_set.clone()
+    }
+
+    pub(crate) fn address_space(&self) -> UserAddressSpace {
+        self.address_space.clone()
     }
 
     pub(crate) fn credentials(&self) -> Result<Credentials, Error> {
@@ -437,7 +445,7 @@ impl Process {
         handle: CapabilityHandle,
     ) -> Result<SharedMemoryMapping, Error> {
         match self.capability(handle)? {
-            Capability::SharedMemory(grant) => grant.map_user(),
+            Capability::SharedMemory(grant) => grant.map_user(self.address_space.clone()),
             Capability::Endpoint(_) => Err(Error::Badf),
         }
     }

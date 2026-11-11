@@ -7,11 +7,13 @@
 
 use crate::kernel::arch::traits::{CpuArchitecture as _, ThreadArchitecture as _};
 use crate::kernel::error::Error;
+use crate::kernel::scheduler::thread::vm::UserAddressSpace;
 
 use super::kernel::Context as KernelContext;
 
 pub(crate) struct Context {
 	kernel: KernelContext,
+	address_space: UserAddressSpace,
 	kernel_stack_pointer: usize,
 	entry: usize,
 	stack_pointer: usize,
@@ -21,6 +23,7 @@ impl Context {
 	pub(crate) fn load(
 		kernel_stack: &mut [u8],
 		kernel_entry: extern "C" fn() -> !,
+		address_space: UserAddressSpace,
 		entry: usize,
 		stack_pointer: usize,
 	) -> Result<Self, Error> {
@@ -29,14 +32,15 @@ impl Context {
 			.ok_or(Error::Overflow)?
 			& !0xf;
 		let stack_address = stack_pointer.checked_sub(1).ok_or(Error::Fault)?;
-		if !crate::kernel::memory::r#virtual::user_range_executable(entry, 1) {
+		if !address_space.user_range_executable(entry, 1) {
 			return Err(Error::NoExec);
 		}
-		if !crate::kernel::memory::r#virtual::user_range_accessible(stack_address, 1, true) {
+		if !address_space.user_range_accessible(stack_address, 1, true) {
 			return Err(Error::Fault);
 		}
 		Ok(Self {
 			kernel: KernelContext::load(kernel_stack, kernel_entry),
+			address_space,
 			kernel_stack_pointer,
 			entry,
 			stack_pointer,
@@ -63,8 +67,10 @@ impl Context {
 		let Some(stack_address) = self.stack_pointer.checked_sub(1) else {
 			crate::kernel::arch::CpuArchitecture::halt();
 		};
-		if !crate::kernel::memory::r#virtual::user_range_executable(self.entry, 1)
-			|| !crate::kernel::memory::r#virtual::user_range_accessible(stack_address, 1, true)
+		if !self.address_space.user_range_executable(self.entry, 1)
+			|| !self.address_space.user_range_accessible(stack_address, 1, true)
+			|| crate::kernel::arch::MemoryArchitecture::current_address_space()
+				!= self.address_space.root()
 		{
 			crate::kernel::arch::CpuArchitecture::halt();
 		}

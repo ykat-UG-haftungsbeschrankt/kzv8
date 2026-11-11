@@ -6,7 +6,7 @@
  */
 
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
@@ -39,6 +39,8 @@ struct PageTable([u64; TABLE_ENTRIES]);
 static mut PAGE_TABLES: [PageTable; PAGE_TABLE_COUNT] =
     [PageTable([0; TABLE_ENTRIES]); PAGE_TABLE_COUNT];
 static NEXT_PAGE_TABLE: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_FREE: [AtomicBool; PAGE_TABLE_COUNT] =
+    [const { AtomicBool::new(false) }; PAGE_TABLE_COUNT];
 static PAGE_TABLE_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 
 pub(crate) unsafe fn map_memory_regions(
@@ -88,7 +90,11 @@ pub(crate) unsafe fn map_memory_regions(
 }
 
 unsafe fn allocate_page_table() -> Option<*mut u64> {
-    let index = NEXT_PAGE_TABLE.fetch_add(1, Ordering::AcqRel);
+    let used_tables = NEXT_PAGE_TABLE.load(Ordering::Acquire).min(PAGE_TABLE_COUNT);
+    let reusable = (0..used_tables).find(|index| {
+        PAGE_TABLE_FREE[*index].swap(false, Ordering::AcqRel)
+    });
+    let index = reusable.unwrap_or_else(|| NEXT_PAGE_TABLE.fetch_add(1, Ordering::AcqRel));
     if index >= PAGE_TABLE_COUNT {
         return None;
     }
@@ -98,6 +104,156 @@ unsafe fn allocate_page_table() -> Option<*mut u64> {
         unsafe { write_volatile(entries.add(entry), 0) };
     }
     Some(entries)
+}
+
+fn free_page_table(table: *mut u64) -> bool {
+    let tables_start = unsafe { addr_of_mut!(PAGE_TABLES).cast::<PageTable>() as usize };
+    let Some(offset) = (table as usize).checked_sub(tables_start) else {
+        return false;
+    };
+    if offset % PAGE_SIZE != 0 {
+        return false;
+    }
+    let index = offset / PAGE_SIZE;
+    if index >= PAGE_TABLE_COUNT
+        || index >= NEXT_PAGE_TABLE.load(Ordering::Acquire)
+        || PAGE_TABLE_FREE[index].swap(true, Ordering::AcqRel)
+    {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn create_address_space() -> Option<(usize, usize, usize)> {
+    const KERNEL_VM_START: usize = 448;
+    const USER_VM_MAX_ENTRIES: usize = 64;
+
+    let _guard = PAGE_TABLE_LOCK.lock();
+    let kernel_root = addr_of_mut!(TTBR0_TABLE.0).cast::<u64>();
+    for index in KERNEL_VM_START..TABLE_ENTRIES {
+        unsafe { split_l1_block(kernel_root.add(index), true)? };
+    }
+
+    let mut best_start = 0;
+    let mut best_length = 0;
+    let mut run_start = 0;
+    let mut run_length = 0;
+    for index in 2..KERNEL_VM_START {
+        if unsafe { read_volatile(kernel_root.add(index)) } == 0 {
+            if run_length == 0 {
+                run_start = index;
+            }
+            run_length += 1;
+        } else {
+            if run_length > best_length {
+                best_start = run_start;
+                best_length = run_length;
+            }
+            run_length = 0;
+        }
+    }
+    if run_length > best_length {
+        best_start = run_start;
+        best_length = run_length;
+    }
+    let arena_entries = best_length.min(USER_VM_MAX_ENTRIES);
+    if arena_entries == 0 {
+        return None;
+    }
+
+    let root = unsafe { allocate_page_table()? };
+    for index in 0..TABLE_ENTRIES {
+        let entry = unsafe { read_volatile(kernel_root.add(index)) };
+        unsafe { write_volatile(root.add(index), entry) };
+    }
+    Some((
+        root as usize,
+        best_start * BLOCK_SIZE as usize,
+        arena_entries * BLOCK_SIZE as usize,
+    ))
+}
+
+pub(crate) fn activate_address_space(root: usize) -> bool {
+    if root == 0
+        || root % PAGE_SIZE != 0
+        || (root as u64 & TABLE_ADDRESS_MASK) != root as u64
+    {
+        return false;
+    }
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "msr ttbr0_el1, {root}",
+            "dsb ish",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            root = in(reg) root as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+    true
+}
+
+pub(crate) fn current_address_space() -> usize {
+    let root: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {root}, ttbr0_el1",
+            root = out(reg) root,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (root & TABLE_ADDRESS_MASK) as usize
+}
+
+pub(crate) fn destroy_address_space(root: usize, user_base: usize, user_length: usize) -> bool {
+    let Some(user_end) = user_base.checked_add(user_length) else {
+        return false;
+    };
+    let address_limit = TABLE_ENTRIES * BLOCK_SIZE as usize;
+    if root == 0
+        || root % PAGE_SIZE != 0
+        || (root as u64 & TABLE_ADDRESS_MASK) != root as u64
+        || user_length == 0
+        || user_base % BLOCK_SIZE as usize != 0
+        || user_length % BLOCK_SIZE as usize != 0
+        || user_end > address_limit
+        || root == current_address_space()
+    {
+        return false;
+    }
+
+    let _guard = PAGE_TABLE_LOCK.lock();
+    let root_table = root as *mut u64;
+    let first_index = user_base / BLOCK_SIZE as usize;
+    let end_index = user_end / BLOCK_SIZE as usize;
+    for root_index in first_index..end_index {
+        let root_entry = unsafe { read_volatile(root_table.add(root_index)) };
+        match root_entry & 0b11 {
+            0 => continue,
+            0b11 => {
+                let level_two = (root_entry & TABLE_ADDRESS_MASK) as *mut u64;
+                for level_two_index in 0..TABLE_ENTRIES {
+                    let entry = unsafe { read_volatile(level_two.add(level_two_index)) };
+                    match entry & 0b11 {
+                        0 => {}
+                        0b11 => {
+                            if !free_page_table((entry & TABLE_ADDRESS_MASK) as *mut u64) {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                if !free_page_table(level_two) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    free_page_table(root_table)
 }
 
 unsafe fn split_l2_block(entry: *mut u64, create: bool) -> Option<*mut u64> {

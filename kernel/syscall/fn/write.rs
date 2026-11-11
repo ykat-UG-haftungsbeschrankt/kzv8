@@ -37,6 +37,8 @@ impl Write {
         let Ok(address) = usize::try_from(arguments.address) else {
             return Err(Error::Fault);
         };
+        let address_space =
+            crate::kernel::scheduler::thread::ThreadManager::current_process()?.address_space();
 
         let mut buffer = [0u8; 256];
         let mut written = 0usize;
@@ -49,7 +51,7 @@ impl Write {
                     Ok(written as i64)
                 };
             };
-            if !crate::kernel::memory::r#virtual::user_range_accessible(source, count, false) {
+            if !address_space.user_range_accessible(source, count, false) {
                 return if written == 0 {
                     Err(Error::Fault)
                 } else {

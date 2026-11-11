@@ -33,7 +33,10 @@ impl Mprotect {
         let Some(permissions) = protection_to_vm(arguments.protection) else {
             return Err(Error::Inval);
         };
-        if crate::kernel::memory::r#virtual::protect_user_mapping(address, length, permissions) {
+        if crate::kernel::scheduler::thread::ThreadManager::current_process()?
+            .address_space()
+            .protect_user_mapping(address, length, permissions)
+        {
             Ok(0)
         } else {
             Err(Error::NoMem)

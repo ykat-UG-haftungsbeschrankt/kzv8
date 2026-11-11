@@ -318,6 +318,10 @@ pub(crate) mod traits {
         const VM_ARENA_SIZE: usize;
         const VM_BASE: usize;
 
+        fn create_address_space() -> Option<(usize, usize, usize)>;
+        fn activate_address_space(root: usize) -> bool;
+        fn current_address_space() -> usize;
+        fn destroy_address_space(root: usize, user_base: usize, user_length: usize) -> bool;
         fn physical_address_limit() -> u64;
         fn identity_mapped_limit() -> u64;
         fn bootstrap_memory_start() -> u64;

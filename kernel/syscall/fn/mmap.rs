@@ -52,7 +52,9 @@ impl Mmap {
             return Err(Error::Inval);
         };
         let hint = (arguments.address_hint != 0).then_some(arguments.address_hint as usize);
-        crate::kernel::memory::r#virtual::reserve_user_mapping(hint, length, permissions, false)
+        crate::kernel::scheduler::thread::ThreadManager::current_process()?
+            .address_space()
+            .reserve_user_mapping(hint, length, permissions, false)
             .map(|address| address as i64)
             .ok_or(Error::NoMem)
     }

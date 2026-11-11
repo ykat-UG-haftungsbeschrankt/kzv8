@@ -13,7 +13,8 @@ use core::ptr::{addr_of_mut, NonNull};
 use core::sync::atomic::AtomicUsize;
 
 use crate::kernel::arch::traits::{
-    CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
+    CpuArchitecture as _, InterruptArchitecture as _, MemoryArchitecture as _,
+    ThreadArchitecture as _,
 };
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
@@ -266,6 +267,7 @@ struct SwitchContext {
     old_context: *mut kernel::Context,
     new_context: *const kernel::Context,
     new_user_kernel_stack: Option<usize>,
+    new_address_space_root: usize,
 }
 
 pub(crate) struct ThreadManager {
@@ -361,6 +363,7 @@ impl ThreadManager {
         let Ok(process) = Process::new() else {
             return false;
         };
+        let process_root = process.address_space().root();
         let (stack_address, stack_size) =
             crate::kernel::arch::ThreadArchitecture::current_thread_stack_bounds(
                 ThreadStack::DEFAULT_SIZE,
@@ -385,6 +388,9 @@ impl ThreadManager {
         }
         manager.busy.push_back(main_thread);
         manager.initialized = true;
+        if !crate::kernel::arch::MemoryArchitecture::activate_address_space(process_root) {
+            crate::kernel::arch::CpuArchitecture::halt();
+        }
         true
     }
 
@@ -535,9 +541,11 @@ impl ThreadManager {
         detached: bool,
     ) -> Result<usize, Error> {
         let mut stack = ThreadStack::try_new(stack_size)?;
+        let address_space = process.address_space();
         let context = userspace::Context::load(
             stack.as_mut_slice(),
             Self::thread_trampoline,
+            address_space,
             entry,
             user_stack_pointer,
         )?;
@@ -651,6 +659,7 @@ impl ThreadManager {
                         old_context,
                         new_context: next.context.kernel() as *const kernel::Context,
                         new_user_kernel_stack: next.context.user_kernel_stack_pointer(),
+                        new_address_space_root: next.process.address_space().root(),
                     };
                     manager.busy.push_front(next);
                     Some(context)
@@ -672,6 +681,11 @@ impl ThreadManager {
             ) {
                 crate::kernel::arch::CpuArchitecture::halt();
             }
+        }
+        if !crate::kernel::arch::MemoryArchitecture::activate_address_space(
+            context.new_address_space_root,
+        ) {
+            crate::kernel::arch::CpuArchitecture::halt();
         }
 
         // SAFETY: both thread boxes remain owned by the queues while their contexts are switched.
@@ -897,6 +911,8 @@ impl ThreadManager {
                     let context = SwitchContext {
                         old_context,
                         new_context: next.context.kernel() as *const kernel::Context,
+                        new_user_kernel_stack: next.context.user_kernel_stack_pointer(),
+                        new_address_space_root: next.process.address_space().root(),
                     };
                     manager.busy.push_front(next);
                     Some(context)
@@ -910,6 +926,18 @@ impl ThreadManager {
         let Some(context) = context else {
             crate::kernel::arch::CpuArchitecture::halt();
         };
+        if let Some(kernel_stack_pointer) = context.new_user_kernel_stack {
+            if !crate::kernel::arch::ThreadArchitecture::set_user_kernel_stack(
+                kernel_stack_pointer,
+            ) {
+                crate::kernel::arch::CpuArchitecture::halt();
+            }
+        }
+        if !crate::kernel::arch::MemoryArchitecture::activate_address_space(
+            context.new_address_space_root,
+        ) {
+            crate::kernel::arch::CpuArchitecture::halt();
+        }
         // SAFETY: the exiting node is retained until another thread has switched onto its stack.
         unsafe { Self::switch_threads(context) };
         crate::kernel::arch::CpuArchitecture::halt()

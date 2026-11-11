@@ -245,6 +245,22 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
             && ram_map::set_page_permissions(address, length, permissions)
     }
 
+    fn create_address_space() -> Option<(usize, usize, usize)> {
+        ram_map::create_address_space()
+    }
+
+    fn activate_address_space(root: usize) -> bool {
+        ram_map::activate_address_space(root)
+    }
+
+    fn current_address_space() -> usize {
+        ram_map::current_address_space()
+    }
+
+    fn destroy_address_space(root: usize, user_base: usize, user_length: usize) -> bool {
+        ram_map::destroy_address_space(root, user_base, user_length)
+    }
+
     fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
         ram_map::set_page_permissions(address, length, permissions)
     }

@@ -21,6 +21,7 @@ use crate::kernel::event::r#loop::{
 };
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::scheduler::thread::vm::UserAddressSpace;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CapabilityRights(u8);
@@ -867,7 +868,10 @@ impl SharedMemoryGrant {
         Ok(())
     }
 
-    pub(crate) fn map_user(&self) -> Result<SharedMemoryMapping, Error> {
+    pub(crate) fn map_user(
+        &self,
+        address_space: UserAddressSpace,
+    ) -> Result<SharedMemoryMapping, Error> {
         const PAGE_SIZE: usize = crate::kernel::memory::r#virtual::PAGE_SIZE;
         let length = self.len();
         if self.range.start % PAGE_SIZE != 0 || length % PAGE_SIZE != 0 {
@@ -879,33 +883,31 @@ impl SharedMemoryGrant {
             return Err(Error::Acces);
         }
         let permissions = if write { 2 } else { 1 };
-        let address = crate::kernel::memory::r#virtual::reserve_user(
-            length,
-            PAGE_SIZE,
-            permissions,
-        )
-        .ok_or(Error::NoMem)?;
+        let address = address_space
+            .reserve_user_mapping(None, length, permissions, false)
+            .ok_or(Error::NoMem)?;
         let physical_base = self.core.buffer.lock().bus_address() as usize;
         for offset in (0..length).step_by(PAGE_SIZE) {
             let Some(physical_address) = physical_base
                 .checked_add(self.range.start)
                 .and_then(|base| base.checked_add(offset))
             else {
-                let _released = crate::kernel::memory::r#virtual::release_user_mapping(address, length);
+                let _released = address_space.release_user_mapping(address, length);
                 return Err(Error::Overflow);
             };
-            if !crate::kernel::memory::r#virtual::map_user_borrowed_page(
+            if !address_space.map_user_borrowed_page(
                 address + offset,
                 physical_address,
                 permissions,
             ) {
-                let _released = crate::kernel::memory::r#virtual::release_user_mapping(address, length);
+                let _released = address_space.release_user_mapping(address, length);
                 return Err(Error::NoMem);
             }
         }
         Ok(SharedMemoryMapping {
             address,
             length,
+            address_space,
             _core: Arc::clone(&self.core),
         })
     }
@@ -914,6 +916,7 @@ impl SharedMemoryGrant {
 pub(crate) struct SharedMemoryMapping {
     address: usize,
     length: usize,
+    address_space: UserAddressSpace,
     _core: Arc<SharedMemoryCore>,
 }
 
@@ -929,8 +932,9 @@ impl SharedMemoryMapping {
 
 impl Drop for SharedMemoryMapping {
     fn drop(&mut self) {
-        let _released =
-            crate::kernel::memory::r#virtual::release_user_mapping(self.address, self.length);
+        let _released = self
+            .address_space
+            .release_user_mapping(self.address, self.length);
     }
 }
 
@@ -1075,14 +1079,22 @@ pub(crate) fn shared_mapping_smoke() -> Result<(), Error> {
     let received_grant_handle = *received_grant.capabilities().first().ok_or(Error::Proto)?;
     let mapping = receiver_process.map_shared_memory(received_grant_handle)?;
     if mapping.len() != page_size
-        || !crate::kernel::memory::r#virtual::user_range_accessible(mapping.address(), 4, false)
-        || crate::kernel::memory::r#virtual::user_range_accessible(mapping.address(), 1, true)
+        || !mapping
+            .address_space
+            .user_range_accessible(mapping.address(), 4, false)
+        || mapping
+            .address_space
+            .user_range_accessible(mapping.address(), 1, true)
     {
         return Err(Error::Proto);
     }
-    // SAFETY: this live mapping grants read access to a page retained by the grant.
-    let mapped_bytes = unsafe { core::slice::from_raw_parts(mapping.address() as *const u8, 4) };
-    if mapped_bytes != b"page" {
+    let mut mapped_bytes = [0; 4];
+    crate::kernel::dl::AddressSpace::read(
+        &mapping.address_space,
+        mapping.address(),
+        &mut mapped_bytes,
+    )?;
+    if &mapped_bytes != b"page" {
         return Err(Error::Proto);
     }
     receiver_process.close_capability(received_grant_handle)?;

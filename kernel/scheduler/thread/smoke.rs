@@ -56,7 +56,10 @@ pub(crate) fn vm_smoke() -> bool {
     const PAGE_SIZE: usize = crate::kernel::memory::r#virtual::PAGE_SIZE;
     const MAPPING_LENGTH: usize = PAGE_SIZE * 2;
 
-    let mut address_space = UserAddressSpace::new();
+    let Ok(process) = ThreadManager::current_process() else {
+        return false;
+    };
+    let mut address_space = process.address_space();
     if !matches!(address_space.allocate_stack(0), Err(Error::NoExec)) {
         return false;
     }
@@ -139,5 +142,56 @@ pub(crate) fn vm_smoke() -> bool {
         return false;
     };
     address_space.release(reclaimed_mapping, MAPPING_LENGTH);
-    true
+    address_space_isolation_smoke(&mut address_space)
+}
+
+fn address_space_isolation_smoke(address_space: &mut UserAddressSpace) -> bool {
+    const PAGE_SIZE: usize = crate::kernel::memory::r#virtual::PAGE_SIZE;
+
+    let Ok(mut isolated_address_space) = UserAddressSpace::new() else {
+        return false;
+    };
+    let Ok(address) = address_space.reserve(None, PAGE_SIZE, PAGE_SIZE, 0, false) else {
+        return false;
+    };
+    let Ok(isolated_address) = isolated_address_space.reserve(
+        Some(address),
+        PAGE_SIZE,
+        PAGE_SIZE,
+        0,
+        true,
+    ) else {
+        address_space.release(address, PAGE_SIZE);
+        return false;
+    };
+    let result = (|| -> Result<(), Error> {
+        if isolated_address != address {
+            return Err(Error::Inval);
+        }
+        address_space.zero(address, PAGE_SIZE)?;
+        let expected = [0x31, 0x72, 0xa4, 0xe8];
+        address_space.write(address, &expected)?;
+        isolated_address_space.zero(isolated_address, PAGE_SIZE)?;
+
+        let mut bytes = [u8::MAX; 4];
+        isolated_address_space.read(isolated_address, &mut bytes)?;
+        if bytes != [0; 4] {
+            return Err(Error::Inval);
+        }
+        address_space.read(address, &mut bytes)?;
+        if bytes != expected {
+            return Err(Error::Inval);
+        }
+
+        if !isolated_address_space.release_user_mapping(isolated_address, PAGE_SIZE) {
+            return Err(Error::NoMem);
+        }
+        address_space.read(address, &mut bytes)?;
+        if bytes != expected {
+            return Err(Error::Inval);
+        }
+        Ok(())
+    })();
+    address_space.release(address, PAGE_SIZE);
+    result.is_ok()
 }

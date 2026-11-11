@@ -38,6 +38,8 @@ static mut PAGE_TABLES: [PageTable; PAGE_TABLE_COUNT] = [PageTable {
     entries: [0; PAGE_TABLE_ENTRIES],
 }; PAGE_TABLE_COUNT];
 static NEXT_PAGE_TABLE: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_FREE: [AtomicBool; PAGE_TABLE_COUNT] =
+    [const { AtomicBool::new(false) }; PAGE_TABLE_COUNT];
 static NX_ENABLED: AtomicBool = AtomicBool::new(false);
 static PAGE_TABLE_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 
@@ -76,6 +78,104 @@ pub(crate) fn initialize() {
         );
     }
     assert!(cr0 & (1 << 31) != 0, "x86 paging was not enabled by boot");
+}
+
+pub(crate) fn create_address_space() -> Option<(usize, usize, usize)> {
+    let _guard = PAGE_TABLE_LOCK.lock();
+    let kernel_root = addr_of_mut!(pml4).cast::<u64>();
+    let user_pml4_index = (1..256).find(|index| unsafe {
+        read_volatile(kernel_root.add(*index)) == 0
+    })?;
+    let root = unsafe { allocate_page_table()? };
+    for index in 0..PAGE_TABLE_ENTRIES {
+        let entry = unsafe { read_volatile(kernel_root.add(index)) };
+        unsafe { write_volatile(root.add(index), entry) };
+    }
+    Some((
+        root as usize,
+        user_pml4_index << 39,
+        64usize << 30,
+    ))
+}
+
+pub(crate) fn activate_address_space(root: usize) -> bool {
+    if root == 0 || root % PAGE_SIZE != 0 || (root as u64 & PAGE_ADDRESS_MASK) != root as u64 {
+        return false;
+    }
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {root}",
+            root = in(reg) root as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+    true
+}
+
+pub(crate) fn current_address_space() -> usize {
+    let root: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {root}, cr3",
+            root = out(reg) root,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (root & PAGE_ADDRESS_MASK) as usize
+}
+
+pub(crate) fn destroy_address_space(root: usize, user_base: usize, user_length: usize) -> bool {
+    let Some(user_end) = user_base.checked_add(user_length) else {
+        return false;
+    };
+    if root == 0
+        || root % PAGE_SIZE != 0
+        || (root as u64 & PAGE_ADDRESS_MASK) != root as u64
+        || user_length == 0
+        || user_base >> 39 != (user_end - 1) >> 39
+        || root == current_address_space()
+    {
+        return false;
+    }
+
+    let _guard = PAGE_TABLE_LOCK.lock();
+    let root_table = root as *mut u64;
+    let pml4_index = (user_base >> 39) & 0x1ff;
+    let root_entry = unsafe { read_volatile(root_table.add(pml4_index)) };
+    if root_entry & PRESENT != 0 {
+        if root_entry & HUGE_PAGE != 0 {
+            return false;
+        }
+        let pdpt = (root_entry & PAGE_ADDRESS_MASK) as *mut u64;
+        for pdpt_index in 0..PAGE_TABLE_ENTRIES {
+            let pdpt_entry = unsafe { read_volatile(pdpt.add(pdpt_index)) };
+            if pdpt_entry & PRESENT == 0 {
+                continue;
+            }
+            if pdpt_entry & HUGE_PAGE != 0 {
+                return false;
+            }
+            let directory = (pdpt_entry & PAGE_ADDRESS_MASK) as *mut u64;
+            for directory_index in 0..PAGE_TABLE_ENTRIES {
+                let directory_entry = unsafe { read_volatile(directory.add(directory_index)) };
+                if directory_entry & PRESENT == 0 {
+                    continue;
+                }
+                if directory_entry & HUGE_PAGE != 0
+                    || !free_page_table((directory_entry & PAGE_ADDRESS_MASK) as *mut u64)
+                {
+                    return false;
+                }
+            }
+            if !free_page_table(directory) {
+                return false;
+            }
+        }
+        if !free_page_table(pdpt) {
+            return false;
+        }
+    }
+    free_page_table(root_table)
 }
 
 pub(crate) fn set_page_permissions(address: usize, length: usize, permissions: i32) -> bool {
@@ -412,7 +512,7 @@ fn page_table_entry(address: usize, create: bool, user: bool) -> Option<*mut u64
     let directory_index = (address >> 21) & 0x1ff;
     let page_index = (address >> 12) & 0x1ff;
 
-    let pml4_table = addr_of_mut!(pml4).cast::<u64>();
+    let pml4_table = current_address_space() as *mut u64;
     let pdpt = unsafe { next_table(pml4_table.add(pml4_index), create, 3, user)? };
     let directory = unsafe { next_table(pdpt.add(pdpt_index), create, 2, user)? };
     let page_table = unsafe { next_table(directory.add(directory_index), create, 1, user)? };
@@ -420,7 +520,11 @@ fn page_table_entry(address: usize, create: bool, user: bool) -> Option<*mut u64
 }
 
 unsafe fn allocate_page_table() -> Option<*mut u64> {
-    let table_index = NEXT_PAGE_TABLE.fetch_add(1, Ordering::AcqRel);
+    let used_tables = NEXT_PAGE_TABLE.load(Ordering::Acquire).min(PAGE_TABLE_COUNT);
+    let reusable = (0..used_tables).find(|index| {
+        PAGE_TABLE_FREE[*index].swap(false, Ordering::AcqRel)
+    });
+    let table_index = reusable.unwrap_or_else(|| NEXT_PAGE_TABLE.fetch_add(1, Ordering::AcqRel));
     if table_index >= PAGE_TABLE_COUNT {
         return None;
     }
@@ -434,6 +538,24 @@ unsafe fn allocate_page_table() -> Option<*mut u64> {
         unsafe { write_volatile(entries.add(index), 0) };
     }
     Some(entries)
+}
+
+fn free_page_table(table: *mut u64) -> bool {
+    let tables_start = unsafe { addr_of_mut!(PAGE_TABLES).cast::<PageTable>() as usize };
+    let Some(offset) = (table as usize).checked_sub(tables_start) else {
+        return false;
+    };
+    if offset % PAGE_SIZE != 0 {
+        return false;
+    }
+    let index = offset / PAGE_SIZE;
+    if index >= PAGE_TABLE_COUNT
+        || index >= NEXT_PAGE_TABLE.load(Ordering::Acquire)
+        || PAGE_TABLE_FREE[index].swap(true, Ordering::AcqRel)
+    {
+        return false;
+    }
+    true
 }
 
 unsafe fn next_table(

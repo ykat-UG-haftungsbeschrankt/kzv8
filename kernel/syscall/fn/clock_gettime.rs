@@ -32,7 +32,9 @@ impl ClockGetTime {
         let Ok(output_address) = usize::try_from(arguments.output_address) else {
             return Err(Error::Fault);
         };
-        if !crate::kernel::memory::r#virtual::user_range_accessible(
+        let address_space =
+            crate::kernel::scheduler::thread::ThreadManager::current_process()?.address_space();
+        if !address_space.user_range_accessible(
             output_address,
             core::mem::size_of::<UserTimespec>(),
             true,
