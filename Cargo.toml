@@ -16,6 +16,7 @@ smoltcp = { version = "0.14.0", default-features = false, features = ["alloc", "
 
 [features]
 default = ["fpu-sse"]
+ebpf-jit = []
 fpu-x87 = []
 fpu-sse = []
 fpu-avx = ["fpu-sse"]

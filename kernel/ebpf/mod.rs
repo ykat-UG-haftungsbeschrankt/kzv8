@@ -6,10 +6,13 @@
  */
 
 // This is a first slice, not a full eBPF subsystem: maps, helpers, packet access,
-// JIT, and runtime/syscall loading are not implemented yet.
+// and runtime/syscall loading are not implemented yet.
 
 use alloc::vec::Vec;
 use crate::error::Error;
+
+#[cfg(feature = "ebpf-jit")]
+mod jit;
 
 const INSTRUCTION_SIZE: usize = 8;
 const MAX_INSTRUCTIONS: usize = 4096;
@@ -88,6 +91,8 @@ impl Instruction {
 
 pub(crate) struct Program {
     instructions: Vec<Instruction>,
+    #[cfg(feature = "ebpf-jit")]
+    jit: Option<jit::Code>,
 }
 
 impl Program {
@@ -106,10 +111,26 @@ impl Program {
         for bytes in bytes.chunks_exact(INSTRUCTION_SIZE) {
             instructions.push(Instruction::decode(bytes));
         }
+        #[cfg(feature = "ebpf-jit")]
+        {
+            let mut program = Self::verify(instructions)?;
+            program.jit = jit::Code::compile(&program.instructions);
+            Ok(program)
+        }
+        #[cfg(not(feature = "ebpf-jit"))]
         Self::verify(instructions)
     }
 
     pub(crate) fn run(&self, input: u64) -> Result<u64, Error> {
+        #[cfg(feature = "ebpf-jit")]
+        if let Some(jit) = &self.jit {
+            return Ok(jit.run(input));
+        }
+
+        self.run_interpreted(input)
+    }
+
+    fn run_interpreted(&self, input: u64) -> Result<u64, Error> {
         let mut registers = [0u64; REGISTER_COUNT];
         registers[1] = input;
         registers[FRAME_POINTER] = STACK_SIZE as u64;
@@ -267,7 +288,11 @@ impl Program {
         if !terminates[0] {
             return Err(Error::Inval);
         }
-        Ok(Self { instructions })
+        Ok(Self {
+            instructions,
+            #[cfg(feature = "ebpf-jit")]
+            jit: None,
+        })
     }
 }
 
