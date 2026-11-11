@@ -18,7 +18,6 @@ mod runtime_v8;
 use crate::kernel::arch::traits::MemoryArchitecture as _;
 use crate::kernel::arch::MemoryArchitecture;
 #[allow(unused_imports)]
-use crate::kernel::block::device::BlockDevice;
 use crate::kernel::driver::virtio::console::Console;
 #[allow(unused_imports)]
 use crate::kernel::event::r#loop::{EventLoop, EventSourceToken};
@@ -32,6 +31,7 @@ extern "C" {
     fn kz_c_malloc_smoke() -> i32;
     fn kz_c_mmap_smoke() -> i32;
     fn kz_c_pthread_smoke() -> i32;
+    fn kz_c_attributes_smoke() -> i32;
 }
 
 
@@ -56,6 +56,9 @@ pub(crate) fn run(context: KernelContext<'_>) {
     }
     if unsafe { kz_c_malloc_smoke() } == 0 {
         let _malloc_status = Console::write(b"kz: malloc/free smoke OK\n");
+    }
+    if unsafe { kz_c_attributes_smoke() } == 0 {
+        let _attributes_status = Console::write(b"kz: VFS xattr and inode flags smoke OK\n");
     }
     if MemoryArchitecture::high_memory_smoke() {
         let _high_memory_status = Console::write(b"kz: RAM above 4 GiB mapped\n");

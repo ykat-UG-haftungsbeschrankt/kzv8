@@ -6,8 +6,8 @@
  */
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -20,7 +20,164 @@ pub(crate) mod plugin;
 pub(crate) type VfsResult<T> = Result<T, Error>;
 pub(crate) type VfsFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+pub(crate) const INODE_FLAG_IMMUTABLE: u32 = 0x0000_0010;
+pub(crate) const INODE_FLAG_APPEND: u32 = 0x0000_0020;
+pub(crate) const INODE_FLAG_NODUMP: u32 = 0x0000_0040;
+pub(crate) const INODE_FLAG_NOATIME: u32 = 0x0000_0080;
+pub(crate) const INODE_FLAG_DIRSYNC: u32 = 0x0001_0000;
+pub(crate) const INODE_FLAG_TOPDIR: u32 = 0x0002_0000;
+const SUPPORTED_INODE_FLAGS: u32 = INODE_FLAG_IMMUTABLE
+    | INODE_FLAG_APPEND
+    | INODE_FLAG_NODUMP
+    | INODE_FLAG_NOATIME
+    | INODE_FLAG_DIRSYNC
+    | INODE_FLAG_TOPDIR;
+const XATTR_CREATE: i32 = 1;
+const XATTR_REPLACE: i32 = 2;
+const XATTR_NAME_MAX: usize = 255;
+const XATTR_SIZE_MAX: usize = 64 * 1024;
+
 static MOUNTED_VFS: IrqSpinLock<Option<Vfs>> = IrqSpinLock::new(None);
+
+#[derive(Clone)]
+pub(crate) struct NodeMetadata {
+    state: Arc<IrqSpinLock<NodeMetadataState>>,
+}
+
+struct NodeMetadataState {
+    flags: u32,
+    xattrs: Vec<Xattr>,
+}
+
+struct Xattr {
+    name: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl NodeMetadata {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(IrqSpinLock::new(NodeMetadataState {
+                flags: 0,
+                xattrs: Vec::new(),
+            })),
+        }
+    }
+
+    pub(crate) fn flags(&self) -> u32 {
+        self.state.lock().flags
+    }
+
+    pub(crate) fn set_flags(&self, flags: u32) -> VfsResult<()> {
+        if flags & !SUPPORTED_INODE_FLAGS != 0 {
+            return Err(Error::Inval);
+        }
+        self.state.lock().flags = flags;
+        Ok(())
+    }
+
+    pub(crate) fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>> {
+        validate_xattr_name(name)?;
+        let state = self.state.lock();
+        let value = state
+            .xattrs
+            .iter()
+            .find(|attribute| attribute.name == name)
+            .map(|attribute| attribute.value.as_slice())
+            .ok_or(Error::NoData)?;
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(value.len()).map_err(|_| Error::NoMem)?;
+        copy.extend_from_slice(value);
+        Ok(copy)
+    }
+
+    pub(crate) fn list_xattrs(&self) -> VfsResult<Vec<Vec<u8>>> {
+        let state = self.state.lock();
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(state.xattrs.len())
+            .map_err(|_| Error::NoMem)?;
+        for attribute in &state.xattrs {
+            let mut name = Vec::new();
+            name.try_reserve_exact(attribute.name.len())
+                .map_err(|_| Error::NoMem)?;
+            name.extend_from_slice(&attribute.name);
+            names.push(name);
+        }
+        Ok(names)
+    }
+
+    pub(crate) fn set_xattr(&self, name: &[u8], value: &[u8], flags: i32) -> VfsResult<()> {
+        validate_xattr_name(name)?;
+        if value.len() > XATTR_SIZE_MAX {
+            return Err(Error::TooBig);
+        }
+        if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0
+            || flags == (XATTR_CREATE | XATTR_REPLACE)
+        {
+            return Err(Error::Inval);
+        }
+
+        let mut owned_name = Vec::new();
+        owned_name
+            .try_reserve_exact(name.len())
+            .map_err(|_| Error::NoMem)?;
+        owned_name.extend_from_slice(name);
+        let mut owned_value = Vec::new();
+        owned_value
+            .try_reserve_exact(value.len())
+            .map_err(|_| Error::NoMem)?;
+        owned_value.extend_from_slice(value);
+
+        let mut state = self.state.lock();
+        if state.flags & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
+            return Err(Error::Error);
+        }
+        if let Some(index) = state
+            .xattrs
+            .iter()
+            .position(|attribute| attribute.name == name)
+        {
+            if flags & XATTR_CREATE != 0 {
+                return Err(Error::Exist);
+            }
+            state.xattrs[index].value = owned_value;
+            return Ok(());
+        }
+        if flags & XATTR_REPLACE != 0 {
+            return Err(Error::NoData);
+        }
+        state.xattrs.try_reserve(1).map_err(|_| Error::NoMem)?;
+        state.xattrs.push(Xattr {
+            name: owned_name,
+            value: owned_value,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
+        validate_xattr_name(name)?;
+        let mut state = self.state.lock();
+        if state.flags & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
+            return Err(Error::Error);
+        }
+        let index = state
+            .xattrs
+            .iter()
+            .position(|attribute| attribute.name == name)
+            .ok_or(Error::NoData)?;
+        state.xattrs.remove(index);
+        Ok(())
+    }
+}
+
+fn validate_xattr_name(name: &[u8]) -> VfsResult<()> {
+    if name.is_empty() || name.len() > XATTR_NAME_MAX || name.contains(&0) {
+        Err(Error::Inval)
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenMode {
@@ -56,6 +213,10 @@ pub(crate) trait DirectoryPlugin: Send + Sync {
 pub(crate) trait FilePlugin: Send + Sync {
     fn read_at<'a>(&'a self, offset: u64, buffer: &'a mut [u8]) -> VfsFuture<'a, VfsResult<usize>>;
 
+    fn size(&self) -> VfsFuture<'_, VfsResult<u64>> {
+        Box::pin(async { Err(Error::NoSys) })
+    }
+
     fn write_at<'a>(&'a self, _offset: u64, _buffer: &'a [u8]) -> VfsFuture<'a, VfsResult<usize>> {
         Box::pin(async { Err(Error::Rofs) })
     }
@@ -63,30 +224,66 @@ pub(crate) trait FilePlugin: Send + Sync {
 
 #[derive(Clone)]
 pub(crate) enum Node {
-    Directory(Arc<dyn DirectoryPlugin>),
-    File(Arc<dyn FilePlugin>),
+    Directory {
+        plugin: Arc<dyn DirectoryPlugin>,
+        metadata: NodeMetadata,
+    },
+    File {
+        plugin: Arc<dyn FilePlugin>,
+        metadata: NodeMetadata,
+    },
 }
 
 impl Node {
     pub(crate) fn directory<P: DirectoryPlugin + 'static>(plugin: P) -> Self {
-        Self::Directory(Arc::new(plugin))
+        Self::directory_with_metadata(plugin, NodeMetadata::new())
     }
 
     pub(crate) fn file<P: FilePlugin + 'static>(plugin: P) -> Self {
-        Self::File(Arc::new(plugin))
+        Self::file_with_metadata(plugin, NodeMetadata::new())
+    }
+
+    pub(crate) fn directory_with_metadata<P: DirectoryPlugin + 'static>(
+        plugin: P,
+        metadata: NodeMetadata,
+    ) -> Self {
+        Self::Directory {
+            plugin: Arc::new(plugin),
+            metadata,
+        }
+    }
+
+    pub(crate) fn file_with_metadata<P: FilePlugin + 'static>(
+        plugin: P,
+        metadata: NodeMetadata,
+    ) -> Self {
+        Self::File {
+            plugin: Arc::new(plugin),
+            metadata,
+        }
+    }
+
+    pub(crate) fn metadata(&self) -> NodeMetadata {
+        match self {
+            Self::Directory { metadata, .. } | Self::File { metadata, .. } => metadata.clone(),
+        }
+    }
+
+    pub(crate) fn flags(&self) -> u32 {
+        self.metadata().flags()
     }
 
     pub(crate) fn lookup<'a>(&'a self, name: &'a str) -> VfsFuture<'a, VfsResult<Node>> {
         match self {
-            Self::Directory(plugin) => plugin.lookup(name),
-            Self::File(_) => Box::pin(async { Err(Error::NotDir) }),
+            Self::Directory { plugin, .. } => plugin.lookup(name),
+            Self::File { .. } => Box::pin(async { Err(Error::NotDir) }),
         }
     }
 
     pub(crate) fn read_dir(&self) -> VfsFuture<'_, VfsResult<Vec<DirectoryEntry>>> {
         match self {
-            Self::Directory(plugin) => plugin.read_dir(),
-            Self::File(_) => Box::pin(async { Err(Error::NotDir) }),
+            Self::Directory { plugin, .. } => plugin.read_dir(),
+            Self::File { .. } => Box::pin(async { Err(Error::NotDir) }),
         }
     }
 
@@ -96,8 +293,15 @@ impl Node {
         buffer: &'a mut [u8],
     ) -> VfsFuture<'a, VfsResult<usize>> {
         match self {
-            Self::File(plugin) => plugin.read_at(offset, buffer),
-            Self::Directory(_) => Box::pin(async { Err(Error::IsDir) }),
+            Self::File { plugin, .. } => plugin.read_at(offset, buffer),
+            Self::Directory { .. } => Box::pin(async { Err(Error::IsDir) }),
+        }
+    }
+
+    pub(crate) fn size(&self) -> VfsFuture<'_, VfsResult<u64>> {
+        match self {
+            Self::File { plugin, .. } => plugin.size(),
+            Self::Directory { .. } => Box::pin(async { Err(Error::IsDir) }),
         }
     }
 
@@ -107,8 +311,17 @@ impl Node {
         buffer: &'a [u8],
     ) -> VfsFuture<'a, VfsResult<usize>> {
         match self {
-            Self::File(plugin) => plugin.write_at(offset, buffer),
-            Self::Directory(_) => Box::pin(async { Err(Error::IsDir) }),
+            Self::File { plugin, metadata } => {
+                let plugin = Arc::clone(plugin);
+                let metadata = metadata.clone();
+                Box::pin(async move {
+                    if metadata.flags() & INODE_FLAG_IMMUTABLE != 0 {
+                        return Err(Error::Error);
+                    }
+                    plugin.write_at(offset, buffer).await
+                })
+            }
+            Self::Directory { .. } => Box::pin(async { Err(Error::IsDir) }),
         }
     }
 }
@@ -143,6 +356,12 @@ impl FileHandle {
             }
             let requested = u64::try_from(buffer.len()).map_err(|_| Error::Fbig)?;
             self.offset.checked_add(requested).ok_or(Error::Fbig)?;
+            if requested == 0 {
+                return Ok(0);
+            }
+            if self.node.flags() & INODE_FLAG_APPEND != 0 {
+                self.offset = self.node.size().await?;
+            }
             let count = self.node.write_at(self.offset, buffer).await?;
             self.offset = self
                 .offset
@@ -202,7 +421,7 @@ impl Vfs {
     ) -> VfsFuture<'a, VfsResult<FileHandle>> {
         Box::pin(async move {
             let node = self.resolve(path).await?;
-            if matches!(&node, Node::Directory(_)) {
+            if matches!(&node, Node::Directory { .. }) {
                 return Err(Error::IsDir);
             }
             Ok(FileHandle {

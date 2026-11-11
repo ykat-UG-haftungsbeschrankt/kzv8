@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #ifndef KZ_POSIX_ERRNO_H_
 #define KZ_POSIX_ERRNO_H_
 
@@ -132,6 +139,9 @@
 #endif
 #ifndef ENOENT
 #define ENOENT 2
+#endif
+#ifndef ENODATA
+#define ENODATA 61
 #endif
 #ifndef ENOEXEC
 #define ENOEXEC 8

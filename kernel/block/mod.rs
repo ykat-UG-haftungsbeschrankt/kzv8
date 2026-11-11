@@ -7,3 +7,4 @@
 
 pub(crate) mod device;
 pub(crate) mod request;
+pub(crate) mod service;

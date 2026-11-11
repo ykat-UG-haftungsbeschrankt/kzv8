@@ -10,18 +10,24 @@ use core::ptr::{copy_nonoverlapping, write_bytes, write_volatile};
 use crate::kernel::arch::traits::{InterruptArchitecture as _, MemoryArchitecture as _};
 use crate::kernel::arch::MemoryArchitecture;
 use crate::kernel::memory::physical::PhysicalAllocator;
+use crate::kernel::vm::device::virtio::GuestVirtioDevices;
+use crate::kernel::vm::device::GuestMemory as GuestMemoryView;
 
 const PAGE_SIZE: usize = 4096;
 const GUEST_MEMORY_SIZE: usize = 2 * 1024 * 1024;
-const TABLE_PAGES: usize = 3;
+const GUEST_DEVICE_APERTURE: u64 = GUEST_MEMORY_SIZE as u64;
+const TABLE_PAGES: usize = 4;
 const ROOT_OFFSET: usize = 0;
 const LEVEL1_OFFSET: usize = PAGE_SIZE;
 const LEVEL2_OFFSET: usize = 2 * PAGE_SIZE;
+const DEVICE_TABLE_OFFSET: usize = 3 * PAGE_SIZE;
 const TABLE_DESCRIPTOR: u64 = 0b11;
 const BLOCK_DESCRIPTOR: u64 = 0b01;
 const MEMORY_ATTRIBUTE_NORMAL_WB: u64 = 0xf << 2;
+const MEMORY_ATTRIBUTE_DEVICE_NGNRE: u64 = 0x1 << 2;
 const STAGE2_READ_WRITE: u64 = 0b11 << 6;
 const INNER_SHAREABLE: u64 = 0b11 << 8;
+const OUTER_SHAREABLE: u64 = 0b10 << 8;
 const ACCESS_FLAG: u64 = 1 << 10;
 const HOST_CONTROL_VM: u64 = 1;
 const HOST_CONTROL_IMO: u64 = 1 << 4;
@@ -353,6 +359,7 @@ static mut KZ_AARCH64_MONITOR_CONTEXTS: [MonitorState; crate::kernel::arch::MAX_
 
 struct GuestMemory {
     physical: usize,
+    retained: bool,
 }
 
 impl GuestMemory {
@@ -378,13 +385,23 @@ impl GuestMemory {
             write_bytes(physical as *mut u8, 0, GUEST_MEMORY_SIZE);
             copy_nonoverlapping(image.as_ptr(), (physical + GUEST_ENTRY) as *mut u8, image.len());
         }
-        Ok(Self { physical })
+        Ok(Self {
+            physical,
+            retained: false,
+        })
+    }
+
+    fn retain(&mut self) {
+        self.retained = true;
     }
 }
 
 impl Drop for GuestMemory {
     fn drop(&mut self) {
-        let _released = PhysicalAllocator::deallocate_contiguous(self.physical, GUEST_MEMORY_SIZE);
+        if !self.retained {
+            let _released =
+                PhysicalAllocator::deallocate_contiguous(self.physical, GUEST_MEMORY_SIZE);
+        }
     }
 }
 
@@ -394,6 +411,7 @@ pub(crate) struct GuestContext {
     owner_cpu: usize,
     guest: GuestState,
     exit: crate::kernel::arch::VirtualMachineExit,
+    devices: GuestVirtioDevices,
 }
 
 unsafe extern "C" {
@@ -425,7 +443,49 @@ impl GuestContext {
                 fpsr: 0,
             },
             exit: empty_guest_exit(),
+            devices: GuestVirtioDevices::new()?,
         })
+    }
+
+    pub(crate) fn guest_memory_region(&self) -> (usize, usize) {
+        (self._memory.physical, GUEST_MEMORY_SIZE)
+    }
+
+    pub(crate) fn retain_guest_memory(&mut self) {
+        self._memory.retain();
+    }
+
+    pub(crate) fn write_guest_memory(
+        &mut self,
+        guest_address: u64,
+        bytes: &[u8],
+    ) -> Result<(), crate::kernel::arch::VirtualizationError> {
+        let start = usize::try_from(guest_address)
+            .map_err(|_| crate::kernel::arch::VirtualizationError::Unsupported)?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or(crate::kernel::arch::VirtualizationError::Unsupported)?;
+        if end > GUEST_MEMORY_SIZE {
+            return Err(crate::kernel::arch::VirtualizationError::Unsupported);
+        }
+        // SAFETY: the checked range is in this context's exclusive guest-memory allocation.
+        unsafe {
+            copy_nonoverlapping(
+                bytes.as_ptr(),
+                (self._memory.physical + start) as *mut u8,
+                bytes.len(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map_guest_mmio(
+        &mut self,
+        guest_address: u64,
+        host_address: u64,
+        length: usize,
+    ) -> Result<(), crate::kernel::arch::VirtualizationError> {
+        self.tables.map_guest_mmio(guest_address, host_address, length)
     }
 
     /// Resume this vCPU until a VM exit should be returned to its scheduler thread.
@@ -448,17 +508,35 @@ impl GuestContext {
         state.vttbr = self.tables.vttbr();
         state.guest = self.guest;
         unsafe { core::ptr::write_volatile(state_pointer, state) };
-        // SAFETY: this vCPU owns the EL2 monitor slot until the host HVC returns.
-        unsafe { kz_aarch64_vcpu_enter(self.owner_cpu) };
-        state = unsafe { core::ptr::read_volatile(state_pointer) };
-        unsafe {
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!((*state_pointer).active),
-                false,
-            );
+        loop {
+            // SAFETY: this vCPU owns the EL2 monitor slot until the host HVC returns.
+            unsafe { kz_aarch64_vcpu_enter(self.owner_cpu) };
+            state = unsafe { core::ptr::read_volatile(state_pointer) };
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!((*state_pointer).active),
+                    false,
+                );
+            }
+            self.guest = state.guest;
+            self.exit = state.exit;
+            if self.exit.reason == crate::kernel::arch::VirtualMachineExitReason::EptViolation
+                && self.emulate_guest_mmio()
+            {
+                let Some(next_pc) = self.guest.pc.checked_add(4) else {
+                    crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+                    return Err(crate::kernel::arch::VirtualizationError::HostSetupFailed);
+                };
+                self.guest.pc = next_pc;
+                state.active = true;
+                state.guest_active = false;
+                state.guest = self.guest;
+                state.exit = empty_guest_exit();
+                unsafe { core::ptr::write_volatile(state_pointer, state) };
+                continue;
+            }
+            break;
         }
-        self.guest = state.guest;
-        self.exit = state.exit;
         match self.exit.reason {
             crate::kernel::arch::VirtualMachineExitReason::PreemptionTimer => {
                 super::timer::handle_interrupt();
@@ -470,6 +548,47 @@ impl GuestContext {
         }
         crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
         Ok(self.exit)
+    }
+
+    fn emulate_guest_mmio(&mut self) -> bool {
+        let Some(address) = self.exit.guest_physical_address else {
+            return false;
+        };
+        if !GuestVirtioDevices::contains(address)
+            || self.exit.qualification & (1 << 24) == 0
+        {
+            return false;
+        }
+        let width = 1u8 << ((self.exit.qualification >> 22) & 0x3);
+        let write = self.exit.qualification & (1 << 6) != 0;
+        let register = ((self.exit.qualification >> 16) & 0x1f) as usize;
+        let access_mask = match width {
+            1 => 0xff,
+            2 => 0xffff,
+            4 => u64::from(u32::MAX),
+            8 => u64::MAX,
+            _ => return false,
+        };
+        let value = if write && register < self.guest.x.len() {
+            self.guest.x[register] & access_mask
+        } else {
+            0
+        };
+        // SAFETY: guest execution has exited and this context exclusively owns its allocated RAM.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(self._memory.physical as *mut u8, GUEST_MEMORY_SIZE)
+        };
+        let mut memory = GuestMemoryView::new(bytes);
+        let Some(value) = self
+            .devices
+            .access(&mut memory, address, width, write, value)
+        else {
+            return false;
+        };
+        if !write && register < self.guest.x.len() {
+            self.guest.x[register] = value & access_mask;
+        }
+        true
     }
 }
 
@@ -552,6 +671,9 @@ extern "C" fn kz_aarch64_el2_dispatch(frame: *mut El2ExceptionFrame) {
         } else {
             None
         };
+        let mmio_fault = frame.vector == 0
+            && syndrome >> 26 == 0x24
+            && (0x04..=0x07).contains(&(syndrome as u8 & 0x3f));
         let reason = if let Some(interrupt_id) = interrupt_id {
             if interrupt_id == super::timer::INTERRUPT_ID {
                 crate::kernel::arch::VirtualMachineExitReason::PreemptionTimer
@@ -560,12 +682,21 @@ extern "C" fn kz_aarch64_el2_dispatch(frame: *mut El2ExceptionFrame) {
             }
         } else if frame.vector == 0 && syndrome >> 26 == 0x16 && syndrome & 0xffff == GUEST_EXIT_HVC {
             crate::kernel::arch::VirtualMachineExitReason::Vmcall
+        } else if mmio_fault {
+            crate::kernel::arch::VirtualMachineExitReason::EptViolation
         } else if frame.vector == 0 {
             crate::kernel::arch::VirtualMachineExitReason::Other((syndrome >> 26) as u32)
         } else {
             crate::kernel::arch::VirtualMachineExitReason::ExternalInterrupt
         };
-        context.save_guest_exit(frame, reason, syndrome, interrupt_id.unwrap_or(0));
+        let guest_physical_address = mmio_fault.then(read_guest_physical_address);
+        context.save_guest_exit(
+            frame,
+            reason,
+            syndrome,
+            guest_physical_address,
+            interrupt_id.unwrap_or(0),
+        );
         context.restore_host(frame);
         return;
     }
@@ -629,6 +760,7 @@ impl MonitorState {
         frame: &El2ExceptionFrame,
         reason: crate::kernel::arch::VirtualMachineExitReason,
         syndrome: u64,
+        guest_physical_address: Option<u64>,
         interrupt_id: u32,
     ) {
         self.guest.x = frame.x;
@@ -651,7 +783,7 @@ impl MonitorState {
             guest_rip: self.guest.pc,
             guest_rsp: self.guest.sp,
             guest_rflags: self.guest.pstate,
-            guest_physical_address: None,
+            guest_physical_address,
             interrupt_info: interrupt_id,
             registers: crate::kernel::arch::GuestRegisters {
                 rax: self.guest.x[0],
@@ -717,6 +849,24 @@ fn read_esr_el2() -> u64 {
         );
     }
     value
+}
+
+fn read_guest_physical_address() -> u64 {
+    let hpfar: u64;
+    let far: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {value}, hpfar_el2",
+            value = out(reg) hpfar,
+            options(nomem, nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "mrs {value}, far_el2",
+            value = out(reg) far,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((hpfar & ((1u64 << 40) - 0x10)) << 8) | (far & 0xfff)
 }
 
 fn read_sctlr_el1() -> u64 {
@@ -898,6 +1048,51 @@ impl Stage2Tables {
             host_vtcr: 0,
             host_vttbr: 0,
         })
+    }
+
+    fn map_guest_mmio(
+        &mut self,
+        guest_address: u64,
+        host_address: u64,
+        length: usize,
+    ) -> Result<(), crate::kernel::arch::VirtualizationError> {
+        if guest_address != GUEST_DEVICE_APERTURE
+            || length == 0
+            || length > GUEST_MEMORY_SIZE
+            || length % PAGE_SIZE != 0
+            || host_address as usize % PAGE_SIZE != 0
+            || host_address
+                .checked_add(length as u64)
+                .is_none_or(|end| end > MemoryArchitecture::physical_address_limit())
+        {
+            return Err(crate::kernel::arch::VirtualizationError::Unsupported);
+        }
+        let level2 = (self.tables_physical + LEVEL2_OFFSET) as *mut u64;
+        let device_table = (self.tables_physical + DEVICE_TABLE_OFFSET) as *mut u64;
+        // SAFETY: both entries point into the context-owned, identity-mapped stage-2 table run.
+        if unsafe { core::ptr::read_volatile(level2.add(1)) } != 0 {
+            return Err(crate::kernel::arch::VirtualizationError::Unsupported);
+        }
+        for page in 0..length / PAGE_SIZE {
+            if unsafe { core::ptr::read_volatile(device_table.add(page)) } != 0 {
+                return Err(crate::kernel::arch::VirtualizationError::Unsupported);
+            }
+        }
+        for page in 0..length / PAGE_SIZE {
+            let physical = host_address + (page * PAGE_SIZE) as u64;
+            let entry = physical
+                | MEMORY_ATTRIBUTE_DEVICE_NGNRE
+                | STAGE2_READ_WRITE
+                | OUTER_SHAREABLE
+                | ACCESS_FLAG
+                | TABLE_DESCRIPTOR;
+            // SAFETY: the vCPU is stopped and the stage-2 leaf belongs to this context.
+            unsafe { write_volatile(device_table.add(page), entry) };
+        }
+        fence(Ordering::SeqCst);
+        // SAFETY: all leaves are initialized before publishing the table descriptor.
+        unsafe { write_volatile(level2.add(1), (device_table as u64) | TABLE_DESCRIPTOR) };
+        Ok(())
     }
 
     pub(crate) const fn vtcr(&self) -> u64 {

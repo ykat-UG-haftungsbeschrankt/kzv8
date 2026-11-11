@@ -6,6 +6,7 @@
  */
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -17,7 +18,9 @@ use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 use crate::kernel::scheduler::sync::IrqSpinLock;
-use crate::kernel::vfs::{DirectoryEntry, DirectoryPlugin, FilePlugin, Node, VfsFuture, VfsResult};
+use crate::kernel::vfs::{
+    DirectoryEntry, DirectoryPlugin, FilePlugin, Node, NodeMetadata, VfsFuture, VfsResult,
+};
 
 struct FuseDirectory {
     filesystem: Arc<VirtioFs>,
@@ -33,6 +36,7 @@ pub(crate) struct VirtioFs {
     transport: VirtioTransport,
     _high_priority_queue: IrqSpinLock<DmaQueue<{ Self::QUEUE_SIZE }>>,
     request_state: IrqSpinLock<RequestState>,
+    node_metadata: IrqSpinLock<BTreeMap<u64, NodeMetadata>>,
     next_unique: AtomicU64,
     tag: String,
     max_write: usize,
@@ -80,6 +84,7 @@ impl VirtioFs {
     const FUSE_KERNEL_MINOR: u32 = 41;
     const FUSE_INIT: u32 = 26;
     const FUSE_LOOKUP: u32 = 1;
+    const FUSE_GETATTR: u32 = 3;
     const FUSE_OPEN: u32 = 14;
     const FUSE_READ: u32 = 15;
     const FUSE_WRITE: u32 = 16;
@@ -88,6 +93,8 @@ impl VirtioFs {
     const FUSE_READDIR: u32 = 28;
     const FUSE_RELEASEDIR: u32 = 29;
     const FUSE_ENTRY_OUT_SIZE: usize = 128;
+    const FUSE_GETATTR_IN_SIZE: usize = 16;
+    const FUSE_ATTR_OUT_SIZE: usize = 104;
     const FUSE_OPEN_OUT_SIZE: usize = 16;
     const FUSE_READ_IN_SIZE: usize = 40;
     const FUSE_WRITE_OUT_SIZE: usize = 8;
@@ -140,6 +147,7 @@ impl VirtioFs {
                 in_flight_head: None,
                 orphaned: false,
             }),
+            node_metadata: IrqSpinLock::new(BTreeMap::new()),
             next_unique: AtomicU64::new(1),
             tag,
             max_write: Self::MAX_REQUEST_SIZE - Self::FUSE_IN_HEADER_SIZE,
@@ -153,10 +161,25 @@ impl VirtioFs {
     }
 
     pub(crate) fn root(self: &Arc<Self>) -> Node {
-        Node::directory(FuseDirectory {
-            filesystem: self.clone(),
-            node_id: Self::FUSE_ROOT_ID,
-        })
+        Node::directory_with_metadata(
+            FuseDirectory {
+                filesystem: self.clone(),
+                node_id: Self::FUSE_ROOT_ID,
+            },
+            self.metadata_for_node(Self::FUSE_ROOT_ID),
+        )
+    }
+
+    fn metadata_for_node(&self, node_id: u64) -> NodeMetadata {
+        if let Some(metadata) = self.node_metadata.lock().get(&node_id).cloned() {
+            return metadata;
+        }
+        let metadata = NodeMetadata::new();
+        self.node_metadata
+            .lock()
+            .entry(node_id)
+            .or_insert(metadata)
+            .clone()
     }
 
     async fn initialize_fuse(&mut self) -> Result<(), Error> {
@@ -263,14 +286,20 @@ impl VirtioFs {
                     let name =
                         String::from(core::str::from_utf8(name_bytes).map_err(|_| Error::Ilseq)?);
                     let node = match file_type {
-                        Self::DIRECTORY_TYPE => Node::directory(FuseDirectory {
-                            filesystem: self.clone(),
-                            node_id: inode,
-                        }),
-                        Self::REGULAR_FILE_TYPE => Node::file(FuseFile {
-                            filesystem: self.clone(),
-                            node_id: inode,
-                        }),
+                        Self::DIRECTORY_TYPE => Node::directory_with_metadata(
+                            FuseDirectory {
+                                filesystem: self.clone(),
+                                node_id: inode,
+                            },
+                            self.metadata_for_node(inode),
+                        ),
+                        Self::REGULAR_FILE_TYPE => Node::file_with_metadata(
+                            FuseFile {
+                                filesystem: self.clone(),
+                                node_id: inode,
+                            },
+                            self.metadata_for_node(inode),
+                        ),
                         _ => {
                             cursor += record_length;
                             offset = next_offset;
@@ -287,6 +316,18 @@ impl VirtioFs {
             }
         }
         Ok(entries)
+    }
+
+    async fn file_size(&self, node_id: u64) -> VfsResult<u64> {
+        let request = [0; Self::FUSE_GETATTR_IN_SIZE];
+        let mut response = [0; Self::FUSE_ATTR_OUT_SIZE];
+        let length = self
+            .transact(Self::FUSE_GETATTR, node_id, &request, &mut response)
+            .await?;
+        if length < Self::FUSE_ATTR_OUT_SIZE {
+            return Err(Error::Proto);
+        }
+        Self::read_u64(&response, 24)
     }
 
     async fn read_at(&self, node_id: u64, offset: u64, buffer: &mut [u8]) -> VfsResult<usize> {
@@ -503,14 +544,20 @@ impl VirtioFs {
 
     fn node_from_type(self: &Arc<Self>, node_id: u64, file_type: u32) -> VfsResult<Node> {
         match file_type & Self::MODE_TYPE_MASK {
-            Self::MODE_DIRECTORY => Ok(Node::directory(FuseDirectory {
-                filesystem: self.clone(),
-                node_id,
-            })),
-            Self::MODE_REGULAR_FILE => Ok(Node::file(FuseFile {
-                filesystem: self.clone(),
-                node_id,
-            })),
+            Self::MODE_DIRECTORY => Ok(Node::directory_with_metadata(
+                FuseDirectory {
+                    filesystem: self.clone(),
+                    node_id,
+                },
+                self.metadata_for_node(node_id),
+            )),
+            Self::MODE_REGULAR_FILE => Ok(Node::file_with_metadata(
+                FuseFile {
+                    filesystem: self.clone(),
+                    node_id,
+                },
+                self.metadata_for_node(node_id),
+            )),
             _ => Err(Error::OpNotSupp),
         }
     }
@@ -583,6 +630,12 @@ impl FilePlugin for FuseFile {
         let filesystem = self.filesystem.clone();
         let node_id = self.node_id;
         Box::pin(async move { filesystem.read_at(node_id, offset, buffer).await })
+    }
+
+    fn size(&self) -> VfsFuture<'_, VfsResult<u64>> {
+        let filesystem = self.filesystem.clone();
+        let node_id = self.node_id;
+        Box::pin(async move { filesystem.file_size(node_id).await })
     }
 
     fn write_at<'a>(&'a self, offset: u64, buffer: &'a [u8]) -> VfsFuture<'a, VfsResult<usize>> {

@@ -10,7 +10,7 @@ use core::mem::MaybeUninit;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::errno::{EINVAL, ENOENT};
+use super::errno::{EEXIST, EINVAL, ENODATA, ENOENT, EPERM};
 use crate::kernel::arch::traits::TimerArchitecture as _;
 
 use super::filesystem::CStat;
@@ -89,6 +89,7 @@ unsafe extern "C" {
     fn pthread_cond_wait(condition: *mut c_void, mutex: *mut c_void) -> i32;
     fn pthread_cond_destroy(condition: *mut c_void) -> i32;
     fn pthread_yield() -> i32;
+    fn ioctl(file_descriptor: i32, request: usize, ...) -> i32;
 }
 
 #[no_mangle]
@@ -622,4 +623,149 @@ pub unsafe extern "C" fn kz_c_filesystem_smoke() -> i32 {
         return -1;
     }
     0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_c_attributes_smoke() -> i32 {
+    const PATH: &[u8] = b"/kz-vfs-attributes-smoke\0";
+    const XATTR_NAME: &[u8] = b"user.kz-smoke\0";
+    const INITIAL: &[u8] = b"initial";
+    const REPLACEMENT: &[u8] = b"updated";
+    const APPENDED: &[u8] = b"!";
+    const IMMUTABLE: usize = crate::kernel::vfs::INODE_FLAG_IMMUTABLE as usize;
+    const APPEND: usize = crate::kernel::vfs::INODE_FLAG_APPEND as usize;
+
+    let file_descriptor = unsafe {
+        super::filesystem::kz_rust_open(
+            PATH.as_ptr().cast(),
+            O_CREAT | O_EXCL | O_RDWR,
+            0o600,
+        )
+    };
+    if file_descriptor < 0 {
+        return -1;
+    }
+
+    let mut value = [0u8; 16];
+    let mut names = [0u8; 32];
+    let mut flags = usize::MAX;
+    let mut status = MaybeUninit::<CStat>::uninit();
+    let mut success = unsafe {
+        super::filesystem::setxattr(
+            PATH.as_ptr().cast(),
+            XATTR_NAME.as_ptr().cast(),
+            INITIAL.as_ptr().cast(),
+            INITIAL.len(),
+            1,
+        ) == 0
+            && super::filesystem::getxattr(
+                PATH.as_ptr().cast(),
+                XATTR_NAME.as_ptr().cast(),
+                core::ptr::null_mut(),
+                0,
+            ) == INITIAL.len() as isize
+            && super::filesystem::fgetxattr(
+                file_descriptor,
+                XATTR_NAME.as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            ) == INITIAL.len() as isize
+            && value[..INITIAL.len()] == INITIAL[..]
+            && super::filesystem::listxattr(
+                PATH.as_ptr().cast(),
+                names.as_mut_ptr().cast(),
+                names.len(),
+            ) == XATTR_NAME.len() as isize
+            && names[..XATTR_NAME.len()] == XATTR_NAME[..]
+            && super::filesystem::flistxattr(file_descriptor, core::ptr::null_mut(), 0)
+                == XATTR_NAME.len() as isize
+            && super::filesystem::setxattr(
+                PATH.as_ptr().cast(),
+                XATTR_NAME.as_ptr().cast(),
+                REPLACEMENT.as_ptr().cast(),
+                REPLACEMENT.len(),
+                1,
+            ) == -1
+            && crate::kernel::scheduler::thread::__errno_location().read() == EEXIST
+            && super::filesystem::fsetxattr(
+                file_descriptor,
+                XATTR_NAME.as_ptr().cast(),
+                REPLACEMENT.as_ptr().cast(),
+                REPLACEMENT.len(),
+                2,
+            ) == 0
+            && super::filesystem::lgetxattr(
+                PATH.as_ptr().cast(),
+                XATTR_NAME.as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            ) == REPLACEMENT.len() as isize
+            && value[..REPLACEMENT.len()] == REPLACEMENT[..]
+            && super::filesystem::fremovexattr(file_descriptor, XATTR_NAME.as_ptr().cast()) == 0
+            && super::filesystem::getxattr(
+                PATH.as_ptr().cast(),
+                XATTR_NAME.as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            ) == -1
+            && crate::kernel::scheduler::thread::__errno_location().read() == ENODATA
+            && super::filesystem::write(file_descriptor, b"start".as_ptr().cast(), 5) == 5
+            && ioctl(
+                file_descriptor,
+                super::filesystem::FS_IOC_GETFLAGS,
+                core::ptr::addr_of_mut!(flags),
+            ) == 0
+            && flags == 0
+            && {
+                flags = IMMUTABLE;
+                ioctl(
+                    file_descriptor,
+                    super::filesystem::FS_IOC_SETFLAGS,
+                    core::ptr::addr_of_mut!(flags),
+                ) == 0
+            }
+            && ioctl(
+                file_descriptor,
+                super::filesystem::FS_IOC_GETFLAGS,
+                core::ptr::addr_of_mut!(flags),
+            ) == 0
+            && flags == IMMUTABLE
+            && super::filesystem::write(file_descriptor, APPENDED.as_ptr().cast(), 1) == -1
+            && crate::kernel::scheduler::thread::__errno_location().read() == EPERM
+            && super::filesystem::setxattr(
+                PATH.as_ptr().cast(),
+                XATTR_NAME.as_ptr().cast(),
+                INITIAL.as_ptr().cast(),
+                INITIAL.len(),
+                0,
+            ) == -1
+            && crate::kernel::scheduler::thread::__errno_location().read() == EPERM
+            && {
+                flags = APPEND;
+                ioctl(
+                    file_descriptor,
+                    super::filesystem::FS_IOC_SETFLAGS,
+                    core::ptr::addr_of_mut!(flags),
+                ) == 0
+            }
+            && super::filesystem::lseek(file_descriptor, 0, SEEK_SET) == 0
+            && super::filesystem::write(file_descriptor, APPENDED.as_ptr().cast(), 1) == 1
+            && super::filesystem::fstat64(file_descriptor, status.as_mut_ptr().cast()) == 0
+            && status.assume_init_ref().size == 6
+    };
+    success &= unsafe {
+        flags = 0;
+        ioctl(
+            file_descriptor,
+            super::filesystem::FS_IOC_SETFLAGS,
+            core::ptr::addr_of_mut!(flags),
+        ) == 0
+    };
+    let close_result = super::filesystem::close(file_descriptor);
+    let unlink_result = unsafe { super::filesystem::unlink(PATH.as_ptr().cast()) };
+    if success && close_result == 0 && unlink_result == 0 {
+        0
+    } else {
+        -1
+    }
 }

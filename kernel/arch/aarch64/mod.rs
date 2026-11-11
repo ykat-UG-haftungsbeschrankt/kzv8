@@ -463,6 +463,62 @@ impl crate::kernel::arch::traits::VirtualizationArchitecture for super::Virtuali
         }
     }
 
+    fn guest_memory_region(context: &Self::GuestContext) -> Option<(usize, usize)> {
+        #[cfg(feature = "aarch64-stage2")]
+        {
+            Some(context.guest_memory_region())
+        }
+        #[cfg(not(feature = "aarch64-stage2"))]
+        {
+            let _ = context;
+            None
+        }
+    }
+
+    fn map_guest_mmio(
+        context: &mut Self::GuestContext,
+        guest_address: u64,
+        host_address: u64,
+        length: usize,
+    ) -> Result<(), super::VirtualizationError> {
+        #[cfg(feature = "aarch64-stage2")]
+        {
+            context.map_guest_mmio(guest_address, host_address, length)
+        }
+        #[cfg(not(feature = "aarch64-stage2"))]
+        {
+            let _ = (context, guest_address, host_address, length);
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    fn write_guest_memory(
+        context: &mut Self::GuestContext,
+        guest_address: u64,
+        bytes: &[u8],
+    ) -> Result<(), super::VirtualizationError> {
+        #[cfg(feature = "aarch64-stage2")]
+        {
+            context.write_guest_memory(guest_address, bytes)
+        }
+        #[cfg(not(feature = "aarch64-stage2"))]
+        {
+            let _ = (context, guest_address, bytes);
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    fn retain_guest_memory(context: &mut Self::GuestContext) {
+        #[cfg(feature = "aarch64-stage2")]
+        {
+            context.retain_guest_memory();
+        }
+        #[cfg(not(feature = "aarch64-stage2"))]
+        {
+            let _ = context;
+        }
+    }
+
     unsafe fn restore_guest_context(
         context: &mut Self::GuestContext,
     ) -> Result<super::VirtualMachineExit, super::VirtualizationError> {

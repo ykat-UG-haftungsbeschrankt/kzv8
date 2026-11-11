@@ -9,8 +9,8 @@ use core::ffi::c_void;
 use core::slice;
 
 use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
-use crate::kernel::block::device::BlockDevice;
-use crate::kernel::block::request::Request;
+use crate::kernel::block::service::BlockClient;
+use crate::kernel::error::Error;
 use crate::kernel::event::r#loop::{
     Completion, EventFlags, EventLoop, EventSourceId, EventSourceToken, RawEvent,
 };
@@ -232,8 +232,6 @@ pub unsafe extern "C" fn kz_host_event_loop_next_deadline(
 }
 
 const MAX_BLOCK_TRANSFER_SIZE: usize = 64 * 1024;
-const BLOCK_TRANSFER_SPINS: usize = 10_000_000;
-const BLOCK_TRANSFER_TIMEOUT_NS: u64 = 5_000_000_000;
 const MAX_TCP_TRANSFER_SIZE: usize = 4096;
 const TCP_TIMEOUT_NS: u64 = 5_000_000_000;
 const TCP_SPINS: usize = 10_000_000;
@@ -243,7 +241,7 @@ pub unsafe extern "C" fn kz_host_block_capacity(device: *mut c_void) -> u64 {
     if device.is_null() {
         return 0;
     }
-    unsafe { &*device.cast::<BlockDevice>() }.capacity_sectors()
+    unsafe { &*device.cast::<BlockClient>() }.capacity_sectors()
 }
 
 #[no_mangle]
@@ -257,25 +255,10 @@ pub unsafe extern "C" fn kz_host_block_read(
         return -1;
     }
     let output = unsafe { slice::from_raw_parts_mut(output, length) };
-    let request = Request::read(sector, output);
-    let mut transfer = match unsafe { &mut *device.cast::<BlockDevice>() }.submit(request) {
-        Ok(transfer) => transfer,
-        Err(_) => return -2,
-    };
-    let started = host_time_ns();
-    for _ in 0..BLOCK_TRANSFER_SPINS {
-        match transfer.poll() {
-            Ok(true) => return length as i32,
-            Ok(false) => {
-                if host_time_ns().saturating_sub(started) >= BLOCK_TRANSFER_TIMEOUT_NS {
-                    return -4;
-                }
-                crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
-            }
-            Err(_) => return -3,
-        }
+    match unsafe { &*device.cast::<BlockClient>() }.read(sector, output) {
+        Ok(()) => length as i32,
+        Err(error) => block_error_code(error),
     }
-    -4
 }
 
 #[no_mangle]
@@ -289,25 +272,19 @@ pub unsafe extern "C" fn kz_host_block_write(
         return -1;
     }
     let input = unsafe { slice::from_raw_parts(input, length) };
-    let request = Request::write(sector, input);
-    let mut transfer = match unsafe { &mut *device.cast::<BlockDevice>() }.submit(request) {
-        Ok(transfer) => transfer,
-        Err(_) => return -2,
-    };
-    let started = host_time_ns();
-    for _ in 0..BLOCK_TRANSFER_SPINS {
-        match transfer.poll() {
-            Ok(true) => return length as i32,
-            Ok(false) => {
-                if host_time_ns().saturating_sub(started) >= BLOCK_TRANSFER_TIMEOUT_NS {
-                    return -4;
-                }
-                crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
-            }
-            Err(_) => return -3,
-        }
+    match unsafe { &*device.cast::<BlockClient>() }.write(sector, input) {
+        Ok(()) => length as i32,
+        Err(error) => block_error_code(error),
     }
-    -4
+}
+
+fn block_error_code(error: Error) -> i32 {
+    match error {
+        Error::Inval | Error::Fault | Error::MsgSize => -1,
+        Error::NoMem | Error::Busy | Error::Mfile => -2,
+        Error::TimedOut => -4,
+        _ => -3,
+    }
 }
 
 fn host_time_ns() -> u64 {

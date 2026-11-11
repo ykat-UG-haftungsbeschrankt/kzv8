@@ -13,13 +13,6 @@ use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
-#[repr(C)]
-struct RequestHeader {
-    request_type: u32,
-    reserved: u32,
-    sector: u64,
-}
-
 pub(crate) struct BlockDevice {
     transport: VirtioTransport,
     capacity_sectors: u64,
@@ -34,8 +27,6 @@ struct BlockState {
 }
 
 struct BlockRequest {
-    header: RequestHeader,
-    status: u8,
     dma_buffer: DmaBuffer,
     head: Option<u16>,
     used_length: Option<u32>,
@@ -47,6 +38,9 @@ impl BlockDevice {
     const QUEUE_SIZE: usize = 8;
     const SECTOR_SIZE: usize = 512;
     const MAX_TRANSFER_SIZE: usize = 64 * 1024;
+    const HEADER_SIZE: usize = 16;
+    const STATUS_OFFSET: usize = Self::HEADER_SIZE;
+    const DATA_OFFSET: usize = 32;
 
     pub(crate) fn initialize() -> Option<Self> {
         let candidate = VirtioTransport::find(Self::DEVICE_ID)?;
@@ -65,13 +59,10 @@ impl BlockDevice {
         free_requests.try_reserve_exact(request_count).ok()?;
         for request_index in 0..request_count {
             requests.push(BlockRequest {
-                header: RequestHeader {
-                    request_type: 0,
-                    reserved: 0,
-                    sector: 0,
-                },
-                status: 0xff,
-                dma_buffer: DmaArena::allocate(Self::MAX_TRANSFER_SIZE, 16)?,
+                dma_buffer: DmaArena::allocate(
+                    Self::DATA_OFFSET + Self::MAX_TRANSFER_SIZE,
+                    16,
+                )?,
                 head: None,
                 used_length: None,
                 abandoned: false,
@@ -139,27 +130,27 @@ impl BlockDevice {
             return Err(Error::Busy);
         };
         let request = &mut state.requests[request_index];
+        let bus_address = request.dma_buffer.bus_address();
+        let buffer = request.dma_buffer.as_mut_slice();
+        buffer[..4].copy_from_slice(&request_type.to_le_bytes());
+        buffer[4..8].fill(0);
+        buffer[8..Self::HEADER_SIZE].copy_from_slice(&sector.to_le_bytes());
+        buffer[Self::STATUS_OFFSET] = 0xff;
         if let Some(input) = input {
-            request.dma_buffer.as_mut_slice()[..length].copy_from_slice(input);
+            buffer[Self::DATA_OFFSET..Self::DATA_OFFSET + length].copy_from_slice(input);
         }
-        request.header = RequestHeader {
-            request_type,
-            reserved: 0,
-            sector,
-        };
-        request.status = 0xff;
         let descriptors = [
             Descriptor::new(
-                &request.header as *const _ as u64,
-                core::mem::size_of::<RequestHeader>() as u32,
+                bus_address,
+                Self::HEADER_SIZE as u32,
                 false,
             ),
             Descriptor::new(
-                request.dma_buffer.bus_address(),
+                bus_address + Self::DATA_OFFSET as u64,
                 length as u32,
                 request_type == 0,
             ),
-            Descriptor::new(&mut request.status as *mut u8 as u64, 1, true),
+            Descriptor::new(bus_address + Self::STATUS_OFFSET as u64, 1, true),
         ];
         let Some(head) = state.queue.submit(&descriptors) else {
             state.free_requests.push(request_index);
@@ -252,10 +243,13 @@ impl BlockTransfer<'_> {
             self.complete = true;
             request.head = None;
             request.abandoned = false;
-            match request.status {
+            let status = request.dma_buffer.as_mut_slice()[BlockDevice::STATUS_OFFSET];
+            match status {
                 0 if used_length >= 1 => {
                     if let Some(output) = self.output.as_mut() {
-                        let source = &request.dma_buffer.as_mut_slice()[..self.length];
+                        let source = &request.dma_buffer.as_mut_slice()[
+                            BlockDevice::DATA_OFFSET..BlockDevice::DATA_OFFSET + self.length
+                        ];
                         (**output).copy_from_slice(source);
                     }
                     Ok(())

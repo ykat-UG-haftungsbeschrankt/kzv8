@@ -14,6 +14,8 @@ use crate::kernel::arch::{
     GuestRegisters, MemoryArchitecture, VirtualMachineExit, VirtualMachineExitReason,
     VirtualizationError,
 };
+use crate::kernel::vm::device::virtio::GuestVirtioDevices;
+use crate::kernel::vm::device::GuestMemory;
 use super::FpuContext;
 use crate::kernel::memory::physical::PhysicalAllocator;
 
@@ -21,9 +23,10 @@ const PAGE_SIZE: usize = 4096;
 const GUEST_MEMORY_SIZE: usize = 2 * 1024 * 1024;
 const GUEST_ENTRY: usize = 0x1_0000;
 const GUEST_STACK: u64 = GUEST_MEMORY_SIZE as u64;
+const GUEST_DEVICE_APERTURE: u64 = GUEST_MEMORY_SIZE as u64;
 const GUEST_GDT: usize = 0x4000;
 const GUEST_TSS: usize = 0x5000;
-const VMX_CONTROL_PAGES: usize = 9;
+const VMX_CONTROL_PAGES: usize = 10;
 const EPT_PML4_OFFSET: usize = 0;
 const EPT_PDPT_OFFSET: usize = PAGE_SIZE;
 const EPT_PD_OFFSET: usize = 2 * PAGE_SIZE;
@@ -33,6 +36,7 @@ const VMCS_OFFSET: usize = 5 * PAGE_SIZE;
 const ENTRY_MSR_LIST_OFFSET: usize = 6 * PAGE_SIZE;
 const EXIT_STORE_MSR_LIST_OFFSET: usize = 7 * PAGE_SIZE;
 const EXIT_LOAD_MSR_LIST_OFFSET: usize = 8 * PAGE_SIZE;
+const EPT_DEVICE_PT_OFFSET: usize = 9 * PAGE_SIZE;
 
 const IA32_FEATURE_CONTROL: u32 = 0x3a;
 const IA32_VMX_BASIC: u32 = 0x480;
@@ -208,6 +212,7 @@ struct VmxControls {
 struct PhysicalRun {
     address: usize,
     length: usize,
+    retained: bool,
 }
 
 impl PhysicalRun {
@@ -228,7 +233,11 @@ impl PhysicalRun {
             let _released = PhysicalAllocator::deallocate_contiguous(address, length);
             return Err(VirtualizationError::Unsupported);
         }
-        Ok(Self { address, length })
+        Ok(Self {
+            address,
+            length,
+            retained: false,
+        })
     }
 
     fn pointer(&self) -> *mut u8 {
@@ -243,11 +252,17 @@ impl PhysicalRun {
         // SAFETY: the allocator returned writable RAM fully covered by the identity map.
         unsafe { write_bytes(self.pointer(), 0, self.length) };
     }
+
+    fn retain(&mut self) {
+        self.retained = true;
+    }
 }
 
 impl Drop for PhysicalRun {
     fn drop(&mut self) {
-        let _released = PhysicalAllocator::deallocate_contiguous(self.address, self.length);
+        if !self.retained {
+            let _released = PhysicalAllocator::deallocate_contiguous(self.address, self.length);
+        }
     }
 }
 
@@ -615,11 +630,12 @@ unsafe extern "C" {
 
 pub(crate) struct GuestContext {
     controls: VmxControls,
-    _guest_memory: PhysicalRun,
+    guest_memory: PhysicalRun,
     control_memory: PhysicalRun,
     owner_apic_id: u32,
     registers: GuestRegisters,
     fpu_context: FpuContext,
+    devices: GuestVirtioDevices,
     launched: bool,
 }
 
@@ -645,13 +661,75 @@ impl GuestContext {
 
         Ok(Self {
             controls,
-            _guest_memory: guest_memory,
+            guest_memory,
             control_memory,
             owner_apic_id: super::interrupts::current_apic_id(),
             registers: GuestRegisters::default(),
             fpu_context: FpuContext::INITIAL,
+            devices: GuestVirtioDevices::new()?,
             launched: false,
         })
+    }
+
+    pub(crate) fn guest_memory_region(&self) -> (usize, usize) {
+        (self.guest_memory.address, self.guest_memory.length)
+    }
+
+    pub(crate) fn retain_guest_memory(&mut self) {
+        self.guest_memory.retain();
+    }
+
+    pub(crate) fn write_guest_memory(
+        &mut self,
+        guest_address: u64,
+        bytes: &[u8],
+    ) -> Result<(), VirtualizationError> {
+        let start = usize::try_from(guest_address).map_err(|_| VirtualizationError::Unsupported)?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or(VirtualizationError::Unsupported)?;
+        if end > self.guest_memory.length {
+            return Err(VirtualizationError::Unsupported);
+        }
+        // SAFETY: the checked range is in this context's exclusive guest-memory allocation.
+        unsafe {
+            copy_nonoverlapping(bytes.as_ptr(), self.guest_memory.pointer_at(start), bytes.len());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map_guest_mmio(
+        &mut self,
+        guest_address: u64,
+        host_address: u64,
+        length: usize,
+    ) -> Result<(), VirtualizationError> {
+        if guest_address != GUEST_DEVICE_APERTURE
+            || length == 0
+            || length > GUEST_MEMORY_SIZE
+            || length % PAGE_SIZE != 0
+            || host_address as usize % PAGE_SIZE != 0
+            || host_address
+                .checked_add(length as u64)
+                .is_none_or(|end| end > self.controls.physical_address_limit)
+        {
+            return Err(VirtualizationError::Unsupported);
+        }
+        let page_table = self.control_memory.pointer_at(EPT_DEVICE_PT_OFFSET).cast::<u64>();
+        // SAFETY: the requested length is page-bounded within the owned EPT leaf table.
+        for page in 0..length / PAGE_SIZE {
+            let entry = unsafe { page_table.add(page) };
+            if unsafe { core::ptr::read_volatile(entry) } != 0 {
+                return Err(VirtualizationError::Unsupported);
+            }
+        }
+        for page in 0..length / PAGE_SIZE {
+            let entry = unsafe { page_table.add(page) };
+            let physical = host_address + (page * PAGE_SIZE) as u64;
+            // SAFETY: the vCPU is stopped and the EPT leaf lies in its owned page-table run.
+            unsafe { write_volatile(entry, physical | 0x3) };
+        }
+        Ok(())
     }
 
     /// Resume this vCPU until a VM exit should be returned to its scheduler thread.
@@ -711,6 +789,12 @@ impl GuestContext {
                     };
                     Some(Some(next_rip))
                 }
+                VirtualMachineExitReason::EptViolation => {
+                    let Some(next_rip) = self.emulate_guest_mmio(&exit) else {
+                        return Ok(exit);
+                    };
+                    Some(Some(next_rip))
+                }
                 VirtualMachineExitReason::PreemptionTimer => return Ok(exit),
                 VirtualMachineExitReason::Vmcall => {
                     if exit.instruction_length == 0 {
@@ -762,6 +846,305 @@ impl GuestContext {
         session.start(&vmxon_operand, &vmcs_operand, ept_pointer, clear_vmcs)?;
         Ok(session)
     }
+
+    fn emulate_guest_mmio(&mut self, exit: &VirtualMachineExit) -> Option<u64> {
+        let address = exit.guest_physical_address?;
+        if !GuestVirtioDevices::contains(address) {
+            return None;
+        }
+        let access = exit.qualification & 0x7;
+        if access != 1 && access != 2 {
+            return None;
+        }
+        let instruction_address = usize::try_from(exit.guest_rip).ok()?;
+        let instruction_length = GUEST_MEMORY_SIZE.checked_sub(instruction_address)?.min(15);
+        if instruction_length == 0 {
+            return None;
+        }
+        // SAFETY: the stopped guest owns this allocated 2 MiB run; the checked slice stays in it.
+        let instruction = unsafe {
+            core::slice::from_raw_parts(
+                self.guest_memory.pointer_at(instruction_address),
+                instruction_length,
+            )
+        };
+        let decoded = decode_mmio_mov(instruction)?;
+        if decoded.write != (access == 2) {
+            return None;
+        }
+        let value = if decoded.write {
+            if let Some(immediate) = decoded.immediate {
+                immediate
+            } else {
+            read_guest_register(
+                &self.registers,
+                decoded.register,
+                decoded.width,
+                decoded.high_byte,
+            )?
+            }
+        } else {
+            0
+        };
+        // SAFETY: the vCPU is stopped at this VM exit and exclusively owns its guest memory.
+        let guest_bytes = unsafe {
+            core::slice::from_raw_parts_mut(self.guest_memory.pointer(), GUEST_MEMORY_SIZE)
+        };
+        let mut memory = GuestMemory::new(guest_bytes);
+        let value = self.devices.access(
+            &mut memory,
+            address,
+            decoded.width as u8,
+            decoded.write,
+            value,
+        )?;
+        if !decoded.write {
+            write_guest_register(
+                &mut self.registers,
+                decoded.register,
+                decoded.register_width,
+                decoded.high_byte,
+                value,
+            )?;
+        }
+        exit.guest_rip.checked_add(decoded.length as u64)
+    }
+}
+
+struct DecodedMmioMov {
+    length: usize,
+    register: usize,
+    width: usize,
+    register_width: usize,
+    high_byte: bool,
+    immediate: Option<u64>,
+    write: bool,
+}
+
+fn decode_mmio_mov(instruction: &[u8]) -> Option<DecodedMmioMov> {
+    let mut cursor = 0;
+    let mut operand_override = false;
+    let mut rex = 0;
+    while let Some(prefix) = instruction.get(cursor).copied() {
+        match prefix {
+            0x66 => operand_override = true,
+            0x67 | 0xf0 | 0xf2 | 0xf3 | 0x2e | 0x36 | 0x3e | 0x26 | 0x64 | 0x65 => {}
+            0x40..=0x4f => rex = prefix,
+            _ => break,
+        }
+        cursor += 1;
+        if cursor >= 15 {
+            return None;
+        }
+    }
+    let opcode = *instruction.get(cursor)?;
+    cursor += 1;
+    let mut zero_extend = false;
+    let mut immediate_store = false;
+    let opcode = if opcode == 0x0f {
+        zero_extend = true;
+        let second = *instruction.get(cursor)?;
+        cursor += 1;
+        if !matches!(second, 0xb6 | 0xb7) {
+            return None;
+        }
+        second
+    } else if matches!(opcode, 0xc6 | 0xc7) {
+        immediate_store = true;
+        opcode
+    } else {
+        opcode
+    };
+    if !zero_extend && !immediate_store && !matches!(opcode, 0x88 | 0x89 | 0x8a | 0x8b) {
+        return None;
+    }
+    let modrm = *instruction.get(cursor)?;
+    cursor += 1;
+    let mode = modrm >> 6;
+    if mode == 3 {
+        return None;
+    }
+    let register_field = usize::from((modrm >> 3) & 7);
+    if immediate_store && register_field != 0 {
+        return None;
+    }
+    let register_extension = if rex & 4 != 0 { 8 } else { 0 };
+    let byte_width = matches!(opcode, 0x88 | 0x8a | 0xb6 | 0xc6);
+    let high_byte = !zero_extend && byte_width && rex == 0 && (4..=7).contains(&register_field);
+    let register = if high_byte {
+        register_field - 4
+    } else {
+        register_field | register_extension
+    };
+    let base = modrm & 7;
+    if mode != 3 && base == 4 {
+        let sib = *instruction.get(cursor)?;
+        cursor += 1;
+        if mode == 0 && sib & 7 == 5 {
+            cursor = cursor.checked_add(4)?;
+        }
+    } else if mode == 0 && base == 5 {
+        cursor = cursor.checked_add(4)?;
+    }
+    if mode == 1 {
+        cursor = cursor.checked_add(1)?;
+    } else if mode == 2 {
+        cursor = cursor.checked_add(4)?;
+    }
+    let immediate = if immediate_store {
+        let immediate_width = if byte_width {
+            1
+        } else if operand_override {
+            2
+        } else {
+            4
+        };
+        let immediate_bytes = instruction.get(cursor..cursor.checked_add(immediate_width)?)?;
+        cursor += immediate_width;
+        let mut bytes = [0; 8];
+        bytes[..immediate_width].copy_from_slice(immediate_bytes);
+        Some(u64::from_le_bytes(bytes))
+    } else {
+        None
+    };
+    if cursor > instruction.len() || cursor > 15 {
+        return None;
+    }
+    Some(DecodedMmioMov {
+        length: cursor,
+        register,
+        width: if byte_width {
+            1
+        } else if zero_extend {
+            2
+        } else if rex & 8 != 0 {
+            8
+        } else if operand_override {
+            2
+        } else {
+            4
+        },
+        register_width: if immediate_store {
+            0
+        } else if zero_extend {
+            if rex & 8 != 0 {
+                8
+            } else if operand_override {
+                2
+            } else {
+                4
+            }
+        } else if rex & 8 != 0 {
+            8
+        } else if operand_override {
+            2
+        } else {
+            4
+        },
+        high_byte,
+        immediate,
+        write: immediate_store || (!zero_extend && matches!(opcode, 0x88 | 0x89)),
+    })
+}
+
+fn read_guest_register(
+    registers: &GuestRegisters,
+    index: usize,
+    width: usize,
+    high_byte: bool,
+) -> Option<u64> {
+    let value = match index {
+        0 => registers.rax,
+        1 => registers.rcx,
+        2 => registers.rdx,
+        3 => registers.rbx,
+        4 => vmread(VMCS_GUEST_RSP).ok()?,
+        5 => registers.rbp,
+        6 => registers.rsi,
+        7 => registers.rdi,
+        8 => registers.r8,
+        9 => registers.r9,
+        10 => registers.r10,
+        11 => registers.r11,
+        12 => registers.r12,
+        13 => registers.r13,
+        14 => registers.r14,
+        15 => registers.r15,
+        _ => return None,
+    };
+    if high_byte {
+        return Some((value >> 8) & 0xff);
+    }
+    Some(match width {
+        1 => value & 0xff,
+        2 => value & 0xffff,
+        4 => value & 0xffff_ffff,
+        8 => value,
+        _ => return None,
+    })
+}
+
+fn write_guest_register(
+    registers: &mut GuestRegisters,
+    index: usize,
+    width: usize,
+    high_byte: bool,
+    value: u64,
+) -> Option<()> {
+    let current = read_guest_register_full(registers, index)?;
+    let updated = if high_byte {
+        (current & !(0xff << 8)) | ((value & 0xff) << 8)
+    } else {
+        match width {
+            1 => (current & !0xff) | (value & 0xff),
+            2 => (current & !0xffff) | (value & 0xffff),
+            4 => value & 0xffff_ffff,
+            8 => value,
+            _ => return None,
+        }
+    };
+    match index {
+        0 => registers.rax = updated,
+        1 => registers.rcx = updated,
+        2 => registers.rdx = updated,
+        3 => registers.rbx = updated,
+        4 => return vmwrite(VMCS_GUEST_RSP, updated).then_some(()),
+        5 => registers.rbp = updated,
+        6 => registers.rsi = updated,
+        7 => registers.rdi = updated,
+        8 => registers.r8 = updated,
+        9 => registers.r9 = updated,
+        10 => registers.r10 = updated,
+        11 => registers.r11 = updated,
+        12 => registers.r12 = updated,
+        13 => registers.r13 = updated,
+        14 => registers.r14 = updated,
+        15 => registers.r15 = updated,
+        _ => return None,
+    }
+    Some(())
+}
+
+fn read_guest_register_full(registers: &GuestRegisters, index: usize) -> Option<u64> {
+    Some(match index {
+        0 => registers.rax,
+        1 => registers.rcx,
+        2 => registers.rdx,
+        3 => registers.rbx,
+        4 => vmread(VMCS_GUEST_RSP).ok()?,
+        5 => registers.rbp,
+        6 => registers.rsi,
+        7 => registers.rdi,
+        8 => registers.r8,
+        9 => registers.r9,
+        10 => registers.r10,
+        11 => registers.r11,
+        12 => registers.r12,
+        13 => registers.r13,
+        14 => registers.r14,
+        15 => registers.r15,
+        _ => return None,
+    })
 }
 
 /// # Safety
@@ -1060,6 +1443,20 @@ fn initialize_guest_memory(guest_memory: &PhysicalRun, image: &[u8]) {
             guest_memory.pointer_at(3 * PAGE_SIZE).cast::<u64>(),
             0x83,
         );
+        write_volatile(
+            guest_memory
+                .pointer_at(3 * PAGE_SIZE)
+                .cast::<u64>()
+                .add(1),
+            GUEST_MEMORY_SIZE as u64 | 0x83,
+        );
+        write_volatile(
+            guest_memory
+                .pointer_at(3 * PAGE_SIZE)
+                .cast::<u64>()
+                .add((VirtioConsole::MMIO_BASE as usize) / (2 * 1024 * 1024)),
+            VirtioConsole::MMIO_BASE | 0x83,
+        );
         let guest_gdt = guest_memory.pointer_at(GUEST_GDT).cast::<u64>();
         write_volatile(guest_gdt, 0);
         write_volatile(guest_gdt.add(1), 0x00af_9a00_0000_ffff);
@@ -1092,6 +1489,13 @@ fn initialize_control_memory(
         write_volatile(
             control_memory.pointer_at(EPT_PD_OFFSET).cast::<u64>(),
             guest_memory.address as u64 | 0xb7,
+        );
+        write_volatile(
+            control_memory
+                .pointer_at(EPT_PD_OFFSET)
+                .cast::<u64>()
+                .add(1),
+            (control_memory.address + EPT_DEVICE_PT_OFFSET) as u64 | 0x7,
         );
         write_bytes(
             control_memory.pointer_at(MSR_BITMAP_OFFSET),

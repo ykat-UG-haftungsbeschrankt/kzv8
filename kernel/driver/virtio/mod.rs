@@ -20,6 +20,7 @@ pub(crate) mod rtc;
 #[allow(dead_code)]
 pub(crate) mod scsi;
 pub(crate) mod serial;
+pub(crate) mod service;
 pub(crate) mod transport;
 #[allow(dead_code)]
 pub(crate) mod vga;

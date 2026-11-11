@@ -267,17 +267,40 @@ pub(crate) mod traits {
             image: &[u8],
         ) -> Result<Self::GuestContext, super::VirtualizationError>;
 
+        fn guest_memory_region(context: &Self::GuestContext) -> Option<(usize, usize)>;
+
+        fn map_guest_mmio(
+            context: &mut Self::GuestContext,
+            guest_address: u64,
+            host_address: u64,
+            length: usize,
+        ) -> Result<(), super::VirtualizationError>;
+
+        fn write_guest_memory(
+            context: &mut Self::GuestContext,
+            guest_address: u64,
+            bytes: &[u8],
+        ) -> Result<(), super::VirtualizationError>;
+
+        fn retain_guest_memory(context: &mut Self::GuestContext);
+
         /// # Safety
         /// Guest execution must be allowed by the caller; only trusted guest images may run.
         unsafe fn restore_guest_context(
             context: &mut Self::GuestContext,
         ) -> Result<super::VirtualMachineExit, super::VirtualizationError>;
 
-        /// Run a single-vCPU, 2 MiB, 64-bit raw image for at most 100 ms.
-        /// The image starts at guest physical address `0x10000`; GPRs start zeroed
-        /// and the stack page is `0x1ff000` with initial RSP `0x200000`.
-        /// CPUID, RDTSC, debugcon, and basic COM1 byte I/O are emulated.
-        /// Other exits are returned. Firmware, Linux boot support, and VirtIO devices are absent.
+        /// Run a single-vCPU, 2 MiB raw image for at most 100 ms.
+        /// The image starts at guest physical address `0x10000`; registers start zeroed
+        /// and the stack page is `0x1ff000` with initial stack pointer `0x200000`.
+        /// A polling VirtIO-MMIO console is available at guest physical address `0x10000000`.
+        /// A polling VirtIO RTC is available at `0x10001000` and exposes one monotonic clock.
+        /// Fixed MMIO devices at `0x10002000`..`0x10008000` are per-VM RAM block, peer-only Ethernet,
+        /// RAM SCSI, a read-only `/hello.txt` FUSE tree, serial-backed input, headless 2D GPU, and
+        /// balloon PFN tracking. The network has no host uplink, GPU has no display sink, and balloon
+        /// does not reclaim host pages.
+        /// An assigned PCI BAR is exposed at `0x200000`; its `KZPC` v1 descriptor is at `0x6000`.
+        /// PCI discovery, interrupt injection, and firmware are absent; assigned devices poll.
         ///
         /// # Safety
         /// The image executes with guest ring-0 privileges. Only trusted images may be run.

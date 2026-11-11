@@ -1,4 +1,5 @@
 When working on files under `runtime/`, do not modify files under `kernel/`. If a runtime task appears to require a kernel change, explain why and ask for approval before editing `kernel/`.
+For POSIX interfaces under `runtime/bridge/posix`, do not remove or change existing functions or constants, including function names and signatures or constant names and values. Change an existing POSIX function only by updating its body, and only when required to accommodate a kernel change; preserve its POSIX-facing semantics.
 
 ## Copyright Headers
 - Add the following notice to every new or modified first-party text source file. Preserve its wording and use the file's native comment syntax.
@@ -17,6 +18,7 @@ When working on files under `runtime/`, do not modify files under `kernel/`. If 
 
 ## Kernel Errors
 - Define all kernel error codes in `kernel/error.rs`; do not define kernel error codes elsewhere.
+- Kernel Functions that report errors must return an appropriate code from `kernel/error.rs`; do not introduce module-local error enums or numeric error codes.
 
 ## Application TypeScript
 - Use TypeScript for application source files under `app/`; do not add JavaScript source files there.

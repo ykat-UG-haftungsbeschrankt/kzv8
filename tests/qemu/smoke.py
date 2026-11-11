@@ -182,9 +182,11 @@ def serve_echo_once(listener, state):
 
 
 def check(architecture):
+    temporary_directory = tempfile.TemporaryDirectory()
+    serial_log = Path(temporary_directory.name) / "early-serial.log"
     common = [
         "-accel", "tcg", "-smp", "2" if architecture == "x86_64" else "1",
-        "-display", "none", "-serial", "none", "-monitor", "none",
+        "-display", "none", "-serial", f"file:{serial_log}", "-monitor", "none",
         "-no-reboot", "-global", "virtio-mmio.force-legacy=false",
         "-device", "virtio-serial-device",
         "-chardev", "stdio,id=console,signal=off",
@@ -199,12 +201,10 @@ def check(architecture):
                    "-cpu", "cortex-a72", "-m", "2G",
                    "-kernel", "build/aarch64/kernel.bin"]
     device_args = []
-    temporary_directory = None
     echo_listener = None
     echo_thread = None
     echo_state = {"accepted": False, "received": None, "error": None}
     if architecture == "x86_64":
-        temporary_directory = tempfile.TemporaryDirectory()
         disk_path = Path(temporary_directory.name) / "smoke.raw"
         app_dist = Path("app/dist")
         create_fat16_image(disk_path, [
@@ -245,17 +245,22 @@ def check(architecture):
             echo_listener.close()
         if echo_thread is not None:
             echo_thread.join(timeout=1)
-        if temporary_directory is not None:
-            temporary_directory.cleanup()
+        serial_output = serial_log.read_bytes() if serial_log.exists() else b""
+        temporary_directory.cleanup()
+    output = serial_output + output
     expected = ""
+    line_ending = "\n" if architecture == "x86_64" else "\r\n"
+    expected += f"kz: kernel startup{line_ending}"
+    expected += f"kz: {architecture} Rust kernel booted{line_ending}"
     if architecture == "x86_64":
         expected += "kz: first lazy page fault resolved\n"
-    expected += f"kz: {architecture} Rust kernel booted\n"
-    expected += "kz: virtio-console transmit OK\n"
-    expected += "kz: kernel thread smoke OK\n"
-    expected += "kz: user VM smoke OK\n"
+    expected += f"kz: kernel thread smoke OK{line_ending}"
+    expected += f"kz: user VM smoke OK{line_ending}"
+    expected += f"kz: IPC smoke OK{line_ending}"
     if architecture == "x86_64":
-        expected += "kz: smp secondary cpus online\n"
+        expected += f"kz: block IPC smoke OK{line_ending}"
+        expected += f"kz: smp secondary cpus online{line_ending}"
+    expected += "kz: virtio-console transmit OK\n"
     expected += "kz: virtio balloon ready\n"
     expected += "kz: RAM above 128 MiB detected\n"
     expected += "kz: C stdio printf 42 hello 0x2a\n"
@@ -263,6 +268,7 @@ def check(architecture):
     expected += "!\n"
     expected += "kz: mmap smoke OK\n"
     expected += "kz: malloc/free smoke OK\n"
+    expected += "kz: VFS xattr and inode flags smoke OK\n"
     if architecture == "x86_64":
         expected += "kz: RAM above 4 GiB mapped\n"
     expected += "kz: pthreads smoke OK\n"
@@ -302,7 +308,7 @@ def check(architecture):
             "kz: virtio device_id=1 type=network",
         ])
     actual_devices = [
-        line.decode().rstrip("\n")
+        line.decode().rstrip("\r\n")
         for line in output.splitlines(keepends=True)
         if line.startswith(b"kz: virtio device_id=")
     ]

@@ -141,7 +141,17 @@ pub(crate) fn read_mmio_u32(physical_address: usize) -> Option<u32> {
     })
 }
 
-fn with_uncached_mmio<T>(physical_address: usize, read: impl FnOnce(*const u8) -> T) -> Option<T> {
+pub(crate) fn write_mmio_u32(physical_address: usize, value: u32) -> Option<()> {
+    if physical_address % core::mem::size_of::<u32>() != 0 {
+        return None;
+    }
+    with_uncached_mmio(physical_address, |address| unsafe {
+        // SAFETY: with_uncached_mmio validates and uncaches this aligned MMIO register.
+        write_volatile(address.cast_mut().cast::<u32>(), value);
+    })
+}
+
+fn with_uncached_mmio<T>(physical_address: usize, access: impl FnOnce(*const u8) -> T) -> Option<T> {
     let page_address = physical_address & !(PAGE_SIZE - 1);
     let page_end = page_address.checked_add(PAGE_SIZE)?;
     let physical_limit = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::physical_address_limit() as usize;
@@ -179,7 +189,7 @@ fn with_uncached_mmio<T>(physical_address: usize, read: impl FnOnce(*const u8) -
             options(nostack, preserves_flags),
         );
     }
-    let value = read(physical_address as *const u8);
+    let value = access(physical_address as *const u8);
     unsafe {
         write_volatile(entry, original);
         core::arch::asm!(
@@ -197,6 +207,16 @@ pub(crate) fn read_mmio_u64(physical_address: usize) -> Option<u64> {
     }
     with_uncached_mmio(physical_address, |address| unsafe {
         read_volatile(address.cast::<u64>())
+    })
+}
+
+pub(crate) fn write_mmio_u64(physical_address: usize, value: u64) -> Option<()> {
+    if physical_address % core::mem::size_of::<u64>() != 0 {
+        return None;
+    }
+    with_uncached_mmio(physical_address, |address| unsafe {
+        // SAFETY: with_uncached_mmio validates and uncaches this aligned MMIO register.
+        write_volatile(address.cast_mut().cast::<u64>(), value);
     })
 }
 

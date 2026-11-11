@@ -4,6 +4,7 @@
     "module": "ESNext",
     "moduleDetection": "legacy",
     "strict": true,
+    "types": [],
     "noEmitOnError": true,
     "forceConsistentCasingInFileNames": true,
     "rootDir": ".",

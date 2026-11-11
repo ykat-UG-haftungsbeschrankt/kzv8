@@ -19,7 +19,7 @@ mod ram_map;
 mod segments;
 mod syscall;
 #[cfg(feature = "intel-vtd")]
-mod vtd;
+pub(crate) mod vtd;
 #[cfg(feature = "intel-vtx")]
 mod vmx;
 #[cfg(feature = "amd-v")]
@@ -438,6 +438,62 @@ impl crate::kernel::arch::traits::VirtualizationArchitecture for super::Virtuali
         {
             let _ = image;
             Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    fn guest_memory_region(context: &Self::GuestContext) -> Option<(usize, usize)> {
+        #[cfg(feature = "intel-vtx")]
+        {
+            Some(context.guest_memory_region())
+        }
+        #[cfg(not(feature = "intel-vtx"))]
+        {
+            let _ = context;
+            None
+        }
+    }
+
+    fn map_guest_mmio(
+        context: &mut Self::GuestContext,
+        guest_address: u64,
+        host_address: u64,
+        length: usize,
+    ) -> Result<(), super::VirtualizationError> {
+        #[cfg(feature = "intel-vtx")]
+        {
+            context.map_guest_mmio(guest_address, host_address, length)
+        }
+        #[cfg(not(feature = "intel-vtx"))]
+        {
+            let _ = (context, guest_address, host_address, length);
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    fn write_guest_memory(
+        context: &mut Self::GuestContext,
+        guest_address: u64,
+        bytes: &[u8],
+    ) -> Result<(), super::VirtualizationError> {
+        #[cfg(feature = "intel-vtx")]
+        {
+            context.write_guest_memory(guest_address, bytes)
+        }
+        #[cfg(not(feature = "intel-vtx"))]
+        {
+            let _ = (context, guest_address, bytes);
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
+    fn retain_guest_memory(context: &mut Self::GuestContext) {
+        #[cfg(feature = "intel-vtx")]
+        {
+            context.retain_guest_memory();
+        }
+        #[cfg(not(feature = "intel-vtx"))]
+        {
+            let _ = context;
         }
     }
 

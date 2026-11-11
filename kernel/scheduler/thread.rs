@@ -6,6 +6,7 @@
  */
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr::{addr_of_mut, NonNull};
@@ -17,6 +18,7 @@ use crate::kernel::arch::traits::{
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
+use crate::kernel::process::Process;
 
 use super::sync::IrqSpinLock;
 
@@ -102,6 +104,7 @@ impl ExecutionContext {
 pub(crate) struct Thread {
     // Thread IDs intentionally use the stable address of the Thread inside its Box.
     pub(crate) id: usize,
+    process: Arc<Process>,
     pub(crate) context: ExecutionContext,
     pub(crate) state: ThreadState,
     pub(crate) start_routine: Option<StartRoutine>,
@@ -117,9 +120,10 @@ pub(crate) struct Thread {
 }
 
 impl Thread {
-    fn main(stack_address: usize, stack_size: usize) -> Self {
+    fn main(stack_address: usize, stack_size: usize, process: Arc<Process>) -> Self {
         Self {
             id: 0,
+            process,
             context: ExecutionContext::Kernel(kernel::Context::main()),
             state: ThreadState::Running,
             start_routine: None,
@@ -138,12 +142,14 @@ impl Thread {
     fn new(
         stack: ThreadStack,
         context: kernel::Context,
+        process: Arc<Process>,
         start_routine: StartRoutine,
         argument: *mut c_void,
         detached: bool,
     ) -> Self {
         Self {
             id: 0,
+            process,
             context: ExecutionContext::Kernel(context),
             state: ThreadState::Ready,
             start_routine: Some(start_routine),
@@ -162,10 +168,12 @@ impl Thread {
     fn new_userspace(
         stack: ThreadStack,
         context: userspace::Context,
+        process: Arc<Process>,
         detached: bool,
     ) -> Self {
         Self {
             id: 0,
+            process,
             context: ExecutionContext::Userspace(context),
             state: ThreadState::Ready,
             start_routine: None,
@@ -182,9 +190,15 @@ impl Thread {
     }
 
     #[cfg(feature = "virtualization")]
-    fn new_vm(stack: ThreadStack, context: vm::VcpuContext, detached: bool) -> Self {
+    fn new_vm(
+        stack: ThreadStack,
+        context: vm::VcpuContext,
+        process: Arc<Process>,
+        detached: bool,
+    ) -> Self {
         Self {
             id: 0,
+            process,
             context: ExecutionContext::Vm(context),
             state: ThreadState::Ready,
             start_routine: None,
@@ -333,6 +347,9 @@ impl ThreadManager {
     }
 
     pub(crate) fn initialize() -> bool {
+        let Ok(process) = Process::new() else {
+            return false;
+        };
         let (stack_address, stack_size) =
             crate::kernel::arch::ThreadArchitecture::current_thread_stack_bounds(
                 ThreadStack::DEFAULT_SIZE,
@@ -340,6 +357,7 @@ impl ThreadManager {
         let mut main_thread = Box::new(ListNode::new(Thread::main(
             stack_address as usize,
             stack_size,
+            process,
         )));
         let id = addr_of_mut!(**main_thread) as usize;
         main_thread.id = id;
@@ -441,11 +459,23 @@ impl ThreadManager {
         argument: *mut c_void,
         detached: bool,
     ) -> Result<usize, Error> {
+        let process = Self::current_process()?;
+        Self::create_thread_in_process(process, stack_size, start_routine, argument, detached)
+    }
+
+    pub(crate) fn create_thread_in_process(
+        process: Arc<Process>,
+        stack_size: usize,
+        start_routine: StartRoutine,
+        argument: *mut c_void,
+        detached: bool,
+    ) -> Result<usize, Error> {
         let mut stack = ThreadStack::try_new(stack_size)?;
         let context = kernel::Context::load(stack.as_mut_slice(), Self::thread_trampoline);
         let mut thread = Box::new(ListNode::new(Thread::new(
             stack,
             context,
+            process,
             start_routine,
             argument,
             detached,
@@ -459,6 +489,27 @@ impl ThreadManager {
         user_stack_pointer: usize,
         detached: bool,
     ) -> Result<usize, Error> {
+        let process = Self::current_process()?;
+        Self::create_userspace_thread_in_process(
+            process,
+            stack_size,
+            entry,
+            user_stack_pointer,
+            detached,
+        )
+    }
+
+    pub(crate) fn create_process() -> Result<Arc<Process>, Error> {
+        Process::new()
+    }
+
+    pub(crate) fn create_userspace_thread_in_process(
+        process: Arc<Process>,
+        stack_size: usize,
+        entry: usize,
+        user_stack_pointer: usize,
+        detached: bool,
+    ) -> Result<usize, Error> {
         let mut stack = ThreadStack::try_new(stack_size)?;
         let context = userspace::Context::load(
             stack.as_mut_slice(),
@@ -467,7 +518,7 @@ impl ThreadManager {
             user_stack_pointer,
         )?;
         let thread = Box::new(ListNode::new(Thread::new_userspace(
-            stack, context, detached,
+            stack, context, process, detached,
         )));
         Self::enqueue_thread(thread)
     }
@@ -478,6 +529,10 @@ impl ThreadManager {
         image: &[u8],
         detached: bool,
     ) -> Result<usize, crate::kernel::arch::VirtualizationError> {
+        let process = Self::current_process().map_err(|error| match error {
+            Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
+            _ => crate::kernel::arch::VirtualizationError::HostSetupFailed,
+        })?;
         let mut stack = ThreadStack::try_new(stack_size).map_err(|error| match error {
             Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
             _ => crate::kernel::arch::VirtualizationError::InvalidGuestImage,
@@ -487,7 +542,39 @@ impl ThreadManager {
             Self::thread_trampoline,
             image,
         )?;
-        let thread = Box::new(ListNode::new(Thread::new_vm(stack, context, detached)));
+        let thread = Box::new(ListNode::new(Thread::new_vm(
+            stack, context, process, detached,
+        )));
+        Self::enqueue_thread(thread).map_err(|error| match error {
+            Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
+            _ => crate::kernel::arch::VirtualizationError::HostSetupFailed,
+        })
+    }
+
+    #[cfg(feature = "virtualization")]
+    pub(crate) fn create_vm_thread_with_pci_function(
+        stack_size: usize,
+        image: &[u8],
+        function: crate::kernel::vm::device::passthru::PciFunction,
+        detached: bool,
+    ) -> Result<usize, crate::kernel::arch::VirtualizationError> {
+        let process = Self::current_process().map_err(|error| match error {
+            Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
+            _ => crate::kernel::arch::VirtualizationError::HostSetupFailed,
+        })?;
+        let mut stack = ThreadStack::try_new(stack_size).map_err(|error| match error {
+            Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
+            _ => crate::kernel::arch::VirtualizationError::InvalidGuestImage,
+        })?;
+        let context = vm::VcpuContext::load_with_pci_function(
+            stack.as_mut_slice(),
+            Self::thread_trampoline,
+            image,
+            function,
+        )?;
+        let thread = Box::new(ListNode::new(Thread::new_vm(
+            stack, context, process, detached,
+        )));
         Self::enqueue_thread(thread).map_err(|error| match error {
             Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
             _ => crate::kernel::arch::VirtualizationError::HostSetupFailed,
@@ -578,6 +665,18 @@ impl ThreadManager {
         } else {
             0
         }
+    }
+
+    pub(crate) fn current_process() -> Result<Arc<Process>, Error> {
+        let manager = THREAD_MANAGER.lock();
+        if !manager.initialized {
+            return Err(Error::Again);
+        }
+        manager
+            .busy
+            .front()
+            .map(|thread| Arc::clone(&thread.process))
+            .ok_or(Error::Again)
     }
 
     pub(crate) fn contains_thread_by_id(id: usize) -> bool {

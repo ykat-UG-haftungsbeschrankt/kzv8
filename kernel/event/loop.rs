@@ -15,12 +15,13 @@
  */
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::ptr::NonNull;
 use crate::kernel::error::Error;
 use crate::kernel::event::timers::{TimerId, TimerQueue};
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Completion {
@@ -82,12 +83,38 @@ impl EventFlags {
         }
     }
 
+    const fn bits(self) -> u8 {
+        self.0
+    }
+
     const fn intersection(self, other: Self) -> Self {
         Self(self.0 & other.0)
     }
 
     const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct EventSignal {
+    readiness: Arc<AtomicU8>,
+}
+
+impl EventSignal {
+    pub(crate) fn new() -> Self {
+        Self {
+            readiness: Arc::new(AtomicU8::new(EventFlags::NONE.bits())),
+        }
+    }
+
+    pub(crate) fn set_readiness(&self, readiness: EventFlags) {
+        self.readiness.store(readiness.bits(), Ordering::Release);
+    }
+
+    fn readiness(&self) -> EventFlags {
+        EventFlags::from_bits(u32::from(self.readiness.load(Ordering::Acquire)))
+            .unwrap_or(EventFlags::NONE)
     }
 }
 
@@ -116,7 +143,7 @@ pub(crate) struct RawEvent {
     pub(crate) data: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SourceWatch {
     source: EventSourceId,
     interest: EventFlags,
@@ -124,6 +151,7 @@ struct SourceWatch {
     data: u64,
     generation: u64,
     ready_node: Option<NonNull<ListNode<usize>>>,
+    signal: Option<EventSignal>,
     active: bool,
 }
 
@@ -135,6 +163,7 @@ impl SourceWatch {
         data: 0,
         generation: 0,
         ready_node: None,
+        signal: None,
         active: false,
     };
 }
@@ -172,7 +201,7 @@ impl<const N: usize> EventLoop<N> {
             timers: TimerQueue::new(),
             events: LinkedList::new(),
             ready_sources: LinkedList::new(),
-            sources: [SourceWatch::EMPTY; N],
+            sources: [const { SourceWatch::EMPTY }; N],
             source_indices: HashMap::new(),
             free_sources,
             free_source_count: N,
@@ -195,6 +224,26 @@ impl<const N: usize> EventLoop<N> {
         interest: EventFlags,
         data: u64,
     ) -> Result<EventSourceToken, Error> {
+        self.register_inner(source, interest, data, None)
+    }
+
+    pub(crate) fn register_signal(
+        &mut self,
+        source: EventSourceId,
+        interest: EventFlags,
+        data: u64,
+        signal: EventSignal,
+    ) -> Result<EventSourceToken, Error> {
+        self.register_inner(source, interest, data, Some(signal))
+    }
+
+    fn register_inner(
+        &mut self,
+        source: EventSourceId,
+        interest: EventFlags,
+        data: u64,
+        signal: Option<EventSignal>,
+    ) -> Result<EventSourceToken, Error> {
         if self.source_indices.contains_key(&source.0) {
             return Err(Error::Exist);
         }
@@ -215,12 +264,16 @@ impl<const N: usize> EventLoop<N> {
         self.sources[index] = SourceWatch {
             source,
             interest,
-            readiness: EventFlags::NONE,
+            readiness: signal
+                .as_ref()
+                .map_or(EventFlags::NONE, EventSignal::readiness),
             data,
             generation,
             ready_node: None,
+            signal,
             active: true,
         };
+        self.queue_ready(index);
         Ok(EventSourceToken { index, generation })
     }
 
@@ -280,6 +333,7 @@ impl<const N: usize> EventLoop<N> {
 
     pub(crate) fn wait(&mut self, now_ns: u64) -> Option<Event> {
         self.queue_expired_timers(now_ns);
+        self.refresh_signals();
         self.pending_device_interrupts |=
             Self::pending_interrupt_source().swap(0, Ordering::AcqRel);
         for _ in 0..3 {
@@ -295,6 +349,11 @@ impl<const N: usize> EventLoop<N> {
             }
         }
         None
+    }
+
+    pub(crate) fn poll_readiness(&mut self) -> Option<Event> {
+        self.refresh_signals();
+        self.next_readiness()
     }
 
     pub(crate) fn poll_raw(&mut self, now_ns: u64) -> Option<RawEvent> {
@@ -356,7 +415,7 @@ impl<const N: usize> EventLoop<N> {
     }
 
     fn queue_ready(&mut self, index: usize) {
-        let watch = self.sources[index];
+        let watch = self.sources[index].clone();
         if !watch.active
             || watch.ready_node.is_some()
             || watch.readiness.intersection(watch.interest).is_empty()
@@ -367,6 +426,19 @@ impl<const N: usize> EventLoop<N> {
         let node_pointer = NonNull::from(node.as_mut());
         self.ready_sources.push_back(node);
         self.sources[index].ready_node = Some(node_pointer);
+    }
+
+    fn refresh_signals(&mut self) {
+        for index in 0..N {
+            let Some(signal) = self.sources[index].signal.clone() else {
+                continue;
+            };
+            let readiness = signal.readiness();
+            if self.sources[index].readiness != readiness {
+                self.sources[index].readiness = readiness;
+                self.queue_ready(index);
+            }
+        }
     }
 
     fn next_readiness(&mut self) -> Option<Event> {

@@ -74,6 +74,11 @@ impl FilePlugin for DeviceMetadataFile {
             Ok(length)
         })
     }
+
+    fn size(&self) -> VfsFuture<'_, VfsResult<u64>> {
+        let length = self.contents.len() as u64;
+        Box::pin(async move { Ok(length) })
+    }
 }
 
 fn directory(entries: Vec<DirectoryEntry>) -> Node {

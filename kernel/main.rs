@@ -19,30 +19,39 @@ use crate::arch::traits::VirtualizationArchitecture as _;
 
 pub(crate) mod arch;
 pub(crate) mod block;
+pub(crate) mod debug;
 pub(crate) mod driver;
 pub(crate) mod dl;
+#[allow(dead_code)]
+pub(crate) mod ebpf;
 pub(crate) mod error;
 pub(crate) mod event;
+pub(crate) mod ipc;
 #[path = "lib/mod.rs"]
 pub(crate) mod kernel_lib;
 pub(crate) use kernel_lib as lib;
 pub(crate) mod memory;
 pub(crate) mod net;
+pub(crate) mod process;
 pub(crate) mod syscall;
 #[path = "../runtime/run.rs"]
 pub(crate) mod runtime;
 pub(crate) mod scheduler;
+#[cfg(feature = "virtualization")]
+pub(crate) mod vm;
 #[allow(dead_code)]
 pub(crate) mod vfs;
 
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
-    pub(crate) use crate::{arch, block, dl, driver, error, event, lib, memory, net, runtime, scheduler, syscall, vfs};
+    pub(crate) use crate::{arch, block, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, process, runtime, scheduler, syscall, vfs};
+    #[cfg(feature = "virtualization")]
+    pub(crate) use crate::vm;
 }
 
 pub(crate) struct KernelContext<'a> {
     pub(crate) events: &'a mut event::r#loop::EventLoop<16>,
-    pub(crate) block_device: Option<&'a mut block::device::BlockDevice>,
+    pub(crate) block_device: Option<&'a mut block::service::BlockClient>,
     pub(crate) network_stack: Option<&'a mut net::stack::NetStack>,
     pub(crate) network_registration: Option<event::r#loop::EventSourceToken>,
 }
@@ -56,12 +65,12 @@ impl Kernel {
         driver::virtio::console::Console::handle_interrupt(pending);
     }
 
-    fn main(boot_info: usize, boot_magic: usize) -> !{
+    fn main(boot_info: usize, boot_magic: usize) -> ! {
+        debug::debug("kz: kernel startup\n");
         let _interrupt_state = arch::InterruptArchitecture::disable_interrupts();
         unsafe {
             arch::InterruptArchitecture::initialize_interrupts();
         }
-        // SAFETY: the bootloader supplies the architecture-specific boot-info pointer.
         assert!(
             unsafe { arch::BootArchitecture::initialize_boot_info(boot_info, boot_magic) },
             "{}",
@@ -109,8 +118,9 @@ impl Kernel {
             "unable to initialize the interrupt controller"
         );
         arch::TimerArchitecture::initialize_timer();
-        let mut block_device = block::device::BlockDevice::initialize();
-        let mut network_stack = net::stack::NetStack::initialize();
+
+        let console_ready = driver::virtio::console::Console::initialize();
+        let mut virtio_services = driver::virtio::service::KernelVirtioServices::initialize();
         let mut events = event::r#loop::EventLoop::<16>::new();
         let network_registration = events
             .register(
@@ -120,47 +130,52 @@ impl Kernel {
             )
             .ok();
         if let Some(now_ns) = arch::TimerArchitecture::now_ns() {
-            if let (Some(stack), Some(source)) = (network_stack.as_mut(), network_registration) {
+            if let (Some(stack), Some(source)) =
+                (virtio_services.network_stack.as_mut(), network_registration)
+            {
                 stack.poll(now_ns, &mut events, source);
             }
             let _event = events.wait(now_ns);
         }
-        let console_ready = driver::virtio::console::Console::initialize();
+
+        debug::write(arch::BootArchitecture::BOOT_MESSAGE);
         arch::InterruptArchitecture::enable_interrupts();
-        if console_ready {
-            if driver::virtio::console::Console::write(arch::BootArchitecture::BOOT_MESSAGE)
-                && driver::virtio::console::Console::write(b"kz: virtio-console transmit OK\n")
-            {
-                driver::virtio::console::Console::write_device_list();
-                if scheduler::thread::smoke::thread_smoke() {
-                    let _thread_smoke_status = driver::virtio::console::Console::write(
-                        b"kz: kernel thread smoke OK\n",
-                    );
-                } else {
-                    let _thread_smoke_status = driver::virtio::console::Console::write(
-                        b"kz: kernel thread smoke FAILED\n",
-                    );
-                }
-                if scheduler::thread::smoke::vm_smoke() {
-                    let _vm_smoke_status = driver::virtio::console::Console::write(
-                        b"kz: user VM smoke OK\n",
-                    );
-                } else {
-                    let _vm_smoke_status = driver::virtio::console::Console::write(
-                        b"kz: user VM smoke FAILED\n",
-                    );
-                }
-                if arch::start_secondary_cpus() > 1 {
-                    let _smp_status =
-                        driver::virtio::console::Console::write(b"kz: smp secondary cpus online\n");
-                }
-                runtime::run(KernelContext {
-                    events: &mut events,
-                    block_device: block_device.as_mut(),
-                    network_stack: network_stack.as_mut(),
-                    network_registration,
-                });
+        if console_ready && driver::virtio::console::Console::write(b"kz: virtio-console transmit OK\n") {
+            debug::write_virtio_devices();
+            if scheduler::thread::smoke::thread_smoke() {
+                debug::debug("kz: kernel thread smoke OK\n");
+            } else {
+                debug::debug("kz: kernel thread smoke FAILED\n");
             }
+            if scheduler::thread::smoke::vm_smoke() {
+                debug::debug("kz: user VM smoke OK\n");
+            } else {
+                debug::debug("kz: user VM smoke FAILED\n");
+            }
+            if ipc::process_capability_smoke().is_ok()
+                && ipc::shared_mapping_smoke().is_ok()
+                && ipc::smoke().is_ok()
+            {
+                debug::debug("kz: IPC smoke OK\n");
+            } else {
+                debug::debug("kz: IPC smoke FAILED\n");
+            }
+            if let Some(block_service) = virtio_services.block_device.as_ref() {
+                if block_service.smoke().is_ok() {
+                    debug::debug("kz: block IPC smoke OK\n");
+                } else {
+                    debug::debug("kz: block IPC smoke FAILED\n");
+                }
+            }
+            if arch::start_secondary_cpus() > 1 {
+                debug::debug("kz: smp secondary cpus online\n");
+            }
+            runtime::run(KernelContext {
+                events: &mut events,
+                block_device: virtio_services.block_device.as_mut(),
+                network_stack: virtio_services.network_stack.as_mut(),
+                network_registration,
+            });
         }
         scheduler::future::run_forever()
     }

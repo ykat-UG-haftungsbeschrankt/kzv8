@@ -1,0 +1,325 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::kernel::error::Error;
+use crate::kernel::ipc::{
+    CallFuture, CallTicket, Capability, CapabilityRights, Endpoint, MessageBody, ReceivedMessage,
+    ReplyCapability, SendFuture, SharedMemoryMapping, MAX_INLINE_BYTES,
+};
+use crate::kernel::scheduler::sync::IrqSpinLock;
+
+const INITIAL_CAPABILITY_SLOTS: usize = 32;
+const MAX_CAPABILITY_SLOTS: usize = 4096;
+static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CapabilityHandle(u64);
+
+impl CapabilityHandle {
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+
+    fn new(index: usize, generation: u32) -> Self {
+        Self((u64::from(generation) << 32) | index as u64)
+    }
+
+    fn parts(self) -> (usize, u32) {
+        (self.0 as u32 as usize, (self.0 >> 32) as u32)
+    }
+}
+
+struct CapabilitySlot {
+    generation: u32,
+    capability: Option<Capability>,
+}
+
+impl CapabilitySlot {
+    const fn empty() -> Self {
+        Self {
+            generation: 0,
+            capability: None,
+        }
+    }
+}
+
+struct CapabilityTable {
+    slots: Vec<CapabilitySlot>,
+}
+
+impl CapabilityTable {
+    fn new() -> Result<Self, Error> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(INITIAL_CAPABILITY_SLOTS)
+            .map_err(|_| Error::NoMem)?;
+        slots.resize_with(INITIAL_CAPABILITY_SLOTS, CapabilitySlot::empty);
+        Ok(Self { slots })
+    }
+
+    fn insert(&mut self, capability: Capability) -> Result<CapabilityHandle, Error> {
+        let index = if let Some(index) = self
+            .slots
+            .iter()
+            .position(|slot| slot.capability.is_none())
+        {
+            index
+        } else {
+            if self.slots.len() == MAX_CAPABILITY_SLOTS {
+                return Err(Error::Mfile);
+            }
+            let growth = self
+                .slots
+                .len()
+                .min(MAX_CAPABILITY_SLOTS - self.slots.len());
+            self.slots.try_reserve(growth).map_err(|_| Error::NoMem)?;
+            let index = self.slots.len();
+            self.slots
+                .resize_with(index + growth, CapabilitySlot::empty);
+            index
+        };
+        let slot = &mut self.slots[index];
+        slot.generation = slot.generation.wrapping_add(1).max(1);
+        slot.capability = Some(capability);
+        Ok(CapabilityHandle::new(index, slot.generation))
+    }
+
+    fn get(&self, handle: CapabilityHandle) -> Result<&Capability, Error> {
+        let (index, generation) = handle.parts();
+        let slot = self.slots.get(index).ok_or(Error::Badf)?;
+        if slot.generation != generation {
+            return Err(Error::Badf);
+        }
+        slot.capability.as_ref().ok_or(Error::Badf)
+    }
+
+    fn remove(&mut self, handle: CapabilityHandle) -> Result<Capability, Error> {
+        let (index, generation) = handle.parts();
+        let slot = self.slots.get_mut(index).ok_or(Error::Badf)?;
+        if slot.generation != generation {
+            return Err(Error::Badf);
+        }
+        slot.capability.take().ok_or(Error::Badf)
+    }
+}
+
+pub(crate) struct Process {
+    id: u64,
+    capabilities: IrqSpinLock<CapabilityTable>,
+}
+
+impl Process {
+    pub(crate) fn new() -> Result<Arc<Self>, Error> {
+        Ok(Arc::new(Self {
+            id: NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed),
+            capabilities: IrqSpinLock::new(CapabilityTable::new()?),
+        }))
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn insert_capability(&self, capability: Capability) -> Result<CapabilityHandle, Error> {
+        self.capabilities.lock().insert(capability)
+    }
+
+    pub(crate) fn create_endpoint_pair(
+        &self,
+        capacity: usize,
+    ) -> Result<(CapabilityHandle, CapabilityHandle), Error> {
+        let (sender, receiver) = Endpoint::channel(capacity)?;
+        let mut table = self.capabilities.lock();
+        let sender = table.insert(Capability::Endpoint(sender))?;
+        match table.insert(Capability::Endpoint(receiver)) {
+            Ok(receiver) => Ok((sender, receiver)),
+            Err(error) => {
+                let _ = table.remove(sender);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn capability(&self, handle: CapabilityHandle) -> Result<Capability, Error> {
+        self.capabilities.lock().get(handle)?.duplicate()
+    }
+
+    pub(crate) fn restrict_capability(
+        &self,
+        handle: CapabilityHandle,
+        rights: CapabilityRights,
+    ) -> Result<CapabilityHandle, Error> {
+        let capability = self.capabilities.lock().get(handle)?.restrict(rights)?;
+        self.capabilities.lock().insert(capability)
+    }
+
+    pub(crate) fn prepare_transfer(
+        &self,
+        handle: CapabilityHandle,
+        rights: CapabilityRights,
+    ) -> Result<Capability, Error> {
+        self.capabilities
+            .lock()
+            .get(handle)?
+            .prepare_transfer(rights)
+    }
+
+    pub(crate) fn attach_capability(
+        &self,
+        body: &mut MessageBody,
+        handle: CapabilityHandle,
+        rights: CapabilityRights,
+    ) -> Result<(), Error> {
+        let capability = self.prepare_transfer(handle, rights)?;
+        body.push_capability(capability)
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        handle: CapabilityHandle,
+        body: MessageBody,
+    ) -> Result<(), Error> {
+        match self.capability(handle)? {
+            Capability::Endpoint(endpoint) => endpoint.try_send(body),
+            Capability::SharedMemory(_) => Err(Error::Badf),
+        }
+    }
+
+    pub(crate) fn send(
+        &self,
+        handle: CapabilityHandle,
+        body: MessageBody,
+    ) -> Result<SendFuture, Error> {
+        match self.capability(handle)? {
+            Capability::Endpoint(endpoint) => Ok(endpoint.send(body)),
+            Capability::SharedMemory(_) => Err(Error::Badf),
+        }
+    }
+
+    pub(crate) fn call_now(
+        &self,
+        handle: CapabilityHandle,
+        body: MessageBody,
+    ) -> Result<CallTicket, Error> {
+        match self.capability(handle)? {
+            Capability::Endpoint(endpoint) => endpoint.call_now(body),
+            Capability::SharedMemory(_) => Err(Error::Badf),
+        }
+    }
+
+    pub(crate) fn call(
+        &self,
+        handle: CapabilityHandle,
+        body: MessageBody,
+    ) -> Result<CallFuture, Error> {
+        match self.capability(handle)? {
+            Capability::Endpoint(endpoint) => endpoint.call(body),
+            Capability::SharedMemory(_) => Err(Error::Badf),
+        }
+    }
+
+    pub(crate) fn map_shared_memory(
+        &self,
+        handle: CapabilityHandle,
+    ) -> Result<SharedMemoryMapping, Error> {
+        match self.capability(handle)? {
+            Capability::SharedMemory(grant) => grant.map_user(),
+            Capability::Endpoint(_) => Err(Error::Badf),
+        }
+    }
+
+    pub(crate) fn try_receive(
+        &self,
+        handle: CapabilityHandle,
+    ) -> Result<ProcessMessage, Error> {
+        let endpoint = self.receive_endpoint(handle)?;
+        let received = endpoint.try_receive()?;
+        self.into_process_message(received)
+    }
+
+    pub(crate) async fn receive(
+        &self,
+        handle: CapabilityHandle,
+    ) -> Result<ProcessMessage, Error> {
+        let endpoint = self.receive_endpoint(handle)?;
+        let received = endpoint.receive().await?;
+        self.into_process_message(received)
+    }
+
+    fn receive_endpoint(&self, handle: CapabilityHandle) -> Result<Endpoint, Error> {
+        match self.capability(handle)? {
+            Capability::Endpoint(endpoint) => Ok(endpoint),
+            Capability::SharedMemory(_) => Err(Error::Badf),
+        }
+    }
+
+    fn into_process_message(&self, received: ReceivedMessage) -> Result<ProcessMessage, Error> {
+        let (body, reply) = received.into_parts();
+        let (opcode, payload, payload_length, capabilities) = body.into_parts();
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(capabilities.len())
+            .map_err(|_| Error::NoMem)?;
+        for capability in capabilities {
+            match self.insert_capability(capability) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    for handle in handles {
+                        let _ = self.close_capability(handle);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(ProcessMessage {
+            opcode,
+            payload,
+            payload_length,
+            capabilities: handles,
+            reply,
+        })
+    }
+
+    pub(crate) fn close_capability(&self, handle: CapabilityHandle) -> Result<(), Error> {
+        drop(self.capabilities.lock().remove(handle)?);
+        Ok(())
+    }
+}
+
+pub(crate) struct ProcessMessage {
+    opcode: u32,
+    payload: [u8; MAX_INLINE_BYTES],
+    payload_length: u8,
+    capabilities: Vec<CapabilityHandle>,
+    reply: Option<ReplyCapability>,
+}
+
+impl ProcessMessage {
+    pub(crate) const fn opcode(&self) -> u32 {
+        self.opcode
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload[..usize::from(self.payload_length)]
+    }
+
+    pub(crate) fn capabilities(&self) -> &[CapabilityHandle] {
+        &self.capabilities
+    }
+
+    pub(crate) fn take_capability(&mut self, index: usize) -> Option<CapabilityHandle> {
+        (index < self.capabilities.len()).then(|| self.capabilities.remove(index))
+    }
+
+    pub(crate) fn reply(self, response: Result<MessageBody, Error>) -> Result<(), Error> {
+        self.reply.ok_or(Error::Inval)?.reply(response)
+    }
+}

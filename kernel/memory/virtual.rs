@@ -6,7 +6,7 @@
  */
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use crate::kernel::arch::traits::{DebugArchitecture as _, MemoryArchitecture as _};
 use crate::kernel::arch::MemoryArchitecture;
@@ -37,7 +37,7 @@ enum PageRangeError {
 }
 
 pub(crate) struct VirtualAreas {
-    page_state: [AtomicU8; VirtualAreas::MAX_VM_PAGES],
+    page_state: [AtomicU16; VirtualAreas::MAX_VM_PAGES],
     mmu_ready: AtomicBool,
     area_index: IntervalTree<(), { VirtualAreas::MAX_VM_AREAS }>,
 }
@@ -49,14 +49,16 @@ impl VirtualAreas {
         <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
     const MAX_VM_PAGES: usize = Self::VM_ARENA_SIZE / Self::PAGE_SIZE;
     const MAX_VM_AREAS: usize = 16384;
-    const VM_USER: u8 = 1 << 6;
-    const VM_RESERVED: u8 = 1 << 7;
-    const VM_PERMISSION_MASK: u8 = 0x07;
+    const VM_USER: u16 = 1 << 6;
+    const VM_RESERVED: u16 = 1 << 7;
+    const VM_OWNED: u16 = 1 << 8;
+    const VM_BORROWED: u16 = 1 << 9;
+    const VM_PERMISSION_MASK: u16 = 0x07;
     const VM_BASE: usize =
         <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_BASE;
 
     const EMPTY: Self = Self {
-        page_state: [const { AtomicU8::new(0) }; Self::MAX_VM_PAGES],
+        page_state: [const { AtomicU16::new(0) }; Self::MAX_VM_PAGES],
         mmu_ready: AtomicBool::new(false),
         area_index: IntervalTree::new(),
     };
@@ -235,7 +237,7 @@ impl VirtualAreas {
         let state_permissions = if permissions == 5 {
             0
         } else {
-            permissions as u8
+            permissions as u16
         };
         let state = Self::VM_RESERVED | state_permissions | if user { Self::VM_USER } else { 0 };
         for page in start_page..end_page {
@@ -374,13 +376,16 @@ impl VirtualAreas {
         let mut decommitted = true;
         for page in range.start_page..range.end_page {
             let virtual_address = Self::VM_BASE + page * Self::PAGE_SIZE;
+            let state = self.page_state[page].load(Ordering::Acquire);
             if let Some(physical_address) = MemoryArchitecture::unmap_page(virtual_address) {
-                if !PhysicalAllocator::deallocate_contiguous(physical_address, Self::PAGE_SIZE) {
+                if state & Self::VM_BORROWED == 0
+                    && !PhysicalAllocator::deallocate_contiguous(physical_address, Self::PAGE_SIZE)
+                {
                     decommitted = false;
                     Self::decommit_debug(b'g');
                 }
             }
-            let user = self.page_state[page].load(Ordering::Acquire) & Self::VM_USER;
+            let user = state & Self::VM_USER;
             self.page_state[page].store(Self::VM_RESERVED | user, Ordering::Release);
         }
         if decommitted {
@@ -481,7 +486,9 @@ impl VirtualAreas {
                 }
             }
             self.page_state[page].store(
-                Self::VM_RESERVED | (state & Self::VM_USER) | permissions as u8,
+                Self::VM_RESERVED
+                    | (state & (Self::VM_USER | Self::VM_OWNED | Self::VM_BORROWED))
+                    | permissions as u16,
                 Ordering::Release,
             );
         }
@@ -528,8 +535,11 @@ impl VirtualAreas {
         let mut released = true;
         for page in start_page..end_page {
             let virtual_address = Self::VM_BASE + page * Self::PAGE_SIZE;
+            let state = self.page_state[page].load(Ordering::Acquire);
             if let Some(physical_address) = MemoryArchitecture::unmap_page(virtual_address) {
-                if !PhysicalAllocator::deallocate_contiguous(physical_address, Self::PAGE_SIZE) {
+                if state & Self::VM_BORROWED == 0
+                    && !PhysicalAllocator::deallocate_contiguous(physical_address, Self::PAGE_SIZE)
+                {
                     released = false;
                 }
             }
@@ -591,11 +601,45 @@ impl VirtualAreas {
                 MemoryArchitecture::set_page_permissions(page_address, Self::PAGE_SIZE, permissions)
             }
         {
+            self.page_state[page].fetch_or(Self::VM_OWNED, Ordering::Release);
             return true;
         }
         let _unmapped = MemoryArchitecture::unmap_page(page_address);
         let _released = PhysicalAllocator::deallocate(frame);
         false
+    }
+
+    fn map_user_borrowed_page(
+        &mut self,
+        virtual_address: usize,
+        physical_address: usize,
+        permissions: i32,
+    ) -> bool {
+        if virtual_address % Self::PAGE_SIZE != 0
+            || physical_address % Self::PAGE_SIZE != 0
+            || !(0..=4).contains(&permissions)
+        {
+            return false;
+        }
+        let Ok(page) = Self::page_start(virtual_address) else {
+            return false;
+        };
+        let Some(state) = self.page_state.get(page).map(|state| state.load(Ordering::Acquire)) else {
+            return false;
+        };
+        if state & (Self::VM_RESERVED | Self::VM_USER) != (Self::VM_RESERVED | Self::VM_USER)
+            || state & (Self::VM_OWNED | Self::VM_BORROWED) != 0
+        {
+            return false;
+        }
+        if !MemoryArchitecture::map_user_page(virtual_address, physical_address, permissions) {
+            return false;
+        }
+        self.page_state[page].store(
+            (state & !Self::VM_PERMISSION_MASK) | permissions as u16 | Self::VM_BORROWED,
+            Ordering::Release,
+        );
+        true
     }
 }
 
@@ -687,6 +731,16 @@ impl VirtualAreasLock {
 
     pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
         Self::get_instance().lock().resolve_page_fault(address, access)
+    }
+
+    fn map_user_borrowed_page(
+        virtual_address: usize,
+        physical_address: usize,
+        permissions: i32,
+    ) -> bool {
+        Self::get_instance()
+            .lock()
+            .map_user_borrowed_page(virtual_address, physical_address, permissions)
     }
 
     #[allow(dead_code)]
@@ -825,6 +879,14 @@ pub(crate) fn protect_user_mapping(address: usize, length: usize, permissions: i
 
 pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
     VirtualAreasLock::resolve_page_fault(address, access)
+}
+
+pub(crate) fn map_user_borrowed_page(
+    virtual_address: usize,
+    physical_address: usize,
+    permissions: i32,
+) -> bool {
+    VirtualAreasLock::map_user_borrowed_page(virtual_address, physical_address, permissions)
 }
 
 #[allow(dead_code)]

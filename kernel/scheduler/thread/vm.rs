@@ -5,15 +5,19 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::vec::Vec;
 use core::ptr::NonNull;
 
 use crate::kernel::dl::{AddressSpace, ElfKind, Error, LoadedObject, Permissions};
 use crate::kernel::arch::traits::{CpuArchitecture as _, ThreadArchitecture as _};
 use crate::kernel::lib::alignment::align_up;
+#[cfg(feature = "virtualization")]
+use crate::kernel::vm::device::passthru::{PassthroughDevice, PciFunction};
 
 #[cfg(feature = "virtualization")]
 pub(crate) struct VcpuContext {
 	kernel: super::kernel::Context,
+	passthrough: Vec<PassthroughDevice>,
 	guest: <crate::kernel::arch::VirtualizationArchitecture as crate::kernel::arch::traits::VirtualizationArchitecture>::GuestContext,
 }
 
@@ -26,7 +30,27 @@ impl VcpuContext {
 	) -> Result<Self, crate::kernel::arch::VirtualizationError> {
 		let guest = crate::kernel::arch::VirtualizationArchitecture::load_guest_context(image)?;
 		let kernel = super::kernel::Context::load(kernel_stack, kernel_entry);
-		Ok(Self { kernel, guest })
+		Ok(Self {
+			kernel,
+			passthrough: Vec::new(),
+			guest,
+		})
+	}
+
+	pub(crate) fn load_with_pci_function(
+		kernel_stack: &mut [u8],
+		kernel_entry: extern "C" fn() -> !,
+		image: &[u8],
+		function: PciFunction,
+	) -> Result<Self, crate::kernel::arch::VirtualizationError> {
+		let mut context = Self::load(kernel_stack, kernel_entry, image)?;
+		context
+			.passthrough
+			.try_reserve(1)
+			.map_err(|_| crate::kernel::arch::VirtualizationError::ResourceExhausted)?;
+		let device = PassthroughDevice::attach(&mut context.guest, function)?;
+		context.passthrough.push(device);
+		Ok(context)
 	}
 
 	pub(super) fn kernel(&self) -> &super::kernel::Context {
@@ -77,6 +101,23 @@ impl VcpuContext {
 					super::ThreadManager::exit_current(core::ptr::null_mut());
 				}
 			}
+		}
+	}
+}
+
+#[cfg(feature = "virtualization")]
+impl Drop for VcpuContext {
+	fn drop(&mut self) {
+		let mut retain_guest_memory = false;
+		for device in &mut self.passthrough {
+			if !device.detach() {
+				retain_guest_memory = true;
+			}
+		}
+		if retain_guest_memory {
+			crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
+				&mut self.guest,
+			);
 		}
 	}
 }
