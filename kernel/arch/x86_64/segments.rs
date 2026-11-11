@@ -57,8 +57,6 @@ impl TaskStateSegment {
 struct HostSegmentSlot {
     kernel_rsp: u64,
     user_rsp: u64,
-    user_rip: u64,
-    user_rflags: u64,
     apic_id: u32,
     initialized: bool,
     gdt: [u64; 7],
@@ -70,8 +68,6 @@ impl HostSegmentSlot {
         Self {
             kernel_rsp: 0,
             user_rsp: 0,
-            user_rip: 0,
-            user_rflags: 0,
             apic_id: u32::MAX,
             initialized: false,
             gdt: [
@@ -160,6 +156,13 @@ pub(crate) fn initialize() -> Option<HostSegmentState> {
 
 pub(crate) fn set_kernel_stack(stack_pointer: usize) -> bool {
     let apic_id = super::interrupts::current_apic_id();
+    let initialized = HOST_SEGMENTS
+        .lock()
+        .iter()
+        .any(|slot| slot.apic_id == apic_id);
+    if !initialized && initialize().is_none() {
+        return false;
+    }
     let mut slots = HOST_SEGMENTS.lock();
     let Some(slot) = slots.iter_mut().find(|slot| slot.apic_id == apic_id) else {
         return false;

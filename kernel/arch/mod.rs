@@ -211,6 +211,11 @@ pub(crate) mod traits {
         fn initialize_thread_stack(stack: &mut [u8], entry: extern "C" fn() -> !) -> usize;
         fn initialize_thread_local_storage(cpu_id: usize) -> bool;
         fn current_thread_stack_bounds(stack_size: usize) -> (*mut core::ffi::c_void, usize);
+        /// Select the kernel stack used by privilege transitions for a userspace thread.
+        /// Architectures without a per-CPU user-entry stack may keep the default no-op.
+        fn set_user_kernel_stack(_stack_pointer: usize) -> bool {
+            true
+        }
         /// Enter an already-mapped user image and do not return to the caller.
         ///
         /// # Safety

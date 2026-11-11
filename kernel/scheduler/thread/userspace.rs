@@ -12,6 +12,7 @@ use super::kernel::Context as KernelContext;
 
 pub(crate) struct Context {
 	kernel: KernelContext,
+	kernel_stack_pointer: usize,
 	entry: usize,
 	stack_pointer: usize,
 }
@@ -23,6 +24,10 @@ impl Context {
 		entry: usize,
 		stack_pointer: usize,
 	) -> Result<Self, Error> {
+		let kernel_stack_pointer = (kernel_stack.as_mut_ptr() as usize)
+			.checked_add(kernel_stack.len())
+			.ok_or(Error::Overflow)?
+			& !0xf;
 		let stack_address = stack_pointer.checked_sub(1).ok_or(Error::Fault)?;
 		if !crate::kernel::memory::r#virtual::user_range_executable(entry, 1) {
 			return Err(Error::NoExec);
@@ -32,9 +37,14 @@ impl Context {
 		}
 		Ok(Self {
 			kernel: KernelContext::load(kernel_stack, kernel_entry),
+			kernel_stack_pointer,
 			entry,
 			stack_pointer,
 		})
+	}
+
+	pub(crate) const fn kernel_stack_pointer(&self) -> usize {
+		self.kernel_stack_pointer
 	}
 
 	pub(super) fn kernel(&self) -> &KernelContext {

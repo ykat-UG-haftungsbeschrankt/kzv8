@@ -287,6 +287,10 @@ impl crate::kernel::arch::traits::ThreadArchitecture for super::ThreadArchitectu
         self::current_thread_stack_bounds(stack_size)
     }
 
+    fn set_user_kernel_stack(stack_pointer: usize) -> bool {
+        segments::set_kernel_stack(stack_pointer)
+    }
+
     unsafe fn enter_user(entry: usize, stack_pointer: usize) -> ! {
         unsafe { self::enter_user(entry, stack_pointer) }
     }

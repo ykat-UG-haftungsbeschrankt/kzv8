@@ -83,6 +83,15 @@ pub(crate) enum ExecutionContext {
 }
 
 impl ExecutionContext {
+    fn user_kernel_stack_pointer(&self) -> Option<usize> {
+        match self {
+            Self::Userspace(context) => Some(context.kernel_stack_pointer()),
+            Self::Kernel(_) => None,
+            #[cfg(feature = "virtualization")]
+            Self::Vm(_) => None,
+        }
+    }
+
     fn kernel(&self) -> &kernel::Context {
         match self {
             Self::Kernel(context) => context,
@@ -256,6 +265,7 @@ impl ThreadStack {
 struct SwitchContext {
     old_context: *mut kernel::Context,
     new_context: *const kernel::Context,
+    new_user_kernel_stack: Option<usize>,
 }
 
 pub(crate) struct ThreadManager {
@@ -640,6 +650,7 @@ impl ThreadManager {
                     let context = SwitchContext {
                         old_context,
                         new_context: next.context.kernel() as *const kernel::Context,
+                        new_user_kernel_stack: next.context.user_kernel_stack_pointer(),
                     };
                     manager.busy.push_front(next);
                     Some(context)
@@ -654,6 +665,14 @@ impl ThreadManager {
             crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
             return false;
         };
+
+        if let Some(kernel_stack_pointer) = context.new_user_kernel_stack {
+            if !crate::kernel::arch::ThreadArchitecture::set_user_kernel_stack(
+                kernel_stack_pointer,
+            ) {
+                crate::kernel::arch::CpuArchitecture::halt();
+            }
+        }
 
         // SAFETY: both thread boxes remain owned by the queues while their contexts are switched.
         unsafe { Self::switch_threads(context) };
