@@ -14,8 +14,11 @@ use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::block::device::BlockDevice;
 use crate::kernel::block::request::Request;
 use crate::kernel::error::Error;
-use crate::kernel::ipc::{Capability, CapabilityRights, Endpoint, MessageBody, SharedMemory};
+use crate::kernel::ipc::{
+    CallTicket, Capability, CapabilityRights, Endpoint, MessageBody, SharedMemory,
+};
 use crate::kernel::process::{CapabilityHandle, Process};
+use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::scheduler::thread::{ThreadManager, ThreadState};
 
 const BLOCK_QUEUE_CAPACITY: usize = 8;
@@ -34,6 +37,7 @@ pub(crate) struct BlockClient {
     shared_memory: CapabilityHandle,
     capacity_sectors: u64,
     request_active: AtomicBool,
+    pending_reply: IrqSpinLock<Option<CallTicket>>,
 }
 
 impl BlockClient {
@@ -56,9 +60,9 @@ impl BlockClient {
     }
 
     pub(crate) fn read(&self, sector: u64, output: &mut [u8]) -> Result<(), Error> {
-        let _active = self.begin_request()?;
+        let mut active = self.begin_request()?;
         let grant = self.shared_grant()?;
-        let response = self.transact(BLOCK_READ, sector, output.len())?;
+        let response = self.transact(BLOCK_READ, sector, output.len(), &mut active)?;
         if response.opcode() != BLOCK_REPLY {
             return Err(Error::Proto);
         }
@@ -66,10 +70,10 @@ impl BlockClient {
     }
 
     pub(crate) fn write(&self, sector: u64, input: &[u8]) -> Result<(), Error> {
-        let _active = self.begin_request()?;
+        let mut active = self.begin_request()?;
         let grant = self.shared_grant()?;
         grant.write(0, input)?;
-        let response = self.transact(BLOCK_WRITE, sector, input.len())?;
+        let response = self.transact(BLOCK_WRITE, sector, input.len(), &mut active)?;
         if response.opcode() != BLOCK_REPLY {
             return Err(Error::Proto);
         }
@@ -77,10 +81,44 @@ impl BlockClient {
     }
 
     fn begin_request(&self) -> Result<BlockRequestGuard<'_>, Error> {
+        self.reap_completed_request()?;
         self.request_active
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| Error::Busy)?;
-        Ok(BlockRequestGuard(&self.request_active))
+        Ok(BlockRequestGuard {
+            request_active: &self.request_active,
+            release_on_drop: true,
+        })
+    }
+
+    fn reap_completed_request(&self) -> Result<(), Error> {
+        let mut pending_reply = self.pending_reply.lock();
+        let Some(ticket) = pending_reply.as_ref() else {
+            return Ok(());
+        };
+        match ticket.try_reply() {
+            Ok(None) => Err(Error::Busy),
+            Ok(Some(_)) | Err(_) => {
+                let completed_ticket = pending_reply.take();
+                drop(pending_reply);
+                drop(completed_ticket);
+                self.request_active.store(false, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+
+    fn retain_timed_out_request(
+        &self,
+        ticket: CallTicket,
+        active: &mut BlockRequestGuard<'_>,
+    ) {
+        let mut pending_reply = self.pending_reply.lock();
+        if pending_reply.is_some() {
+            crate::kernel::arch::CpuArchitecture::halt();
+        }
+        *pending_reply = Some(ticket);
+        active.retain();
     }
 
     fn shared_grant(&self) -> Result<crate::kernel::ipc::SharedMemoryGrant, Error> {
@@ -95,6 +133,7 @@ impl BlockClient {
         operation: u32,
         sector: u64,
         length: usize,
+        active: &mut BlockRequestGuard<'_>,
     ) -> Result<MessageBody, Error> {
         if length == 0
             || length > BLOCK_MAX_TRANSFER_SIZE
@@ -126,21 +165,34 @@ impl BlockClient {
                 return Ok(response);
             }
             if block_time_ns().saturating_sub(started) >= BLOCK_TIMEOUT_NS {
+                self.retain_timed_out_request(ticket, active);
                 return Err(Error::TimedOut);
             }
             if !ThreadManager::switch_current(ThreadState::Ready) {
                 crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
             }
         }
+        self.retain_timed_out_request(ticket, active);
         Err(Error::TimedOut)
     }
 }
 
-struct BlockRequestGuard<'a>(&'a AtomicBool);
+struct BlockRequestGuard<'a> {
+    request_active: &'a AtomicBool,
+    release_on_drop: bool,
+}
+
+impl BlockRequestGuard<'_> {
+    fn retain(&mut self) {
+        self.release_on_drop = false;
+    }
+}
 
 impl Drop for BlockRequestGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        if self.release_on_drop {
+            self.request_active.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -203,6 +255,7 @@ impl BlockService {
             shared_memory: shared_memory_handle,
             capacity_sectors,
             request_active: AtomicBool::new(false),
+            pending_reply: IrqSpinLock::new(None),
         })
     }
 
