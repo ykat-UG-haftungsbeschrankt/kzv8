@@ -166,6 +166,39 @@ pub(crate) fn wait_for_interrupt() {
     unsafe { core::arch::asm!("msr daifclr, #0xf", "wfe") };
 }
 
+pub(crate) fn random_u32() -> Option<u32> {
+    let feature_register: u64;
+    // SAFETY: ID_AA64ISAR0_EL1 is readable at EL1 and gates use of the optional RNDR register.
+    unsafe {
+        core::arch::asm!(
+            "mrs {feature_register}, id_aa64isar0_el1",
+            feature_register = out(reg) feature_register,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if (feature_register >> 60) & 0xf == 0 {
+        return None;
+    }
+    for _ in 0..10 {
+        let value: u64;
+        let success: u32;
+        // SAFETY: ID_AA64ISAR0_EL1 reports FEAT_RNG; RNDR failure is detected through NZCV.
+        unsafe {
+            core::arch::asm!(
+                "mrs {value}, rndr",
+                "cset {success:w}, ne",
+                value = out(reg) value,
+                success = lateout(reg) success,
+                options(nomem, nostack),
+            );
+        }
+        if success != 0 {
+            return Some(value as u32);
+        }
+    }
+    None
+}
+
 impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitecture {
     const VM_ARENA_SIZE: usize = 64 << 30;
     const VM_BASE: usize = 448usize << 30;
@@ -399,6 +432,10 @@ impl crate::kernel::arch::traits::CpuArchitecture for super::CpuArchitecture {
 
     fn notify_executor() {
         self::notify_executor();
+    }
+
+    fn random_u32() -> Option<u32> {
+        self::random_u32()
     }
 
     fn wait_for_interrupt() {

@@ -156,6 +156,30 @@ pub(crate) fn halt() -> ! {
 
 pub(crate) fn notify_executor() {}
 
+pub(crate) fn random_u32() -> Option<u32> {
+    if core::arch::x86_64::__cpuid(1).ecx & (1 << 30) == 0 {
+        return None;
+    }
+    for _ in 0..10 {
+        let value: u32;
+        let success: u8;
+        // SAFETY: CPUID verified RDRAND support; a failed sample is discarded.
+        unsafe {
+            core::arch::asm!(
+                "rdrand {value:e}",
+                "setc {success}",
+                value = out(reg) value,
+                success = out(reg_byte) success,
+                options(nomem, nostack),
+            );
+        }
+        if success != 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
 pub(crate) fn handle_tlb_shootdown_nmi() -> bool {
     paging::handle_tlb_shootdown_nmi()
 }
@@ -372,6 +396,10 @@ impl crate::kernel::arch::traits::CpuArchitecture for super::CpuArchitecture {
 
     fn notify_executor() {
         self::notify_executor();
+    }
+
+    fn random_u32() -> Option<u32> {
+        self::random_u32()
     }
 
     fn wait_for_interrupt() {

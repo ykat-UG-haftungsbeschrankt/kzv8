@@ -250,6 +250,7 @@ pub(crate) mod traits {
     pub(crate) trait CpuArchitecture {
         fn halt() -> !;
         fn notify_executor();
+        fn random_u32() -> Option<u32>;
         fn wait_for_interrupt();
     }
 
