@@ -30,6 +30,7 @@ For POSIX interfaces under `runtime/bridge/posix`, do not remove or change exist
 
 ## Object Identity
 - For identity of a live in-memory object, use its address (for `Arc<T>`, `Arc::as_ptr`) rather than assigning a separate integer ID and maintaining an integer-to-object mapping.
+- A trusted userspace API may expose that address as an opaque identity or correlation token for a live object. Do not dereference it, and do not use a raw kernel address as a descriptor, authorization token, or handle accepted back from userspace.
 - Treat pointer-derived values as opaque identity only; never dereference an address received from userspace or another untrusted boundary. Keep validated generational handles where an external ABI or stale-handle protection requires them.
 
 ## Rust Naming

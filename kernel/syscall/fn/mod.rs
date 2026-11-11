@@ -6,6 +6,7 @@
  */
 
 pub(crate) mod clock_gettime;
+pub(crate) mod close;
 pub(crate) mod exit;
 pub(crate) mod exit_group;
 pub(crate) mod getpid;
@@ -13,6 +14,8 @@ pub(crate) mod gettid;
 pub(crate) mod mmap;
 pub(crate) mod mprotect;
 pub(crate) mod munmap;
+pub(crate) mod openat;
+pub(crate) mod read;
 pub(crate) mod sched_yield;
 pub(crate) mod write;
 

@@ -20,6 +20,7 @@ use crate::kernel::scheduler::thread::vm::UserAddressSpace;
 use crate::kernel::vfs::FileHandle;
 
 const INITIAL_CAPABILITY_SLOTS: usize = 32;
+const FIRST_FILE_DESCRIPTOR: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UserId(u32);
@@ -230,18 +231,27 @@ impl KernelObjectRef {
 }
 
 pub(crate) struct KernelObject {
-    file: IrqSpinLock<FileHandle>,
+    file: IrqSpinLock<Option<FileHandle>>,
 }
 
 impl KernelObject {
     fn new(file: FileHandle) -> Self {
         Self {
-            file: IrqSpinLock::new(file),
+            file: IrqSpinLock::new(Some(file)),
         }
     }
 
-    pub(crate) fn file(&self) -> &IrqSpinLock<FileHandle> {
-        &self.file
+    pub(crate) fn take_file(&self) -> Result<FileHandle, Error> {
+        self.file.lock().take().ok_or(Error::Busy)
+    }
+
+    pub(crate) fn restore_file(&self, file: FileHandle) -> Result<(), Error> {
+        let mut slot = self.file.lock();
+        if slot.is_some() {
+            return Err(Error::Busy);
+        }
+        *slot = Some(file);
+        Ok(())
     }
 }
 
@@ -278,12 +288,65 @@ impl KernelObjectTable {
     }
 }
 
+struct FileDescriptorTable {
+    entries: Vec<Option<KernelObjectRef>>,
+}
+
+impl FileDescriptorTable {
+    const fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    fn descriptor(index: usize) -> Result<u32, Error> {
+        u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(FIRST_FILE_DESCRIPTOR))
+            .ok_or(Error::Mfile)
+    }
+
+    fn insert(&mut self, object: KernelObjectRef) -> Result<u32, Error> {
+        if let Some(index) = self.entries.iter().position(Option::is_none) {
+            let descriptor = Self::descriptor(index)?;
+            self.entries[index] = Some(object);
+            return Ok(descriptor);
+        }
+
+        let index = self.entries.len();
+        let descriptor = Self::descriptor(index)?;
+        self.entries.try_reserve(1).map_err(|_| Error::NoMem)?;
+        self.entries.push(Some(object));
+        Ok(descriptor)
+    }
+
+    fn get(&self, descriptor: u32) -> Result<KernelObjectRef, Error> {
+        let index = descriptor
+            .checked_sub(FIRST_FILE_DESCRIPTOR)
+            .ok_or(Error::Badf)? as usize;
+        self.entries
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or(Error::Badf)
+    }
+
+    fn remove(&mut self, descriptor: u32) -> Result<KernelObjectRef, Error> {
+        let index = descriptor
+            .checked_sub(FIRST_FILE_DESCRIPTOR)
+            .ok_or(Error::Badf)? as usize;
+        self.entries
+            .get_mut(index)
+            .and_then(Option::take)
+            .ok_or(Error::Badf)
+    }
+}
+
 pub(crate) struct Process {
     namespace_set: NamespaceSet,
     address_space: UserAddressSpace,
     credentials: IrqSpinLock<Credentials>,
     capabilities: IrqSpinLock<CapabilityTable>,
     kernel_objects: IrqSpinLock<KernelObjectTable>,
+    file_descriptors: IrqSpinLock<FileDescriptorTable>,
 }
 
 impl Process {
@@ -307,6 +370,7 @@ impl Process {
             credentials: IrqSpinLock::new(credentials),
             capabilities: IrqSpinLock::new(capabilities),
             kernel_objects: IrqSpinLock::new(KernelObjectTable::new()),
+            file_descriptors: IrqSpinLock::new(FileDescriptorTable::new()),
         }))
     }
 
@@ -328,6 +392,28 @@ impl Process {
 
     pub(crate) fn insert_file_object(&self, file: FileHandle) -> Result<KernelObjectRef, Error> {
         self.kernel_objects.lock().insert(file)
+    }
+
+    pub(crate) fn insert_file_descriptor(&self, file: FileHandle) -> Result<u32, Error> {
+        let object_ref = self.insert_file_object(file)?;
+        let descriptor = self.file_descriptors.lock().insert(object_ref);
+        match descriptor {
+            Ok(descriptor) => Ok(descriptor),
+            Err(error) => {
+                let _ = self.close_kernel_object(object_ref);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn file_descriptor(&self, descriptor: u32) -> Result<Arc<KernelObject>, Error> {
+        let object_ref = self.file_descriptors.lock().get(descriptor)?;
+        self.kernel_object(object_ref)
+    }
+
+    pub(crate) fn close_file_descriptor(&self, descriptor: u32) -> Result<(), Error> {
+        let object_ref = self.file_descriptors.lock().remove(descriptor)?;
+        self.close_kernel_object(object_ref)
     }
 
     pub(crate) fn kernel_object(
@@ -541,7 +627,9 @@ impl ProcessMessage {
 mod tests {
     use alloc::sync::Arc;
 
-    use super::{Capability, CapabilityTable, Process};
+    use super::{
+        Capability, CapabilityTable, FileDescriptorTable, KernelObjectRef, Process,
+    };
     use crate::kernel::ipc::Endpoint;
 
     #[test]
@@ -560,5 +648,21 @@ mod tests {
     fn process_identity_is_its_arc_allocation_address() {
         let process = Process::new().unwrap();
         assert_eq!(process.id(), Arc::as_ptr(&process) as usize as u64);
+    }
+
+    #[test]
+    fn file_descriptors_start_after_stdio_and_reuse_closed_slots() {
+        let mut descriptors = FileDescriptorTable::new();
+        let first = KernelObjectRef::from_raw(0x1000);
+        let second = KernelObjectRef::from_raw(0x2000);
+        let third = KernelObjectRef::from_raw(0x3000);
+
+        assert_eq!(descriptors.insert(first).unwrap(), 3);
+        assert_eq!(descriptors.insert(second).unwrap(), 4);
+        assert_eq!(descriptors.get(4).unwrap(), second);
+        assert_eq!(descriptors.remove(3).unwrap(), first);
+        assert_eq!(descriptors.insert(third).unwrap(), 3);
+        assert_eq!(descriptors.get(3).unwrap(), third);
+        assert!(descriptors.get(0).is_err());
     }
 }

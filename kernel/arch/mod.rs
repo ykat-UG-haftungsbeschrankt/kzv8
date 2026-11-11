@@ -155,7 +155,10 @@ pub(crate) mod syscall {
         const GET_PID: u64;
         const GET_TID: u64;
         const SCHED_YIELD: u64;
+        const READ: u64;
         const WRITE: u64;
+        const CLOSE: u64;
+        const OPENAT: u64;
         const CLOCK_GET_TIME: u64;
         const MMAP: u64;
         const MUNMAP: u64;
@@ -175,7 +178,13 @@ pub(crate) mod syscall {
     #[allow(non_upper_case_globals)]
     pub(crate) const SchedYield: u64 = <Syscall as SyscallNumbers>::SCHED_YIELD;
     #[allow(non_upper_case_globals)]
+    pub(crate) const Read: u64 = <Syscall as SyscallNumbers>::READ;
+    #[allow(non_upper_case_globals)]
     pub(crate) const Write: u64 = <Syscall as SyscallNumbers>::WRITE;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Close: u64 = <Syscall as SyscallNumbers>::CLOSE;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const OpenAt: u64 = <Syscall as SyscallNumbers>::OPENAT;
     #[allow(non_upper_case_globals)]
     pub(crate) const ClockGetTime: u64 = <Syscall as SyscallNumbers>::CLOCK_GET_TIME;
     #[allow(non_upper_case_globals)]
@@ -348,7 +357,10 @@ pub(crate) mod traits {
         const GET_PID: u64;
         const GET_TID: u64;
         const SCHED_YIELD: u64;
+        const READ: u64;
         const WRITE: u64;
+        const CLOSE: u64;
+        const OPENAT: u64;
         const CLOCK_GET_TIME: u64;
         const MMAP: u64;
         const MUNMAP: u64;

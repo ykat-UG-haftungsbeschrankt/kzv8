@@ -8,12 +8,15 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::string::String;
+use alloc::task::Wake;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 
 use crate::kernel::error::Error;
 use crate::kernel::process::{Credentials, GroupId, UserId};
+use crate::kernel::scheduler::thread::{ThreadManager, ThreadState};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 pub(crate) mod plugin;
@@ -476,6 +479,10 @@ pub(crate) struct FileHandle {
 }
 
 impl FileHandle {
+    pub(crate) fn read_blocking(&mut self, buffer: &mut [u8]) -> VfsResult<usize> {
+        run_vfs_future(self.read(buffer))
+    }
+
     pub(crate) fn read<'a>(&'a mut self, buffer: &'a mut [u8]) -> VfsFuture<'a, VfsResult<usize>> {
         Box::pin(async move {
             if !self.mode.allows_read() {
@@ -493,6 +500,10 @@ impl FileHandle {
                 .ok_or(Error::Fbig)?;
             Ok(count)
         })
+    }
+
+    pub(crate) fn write_blocking(&mut self, buffer: &[u8]) -> VfsResult<usize> {
+        run_vfs_future(self.write(buffer))
     }
 
     pub(crate) fn write<'a>(&'a mut self, buffer: &'a [u8]) -> VfsFuture<'a, VfsResult<usize>> {
@@ -590,6 +601,15 @@ impl Vfs {
         })
     }
 
+    pub(crate) fn open_blocking(
+        &self,
+        path: &str,
+        mode: OpenMode,
+        credentials: Credentials,
+    ) -> VfsResult<FileHandle> {
+        run_vfs_future(self.open(path, mode, credentials))
+    }
+
     pub(crate) fn resolve<'a>(
         &'a self,
         path: &'a str,
@@ -634,4 +654,25 @@ pub(crate) fn mount_virtio_devices(virtio_fs_root: Option<Node>) -> usize {
 
 pub(crate) fn mounted() -> Option<Vfs> {
     MOUNTED_VFS.lock().as_ref().cloned()
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn run_vfs_future<T>(mut future: VfsFuture<'_, VfsResult<T>>) -> VfsResult<T> {
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => {
+                if !ThreadManager::switch_current(ThreadState::Ready) {
+                    crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+                }
+            }
+        }
+    }
 }

@@ -25,7 +25,10 @@ pub(crate) fn dispatch(frame: &mut SyscallFrame) {
         r#fn::getpid::GetPid::ID => r#fn::getpid::GetPid::handle(*frame),
         r#fn::gettid::GetTid::ID => r#fn::gettid::GetTid::handle(*frame),
         r#fn::sched_yield::SchedYield::ID => r#fn::sched_yield::SchedYield::handle(*frame),
+        r#fn::read::Read::ID => r#fn::read::Read::handle(*frame),
         r#fn::write::Write::ID => r#fn::write::Write::handle(*frame),
+        r#fn::close::Close::ID => r#fn::close::Close::handle(*frame),
+        r#fn::openat::OpenAt::ID => r#fn::openat::OpenAt::handle(*frame),
         r#fn::clock_gettime::ClockGetTime::ID => {
             r#fn::clock_gettime::ClockGetTime::handle(*frame)
         }

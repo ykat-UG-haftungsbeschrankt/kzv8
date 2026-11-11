@@ -232,7 +232,10 @@ impl SyscallNumbers for Syscall {
     const GET_PID: u64 = 39;
     const GET_TID: u64 = 186;
     const SCHED_YIELD: u64 = 24;
+    const READ: u64 = 0;
     const WRITE: u64 = 1;
+    const CLOSE: u64 = 3;
+    const OPENAT: u64 = 257;
     const CLOCK_GET_TIME: u64 = 228;
     const MMAP: u64 = 9;
     const MUNMAP: u64 = 11;
