@@ -33,6 +33,10 @@ pub(crate) const NETWORK_EVENT_SOURCE: EventSourceId = EventSourceId::new(1);
 const INITIAL_ROUTE_CAPACITY: usize = 2;
 const INITIAL_RECEIVE_BUDGET: usize = 16;
 const INITIAL_PENDING_CAPACITY: usize = 16;
+const MAX_PENDING_ROUTE_ENTRIES: usize = 256;
+const MAX_PENDING_ROUTE_BYTES: usize = 1024 * 1024;
+const MAX_NEIGHBORS: usize = 256;
+const MAX_TUNNEL_PEERS: usize = 256;
 const NEIGHBOR_LIFETIME_NS: u64 = 60_000_000_000;
 const INITIAL_TTL: u8 = 64;
 const INITIAL_LOCAL_ADDRESS: Ipv4Address = Ipv4Address([10, 0, 2, 15]);
@@ -277,6 +281,7 @@ pub(crate) struct NetStack {
     pending_transmissions: VecDeque<TcpTransmission>,
     pending_udp_transmissions: VecDeque<UdpTransmission>,
     pending_ipv4_transmissions: VecDeque<PendingIpv4Transmission>,
+    pending_route_bytes: usize,
     next_ipv4_identification: u16,
 }
 
@@ -327,6 +332,7 @@ impl NetStack {
             pending_transmissions,
             pending_udp_transmissions,
             pending_ipv4_transmissions,
+            pending_route_bytes: 0,
             next_ipv4_identification: 1,
         })
     }
@@ -811,6 +817,9 @@ impl NetStack {
             self.transmit_forwarded_ipv4(&packet, mac_address);
             return true;
         }
+        if !self.can_queue_pending_route(packet.len()) {
+            return false;
+        }
         if self.pending_ipv4_transmissions.try_reserve(1).is_err() {
             return false;
         }
@@ -818,11 +827,13 @@ impl NetStack {
             .pending_ipv4_transmissions
             .iter()
             .any(|pending| pending.next_hop == next_hop);
+        let packet_bytes = packet.len();
         self.pending_ipv4_transmissions
             .push_back(PendingIpv4Transmission {
                 next_hop,
                 packet,
             });
+        self.pending_route_bytes += packet_bytes;
         if !request_pending {
             self.send_arp_request(next_hop);
         }
@@ -869,6 +880,10 @@ impl NetStack {
             self.transmit_tcp(transmission, mac_address);
             return;
         }
+        let payload_bytes = transmission.payload.len();
+        if !self.can_queue_pending_route(payload_bytes) {
+            return;
+        }
         let request_pending = self
             .pending_transmissions
             .iter()
@@ -877,6 +892,7 @@ impl NetStack {
             return;
         }
         self.pending_transmissions.push_back(transmission);
+        self.pending_route_bytes += payload_bytes;
         if !request_pending {
             self.send_arp_request(next_hop);
         }
@@ -888,10 +904,15 @@ impl NetStack {
             let Some(transmission) = self.pending_transmissions.pop_front() else {
                 break;
             };
+            let payload_bytes = transmission.payload.len();
             let Some(next_hop) = self.next_hop(transmission.destination_address) else {
+                self.pending_route_bytes =
+                    self.pending_route_bytes.saturating_sub(payload_bytes);
                 continue;
             };
             if let Some(mac_address) = self.neighbor_mac(next_hop, now_ns) {
+                self.pending_route_bytes =
+                    self.pending_route_bytes.saturating_sub(payload_bytes);
                 self.transmit_tcp(transmission, mac_address);
             } else {
                 self.pending_transmissions.push_back(transmission);
@@ -921,41 +942,51 @@ impl NetStack {
             payload,
         )?;
         let length = transmission.payload.len();
-        self.queue_udp_transmission(transmission, now_ns);
+        self.queue_udp_transmission(transmission, now_ns)?;
         Ok(length)
     }
 
-    fn queue_udp_transmission(&mut self, transmission: UdpTransmission, now_ns: u64) {
+    fn queue_udp_transmission(
+        &mut self,
+        transmission: UdpTransmission,
+        now_ns: u64,
+    ) -> Result<(), Error> {
         if let Some(device) = self.routes.tunnel_device(transmission.destination_address) {
             self.transmit_udp_tun(transmission, &device);
-            return;
+            return Ok(());
         }
         if self.is_broadcast_address(transmission.destination_address) {
             self.transmit_udp(transmission, MacAddress::BROADCAST);
-            return;
+            return Ok(());
         }
         if let Some(device) = self.tunnel_peer(transmission.destination_address, now_ns) {
             self.transmit_udp_tun(transmission, &device);
-            return;
+            return Ok(());
         }
         let Some(next_hop) = self.next_hop(transmission.destination_address) else {
-            return;
+            return Ok(());
         };
         if let Some(mac_address) = self.neighbor_mac(next_hop, now_ns) {
             self.transmit_udp(transmission, mac_address);
-            return;
+            return Ok(());
+        }
+        let payload_bytes = transmission.payload.len();
+        if !self.can_queue_pending_route(payload_bytes) {
+            return Err(Error::NoBufs);
         }
         let request_pending = self
             .pending_udp_transmissions
             .iter()
             .any(|pending| self.next_hop(pending.destination_address) == Some(next_hop));
         if self.pending_udp_transmissions.try_reserve(1).is_err() {
-            return;
+            return Err(Error::NoMem);
         }
         self.pending_udp_transmissions.push_back(transmission);
+        self.pending_route_bytes += payload_bytes;
         if !request_pending {
             self.send_arp_request(next_hop);
         }
+        Ok(())
     }
 
     fn flush_pending_udp_transmissions(&mut self, now_ns: u64) {
@@ -964,10 +995,15 @@ impl NetStack {
             let Some(transmission) = self.pending_udp_transmissions.pop_front() else {
                 break;
             };
+            let payload_bytes = transmission.payload.len();
             let Some(next_hop) = self.next_hop(transmission.destination_address) else {
+                self.pending_route_bytes =
+                    self.pending_route_bytes.saturating_sub(payload_bytes);
                 continue;
             };
             if let Some(mac_address) = self.neighbor_mac(next_hop, now_ns) {
+                self.pending_route_bytes =
+                    self.pending_route_bytes.saturating_sub(payload_bytes);
                 self.transmit_udp(transmission, mac_address);
             } else {
                 self.pending_udp_transmissions.push_back(transmission);
@@ -981,7 +1017,10 @@ impl NetStack {
             let Some(pending) = self.pending_ipv4_transmissions.pop_front() else {
                 break;
             };
+            let packet_bytes = pending.packet.len();
             if let Some(mac_address) = self.neighbor_mac(pending.next_hop, now_ns) {
+                self.pending_route_bytes =
+                    self.pending_route_bytes.saturating_sub(packet_bytes);
                 self.transmit_forwarded_ipv4(&pending.packet, mac_address);
             } else {
                 self.pending_ipv4_transmissions.push_back(pending);
@@ -1194,6 +1233,7 @@ impl NetStack {
         if address == Ipv4Address([0; 4]) || mac.is_multicast() {
             return;
         }
+        self.expire_neighbors(now_ns);
         let expires_at_ns = now_ns.saturating_add(NEIGHBOR_LIFETIME_NS);
         if let Some(entry) = self
             .neighbors
@@ -1202,6 +1242,9 @@ impl NetStack {
         {
             entry.mac = mac;
             entry.expires_at_ns = expires_at_ns;
+            return;
+        }
+        if self.neighbors.len() >= MAX_NEIGHBORS {
             return;
         }
         if self.neighbors.try_reserve(1).is_err() {
@@ -1232,6 +1275,7 @@ impl NetStack {
         device: Arc<TunDevice>,
         now_ns: u64,
     ) {
+        self.expire_tunnel_peers(now_ns);
         let expires_at_ns = now_ns.saturating_add(NEIGHBOR_LIFETIME_NS);
         if let Some(peer) = self
             .tunnel_peers
@@ -1240,6 +1284,9 @@ impl NetStack {
         {
             peer.device = device;
             peer.expires_at_ns = expires_at_ns;
+            return;
+        }
+        if self.tunnel_peers.len() >= MAX_TUNNEL_PEERS {
             return;
         }
         if self.tunnel_peers.try_reserve(1).is_err() {
@@ -1262,6 +1309,19 @@ impl NetStack {
     fn expire_tunnel_peers(&mut self, now_ns: u64) {
         self.tunnel_peers
             .retain(|peer| peer.expires_at_ns > now_ns);
+    }
+
+    fn can_queue_pending_route(&self, payload_bytes: usize) -> bool {
+        let queued_entries = self
+            .pending_transmissions
+            .len()
+            .saturating_add(self.pending_udp_transmissions.len())
+            .saturating_add(self.pending_ipv4_transmissions.len());
+        queued_entries < MAX_PENDING_ROUTE_ENTRIES
+            && self
+                .pending_route_bytes
+                .checked_add(payload_bytes)
+                .is_some_and(|bytes| bytes <= MAX_PENDING_ROUTE_BYTES)
     }
 
     fn flush_host_transmissions(&mut self) {

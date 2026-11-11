@@ -17,6 +17,10 @@ use crate::kernel::net::tcp::segment::{
 use crate::kernel::net::wire::Ipv4Address;
 
 const MAX_TCP_RECEIVE_WINDOW: usize = u16::MAX as usize;
+const MAX_TCP_SOCKETS: usize = 256;
+const MAX_TCP_ACCEPT_BACKLOG: usize = 128;
+const MAX_TCP_SEND_BUFFER_PER_SOCKET: usize = 64 * 1024;
+const MAX_TCP_SEND_BUFFER_TOTAL: usize = 4 * 1024 * 1024;
 const INITIAL_RETRANSMIT_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAXIMUM_RETRANSMIT_TIMEOUT_NS: u64 = 60_000_000_000;
 const MAXIMUM_RETRANSMISSIONS: u8 = 5;
@@ -94,6 +98,7 @@ pub(crate) struct TcpTransmission {
 pub(crate) struct TcpSocketTable {
     slots: Vec<SocketSlot>,
     maximum_segment_size: usize,
+    queued_send_bytes: usize,
 }
 
 impl TcpSocketTable {
@@ -104,6 +109,7 @@ impl TcpSocketTable {
         (maximum_segment_size != 0).then_some(Self {
             slots: Vec::new(),
             maximum_segment_size,
+            queued_send_bytes: 0,
         })
     }
 
@@ -111,6 +117,9 @@ impl TcpSocketTable {
         let index = if let Some(index) = self.slots.iter().position(|slot| slot.socket.is_none()) {
             index
         } else {
+            if self.slots.len() >= MAX_TCP_SOCKETS {
+                return Err(Error::NoBufs);
+            }
             self.slots.try_reserve(1).map_err(|_| Error::NoMem)?;
             self.slots.push(SocketSlot {
                 generation: 0,
@@ -185,7 +194,7 @@ impl TcpSocketTable {
             sequence_number,
             TcpState::Listen,
         )?;
-        socket.backlog = backlog.max(1);
+        socket.backlog = backlog.clamp(1, MAX_TCP_ACCEPT_BACKLOG);
         socket
             .accept_queue
             .try_reserve_exact(socket.backlog)
@@ -233,7 +242,8 @@ impl TcpSocketTable {
         if socket.state != TcpState::Established {
             return false;
         }
-        true
+        socket.send_buffer.len() < MAX_TCP_SEND_BUFFER_PER_SOCKET
+            && self.queued_send_bytes < MAX_TCP_SEND_BUFFER_TOTAL
     }
 
     pub(crate) fn local_endpoint(
@@ -257,16 +267,24 @@ impl TcpSocketTable {
         handle: TcpSocketHandle,
         bytes: &[u8],
     ) -> Result<usize, Error> {
-        let socket = self.socket_mut(handle).ok_or(Error::BadFd)?;
+        let socket = self.socket(handle).ok_or(Error::BadFd)?;
         if socket.state != TcpState::Established {
             return Err(Error::Busy);
         }
-        socket
-            .send_buffer
-            .try_reserve(bytes.len())
+        let accepted = bytes
+            .len()
+            .min(MAX_TCP_SEND_BUFFER_PER_SOCKET.saturating_sub(socket.send_buffer.len()))
+            .min(MAX_TCP_SEND_BUFFER_TOTAL.saturating_sub(self.queued_send_bytes));
+        if accepted == 0 && !bytes.is_empty() {
+            return Err(Error::NoBufs);
+        }
+        let socket = self.socket_mut(handle).ok_or(Error::BadFd)?;
+        socket.send_buffer
+            .try_reserve(accepted)
             .map_err(|_| Error::NoMem)?;
-        socket.send_buffer.extend(bytes.iter().copied());
-        Ok(bytes.len())
+        socket.send_buffer.extend(bytes[..accepted].iter().copied());
+        self.queued_send_bytes += accepted;
+        Ok(accepted)
     }
 
     pub(crate) fn receive(
@@ -307,13 +325,21 @@ impl TcpSocketTable {
     }
 
     pub(crate) fn remove(&mut self, handle: TcpSocketHandle) -> bool {
-        let Some(slot) = self.slots.get_mut(handle.index) else {
-            return false;
+        let buffered_send_bytes = {
+            let Some(slot) = self.slots.get_mut(handle.index) else {
+                return false;
+            };
+            if slot.generation != handle.generation || slot.socket.is_none() {
+                return false;
+            }
+            let buffered_send_bytes = slot
+                .socket
+                .as_ref()
+                .map_or(0, |socket| socket.send_buffer.len());
+            slot.socket = None;
+            buffered_send_bytes
         };
-        if slot.generation != handle.generation || slot.socket.is_none() {
-            return false;
-        }
-        slot.socket = None;
+        self.queued_send_bytes = self.queued_send_bytes.saturating_sub(buffered_send_bytes);
         true
     }
 
@@ -327,88 +353,101 @@ impl TcpSocketTable {
             .try_reserve(self.slots.len())
             .map_err(|_| Error::NoMem)?;
         let mut changed = false;
-        for slot in &mut self.slots {
-            let Some(socket) = slot.socket.as_mut() else {
-                continue;
-            };
-            if socket.orphaned
-                && socket
-                    .close_deadline_ns
-                    .is_some_and(|deadline| now_ns >= deadline)
-            {
-                socket.state = TcpState::Closed;
-                socket.outstanding = None;
-            }
-            if socket.state == TcpState::Closed {
-                if socket.orphaned {
-                    slot.socket = None;
-                }
-                continue;
-            }
-            if socket.outstanding.is_some() {
-                if now_ns < socket.retransmit_at_ns {
+        let mut removed_send_bytes = 0usize;
+        let poll_result = (|| -> Result<(), Error> {
+            for slot in &mut self.slots {
+                let Some(socket) = slot.socket.as_mut() else {
                     continue;
-                }
-                if socket.retransmissions == MAXIMUM_RETRANSMISSIONS {
+                };
+                if socket.orphaned
+                    && socket
+                        .close_deadline_ns
+                        .is_some_and(|deadline| now_ns >= deadline)
+                {
                     socket.state = TcpState::Closed;
                     socket.outstanding = None;
-                    changed = true;
+                }
+                if socket.state == TcpState::Closed {
+                    if socket.orphaned {
+                        removed_send_bytes =
+                            removed_send_bytes.saturating_add(socket.send_buffer.len());
+                        slot.socket = None;
+                    }
                     continue;
                 }
-                let outstanding = socket.outstanding.as_ref().ok_or(Error::Proto)?;
-                transmissions.push(socket.transmission(
-                    outstanding.sequence_number,
-                    outstanding.flags,
-                    &outstanding.payload,
-                )?);
-                socket.retransmissions += 1;
-                socket.retransmit_timeout_ns = socket
-                    .retransmit_timeout_ns
-                    .saturating_mul(2)
-                    .min(MAXIMUM_RETRANSMIT_TIMEOUT_NS);
-                socket.retransmit_at_ns = now_ns.saturating_add(socket.retransmit_timeout_ns);
-                continue;
-            }
-            match socket.state {
-                TcpState::SynSent => {
-                    socket.start_outstanding(TCP_FLAG_SYN, &[], now_ns, transmissions)?;
-                }
-                TcpState::Established | TcpState::CloseWait => {
-                    if !socket.send_buffer.is_empty() && socket.peer_window != 0 {
-                        let length = socket
-                            .send_buffer
-                            .len()
-                            .min(usize::from(socket.peer_window))
-                            .min(maximum_segment_size);
-                        let mut payload = Vec::new();
-                        payload
-                            .try_reserve_exact(length)
-                            .map_err(|_| Error::NoMem)?;
-                        for _ in 0..length {
-                            if let Some(byte) = socket.send_buffer.pop_front() {
-                                payload.push(byte);
-                            }
-                        }
-                        socket.start_outstanding(
-                            TCP_FLAG_ACK | TCP_FLAG_PSH,
-                            &payload,
-                            now_ns,
-                            transmissions,
-                        )?;
-                    } else if socket.close_requested && socket.send_buffer.is_empty() {
-                        let flags = TCP_FLAG_ACK | TCP_FLAG_FIN;
-                        socket.start_outstanding(flags, &[], now_ns, transmissions)?;
-                        socket.state = if socket.state == TcpState::CloseWait {
-                            TcpState::LastAck
-                        } else {
-                            TcpState::FinWait1
-                        };
+                if socket.outstanding.is_some() {
+                    if now_ns < socket.retransmit_at_ns {
+                        continue;
                     }
+                    if socket.retransmissions == MAXIMUM_RETRANSMISSIONS {
+                        socket.state = TcpState::Closed;
+                        socket.outstanding = None;
+                        changed = true;
+                        continue;
+                    }
+                    let outstanding = socket.outstanding.as_ref().ok_or(Error::Proto)?;
+                    transmissions.push(socket.transmission(
+                        outstanding.sequence_number,
+                        outstanding.flags,
+                        &outstanding.payload,
+                    )?);
+                    socket.retransmissions += 1;
+                    socket.retransmit_timeout_ns = socket
+                        .retransmit_timeout_ns
+                        .saturating_mul(2)
+                        .min(MAXIMUM_RETRANSMIT_TIMEOUT_NS);
+                    socket.retransmit_at_ns = now_ns.saturating_add(socket.retransmit_timeout_ns);
+                    continue;
                 }
-                TcpState::Listen | TcpState::SynReceived | TcpState::FinWait1
-                | TcpState::FinWait2 | TcpState::LastAck | TcpState::Closed => {}
+                match socket.state {
+                    TcpState::SynSent => {
+                        socket.start_outstanding(TCP_FLAG_SYN, &[], now_ns, transmissions)?;
+                    }
+                    TcpState::Established | TcpState::CloseWait => {
+                        if !socket.send_buffer.is_empty() && socket.peer_window != 0 {
+                            let length = socket
+                                .send_buffer
+                                .len()
+                                .min(usize::from(socket.peer_window))
+                                .min(maximum_segment_size);
+                            let mut payload = Vec::new();
+                            payload
+                                .try_reserve_exact(length)
+                                .map_err(|_| Error::NoMem)?;
+                            for _ in 0..length {
+                                if let Some(byte) = socket.send_buffer.pop_front() {
+                                    payload.push(byte);
+                                }
+                            }
+                            removed_send_bytes = removed_send_bytes.saturating_add(length);
+                            socket.start_outstanding(
+                                TCP_FLAG_ACK | TCP_FLAG_PSH,
+                                &payload,
+                                now_ns,
+                                transmissions,
+                            )?;
+                        } else if socket.close_requested && socket.send_buffer.is_empty() {
+                            let flags = TCP_FLAG_ACK | TCP_FLAG_FIN;
+                            socket.start_outstanding(flags, &[], now_ns, transmissions)?;
+                            socket.state = if socket.state == TcpState::CloseWait {
+                                TcpState::LastAck
+                            } else {
+                                TcpState::FinWait1
+                            };
+                        }
+                    }
+                    TcpState::Listen
+                    | TcpState::SynReceived
+                    | TcpState::FinWait1
+                    | TcpState::FinWait2
+                    | TcpState::LastAck
+                    | TcpState::Closed => {}
+                }
             }
-        }
+            Ok(())
+        })();
+        self.queued_send_bytes = self.queued_send_bytes.saturating_sub(removed_send_bytes);
+        poll_result?;
         Ok(changed)
     }
 
@@ -758,7 +797,10 @@ impl TcpSocket {
 mod tests {
     use alloc::vec::Vec;
 
-    use super::{TcpSocketTable, TcpState};
+    use super::{
+        TcpSocketTable, TcpState, MAX_TCP_SEND_BUFFER_PER_SOCKET, MAX_TCP_SEND_BUFFER_TOTAL,
+        MAX_TCP_SOCKETS,
+    };
     use crate::kernel::net::tcp::segment::{
         write_segment, TcpSegment, TCP_FLAG_ACK, TCP_FLAG_SYN,
     };
@@ -815,12 +857,67 @@ mod tests {
         let local = Ipv4Address([192, 0, 2, 1]);
         let remote = Ipv4Address([192, 0, 2, 2]);
         let mut sockets = TcpSocketTable::new(1500).unwrap();
-        for index in 0..32u16 {
+        for index in 0..MAX_TCP_SOCKETS {
             sockets
-                .connect(local, remote, 49152 + index, 443, u64::from(index))
+                .connect(
+                    local,
+                    remote,
+                    49152 + index as u16,
+                    443,
+                    index as u64,
+                )
                 .unwrap();
         }
-        assert_eq!(sockets.slots.len(), 32);
+        assert_eq!(sockets.slots.len(), MAX_TCP_SOCKETS);
+        assert!(matches!(
+            sockets.connect(local, remote, 49408, 443, 1),
+            Err(crate::kernel::error::Error::NoBufs)
+        ));
+    }
+
+    #[test]
+    fn send_buffer_limits_accept_partial_data_then_apply_backpressure() {
+        let local = Ipv4Address([192, 0, 2, 1]);
+        let remote = Ipv4Address([192, 0, 2, 2]);
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
+        let handle = sockets.connect(local, remote, 49152, 443, 1).unwrap();
+        sockets.socket_mut(handle).unwrap().state = TcpState::Established;
+        let mut payload = Vec::new();
+        payload.resize(MAX_TCP_SEND_BUFFER_PER_SOCKET + 1, 0x5a);
+
+        assert_eq!(
+            sockets.send(handle, &payload).unwrap(),
+            MAX_TCP_SEND_BUFFER_PER_SOCKET
+        );
+        assert_eq!(sockets.queued_send_bytes, MAX_TCP_SEND_BUFFER_PER_SOCKET);
+        assert!(matches!(
+            sockets.send(handle, b"next"),
+            Err(crate::kernel::error::Error::NoBufs)
+        ));
+        assert!(!sockets.writable(handle));
+        assert!(sockets.remove(handle));
+        assert_eq!(sockets.queued_send_bytes, 0);
+
+        for index in 0..(MAX_TCP_SEND_BUFFER_TOTAL / MAX_TCP_SEND_BUFFER_PER_SOCKET) {
+            let handle = sockets
+                .connect(local, remote, 49152 + index as u16, 443, index as u64)
+                .unwrap();
+            sockets.socket_mut(handle).unwrap().state = TcpState::Established;
+            assert_eq!(
+                sockets
+                    .send(handle, &payload[..MAX_TCP_SEND_BUFFER_PER_SOCKET])
+                    .unwrap(),
+                MAX_TCP_SEND_BUFFER_PER_SOCKET
+            );
+        }
+        assert_eq!(sockets.queued_send_bytes, MAX_TCP_SEND_BUFFER_TOTAL);
+        let overflow_handle = sockets.connect(local, remote, 49216, 443, 1).unwrap();
+        sockets.socket_mut(overflow_handle).unwrap().state = TcpState::Established;
+        assert!(matches!(
+            sockets.send(overflow_handle, b"x"),
+            Err(crate::kernel::error::Error::NoBufs)
+        ));
+        assert!(!sockets.writable(overflow_handle));
     }
 
     #[test]
