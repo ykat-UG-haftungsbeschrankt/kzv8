@@ -24,6 +24,8 @@ pub(crate) mod driver;
 pub(crate) mod dl;
 #[allow(dead_code)]
 pub(crate) mod ebpf;
+#[allow(dead_code)]
+pub(crate) mod beam;
 pub(crate) mod error;
 pub(crate) mod event;
 pub(crate) mod ipc;
@@ -45,7 +47,7 @@ pub(crate) mod vfs;
 
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
-    pub(crate) use crate::{arch, block, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, namespace, process, runtime, scheduler, syscall, vfs};
+    pub(crate) use crate::{arch, beam, block, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, namespace, process, runtime, scheduler, syscall, vfs};
     #[cfg(feature = "virtualization")]
     pub(crate) use crate::vm;
 }

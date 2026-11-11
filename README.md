@@ -28,6 +28,8 @@ interrupts, scheduling, VirtIO devices, a small VFS, and JavaScript with V8.
 - Feature-gated virtualization support with vCPU contexts integrated into the
   thread scheduler.
 - A small internal VFS with a device metadata tree and VirtIO-FS mount support.
+- A bounded OTP-27 BEAM format-0 interpreter for a small register/integer
+  instruction subset, with an optional x86_64 JIT behind `beam-jit`.
 - An embedded V8 runtime, a C/C++ bridge, and a small freestanding C library.
 - A TypeScript VFAT reader/writer for FAT16 and FAT32 volumes, used to load
   JavaScript modules from a block device.
@@ -61,6 +63,10 @@ make run-aarch64
 
 To build an image without starting QEMU, use
 `make build/x86_64/kernel.elf` or `make build/aarch64/kernel.bin`.
+
+The BEAM interpreter is available by default. Cargo builds can opt into its
+x86_64 JIT with `--features beam-jit`; unsupported BEAM instructions continue
+to use the interpreter when running through the JIT-preferred entry point.
 
 ## A small map
 
