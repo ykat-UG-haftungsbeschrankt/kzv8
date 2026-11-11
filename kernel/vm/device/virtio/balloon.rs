@@ -40,6 +40,7 @@ impl VirtioBalloon {
                 config,
                 writable,
                 2,
+                256,
             ),
             guest_pfns: [false; PAGE_COUNT as usize],
             actual_pages: 0,

@@ -72,6 +72,7 @@ impl VirtioFs {
                 config,
                 [0; 16],
                 3,
+                256,
             ),
             request,
             response,

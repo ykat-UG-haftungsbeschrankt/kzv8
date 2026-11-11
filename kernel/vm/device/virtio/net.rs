@@ -445,6 +445,7 @@ impl VirtioNet {
                 config,
                 [0; 16],
                 2,
+                256,
             ),
             peer_id,
         })

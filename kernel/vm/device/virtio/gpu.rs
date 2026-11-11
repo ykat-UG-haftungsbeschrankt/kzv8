@@ -74,6 +74,7 @@ impl VirtioGpu {
                 config,
                 [0; 16],
                 2,
+                256,
             ),
             request,
             response,

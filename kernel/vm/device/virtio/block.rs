@@ -58,6 +58,7 @@ impl VirtioBlock {
                 config,
                 [0; 16],
                 1,
+                256,
             ),
             disk,
             request,

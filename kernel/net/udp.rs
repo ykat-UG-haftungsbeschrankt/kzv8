@@ -12,9 +12,6 @@ use crate::kernel::error::Error;
 use crate::kernel::net::wire::{ipv4_transport_checksum, Ipv4Address, IPV4_PROTOCOL_UDP};
 
 pub(crate) const UDP_HEADER_LENGTH: usize = 8;
-const MAX_UDP_SOCKETS: usize = 16;
-const MAX_QUEUED_DATAGRAMS: usize = 8;
-pub(crate) const MAX_UDP_PAYLOAD_LENGTH: usize = 1472;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UdpError {
@@ -123,34 +120,31 @@ pub(crate) struct UdpSocketTable {
 
 impl UdpSocketTable {
     pub(crate) fn new() -> Option<Self> {
-        let mut slots = Vec::new();
-        slots.try_reserve_exact(MAX_UDP_SOCKETS).ok()?;
-        for _ in 0..MAX_UDP_SOCKETS {
-            slots.push(UdpSocketSlot {
-                generation: 0,
-                socket: None,
-            });
-        }
-        Some(Self { slots })
+        Some(Self { slots: Vec::new() })
     }
 
     pub(crate) fn create(&mut self) -> Result<UdpSocketHandle, Error> {
-        let index = self
+        let index = if let Some(index) = self
             .slots
             .iter()
             .position(|slot| slot.socket.is_none())
-            .ok_or(Error::Mfile)?;
-        let mut received = VecDeque::new();
-        received
-            .try_reserve_exact(MAX_QUEUED_DATAGRAMS)
-            .map_err(|_| Error::NoMem)?;
+        {
+            index
+        } else {
+            self.slots.try_reserve(1).map_err(|_| Error::NoMem)?;
+            self.slots.push(UdpSocketSlot {
+                generation: 0,
+                socket: None,
+            });
+            self.slots.len() - 1
+        };
         let generation = self.slots[index].generation.wrapping_add(1).max(1);
         self.slots[index].generation = generation;
         self.slots[index].socket = Some(UdpSocket {
             local_address: Ipv4Address([0; 4]),
             local_port: 0,
             remote_endpoint: None,
-            received,
+            received: VecDeque::new(),
         });
         Ok(UdpSocketHandle { index, generation })
     }
@@ -195,7 +189,7 @@ impl UdpSocketTable {
         destination_port: u16,
         payload: &[u8],
     ) -> Result<UdpTransmission, Error> {
-        if payload.len() > MAX_UDP_PAYLOAD_LENGTH {
+        if payload.len() > usize::from(u16::MAX) - UDP_HEADER_LENGTH {
             return Err(Error::MsgSize);
         }
         let socket = self.socket(handle)?;
@@ -239,7 +233,6 @@ impl UdpSocketTable {
                 || !socket.remote_endpoint.map_or(true, |peer| {
                     peer == (source_address, datagram.source_port)
                 })
-                || socket.received.len() == MAX_QUEUED_DATAGRAMS
             {
                 continue;
             }
@@ -248,6 +241,7 @@ impl UdpSocketTable {
                 .try_reserve_exact(datagram.payload.len())
                 .map_err(|_| Error::NoMem)?;
             payload.extend_from_slice(datagram.payload);
+            socket.received.try_reserve(1).map_err(|_| Error::NoMem)?;
             socket.received.push_back(ReceivedDatagram {
                 source_address,
                 source_port: datagram.source_port,
@@ -352,5 +346,14 @@ mod tests {
         let received = sockets.receive(socket, &mut output).unwrap().unwrap();
         assert_eq!(received, (5, client, 49152));
         assert_eq!(&output[..5], b"query");
+    }
+
+    #[test]
+    fn socket_table_grows_beyond_initial_capacity() {
+        let mut sockets = UdpSocketTable::new().unwrap();
+        for _ in 0..32 {
+            sockets.create().unwrap();
+        }
+        assert_eq!(sockets.slots.len(), 32);
     }
 }

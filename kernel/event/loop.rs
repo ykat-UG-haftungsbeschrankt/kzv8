@@ -112,6 +112,10 @@ impl EventSignal {
         self.readiness.store(readiness.bits(), Ordering::Release);
     }
 
+    pub(crate) fn source_id(&self) -> EventSourceId {
+        EventSourceId::new(Arc::as_ptr(&self.readiness) as usize as u64)
+    }
+
     fn readiness(&self) -> EventFlags {
         EventFlags::from_bits(u32::from(self.readiness.load(Ordering::Acquire)))
             .unwrap_or(EventFlags::NONE)

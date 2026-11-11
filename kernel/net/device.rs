@@ -31,6 +31,10 @@ impl EthernetDevice {
         self.device.mac_address()
     }
 
+    pub(crate) const fn max_frame_size(&self) -> usize {
+        self.device.max_frame_size()
+    }
+
     pub(crate) const fn mtu(&self) -> usize {
         self.device.mtu()
     }

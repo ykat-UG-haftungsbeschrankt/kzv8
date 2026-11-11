@@ -67,6 +67,7 @@ impl VirtioScsi {
                 config,
                 [0; 16],
                 3,
+                256,
             ),
             disk,
             request,

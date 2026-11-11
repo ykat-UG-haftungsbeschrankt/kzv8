@@ -342,7 +342,7 @@ pub(crate) fn interface_ioctl(
             }
             let address = Ipv4Address(sockaddr.address.to_ne_bytes());
             if request == SIOCSIFADDR {
-                validate_interface_address(index, address)?;
+                validate_interface_address(address, Some(index))?;
                 device.set_ipv4_address(address);
                 Ok(())
             } else {
@@ -391,8 +391,11 @@ fn host_interface_ioctl(
             }
         }
         SIOCGIFADDR | SIOCGIFNETMASK => {
-            let address = active_context(|context| context.local_ipv4())?.ok_or(Error::NoDev)?;
-            let prefix_length = 24;
+            let (address, prefix_length) = active_context(|context| {
+                (context.local_ipv4(), context.local_ipv4_prefix_length())
+            })?;
+            let address = address.ok_or(Error::NoDev)?;
+            let prefix_length = prefix_length.ok_or(Error::NoDev)?;
             let address = if request == SIOCGIFADDR {
                 address
             } else {
@@ -428,7 +431,38 @@ fn host_interface_ioctl(
             }
             Ok(())
         }
-        SIOCSIFADDR | SIOCSIFNETMASK => Err(Error::NoSys),
+        SIOCSIFADDR | SIOCSIFNETMASK => {
+            let sockaddr = unsafe {
+                ptr::read_unaligned(argument.cast::<u8>().add(16).cast::<SockaddrIn>())
+            };
+            if i32::from(sockaddr.family) != AF_INET {
+                return Err(Error::AfNoSupport);
+            }
+            let configured_address = Ipv4Address(sockaddr.address.to_ne_bytes());
+            let (current_address, current_prefix) = active_context(|context| {
+                (context.local_ipv4(), context.local_ipv4_prefix_length())
+            })?;
+            if request == SIOCSIFADDR {
+                validate_interface_address(configured_address, None)?;
+                active_context(|context| {
+                    context.set_host_ipv4_configuration(
+                        configured_address,
+                        current_prefix.ok_or(Error::NoDev)?,
+                    )
+                })??;
+            } else {
+                let Some(prefix_length) = prefix_from_mask(configured_address.0) else {
+                    return Err(Error::Inval);
+                };
+                active_context(|context| {
+                    context.set_host_ipv4_configuration(
+                        current_address.ok_or(Error::NoDev)?,
+                        prefix_length,
+                    )
+                })??;
+            }
+            Ok(())
+        }
         _ => Err(Error::NoSys),
     }
 }
@@ -445,7 +479,10 @@ fn packet_interface_index(name: [u8; 16]) -> Result<usize, Error> {
         .ok_or(Error::NoDev)
 }
 
-fn validate_interface_address(index: usize, address: Ipv4Address) -> Result<(), Error> {
+fn validate_interface_address(
+    address: Ipv4Address,
+    excluded_packet_index: Option<usize>,
+) -> Result<(), Error> {
     if address == Ipv4Address([0; 4]) {
         return Ok(());
     }
@@ -454,7 +491,7 @@ fn validate_interface_address(index: usize, address: Ipv4Address) -> Result<(), 
     }
     let devices = PACKET_DEVICES.lock();
     if devices.iter().enumerate().any(|(other_index, descriptor)| {
-        other_index != index
+        Some(other_index) != excluded_packet_index
             && descriptor.as_ref().is_some_and(|descriptor| {
                 descriptor.mode.is_some()
                     && descriptor

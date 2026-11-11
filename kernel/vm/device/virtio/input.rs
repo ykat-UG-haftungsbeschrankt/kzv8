@@ -57,6 +57,7 @@ impl VirtioInput {
                 [0; 16],
                 [0; 16],
                 2,
+                256,
             ),
             select: 0,
             subselect: 0,

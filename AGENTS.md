@@ -28,6 +28,10 @@ For POSIX interfaces under `runtime/bridge/posix`, do not remove or change exist
 - Prefer safe Rust and avoid `unsafe` whenever a safe API can express the operation.
 - When `unsafe` is necessary, keep the block minimal and document its safety invariants.
 
+## Object Identity
+- For identity of a live in-memory object, use its address (for `Arc<T>`, `Arc::as_ptr`) rather than assigning a separate integer ID and maintaining an integer-to-object mapping.
+- Treat pointer-derived values as opaque identity only; never dereference an address received from userspace or another untrusted boundary. Keep validated generational handles where an external ABI or stale-handle protection requires them.
+
 ## Rust Naming
 Follow the [Rust API Guidelines naming conventions](https://rust-lang.github.io/api-guidelines/naming.html):
 - Use `snake_case` for modules, functions, methods, macros, and local variables; use `UpperCamelCase` for types, traits, and enum variants; use `SCREAMING_SNAKE_CASE` for constants and statics.

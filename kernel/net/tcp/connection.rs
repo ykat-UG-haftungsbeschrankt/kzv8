@@ -11,13 +11,12 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::kernel::error::Error;
 use crate::kernel::net::tcp::segment::{
-    TcpSegment, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
+    TcpSegment, TCP_HEADER_LENGTH, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST,
+    TCP_FLAG_SYN,
 };
 use crate::kernel::net::wire::Ipv4Address;
 
-const MAX_TCP_SOCKETS: usize = 16;
-const TCP_BUFFER_CAPACITY: usize = 4096;
-const TCP_MAXIMUM_SEGMENT_SIZE: usize = 536;
+const MAX_TCP_RECEIVE_WINDOW: usize = u16::MAX as usize;
 const INITIAL_RETRANSMIT_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAXIMUM_RETRANSMIT_TIMEOUT_NS: u64 = 60_000_000_000;
 const MAXIMUM_RETRANSMISSIONS: u8 = 5;
@@ -44,13 +43,11 @@ pub(crate) struct TcpSocketHandle {
     generation: u32,
 }
 
-#[derive(Clone, Copy)]
 struct OutstandingSegment {
     sequence_number: u32,
     end_sequence_number: u32,
     flags: u8,
-    payload: [u8; TCP_MAXIMUM_SEGMENT_SIZE],
-    payload_length: usize,
+    payload: Vec<u8>,
 }
 
 struct TcpSocket {
@@ -96,19 +93,34 @@ pub(crate) struct TcpTransmission {
 
 pub(crate) struct TcpSocketTable {
     slots: Vec<SocketSlot>,
+    maximum_segment_size: usize,
 }
 
 impl TcpSocketTable {
-    pub(crate) fn new() -> Option<Self> {
-        let mut slots = Vec::new();
-        slots.try_reserve_exact(MAX_TCP_SOCKETS).ok()?;
-        for _ in 0..MAX_TCP_SOCKETS {
-            slots.push(SocketSlot {
+    pub(crate) fn new(interface_mtu: usize) -> Option<Self> {
+        let maximum_segment_size = interface_mtu
+            .saturating_sub(20 + TCP_HEADER_LENGTH)
+            .min(usize::from(u16::MAX));
+        (maximum_segment_size != 0).then_some(Self {
+            slots: Vec::new(),
+            maximum_segment_size,
+        })
+    }
+
+    fn allocate_slot(&mut self) -> Result<(usize, u32), Error> {
+        let index = if let Some(index) = self.slots.iter().position(|slot| slot.socket.is_none()) {
+            index
+        } else {
+            self.slots.try_reserve(1).map_err(|_| Error::NoMem)?;
+            self.slots.push(SocketSlot {
                 generation: 0,
                 socket: None,
             });
-        }
-        Some(Self { slots })
+            self.slots.len() - 1
+        };
+        let generation = self.slots[index].generation.wrapping_add(1).max(1);
+        self.slots[index].generation = generation;
+        Ok((index, generation))
     }
 
     pub(crate) fn connect(
@@ -122,10 +134,7 @@ impl TcpSocketTable {
         if local_port == 0 || remote_port == 0 {
             return Err(Error::Inval);
         }
-        let Some(index) = self.slots.iter().position(|slot| slot.socket.is_none()) else {
-            return Err(Error::Mfile);
-        };
-        let generation = self.slots[index].generation.wrapping_add(1).max(1);
+        let (index, generation) = self.allocate_slot()?;
         let sequence_number = NEXT_INITIAL_SEQUENCE
             .fetch_add(0x9e37_79b9, Ordering::Relaxed)
             .wrapping_add(now_ns as u32)
@@ -138,7 +147,6 @@ impl TcpSocketTable {
             sequence_number,
             TcpState::SynSent,
         )?;
-        self.slots[index].generation = generation;
         self.slots[index].socket = Some(socket);
         Ok(TcpSocketHandle { index, generation })
     }
@@ -164,10 +172,7 @@ impl TcpSocketTable {
         }) {
             return Err(Error::Exist);
         }
-        let Some(index) = self.slots.iter().position(|slot| slot.socket.is_none()) else {
-            return Err(Error::Mfile);
-        };
-        let generation = self.slots[index].generation.wrapping_add(1).max(1);
+        let (index, generation) = self.allocate_slot()?;
         let sequence_number = NEXT_INITIAL_SEQUENCE
             .fetch_add(0x9e37_79b9, Ordering::Relaxed)
             .wrapping_add(now_ns as u32)
@@ -180,12 +185,11 @@ impl TcpSocketTable {
             sequence_number,
             TcpState::Listen,
         )?;
-        socket.backlog = backlog.max(1).min(MAX_TCP_SOCKETS);
+        socket.backlog = backlog.max(1);
         socket
             .accept_queue
             .try_reserve_exact(socket.backlog)
             .map_err(|_| Error::NoMem)?;
-        self.slots[index].generation = generation;
         self.slots[index].socket = Some(socket);
         Ok(TcpSocketHandle { index, generation })
     }
@@ -229,11 +233,7 @@ impl TcpSocketTable {
         if socket.state != TcpState::Established {
             return false;
         }
-        let outstanding_length = socket
-            .outstanding
-            .filter(|segment| segment.flags & (TCP_FLAG_SYN | TCP_FLAG_FIN) == 0)
-            .map_or(0, |segment| segment.payload_length);
-        socket.send_buffer.len().saturating_add(outstanding_length) < TCP_BUFFER_CAPACITY
+        true
     }
 
     pub(crate) fn local_endpoint(
@@ -261,19 +261,12 @@ impl TcpSocketTable {
         if socket.state != TcpState::Established {
             return Err(Error::Busy);
         }
-        let outstanding_length = socket
-            .outstanding
-            .filter(|segment| segment.flags & (TCP_FLAG_SYN | TCP_FLAG_FIN) == 0)
-            .map_or(0, |segment| segment.payload_length);
-        let available = TCP_BUFFER_CAPACITY
-            .saturating_sub(socket.send_buffer.len().saturating_add(outstanding_length));
-        let length = available.min(bytes.len());
         socket
             .send_buffer
-            .try_reserve(length)
+            .try_reserve(bytes.len())
             .map_err(|_| Error::NoMem)?;
-        socket.send_buffer.extend(bytes[..length].iter().copied());
-        Ok(length)
+        socket.send_buffer.extend(bytes.iter().copied());
+        Ok(bytes.len())
     }
 
     pub(crate) fn receive(
@@ -329,6 +322,7 @@ impl TcpSocketTable {
         now_ns: u64,
         transmissions: &mut Vec<TcpTransmission>,
     ) -> Result<bool, Error> {
+        let maximum_segment_size = self.maximum_segment_size;
         transmissions
             .try_reserve(self.slots.len())
             .map_err(|_| Error::NoMem)?;
@@ -351,7 +345,7 @@ impl TcpSocketTable {
                 }
                 continue;
             }
-            if let Some(outstanding) = socket.outstanding {
+            if socket.outstanding.is_some() {
                 if now_ns < socket.retransmit_at_ns {
                     continue;
                 }
@@ -361,10 +355,11 @@ impl TcpSocketTable {
                     changed = true;
                     continue;
                 }
+                let outstanding = socket.outstanding.as_ref().ok_or(Error::Proto)?;
                 transmissions.push(socket.transmission(
                     outstanding.sequence_number,
                     outstanding.flags,
-                    &outstanding.payload[..outstanding.payload_length],
+                    &outstanding.payload,
                 )?);
                 socket.retransmissions += 1;
                 socket.retransmit_timeout_ns = socket
@@ -384,7 +379,7 @@ impl TcpSocketTable {
                             .send_buffer
                             .len()
                             .min(usize::from(socket.peer_window))
-                            .min(TCP_MAXIMUM_SEGMENT_SIZE);
+                            .min(maximum_segment_size);
                         let mut payload = Vec::new();
                         payload
                             .try_reserve_exact(length)
@@ -535,10 +530,9 @@ impl TcpSocketTable {
         if pending_children >= backlog {
             return Ok(false);
         }
-        let Some(child_index) = self.slots.iter().position(|slot| slot.socket.is_none()) else {
+        let Ok((child_index, child_generation)) = self.allocate_slot() else {
             return Ok(false);
         };
-        let child_generation = self.slots[child_index].generation.wrapping_add(1).max(1);
         let initial_sequence = NEXT_INITIAL_SEQUENCE
             .fetch_add(0x9e37_79b9, Ordering::Relaxed)
             .wrapping_add(now_ns as u32)
@@ -560,7 +554,6 @@ impl TcpSocketTable {
             now_ns,
             transmissions,
         )?;
-        self.slots[child_index].generation = child_generation;
         self.slots[child_index].socket = Some(child);
         Ok(true)
     }
@@ -593,7 +586,7 @@ impl TcpSocketTable {
         if !segment.payload.is_empty() {
             send_ack = true;
             if expected_sequence == Some(segment.sequence_number) {
-                let available = TCP_BUFFER_CAPACITY.saturating_sub(socket.receive_buffer.len());
+                let available = MAX_TCP_RECEIVE_WINDOW.saturating_sub(socket.receive_buffer.len());
                 if segment.payload.len() <= available {
                     socket
                         .receive_buffer
@@ -658,14 +651,6 @@ impl TcpSocket {
         initial_sequence: u32,
         state: TcpState,
     ) -> Result<Self, Error> {
-        let mut send_buffer = VecDeque::new();
-        send_buffer
-            .try_reserve_exact(TCP_BUFFER_CAPACITY)
-            .map_err(|_| Error::NoMem)?;
-        let mut receive_buffer = VecDeque::new();
-        receive_buffer
-            .try_reserve_exact(TCP_BUFFER_CAPACITY)
-            .map_err(|_| Error::NoMem)?;
         Ok(Self {
             state,
             local_address,
@@ -676,8 +661,8 @@ impl TcpSocket {
             send_next: initial_sequence,
             receive_next: None,
             peer_window: u16::MAX,
-            send_buffer,
-            receive_buffer,
+            send_buffer: VecDeque::new(),
+            receive_buffer: VecDeque::new(),
             outstanding: None,
             retransmit_at_ns: 0,
             retransmit_timeout_ns: INITIAL_RETRANSMIT_TIMEOUT_NS,
@@ -699,8 +684,11 @@ impl TcpSocket {
         transmissions: &mut Vec<TcpTransmission>,
     ) -> Result<(), Error> {
         let sequence_number = self.send_next;
-        let mut saved_payload = [0; TCP_MAXIMUM_SEGMENT_SIZE];
-        saved_payload[..payload.len()].copy_from_slice(payload);
+        let mut saved_payload = Vec::new();
+        saved_payload
+            .try_reserve_exact(payload.len())
+            .map_err(|_| Error::NoMem)?;
+        saved_payload.extend_from_slice(payload);
         let sequence_length = payload.len() as u32
             + u32::from(flags & TCP_FLAG_SYN != 0)
             + u32::from(flags & TCP_FLAG_FIN != 0);
@@ -711,7 +699,6 @@ impl TcpSocket {
             end_sequence_number,
             flags,
             payload: saved_payload,
-            payload_length: payload.len(),
         });
         self.send_next = end_sequence_number;
         self.retransmit_timeout_ns = INITIAL_RETRANSMIT_TIMEOUT_NS;
@@ -722,16 +709,17 @@ impl TcpSocket {
     }
 
     fn acknowledge_outstanding(&mut self, acknowledgment_number: u32) -> bool {
-        let Some(outstanding) = self.outstanding else {
+        let Some(outstanding) = self.outstanding.as_ref() else {
             return false;
         };
         if acknowledgment_number != outstanding.end_sequence_number {
             return false;
         }
+        let flags = outstanding.flags;
         self.send_unacknowledged = acknowledgment_number;
         self.outstanding = None;
         self.retransmissions = 0;
-        if outstanding.flags & TCP_FLAG_FIN != 0 {
+        if flags & TCP_FLAG_FIN != 0 {
             self.state = match self.state {
                 TcpState::FinWait1 => TcpState::FinWait2,
                 TcpState::LastAck => TcpState::Closed,
@@ -760,7 +748,7 @@ impl TcpSocket {
             sequence_number,
             acknowledgment_number: self.receive_next.unwrap_or(0),
             flags,
-            window: (TCP_BUFFER_CAPACITY.saturating_sub(self.receive_buffer.len())) as u16,
+            window: (MAX_TCP_RECEIVE_WINDOW.saturating_sub(self.receive_buffer.len())) as u16,
             payload: copied_payload,
         })
     }
@@ -780,7 +768,7 @@ mod tests {
     fn client_enters_established_after_syn_ack() {
         let local = Ipv4Address([192, 0, 2, 1]);
         let remote = Ipv4Address([192, 0, 2, 2]);
-        let mut sockets = TcpSocketTable::new().unwrap();
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
         let handle = sockets.connect(local, remote, 49152, 443, 1).unwrap();
         let mut transmissions = Vec::new();
         sockets.poll(1, &mut transmissions).unwrap();
@@ -816,17 +804,30 @@ mod tests {
     fn stale_socket_handle_is_rejected() {
         let local = Ipv4Address([192, 0, 2, 1]);
         let remote = Ipv4Address([192, 0, 2, 2]);
-        let mut sockets = TcpSocketTable::new().unwrap();
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
         let handle = sockets.connect(local, remote, 49152, 443, 1).unwrap();
         assert!(sockets.remove(handle));
         assert_eq!(sockets.state(handle), None);
     }
 
     #[test]
+    fn socket_table_grows_beyond_initial_capacity() {
+        let local = Ipv4Address([192, 0, 2, 1]);
+        let remote = Ipv4Address([192, 0, 2, 2]);
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
+        for index in 0..32u16 {
+            sockets
+                .connect(local, remote, 49152 + index, 443, u64::from(index))
+                .unwrap();
+        }
+        assert_eq!(sockets.slots.len(), 32);
+    }
+
+    #[test]
     fn listener_accepts_completed_handshake() {
         let server = Ipv4Address([192, 0, 2, 1]);
         let client = Ipv4Address([192, 0, 2, 2]);
-        let mut sockets = TcpSocketTable::new().unwrap();
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
         let listener = sockets.listen(server, 8080, 4, 1).unwrap();
         let mut transmissions = Vec::new();
 

@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+use crate::kernel::error::Error;
 use crate::kernel::net::wire::internet_checksum;
 
 pub(crate) const ICMP_ECHO_REPLY: u8 = 0;
@@ -13,22 +14,15 @@ pub(crate) const ICMP_DESTINATION_UNREACHABLE: u8 = 3;
 pub(crate) const ICMP_TIME_EXCEEDED: u8 = 11;
 const ICMP_ECHO_HEADER_LENGTH: usize = 8;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IcmpError {
-    Truncated,
-    InvalidChecksum,
-    UnsupportedMessage,
-}
-
-pub(crate) fn write_echo_reply(request: &[u8], output: &mut [u8]) -> Result<usize, IcmpError> {
+pub(crate) fn write_echo_reply(request: &[u8], output: &mut [u8]) -> Result<usize, Error> {
     if request.len() < ICMP_ECHO_HEADER_LENGTH || output.len() < request.len() {
-        return Err(IcmpError::Truncated);
+        return Err(Error::MsgSize);
     }
     if request[0] != ICMP_ECHO_REQUEST || request[1] != 0 {
-        return Err(IcmpError::UnsupportedMessage);
+        return Err(Error::Proto);
     }
     if internet_checksum(request) != 0 {
-        return Err(IcmpError::InvalidChecksum);
+        return Err(Error::Proto);
     }
 
     output[..request.len()].copy_from_slice(request);
@@ -43,7 +37,7 @@ pub(crate) fn write_time_exceeded(
     original_header: &[u8],
     original_payload: &[u8],
     output: &mut [u8],
-) -> Result<usize, IcmpError> {
+) -> Result<usize, Error> {
     write_error(
         ICMP_TIME_EXCEEDED,
         0,
@@ -58,7 +52,7 @@ pub(crate) fn write_destination_unreachable(
     original_header: &[u8],
     original_payload: &[u8],
     output: &mut [u8],
-) -> Result<usize, IcmpError> {
+) -> Result<usize, Error> {
     write_error(
         ICMP_DESTINATION_UNREACHABLE,
         code,
@@ -74,14 +68,14 @@ fn write_error(
     original_header: &[u8],
     original_payload: &[u8],
     output: &mut [u8],
-) -> Result<usize, IcmpError> {
+) -> Result<usize, Error> {
     if original_header.len() < 20 {
-        return Err(IcmpError::Truncated);
+        return Err(Error::MsgSize);
     }
     let quote_length = original_payload.len().min(8);
     let length = ICMP_ECHO_HEADER_LENGTH + original_header.len() + quote_length;
     if output.len() < length {
-        return Err(IcmpError::Truncated);
+        return Err(Error::MsgSize);
     }
     output[..length].fill(0);
     output[0] = message_type;

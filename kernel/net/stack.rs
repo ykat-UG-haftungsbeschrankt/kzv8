@@ -19,7 +19,7 @@ use crate::kernel::net::icmp::{
 use crate::kernel::net::tcp::connection::{TcpSocketTable, TcpTransmission};
 use crate::kernel::net::tcp::segment::{write_segment, TcpSegment};
 use crate::kernel::net::udp::{
-    write_datagram, UdpDatagram, UdpSocketTable, UdpTransmission, MAX_UDP_PAYLOAD_LENGTH,
+    write_datagram, UdpDatagram, UdpSocketTable, UdpTransmission, UDP_HEADER_LENGTH,
 };
 use crate::kernel::net::wire::{
     rewrite_forwarded_ipv4_header, write_ethernet_header, write_ipv4_header, EthernetFrame,
@@ -30,17 +30,14 @@ use crate::kernel::net::wire::{
 use crate::kernel::vfs::plugin::tun::{self, TunDevice, TunTapMode};
 
 pub(crate) const NETWORK_EVENT_SOURCE: EventSourceId = EventSourceId::new(1);
-const MAX_ETHERNET_FRAME_LENGTH: usize = 1514;
-const MAX_NEIGHBORS: usize = 16;
-const MAX_PENDING_TRANSMISSIONS: usize = 16;
-const MAX_PENDING_IPV4_TRANSMISSIONS: usize = 16;
-const MAX_IPV4_ROUTES: usize = 16;
-const RECEIVE_BUDGET: usize = 16;
-const MAX_TUN_PEERS: usize = 16;
+const INITIAL_ROUTE_CAPACITY: usize = 2;
+const INITIAL_RECEIVE_BUDGET: usize = 16;
+const INITIAL_PENDING_CAPACITY: usize = 16;
 const NEIGHBOR_LIFETIME_NS: u64 = 60_000_000_000;
-const DEFAULT_TTL: u8 = 64;
-const LOCAL_ADDRESS: Ipv4Address = Ipv4Address([10, 0, 2, 15]);
-const DEFAULT_GATEWAY: Ipv4Address = Ipv4Address([10, 0, 2, 2]);
+const INITIAL_TTL: u8 = 64;
+const INITIAL_LOCAL_ADDRESS: Ipv4Address = Ipv4Address([10, 0, 2, 15]);
+const INITIAL_PREFIX_LENGTH: u8 = 24;
+const INITIAL_DEFAULT_GATEWAY: Ipv4Address = Ipv4Address([10, 0, 2, 2]);
 
 #[derive(Clone, Copy)]
 struct NeighborEntry {
@@ -68,19 +65,23 @@ struct Ipv4RouteTable {
 }
 
 impl Ipv4RouteTable {
-    fn new() -> Option<Self> {
+    fn new(
+        local_address: Ipv4Address,
+        prefix_length: u8,
+        default_gateway: Ipv4Address,
+    ) -> Option<Self> {
         let mut routes = Vec::new();
-        routes.try_reserve_exact(MAX_IPV4_ROUTES).ok()?;
+        routes.try_reserve_exact(INITIAL_ROUTE_CAPACITY).ok()?;
         routes.push(Ipv4Route {
-            network: Ipv4Address([10, 0, 2, 0]),
-            prefix_length: 24,
+            network: mask_ipv4(local_address, prefix_length),
+            prefix_length,
             gateway: None,
             tunnel: None,
         });
         routes.push(Ipv4Route {
             network: Ipv4Address([0; 4]),
             prefix_length: 0,
-            gateway: Some(DEFAULT_GATEWAY),
+            gateway: Some(default_gateway),
             tunnel: None,
         });
         Some(Self { routes })
@@ -105,15 +106,41 @@ impl Ipv4RouteTable {
             route.tunnel = None;
             return Ok(());
         }
-        if self.routes.len() == MAX_IPV4_ROUTES {
-            return Err(Error::NoBufs);
-        }
+        self.routes.try_reserve(1).map_err(|_| Error::NoMem)?;
         self.routes.push(Ipv4Route {
             network,
             prefix_length,
             gateway,
             tunnel: None,
         });
+        Ok(())
+    }
+
+    fn update_connected_route(
+        &mut self,
+        old_address: Ipv4Address,
+        old_prefix_length: u8,
+        new_address: Ipv4Address,
+        new_prefix_length: u8,
+    ) -> Result<(), Error> {
+        let old_network = mask_ipv4(old_address, old_prefix_length);
+        let new_network = mask_ipv4(new_address, new_prefix_length);
+        if old_network == new_network && old_prefix_length == new_prefix_length {
+            return Ok(());
+        }
+        self.add(new_network, new_prefix_length, None)?;
+        if let Some(index) = self.routes.iter().position(|route| {
+            route.network == old_network
+                && route.prefix_length == old_prefix_length
+                && route.gateway.is_none()
+                && route.tunnel.is_none()
+        }) {
+            if self.routes[index].network != new_network
+                || self.routes[index].prefix_length != new_prefix_length
+            {
+                self.routes.remove(index);
+            }
+        }
         Ok(())
     }
 
@@ -140,9 +167,7 @@ impl Ipv4RouteTable {
             route.tunnel = Some(device);
             return Ok(());
         }
-        if self.routes.len() == MAX_IPV4_ROUTES {
-            return Err(Error::NoBufs);
-        }
+        self.routes.try_reserve(1).map_err(|_| Error::NoMem)?;
         self.routes.push(Ipv4Route {
             network,
             prefix_length,
@@ -228,12 +253,23 @@ fn mask_ipv4(mut address: Ipv4Address, prefix_length: u8) -> Ipv4Address {
     address
 }
 
+fn allocate_zeroed(length: usize) -> Option<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(length).ok()?;
+    buffer.resize(length, 0);
+    Some(buffer)
+}
+
 pub(crate) struct NetStack {
     pub(crate) tcp_sockets: TcpSocketTable,
     pub(crate) udp_sockets: UdpSocketTable,
     device: EthernetDevice,
+    frame_size: usize,
     mac_address: MacAddress,
     local_address: Ipv4Address,
+    local_prefix_length: u8,
+    default_ttl: u8,
+    receive_budget: usize,
     neighbors: Vec<NeighborEntry>,
     tunnel_peers: Vec<TunnelPeer>,
     routes: Ipv4RouteTable,
@@ -248,32 +284,45 @@ impl NetStack {
     pub(crate) fn initialize() -> Option<Self> {
         let mut device = EthernetDevice::initialize()?;
         let mac_address = MacAddress(device.mac_address());
+        let frame_size = device.max_frame_size();
+        let local_address = INITIAL_LOCAL_ADDRESS;
+        let local_prefix_length = INITIAL_PREFIX_LENGTH;
         crate::kernel::vm::device::virtio::net::register_host_interface(mac_address.0);
         let mut neighbors = Vec::new();
-        neighbors.try_reserve_exact(MAX_NEIGHBORS).ok()?;
+        neighbors.try_reserve_exact(INITIAL_PENDING_CAPACITY).ok()?;
         let mut tunnel_peers = Vec::new();
-        tunnel_peers.try_reserve_exact(MAX_TUN_PEERS).ok()?;
+        tunnel_peers.try_reserve_exact(INITIAL_PENDING_CAPACITY).ok()?;
         let mut pending_transmissions = VecDeque::new();
         pending_transmissions
-            .try_reserve_exact(MAX_PENDING_TRANSMISSIONS)
+            .try_reserve_exact(INITIAL_PENDING_CAPACITY)
             .ok()?;
         let mut pending_udp_transmissions = VecDeque::new();
         pending_udp_transmissions
-            .try_reserve_exact(MAX_PENDING_TRANSMISSIONS)
+            .try_reserve_exact(INITIAL_PENDING_CAPACITY)
             .ok()?;
         let mut pending_ipv4_transmissions = VecDeque::new();
         pending_ipv4_transmissions
-            .try_reserve_exact(MAX_PENDING_IPV4_TRANSMISSIONS)
+            .try_reserve_exact(INITIAL_PENDING_CAPACITY)
             .ok()?;
         Some(Self {
-            tcp_sockets: TcpSocketTable::new()?,
+            tcp_sockets: TcpSocketTable::new(
+                device.max_frame_size().saturating_sub(ETHERNET_HEADER_LENGTH),
+            )?,
             udp_sockets: UdpSocketTable::new()?,
             device,
+            frame_size,
             mac_address,
-            local_address: LOCAL_ADDRESS,
+            local_address,
+            local_prefix_length,
+            default_ttl: INITIAL_TTL,
+            receive_budget: INITIAL_RECEIVE_BUDGET,
             neighbors,
             tunnel_peers,
-            routes: Ipv4RouteTable::new()?,
+            routes: Ipv4RouteTable::new(
+                local_address,
+                local_prefix_length,
+                INITIAL_DEFAULT_GATEWAY,
+            )?,
             ipv4_forwarding_enabled: false,
             pending_transmissions,
             pending_udp_transmissions,
@@ -290,9 +339,11 @@ impl NetStack {
     ) -> bool {
         crate::kernel::vm::device::virtio::net::poll_tap_devices();
         let mut changed = false;
-        let mut input = [0; MAX_ETHERNET_FRAME_LENGTH];
-        changed |= self.poll_tun_devices(now_ns);
-        for _ in 0..RECEIVE_BUDGET {
+        let Some(mut input) = allocate_zeroed(self.frame_size) else {
+            return false;
+        };
+        changed |= self.poll_tun_devices(now_ns, self.receive_budget);
+        for _ in 0..self.receive_budget {
             let length = match self.device.poll_receive_frame() {
                 Ok(Some(length)) if length <= input.len() => length,
                 Ok(Some(_)) => continue,
@@ -305,7 +356,7 @@ impl NetStack {
             crate::kernel::vm::device::virtio::net::host_ingress_frame(&input[..length]);
             changed |= self.process_frame(&input[..length], now_ns);
         }
-        for _ in 0..RECEIVE_BUDGET {
+        for _ in 0..self.receive_budget {
             let Some(length) = crate::kernel::vm::device::virtio::net::receive_host_stack_frame(
                 &mut input,
             ) else {
@@ -339,6 +390,45 @@ impl NetStack {
 
     pub(crate) const fn ipv4_address(&self) -> Ipv4Address {
         self.local_address
+    }
+
+    pub(crate) const fn ipv4_prefix_length(&self) -> u8 {
+        self.local_prefix_length
+    }
+
+    pub(crate) fn set_ipv4_configuration(
+        &mut self,
+        address: Ipv4Address,
+        prefix_length: u8,
+    ) -> Result<(), Error> {
+        if prefix_length > 32 {
+            return Err(Error::Inval);
+        }
+        self.routes.update_connected_route(
+            self.local_address,
+            self.local_prefix_length,
+            address,
+            prefix_length,
+        )?;
+        self.local_address = address;
+        self.local_prefix_length = prefix_length;
+        Ok(())
+    }
+
+    pub(crate) fn set_default_ttl(&mut self, ttl: u8) -> Result<(), Error> {
+        if ttl == 0 {
+            return Err(Error::Inval);
+        }
+        self.default_ttl = ttl;
+        Ok(())
+    }
+
+    pub(crate) fn set_receive_budget(&mut self, budget: usize) -> Result<(), Error> {
+        if budget == 0 {
+            return Err(Error::Inval);
+        }
+        self.receive_budget = budget;
+        Ok(())
     }
 
     pub(crate) const fn ethernet_mac_address(&self) -> [u8; 6] {
@@ -402,7 +492,7 @@ impl NetStack {
         self.device.interrupt_slot()
     }
 
-    fn poll_tun_devices(&mut self, now_ns: u64) -> bool {
+    fn poll_tun_devices(&mut self, now_ns: u64, receive_budget: usize) -> bool {
         let Ok(devices) = tun::open_devices() else {
             return false;
         };
@@ -411,7 +501,7 @@ impl NetStack {
             if !device.is_configured() || device.mode() != TunTapMode::Tun {
                 continue;
             }
-            for _ in 0..RECEIVE_BUDGET {
+            for _ in 0..receive_budget {
                 let Ok(packet) = device.dequeue_transmitted_packet() else {
                     break;
                 };
@@ -450,7 +540,9 @@ impl NetStack {
                 .unwrap_or(false);
         }
         if packet.protocol == IPV4_PROTOCOL_ICMP {
-            let mut response = [0; MAX_ETHERNET_FRAME_LENGTH];
+            let Some(mut response) = allocate_zeroed(self.frame_size) else {
+                return false;
+            };
             let Ok(icmp_length) = write_echo_reply(packet.payload, &mut response[20..]) else {
                 return false;
             };
@@ -459,7 +551,7 @@ impl NetStack {
                 self.local_address,
                 packet.source,
                 IPV4_PROTOCOL_ICMP,
-                DEFAULT_TTL,
+                self.default_ttl,
                 self.next_ipv4_identification,
                 0,
                 icmp_length,
@@ -548,7 +640,9 @@ impl NetStack {
                 .unwrap_or(false);
         }
         if packet.protocol == IPV4_PROTOCOL_ICMP {
-            let mut frame_bytes = [0; MAX_ETHERNET_FRAME_LENGTH];
+            let Some(mut frame_bytes) = allocate_zeroed(self.frame_size) else {
+                return false;
+            };
             let icmp_offset = ETHERNET_HEADER_LENGTH + IPV4_MINIMUM_HEADER_LENGTH;
             let Ok(icmp_length) = write_echo_reply(
                 packet.payload,
@@ -561,7 +655,7 @@ impl NetStack {
                 self.local_address,
                 packet.source,
                 IPV4_PROTOCOL_ICMP,
-                DEFAULT_TTL,
+                self.default_ttl,
                 self.next_ipv4_identification,
                 0,
                 icmp_length,
@@ -624,7 +718,7 @@ impl NetStack {
         let Some(packet_length) = packet.header.len().checked_add(packet.payload.len()) else {
             return false;
         };
-        if packet_length > MAX_ETHERNET_FRAME_LENGTH - ETHERNET_HEADER_LENGTH {
+        if packet_length > self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH) {
             if packet.dont_fragment {
                 self.send_icmp_error(packet, ingress_address, now_ns, false, 4);
             }
@@ -681,7 +775,7 @@ impl NetStack {
             source_address,
             packet.source,
             IPV4_PROTOCOL_ICMP,
-            DEFAULT_TTL,
+            self.default_ttl,
             self.next_ipv4_identification,
             0,
             icmp_length,
@@ -717,7 +811,7 @@ impl NetStack {
             self.transmit_forwarded_ipv4(&packet, mac_address);
             return true;
         }
-        if self.pending_ipv4_transmissions.len() == MAX_PENDING_IPV4_TRANSMISSIONS {
+        if self.pending_ipv4_transmissions.try_reserve(1).is_err() {
             return false;
         }
         let request_pending = self
@@ -736,10 +830,12 @@ impl NetStack {
     }
 
     fn transmit_forwarded_ipv4(&mut self, packet: &[u8], destination_mac: MacAddress) {
-        if packet.len() > MAX_ETHERNET_FRAME_LENGTH - ETHERNET_HEADER_LENGTH {
+        if packet.len() > self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH) {
             return;
         }
-        let mut frame = [0; MAX_ETHERNET_FRAME_LENGTH];
+        let Some(mut frame) = allocate_zeroed(self.frame_size) else {
+            return;
+        };
         if write_ethernet_header(
             &mut frame[..ETHERNET_HEADER_LENGTH],
             destination_mac,
@@ -777,9 +873,10 @@ impl NetStack {
             .pending_transmissions
             .iter()
             .any(|pending| self.next_hop(pending.destination_address) == Some(next_hop));
-        if self.pending_transmissions.len() < MAX_PENDING_TRANSMISSIONS {
-            self.pending_transmissions.push_back(transmission);
+        if self.pending_transmissions.try_reserve(1).is_err() {
+            return;
         }
+        self.pending_transmissions.push_back(transmission);
         if !request_pending {
             self.send_arp_request(next_hop);
         }
@@ -810,7 +907,10 @@ impl NetStack {
         payload: &[u8],
         now_ns: u64,
     ) -> Result<usize, Error> {
-        if payload.len() > MAX_UDP_PAYLOAD_LENGTH {
+        let maximum_payload_length = self
+            .frame_size
+            .saturating_sub(ETHERNET_HEADER_LENGTH + IPV4_MINIMUM_HEADER_LENGTH + UDP_HEADER_LENGTH);
+        if payload.len() > maximum_payload_length {
             return Err(Error::MsgSize);
         }
         let transmission = self.udp_sockets.send_to(
@@ -849,9 +949,10 @@ impl NetStack {
             .pending_udp_transmissions
             .iter()
             .any(|pending| self.next_hop(pending.destination_address) == Some(next_hop));
-        if self.pending_udp_transmissions.len() < MAX_PENDING_TRANSMISSIONS {
-            self.pending_udp_transmissions.push_back(transmission);
+        if self.pending_udp_transmissions.try_reserve(1).is_err() {
+            return;
         }
+        self.pending_udp_transmissions.push_back(transmission);
         if !request_pending {
             self.send_arp_request(next_hop);
         }
@@ -889,7 +990,9 @@ impl NetStack {
     }
 
     fn transmit_udp(&mut self, transmission: UdpTransmission, destination_mac: MacAddress) {
-        let mut frame = [0; MAX_ETHERNET_FRAME_LENGTH];
+        let Some(mut frame) = allocate_zeroed(self.frame_size) else {
+            return;
+        };
         let udp_offset = ETHERNET_HEADER_LENGTH + IPV4_MINIMUM_HEADER_LENGTH;
         let Ok(udp_length) = write_datagram(
             &mut frame[udp_offset..],
@@ -906,7 +1009,7 @@ impl NetStack {
             transmission.source_address,
             transmission.destination_address,
             IPV4_PROTOCOL_UDP,
-            DEFAULT_TTL,
+            self.default_ttl,
             self.next_ipv4_identification,
             0,
             udp_length,
@@ -930,7 +1033,10 @@ impl NetStack {
     }
 
     fn transmit_tcp_tun(&mut self, transmission: TcpTransmission, device: &TunDevice) {
-        let mut packet = [0; MAX_ETHERNET_FRAME_LENGTH];
+        let packet_size = self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH);
+        let Some(mut packet) = allocate_zeroed(packet_size) else {
+            return;
+        };
         let tcp_offset = IPV4_MINIMUM_HEADER_LENGTH;
         let Ok(tcp_length) = write_segment(
             &mut packet[tcp_offset..],
@@ -951,7 +1057,7 @@ impl NetStack {
             transmission.source_address,
             transmission.destination_address,
             IPV4_PROTOCOL_TCP,
-            DEFAULT_TTL,
+            self.default_ttl,
             self.next_ipv4_identification,
             0,
             tcp_length,
@@ -963,7 +1069,10 @@ impl NetStack {
     }
 
     fn transmit_udp_tun(&mut self, transmission: UdpTransmission, device: &TunDevice) {
-        let mut packet = [0; MAX_ETHERNET_FRAME_LENGTH];
+        let packet_size = self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH);
+        let Some(mut packet) = allocate_zeroed(packet_size) else {
+            return;
+        };
         let udp_offset = IPV4_MINIMUM_HEADER_LENGTH;
         let Ok(udp_length) = write_datagram(
             &mut packet[udp_offset..],
@@ -980,7 +1089,7 @@ impl NetStack {
             transmission.source_address,
             transmission.destination_address,
             IPV4_PROTOCOL_UDP,
-            DEFAULT_TTL,
+            self.default_ttl,
             self.next_ipv4_identification,
             0,
             udp_length,
@@ -992,7 +1101,9 @@ impl NetStack {
     }
 
     fn transmit_tcp(&mut self, transmission: TcpTransmission, destination_mac: MacAddress) {
-        let mut frame = [0; MAX_ETHERNET_FRAME_LENGTH];
+        let Some(mut frame) = allocate_zeroed(self.frame_size) else {
+            return;
+        };
         let tcp_offset = ETHERNET_HEADER_LENGTH + IPV4_MINIMUM_HEADER_LENGTH;
         let Ok(tcp_length) = write_segment(
             &mut frame[tcp_offset..],
@@ -1013,7 +1124,7 @@ impl NetStack {
             transmission.source_address,
             transmission.destination_address,
             IPV4_PROTOCOL_TCP,
-            DEFAULT_TTL,
+            self.default_ttl,
             self.next_ipv4_identification,
             0,
             tcp_length,
@@ -1093,26 +1204,14 @@ impl NetStack {
             entry.expires_at_ns = expires_at_ns;
             return;
         }
-        if self.neighbors.len() == MAX_NEIGHBORS {
-            if let Some((index, _)) = self
-                .neighbors
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.expires_at_ns)
-            {
-                self.neighbors[index] = NeighborEntry {
-                    address,
-                    mac,
-                    expires_at_ns,
-                };
-            }
-        } else {
-            self.neighbors.push(NeighborEntry {
-                address,
-                mac,
-                expires_at_ns,
-            });
+        if self.neighbors.try_reserve(1).is_err() {
+            return;
         }
+        self.neighbors.push(NeighborEntry {
+            address,
+            mac,
+            expires_at_ns,
+        });
     }
 
     fn neighbor_mac(&self, address: Ipv4Address, now_ns: u64) -> Option<MacAddress> {
@@ -1143,26 +1242,14 @@ impl NetStack {
             peer.expires_at_ns = expires_at_ns;
             return;
         }
-        if self.tunnel_peers.len() == MAX_TUN_PEERS {
-            if let Some((index, _)) = self
-                .tunnel_peers
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, peer)| peer.expires_at_ns)
-            {
-                self.tunnel_peers[index] = TunnelPeer {
-                    address,
-                    device,
-                    expires_at_ns,
-                };
-            }
-        } else {
-            self.tunnel_peers.push(TunnelPeer {
-                address,
-                device,
-                expires_at_ns,
-            });
+        if self.tunnel_peers.try_reserve(1).is_err() {
+            return;
         }
+        self.tunnel_peers.push(TunnelPeer {
+            address,
+            device,
+            expires_at_ns,
+        });
     }
 
     fn tunnel_peer(&self, address: Ipv4Address, now_ns: u64) -> Option<Arc<TunDevice>> {
@@ -1178,8 +1265,10 @@ impl NetStack {
     }
 
     fn flush_host_transmissions(&mut self) {
-        let mut frame = [0; MAX_ETHERNET_FRAME_LENGTH];
-        for _ in 0..RECEIVE_BUDGET {
+        let Some(mut frame) = allocate_zeroed(self.frame_size) else {
+            return;
+        };
+        for _ in 0..self.receive_budget {
             let Some(length) =
                 crate::kernel::vm::device::virtio::net::receive_host_transmit_frame(&mut frame)
             else {
@@ -1200,7 +1289,7 @@ impl NetStack {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ipv4Address, Ipv4RouteTable, DEFAULT_GATEWAY};
+    use super::{Ipv4Address, Ipv4RouteTable, INITIAL_DEFAULT_GATEWAY};
 
     #[test]
     fn route_lookup_prefers_the_longest_prefix() {
@@ -1225,7 +1314,7 @@ mod tests {
         );
         assert_eq!(
             routes.next_hop(Ipv4Address([203, 0, 113, 1])),
-            Some(DEFAULT_GATEWAY)
+            Some(INITIAL_DEFAULT_GATEWAY)
         );
     }
 

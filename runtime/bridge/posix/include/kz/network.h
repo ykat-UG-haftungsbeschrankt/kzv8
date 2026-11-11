@@ -15,6 +15,8 @@ extern "C" {
 #endif
 
 int kz_host_network_set_ipv4_forwarding(int enabled);
+int kz_host_network_set_ipv4_ttl(uint32_t ttl);
+int kz_host_network_set_receive_budget(uint32_t budget);
 int kz_host_network_add_ipv4_route(const uint8_t network[4], uint32_t prefix_length,
                                    const uint8_t gateway[4]);
 int kz_host_network_delete_ipv4_route(const uint8_t network[4], uint32_t prefix_length);

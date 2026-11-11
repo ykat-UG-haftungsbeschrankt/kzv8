@@ -13,27 +13,14 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::ops::Range;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use crate::kernel::error::Error;
 use crate::kernel::event::r#loop::{
-    EventFlags, EventLoop, EventSignal, EventSourceId, EventSourceToken,
+    EventFlags, EventLoop, EventSignal, EventSourceToken,
 };
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 use crate::kernel::scheduler::sync::IrqSpinLock;
-
-pub(crate) const MAX_INLINE_BYTES: usize = 64;
-pub(crate) const MAX_MESSAGE_CAPABILITIES: usize = 4;
-const MAX_ENDPOINT_QUEUE: usize = 1024;
-const MAX_WAITERS: usize = 64;
-const MAX_SHARED_MEMORY_BYTES: usize = 512 * 1024;
-const SEND_EVENT_SOURCE_PREFIX: u64 = 0x4950_4300_0000_0000;
-const RECEIVE_EVENT_SOURCE_PREFIX: u64 = 0x4950_4400_0000_0000;
-const REPLY_EVENT_SOURCE_PREFIX: u64 = 0x5250_4c00_0000_0000;
-
-static NEXT_ENDPOINT_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_REPLY_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CapabilityRights(u8);
@@ -62,22 +49,20 @@ impl CapabilityRights {
 
 pub(crate) struct MessageBody {
     opcode: u32,
-    payload: [u8; MAX_INLINE_BYTES],
-    payload_length: u8,
+    payload: Vec<u8>,
     capabilities: Vec<Capability>,
 }
 
 impl MessageBody {
     pub(crate) fn new(opcode: u32, payload: &[u8]) -> Result<Self, Error> {
-        if payload.len() > MAX_INLINE_BYTES {
-            return Err(Error::MsgSize);
-        }
-        let mut bytes = [0; MAX_INLINE_BYTES];
-        bytes[..payload.len()].copy_from_slice(payload);
+        let mut owned_payload = Vec::new();
+        owned_payload
+            .try_reserve_exact(payload.len())
+            .map_err(|_| Error::NoMem)?;
+        owned_payload.extend_from_slice(payload);
         Ok(Self {
             opcode,
-            payload: bytes,
-            payload_length: payload.len() as u8,
+            payload: owned_payload,
             capabilities: Vec::new(),
         })
     }
@@ -87,7 +72,7 @@ impl MessageBody {
     }
 
     pub(crate) fn payload(&self) -> &[u8] {
-        &self.payload[..usize::from(self.payload_length)]
+        &self.payload
     }
 
     pub(crate) fn capabilities(&self) -> &[Capability] {
@@ -98,14 +83,11 @@ impl MessageBody {
         (index < self.capabilities.len()).then(|| self.capabilities.remove(index))
     }
 
-    pub(crate) fn into_parts(self) -> (u32, [u8; MAX_INLINE_BYTES], u8, Vec<Capability>) {
-        (self.opcode, self.payload, self.payload_length, self.capabilities)
+    pub(crate) fn into_parts(self) -> (u32, Vec<u8>, Vec<Capability>) {
+        (self.opcode, self.payload, self.capabilities)
     }
 
     pub(crate) fn push_capability(&mut self, capability: Capability) -> Result<(), Error> {
-        if self.capabilities.len() == MAX_MESSAGE_CAPABILITIES {
-            return Err(Error::TooManyRefs);
-        }
         self.capabilities.try_reserve(1).map_err(|_| Error::NoMem)?;
         self.capabilities.push(capability);
         Ok(())
@@ -195,8 +177,6 @@ struct EndpointState {
 }
 
 struct EndpointCore {
-    send_event_id: u64,
-    receive_event_id: u64,
     capacity: usize,
     state: IrqSpinLock<EndpointState>,
     send_signal: EventSignal,
@@ -207,12 +187,9 @@ impl EndpointCore {
     fn new(capacity: usize) -> Result<Self, Error> {
         let mut queue = VecDeque::new();
         queue.try_reserve_exact(capacity).map_err(|_| Error::NoMem)?;
-        let id = NEXT_ENDPOINT_ID.fetch_add(1, Ordering::Relaxed);
         let send_signal = EventSignal::new();
         send_signal.set_readiness(EventFlags::WRITABLE);
         Ok(Self {
-            send_event_id: SEND_EVENT_SOURCE_PREFIX | (id & 0x00ff_ffff_ffff_ffff),
-            receive_event_id: RECEIVE_EVENT_SOURCE_PREFIX | (id & 0x00ff_ffff_ffff_ffff),
             capacity,
             state: IrqSpinLock::new(EndpointState {
                 queue,
@@ -327,7 +304,7 @@ pub(crate) struct Endpoint {
 
 impl Endpoint {
     pub(crate) fn channel(capacity: usize) -> Result<(Self, Self), Error> {
-        if capacity == 0 || capacity > MAX_ENDPOINT_QUEUE {
+        if capacity == 0 {
             return Err(Error::Inval);
         }
         let core = Arc::new(EndpointCore::new(capacity)?);
@@ -368,13 +345,13 @@ impl Endpoint {
             self.rights.contains(CapabilityRights::RECEIVE),
         ) {
             (true, false) => events.register_signal(
-                EventSourceId::new(self.core.send_event_id),
+                self.core.send_signal.source_id(),
                 interest,
                 data,
                 self.core.send_signal.clone(),
             ),
             (false, true) => events.register_signal(
-                EventSourceId::new(self.core.receive_event_id),
+                self.core.receive_signal.source_id(),
                 interest,
                 data,
                 self.core.receive_signal.clone(),
@@ -550,15 +527,12 @@ struct ReplyState {
 }
 
 struct ReplySlot {
-    id: u64,
     state: IrqSpinLock<ReplyState>,
     signal: EventSignal,
 }
 
 fn new_reply_slot() -> Arc<ReplySlot> {
     Arc::new(ReplySlot {
-            id: REPLY_EVENT_SOURCE_PREFIX
-                | (NEXT_REPLY_ID.fetch_add(1, Ordering::Relaxed) & 0x00ff_ffff_ffff_ffff),
         state: IrqSpinLock::new(ReplyState {
             response: None,
             waiter: None,
@@ -578,7 +552,7 @@ impl CallTicket {
         data: u64,
     ) -> Result<EventSourceToken, Error> {
         events.register_signal(
-            EventSourceId::new(self.reply.id),
+            self.reply.signal.source_id(),
             EventFlags::READABLE,
             data,
             self.reply.signal.clone(),
@@ -792,7 +766,7 @@ struct SharedMemoryCore {
 
 impl SharedMemory {
     pub(crate) fn new(size: usize) -> Result<Self, Error> {
-        if size == 0 || size > MAX_SHARED_MEMORY_BYTES {
+        if size == 0 {
             return Err(Error::Inval);
         }
         let length = size
@@ -963,9 +937,6 @@ impl Drop for SharedMemoryMapping {
 fn register_waker(waiters: &mut Vec<Waker>, waker: &Waker) -> Result<(), Error> {
     if waiters.iter().any(|waiter| waiter.will_wake(waker)) {
         return Ok(());
-    }
-    if waiters.len() == MAX_WAITERS {
-        return Err(Error::NoBufs);
     }
     waiters.try_reserve(1).map_err(|_| Error::NoMem)?;
     waiters.push(waker.clone());
@@ -1342,4 +1313,35 @@ pub(crate) fn smoke() -> Result<(), Error> {
         return Err(Error::Proto);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod dynamic_capacity_tests {
+    use alloc::vec;
+
+    use super::{Capability, Endpoint, MessageBody};
+
+    #[test]
+    fn message_payload_and_capabilities_grow_dynamically() {
+        let payload = vec![0x5a; 4096];
+        let mut message = MessageBody::new(1, &payload).unwrap();
+        assert_eq!(message.payload(), payload.as_slice());
+
+        for _ in 0..8 {
+            let (endpoint, _receiver) = Endpoint::channel(1).unwrap();
+            message
+                .push_capability(Capability::Endpoint(endpoint))
+                .unwrap();
+        }
+        assert_eq!(message.capabilities().len(), 8);
+    }
+
+    #[test]
+    fn endpoint_queue_capacity_can_exceed_previous_global_limit() {
+        let (sender, receiver) = Endpoint::channel(1100).unwrap();
+        for _ in 0..1100 {
+            sender.try_send(MessageBody::new(2, b"queued").unwrap()).unwrap();
+        }
+        assert_eq!(receiver.core.state.lock().queue.len(), 1100);
+    }
 }

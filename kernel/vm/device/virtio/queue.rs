@@ -5,11 +5,11 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::vec::Vec;
 use core::sync::atomic::{fence, Ordering};
 
 use crate::kernel::vm::device::GuestMemory;
 
-const MAX_QUEUE_SIZE: u16 = 8;
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
 
@@ -21,19 +21,9 @@ struct Descriptor {
     next: u16,
 }
 
-impl Descriptor {
-    const EMPTY: Self = Self {
-        address: 0,
-        length: 0,
-        flags: 0,
-        next: 0,
-    };
-}
-
-#[derive(Clone, Copy)]
 pub(crate) struct GuestChain {
     head: u16,
-    descriptors: [Descriptor; MAX_QUEUE_SIZE as usize],
+    descriptors: Vec<Descriptor>,
     length: usize,
 }
 
@@ -120,6 +110,7 @@ impl GuestChain {
 
 #[derive(Clone, Copy)]
 pub(crate) struct GuestVirtQueue {
+    max_size: u16,
     size: u16,
     ready: bool,
     descriptors: u64,
@@ -128,18 +119,34 @@ pub(crate) struct GuestVirtQueue {
     last_available_index: u16,
 }
 
-impl GuestVirtQueue {
-    pub(crate) const EMPTY: Self = Self {
-        size: 0,
-        ready: false,
-        descriptors: 0,
-        available: 0,
-        used: 0,
-        last_available_index: 0,
-    };
+#[cfg(test)]
+mod tests {
+    use super::GuestVirtQueue;
 
-    pub(crate) const fn max_size() -> u16 {
-        MAX_QUEUE_SIZE
+    #[test]
+    fn configured_queue_maximum_exceeds_previous_fixed_limit() {
+        let mut queue = GuestVirtQueue::new(256);
+        assert_eq!(queue.max_size(), 256);
+        assert!(queue.set_size(256));
+        assert_eq!(queue.size(), 256);
+    }
+}
+
+impl GuestVirtQueue {
+    pub(crate) const fn new(max_size: u16) -> Self {
+        Self {
+            max_size,
+            size: 0,
+            ready: false,
+            descriptors: 0,
+            available: 0,
+            used: 0,
+            last_available_index: 0,
+        }
+    }
+
+    pub(crate) const fn max_size(&self) -> u16 {
+        self.max_size
     }
 
     pub(crate) const fn size(&self) -> u16 {
@@ -148,6 +155,15 @@ impl GuestVirtQueue {
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.ready
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.size = 0;
+        self.ready = false;
+        self.descriptors = 0;
+        self.available = 0;
+        self.used = 0;
+        self.last_available_index = 0;
     }
 
     pub(crate) fn descriptor_address(&self) -> u64 {
@@ -163,7 +179,7 @@ impl GuestVirtQueue {
     }
 
     pub(crate) fn set_size(&mut self, value: u32) -> bool {
-        if self.ready || value == 0 || value > u32::from(MAX_QUEUE_SIZE) || !value.is_power_of_two()
+        if self.ready || value == 0 || value > u32::from(self.max_size) || !value.is_power_of_two()
         {
             return false;
         }
@@ -218,7 +234,7 @@ impl GuestVirtQueue {
 
     pub(crate) fn is_valid(&self, memory: &GuestMemory<'_>) -> bool {
         self.size != 0
-            && self.size <= MAX_QUEUE_SIZE
+            && self.size <= self.max_size
             && self.size.is_power_of_two()
             && self.descriptors & 0xf == 0
             && self.available & 1 == 0
@@ -253,22 +269,27 @@ impl GuestVirtQueue {
         if head >= self.size {
             return Err(());
         }
+        let mut descriptors = Vec::new();
+        descriptors.try_reserve_exact(usize::from(self.size)).map_err(|_| ())?;
+        let queue_size = usize::from(self.size);
+        let mut visited = Vec::new();
+        visited.try_reserve_exact(queue_size).map_err(|_| ())?;
+        visited.resize(queue_size, false);
         let mut chain = GuestChain {
             head,
-            descriptors: [Descriptor::EMPTY; MAX_QUEUE_SIZE as usize],
+            descriptors,
             length: 0,
         };
         let mut descriptor_index = head;
-        let mut visited = 0u16;
         for _ in 0..self.size {
             if descriptor_index >= self.size {
                 return Err(());
             }
-            let bit = 1u16.checked_shl(u32::from(descriptor_index)).ok_or(())?;
-            if visited & bit != 0 {
+            let visited_slot = &mut visited[usize::from(descriptor_index)];
+            if *visited_slot {
                 return Err(());
             }
-            visited |= bit;
+            *visited_slot = true;
 
             let address = self.descriptors + u64::from(descriptor_index) * 16;
             let Some(buffer_address) = memory.read_u64(address) else {

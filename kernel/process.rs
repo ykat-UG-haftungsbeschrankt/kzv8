@@ -7,12 +7,11 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::kernel::error::Error;
 use crate::kernel::ipc::{
     CallFuture, CallTicket, Capability, CapabilityRights, Endpoint, MessageBody, ReceivedMessage,
-    ReplyCapability, SendFuture, SharedMemoryMapping, MAX_INLINE_BYTES,
+    ReplyCapability, SendFuture, SharedMemoryMapping,
 };
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::namespace::NamespaceSet;
@@ -20,8 +19,6 @@ use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::vfs::FileHandle;
 
 const INITIAL_CAPABILITY_SLOTS: usize = 32;
-const MAX_CAPABILITY_SLOTS: usize = 4096;
-static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UserId(u32);
@@ -136,8 +133,9 @@ impl CapabilityHandle {
         self.0
     }
 
-    fn new(index: usize, generation: u32) -> Self {
-        Self((u64::from(generation) << 32) | index as u64)
+    fn new(index: usize, generation: u32) -> Result<Self, Error> {
+        let index = u32::try_from(index).map_err(|_| Error::Mfile)?;
+        Ok(Self((u64::from(generation) << 32) | u64::from(index)))
     }
 
     fn parts(self) -> (usize, u32) {
@@ -181,23 +179,17 @@ impl CapabilityTable {
         {
             index
         } else {
-            if self.slots.len() == MAX_CAPABILITY_SLOTS {
-                return Err(Error::Mfile);
-            }
-            let growth = self
-                .slots
-                .len()
-                .min(MAX_CAPABILITY_SLOTS - self.slots.len());
-            self.slots.try_reserve(growth).map_err(|_| Error::NoMem)?;
+            self.slots.try_reserve(1).map_err(|_| Error::NoMem)?;
             let index = self.slots.len();
-            self.slots
-                .resize_with(index + growth, CapabilitySlot::empty);
+            self.slots.push(CapabilitySlot::empty());
             index
         };
         let slot = &mut self.slots[index];
-        slot.generation = slot.generation.wrapping_add(1).max(1);
+        let generation = slot.generation.wrapping_add(1).max(1);
+        let handle = CapabilityHandle::new(index, generation)?;
+        slot.generation = generation;
         slot.capability = Some(capability);
-        Ok(CapabilityHandle::new(index, slot.generation))
+        Ok(handle)
     }
 
     fn get(&self, handle: CapabilityHandle) -> Result<&Capability, Error> {
@@ -286,7 +278,6 @@ impl KernelObjectTable {
 }
 
 pub(crate) struct Process {
-    id: u64,
     namespace_set: NamespaceSet,
     credentials: IrqSpinLock<Credentials>,
     capabilities: IrqSpinLock<CapabilityTable>,
@@ -307,7 +298,6 @@ impl Process {
         credentials: Credentials,
     ) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
-            id: NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed),
             namespace_set,
             credentials: IrqSpinLock::new(credentials),
             capabilities: IrqSpinLock::new(CapabilityTable::new()?),
@@ -315,8 +305,8 @@ impl Process {
         }))
     }
 
-    pub(crate) const fn id(&self) -> u64 {
-        self.id
+    pub(crate) fn id(self: &Arc<Self>) -> u64 {
+        Arc::as_ptr(self) as usize as u64
     }
 
     pub(crate) fn namespace_set(&self) -> NamespaceSet {
@@ -479,7 +469,7 @@ impl Process {
 
     fn into_process_message(&self, received: ReceivedMessage) -> Result<ProcessMessage, Error> {
         let (body, reply) = received.into_parts();
-        let (opcode, payload, payload_length, capabilities) = body.into_parts();
+        let (opcode, payload, capabilities) = body.into_parts();
         let mut handles = Vec::new();
         handles
             .try_reserve_exact(capabilities.len())
@@ -498,7 +488,6 @@ impl Process {
         Ok(ProcessMessage {
             opcode,
             payload,
-            payload_length,
             capabilities: handles,
             reply,
         })
@@ -512,8 +501,7 @@ impl Process {
 
 pub(crate) struct ProcessMessage {
     opcode: u32,
-    payload: [u8; MAX_INLINE_BYTES],
-    payload_length: u8,
+    payload: Vec<u8>,
     capabilities: Vec<CapabilityHandle>,
     reply: Option<ReplyCapability>,
 }
@@ -524,7 +512,7 @@ impl ProcessMessage {
     }
 
     pub(crate) fn payload(&self) -> &[u8] {
-        &self.payload[..usize::from(self.payload_length)]
+        &self.payload
     }
 
     pub(crate) fn capabilities(&self) -> &[CapabilityHandle] {
@@ -537,5 +525,31 @@ impl ProcessMessage {
 
     pub(crate) fn reply(self, response: Result<MessageBody, Error>) -> Result<(), Error> {
         self.reply.ok_or(Error::Inval)?.reply(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use super::{Capability, CapabilityTable, Process};
+    use crate::kernel::ipc::Endpoint;
+
+    #[test]
+    fn capability_table_grows_past_previous_limit() {
+        let (endpoint, _receiver) = Endpoint::channel(1).unwrap();
+        let mut table = CapabilityTable::new().unwrap();
+        for _ in 0..4100 {
+            table
+                .insert(Capability::Endpoint(endpoint.clone()))
+                .unwrap();
+        }
+        assert_eq!(table.slots.len(), 4100);
+    }
+
+    #[test]
+    fn process_id_is_its_arc_allocation_address() {
+        let process = Process::new().unwrap();
+        assert_eq!(process.id(), Arc::as_ptr(&process) as usize as u64);
     }
 }

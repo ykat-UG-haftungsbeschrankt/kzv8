@@ -73,6 +73,31 @@ impl TcpContext {
         }
     }
 
+    pub(crate) fn local_ipv4_prefix_length(&self) -> Option<u8> {
+        if self.network_stack.is_null() {
+            None
+        } else {
+            Some(unsafe { &*self.network_stack }.ipv4_prefix_length())
+        }
+    }
+
+    pub(crate) fn set_host_ipv4_configuration(
+        &mut self,
+        address: Ipv4Address,
+        prefix_length: u8,
+    ) -> Result<(), Error> {
+        self.network_stack_mut()?
+            .set_ipv4_configuration(address, prefix_length)
+    }
+
+    pub(crate) fn set_host_ipv4_ttl(&mut self, ttl: u8) -> Result<(), Error> {
+        self.network_stack_mut()?.set_default_ttl(ttl)
+    }
+
+    pub(crate) fn set_network_receive_budget(&mut self, budget: usize) -> Result<(), Error> {
+        self.network_stack_mut()?.set_receive_budget(budget)
+    }
+
     pub(crate) fn is_local_ipv4_address(&self, address: Ipv4Address) -> bool {
         !self.network_stack.is_null()
             && unsafe { &*self.network_stack }.is_local_ipv4_address(address)
@@ -361,6 +386,28 @@ pub extern "C" fn kz_host_network_set_ipv4_forwarding(enabled: i32) -> i32 {
     }
     network_config_result(with_active_tcp_context(|context| {
         context.set_ipv4_forwarding(enabled != 0)
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn kz_host_network_set_ipv4_ttl(ttl: u32) -> i32 {
+    let Ok(ttl) = u8::try_from(ttl) else {
+        set_network_errno(Error::Inval);
+        return -1;
+    };
+    network_config_result(with_active_tcp_context(|context| {
+        context.set_host_ipv4_ttl(ttl)
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn kz_host_network_set_receive_budget(budget: u32) -> i32 {
+    let Ok(budget) = usize::try_from(budget) else {
+        set_network_errno(Error::Inval);
+        return -1;
+    };
+    network_config_result(with_active_tcp_context(|context| {
+        context.set_network_receive_budget(budget)
     }))
 }
 

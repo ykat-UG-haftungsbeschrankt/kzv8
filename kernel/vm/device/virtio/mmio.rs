@@ -49,8 +49,13 @@ impl VirtioMmio {
         device_config: [u32; DEVICE_CONFIG_SIZE],
         config_writable: [u32; DEVICE_CONFIG_SIZE],
         queue_count: usize,
+        queue_max_size: u16,
     ) -> Self {
-        assert!(queue_count > 0 && queue_count <= MAX_QUEUES);
+        assert!(
+            queue_count > 0
+                && queue_count <= MAX_QUEUES
+                && queue_max_size.is_power_of_two()
+        );
         Self {
             base,
             device_id,
@@ -59,7 +64,7 @@ impl VirtioMmio {
             device_config,
             config_writable,
             queue_count,
-            queues: [GuestVirtQueue::EMPTY; MAX_QUEUES],
+            queues: [GuestVirtQueue::new(queue_max_size); MAX_QUEUES],
             device_features_select: 0,
             driver_features_select: 0,
             driver_features: [0; 2],
@@ -161,7 +166,7 @@ impl VirtioMmio {
             0x030 => self.queue_select,
             0x034 => self
                 .selected_queue()
-                .map_or(0, |_| u32::from(GuestVirtQueue::max_size())),
+                .map_or(0, |queue| u32::from(queue.max_size())),
             0x038 => self
                 .selected_queue()
                 .map_or(0, |queue| u32::from(queue.size())),
@@ -274,7 +279,9 @@ impl VirtioMmio {
             self.queue_select = 0;
             self.status = 0;
             self.interrupt_status = 0;
-            self.queues = [GuestVirtQueue::EMPTY; MAX_QUEUES];
+            for queue in &mut self.queues {
+                queue.reset();
+            }
             return;
         }
         if value & self.status != self.status {
