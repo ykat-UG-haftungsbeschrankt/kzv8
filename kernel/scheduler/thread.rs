@@ -19,6 +19,7 @@ use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
 use crate::kernel::process::Process;
+use crate::kernel::namespace::NamespaceSet;
 
 use super::sync::IrqSpinLock;
 
@@ -500,7 +501,20 @@ impl ThreadManager {
     }
 
     pub(crate) fn create_process() -> Result<Arc<Process>, Error> {
-        Process::new()
+        let parent = Self::current_process()?;
+        Process::new_in_namespace_set_with_credentials(
+            parent.namespace_set(),
+            parent.credentials()?,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_container_process() -> Result<Arc<Process>, Error> {
+        let parent = Self::current_process()?;
+        Process::new_in_namespace_set_with_credentials(
+            NamespaceSet::new_container(),
+            parent.credentials()?,
+        )
     }
 
     pub(crate) fn create_userspace_thread_in_process(

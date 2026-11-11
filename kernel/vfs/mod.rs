@@ -13,6 +13,7 @@ use core::future::Future;
 use core::pin::Pin;
 
 use crate::kernel::error::Error;
+use crate::kernel::process::{Credentials, GroupId, UserId};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 pub(crate) mod plugin;
@@ -36,6 +37,10 @@ const XATTR_CREATE: i32 = 1;
 const XATTR_REPLACE: i32 = 2;
 const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 64 * 1024;
+const PERMISSION_MASK: u16 = 0o777;
+const ACCESS_EXECUTE: u16 = 0o1;
+const ACCESS_WRITE: u16 = 0o2;
+const ACCESS_READ: u16 = 0o4;
 
 static MOUNTED_VFS: IrqSpinLock<Option<Vfs>> = IrqSpinLock::new(None);
 
@@ -45,6 +50,9 @@ pub(crate) struct NodeMetadata {
 }
 
 struct NodeMetadataState {
+    owner: UserId,
+    group: GroupId,
+    mode: u16,
     flags: u32,
     xattrs: Vec<Xattr>,
 }
@@ -56,12 +64,124 @@ struct Xattr {
 
 impl NodeMetadata {
     pub(crate) fn new() -> Self {
+        Self::new_with_defaults(UserId::ROOT, GroupId::ROOT, 0o644)
+    }
+
+    fn new_directory() -> Self {
+        Self::new_with_defaults(UserId::ROOT, GroupId::ROOT, 0o755)
+    }
+
+    pub(crate) fn with_owner_and_mode(
+        owner: UserId,
+        group: GroupId,
+        mode: u16,
+    ) -> VfsResult<Self> {
+        if mode & !PERMISSION_MASK != 0 {
+            return Err(Error::Inval);
+        }
+        Ok(Self::new_with_defaults(owner, group, mode))
+    }
+
+    fn new_with_defaults(owner: UserId, group: GroupId, mode: u16) -> Self {
         Self {
             state: Arc::new(IrqSpinLock::new(NodeMetadataState {
+                owner,
+                group,
+                mode,
                 flags: 0,
                 xattrs: Vec::new(),
             })),
         }
+    }
+
+    pub(crate) fn owner(&self) -> UserId {
+        self.state.lock().owner
+    }
+
+    pub(crate) fn group(&self) -> GroupId {
+        self.state.lock().group
+    }
+
+    pub(crate) fn mode(&self) -> u16 {
+        self.state.lock().mode
+    }
+
+    fn check_access(
+        &self,
+        credentials: &Credentials,
+        requested: u16,
+        is_directory: bool,
+    ) -> VfsResult<()> {
+        if requested == 0 || requested & !0o7 != 0 {
+            return Err(Error::Inval);
+        }
+
+        let state = self.state.lock();
+        if credentials.is_root() {
+            if !is_directory
+                && requested & ACCESS_EXECUTE != 0
+                && state.mode & 0o111 == 0
+            {
+                return Err(Error::Acces);
+            }
+            return Ok(());
+        }
+
+        let shift = if credentials.effective_user() == state.owner {
+            6
+        } else if credentials.is_member_of(state.group) {
+            3
+        } else {
+            0
+        };
+        if (state.mode >> shift) & requested == requested {
+            Ok(())
+        } else {
+            Err(Error::Acces)
+        }
+    }
+
+    pub(crate) fn set_mode(&self, credentials: &Credentials, mode: u16) -> VfsResult<()> {
+        if mode & !PERMISSION_MASK != 0 {
+            return Err(Error::Inval);
+        }
+        let mut state = self.state.lock();
+        if !credentials.is_root() && credentials.effective_user() != state.owner {
+            return Err(Error::Acces);
+        }
+        state.mode = mode;
+        Ok(())
+    }
+
+    pub(crate) fn set_owner_and_group(
+        &self,
+        credentials: &Credentials,
+        owner: UserId,
+        group: GroupId,
+    ) -> VfsResult<()> {
+        if !credentials.is_root() {
+            return Err(Error::Acces);
+        }
+        let mut state = self.state.lock();
+        state.owner = owner;
+        state.group = group;
+        Ok(())
+    }
+
+    pub(crate) fn update_from_filesystem(
+        &self,
+        owner: UserId,
+        group: GroupId,
+        mode: u16,
+    ) -> VfsResult<()> {
+        if mode & !PERMISSION_MASK != 0 {
+            return Err(Error::Inval);
+        }
+        let mut state = self.state.lock();
+        state.owner = owner;
+        state.group = group;
+        state.mode = mode;
+        Ok(())
     }
 
     pub(crate) fn flags(&self) -> u32 {
@@ -194,6 +314,14 @@ impl OpenMode {
     fn allows_write(self) -> bool {
         matches!(self, Self::WriteOnly | Self::ReadWrite)
     }
+
+    fn access_mask(self) -> u16 {
+        match self {
+            Self::ReadOnly => ACCESS_READ,
+            Self::WriteOnly => ACCESS_WRITE,
+            Self::ReadWrite => ACCESS_READ | ACCESS_WRITE,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +339,13 @@ pub(crate) trait DirectoryPlugin: Send + Sync {
 }
 
 pub(crate) trait FilePlugin: Send + Sync {
+    fn open(
+        &self,
+        _mode: OpenMode,
+    ) -> VfsFuture<'_, VfsResult<Option<Arc<dyn FilePlugin>>>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn read_at<'a>(&'a self, offset: u64, buffer: &'a mut [u8]) -> VfsFuture<'a, VfsResult<usize>>;
 
     fn size(&self) -> VfsFuture<'_, VfsResult<u64>> {
@@ -236,7 +371,7 @@ pub(crate) enum Node {
 
 impl Node {
     pub(crate) fn directory<P: DirectoryPlugin + 'static>(plugin: P) -> Self {
-        Self::directory_with_metadata(plugin, NodeMetadata::new())
+        Self::directory_with_metadata(plugin, NodeMetadata::new_directory())
     }
 
     pub(crate) fn file<P: FilePlugin + 'static>(plugin: P) -> Self {
@@ -271,6 +406,13 @@ impl Node {
 
     pub(crate) fn flags(&self) -> u32 {
         self.metadata().flags()
+    }
+
+    fn check_access(&self, credentials: &Credentials, requested: u16) -> VfsResult<()> {
+        match self {
+            Self::Directory { metadata, .. } => metadata.check_access(credentials, requested, true),
+            Self::File { metadata, .. } => metadata.check_access(credentials, requested, false),
+        }
     }
 
     pub(crate) fn lookup<'a>(&'a self, name: &'a str) -> VfsFuture<'a, VfsResult<Node>> {
@@ -328,6 +470,7 @@ impl Node {
 
 pub(crate) struct FileHandle {
     node: Node,
+    opened_plugin: Option<Arc<dyn FilePlugin>>,
     mode: OpenMode,
     offset: u64,
 }
@@ -340,7 +483,10 @@ impl FileHandle {
             }
             let requested = u64::try_from(buffer.len()).map_err(|_| Error::Fbig)?;
             self.offset.checked_add(requested).ok_or(Error::Fbig)?;
-            let count = self.node.read_at(self.offset, buffer).await?;
+            let count = match &self.opened_plugin {
+                Some(plugin) => plugin.read_at(self.offset, buffer).await?,
+                None => self.node.read_at(self.offset, buffer).await?,
+            };
             self.offset = self
                 .offset
                 .checked_add(u64::try_from(count).map_err(|_| Error::Fbig)?)
@@ -360,9 +506,15 @@ impl FileHandle {
                 return Ok(0);
             }
             if self.node.flags() & INODE_FLAG_APPEND != 0 {
-                self.offset = self.node.size().await?;
+                self.offset = match &self.opened_plugin {
+                    Some(plugin) => plugin.size().await?,
+                    None => self.node.size().await?,
+                };
             }
-            let count = self.node.write_at(self.offset, buffer).await?;
+            let count = match &self.opened_plugin {
+                Some(plugin) => plugin.write_at(self.offset, buffer).await?,
+                None => self.node.write_at(self.offset, buffer).await?,
+            };
             self.offset = self
                 .offset
                 .checked_add(u64::try_from(count).map_err(|_| Error::Fbig)?)
@@ -418,31 +570,58 @@ impl Vfs {
         &'a self,
         path: &'a str,
         mode: OpenMode,
+        credentials: Credentials,
     ) -> VfsFuture<'a, VfsResult<FileHandle>> {
         Box::pin(async move {
-            let node = self.resolve(path).await?;
-            if matches!(&node, Node::Directory { .. }) {
-                return Err(Error::IsDir);
-            }
+            let node = self.resolve(path, &credentials).await?;
+            let opened_plugin = match &node {
+                Node::File { plugin, .. } => {
+                    node.check_access(&credentials, mode.access_mask())?;
+                    plugin.open(mode).await?
+                }
+                Node::Directory { .. } => return Err(Error::IsDir),
+            };
             Ok(FileHandle {
                 node,
+                opened_plugin,
                 mode,
                 offset: 0,
             })
         })
     }
 
-    pub(crate) fn resolve<'a>(&'a self, path: &'a str) -> VfsFuture<'a, VfsResult<Node>> {
+    pub(crate) fn resolve<'a>(
+        &'a self,
+        path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<Node>> {
         Box::pin(async move {
             let mut node = self.root.clone();
             for component in path.split('/') {
                 match component {
                     "" | "." => continue,
                     ".." => return Err(Error::Inval),
-                    name => node = node.lookup(name).await?,
+                    name => {
+                        if matches!(node, Node::Directory { .. }) {
+                            node.check_access(credentials, ACCESS_EXECUTE)?;
+                        }
+                        node = node.lookup(name).await?;
+                    }
                 }
             }
             Ok(node)
+        })
+    }
+
+    pub(crate) fn read_dir<'a>(
+        &'a self,
+        path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<Vec<DirectoryEntry>>> {
+        Box::pin(async move {
+            let node = self.resolve(path, credentials).await?;
+            node.check_access(credentials, ACCESS_READ | ACCESS_EXECUTE)?;
+            node.read_dir().await
         })
     }
 }

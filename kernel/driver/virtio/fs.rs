@@ -17,6 +17,7 @@ use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
 use crate::kernel::error::Error;
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
+use crate::kernel::process::{GroupId, UserId};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::vfs::{
     DirectoryEntry, DirectoryPlugin, FilePlugin, Node, NodeMetadata, VfsFuture, VfsResult,
@@ -93,8 +94,14 @@ impl VirtioFs {
     const FUSE_READDIR: u32 = 28;
     const FUSE_RELEASEDIR: u32 = 29;
     const FUSE_ENTRY_OUT_SIZE: usize = 128;
+    const FUSE_ENTRY_MODE_OFFSET: usize = 100;
+    const FUSE_ENTRY_UID_OFFSET: usize = 108;
+    const FUSE_ENTRY_GID_OFFSET: usize = 112;
     const FUSE_GETATTR_IN_SIZE: usize = 16;
     const FUSE_ATTR_OUT_SIZE: usize = 104;
+    const FUSE_ATTR_MODE_OFFSET: usize = 76;
+    const FUSE_ATTR_UID_OFFSET: usize = 84;
+    const FUSE_ATTR_GID_OFFSET: usize = 88;
     const FUSE_OPEN_OUT_SIZE: usize = 16;
     const FUSE_READ_IN_SIZE: usize = 40;
     const FUSE_WRITE_OUT_SIZE: usize = 8;
@@ -153,6 +160,7 @@ impl VirtioFs {
             max_write: Self::MAX_REQUEST_SIZE - Self::FUSE_IN_HEADER_SIZE,
         };
         filesystem.initialize_fuse().await.ok()?;
+        filesystem.refresh_metadata(Self::FUSE_ROOT_ID).await.ok()?;
         Some(Arc::new(filesystem))
     }
 
@@ -180,6 +188,37 @@ impl VirtioFs {
             .entry(node_id)
             .or_insert(metadata)
             .clone()
+    }
+
+    fn update_metadata_for_node(
+        &self,
+        node_id: u64,
+        owner: u32,
+        group: u32,
+        mode: u32,
+    ) -> VfsResult<NodeMetadata> {
+        let metadata = self.metadata_for_node(node_id);
+        metadata.update_from_filesystem(
+            UserId::new(owner),
+            GroupId::new(group),
+            (mode & 0o777) as u16,
+        )?;
+        Ok(metadata)
+    }
+
+    async fn refresh_metadata(&self, node_id: u64) -> VfsResult<NodeMetadata> {
+        let request = [0; Self::FUSE_GETATTR_IN_SIZE];
+        let mut response = [0; Self::FUSE_ATTR_OUT_SIZE];
+        let response_length = self
+            .transact(Self::FUSE_GETATTR, node_id, &request, &mut response)
+            .await?;
+        if response_length < Self::FUSE_ATTR_OUT_SIZE {
+            return Err(Error::Proto);
+        }
+        let mode = Self::read_u32(&response, Self::FUSE_ATTR_MODE_OFFSET)?;
+        let owner = Self::read_u32(&response, Self::FUSE_ATTR_UID_OFFSET)?;
+        let group = Self::read_u32(&response, Self::FUSE_ATTR_GID_OFFSET)?;
+        self.update_metadata_for_node(node_id, owner, group, mode)
     }
 
     async fn initialize_fuse(&mut self) -> Result<(), Error> {
@@ -221,8 +260,10 @@ impl VirtioFs {
             return Err(Error::Proto);
         }
         let node_id = Self::read_u64(&response, 0)?;
-        let mode = Self::read_u32(&response, 100)?;
-        self.node_from_type(node_id, mode)
+        let mode = Self::read_u32(&response, Self::FUSE_ENTRY_MODE_OFFSET)?;
+        let owner = Self::read_u32(&response, Self::FUSE_ENTRY_UID_OFFSET)?;
+        let group = Self::read_u32(&response, Self::FUSE_ENTRY_GID_OFFSET)?;
+        self.node_from_type(node_id, mode, owner, group)
     }
 
     async fn read_dir(self: &Arc<Self>, node_id: u64) -> VfsResult<Vec<DirectoryEntry>> {
@@ -285,20 +326,30 @@ impl VirtioFs {
                 if name_bytes != b"." && name_bytes != b".." {
                     let name =
                         String::from(core::str::from_utf8(name_bytes).map_err(|_| Error::Ilseq)?);
+                    let metadata = match file_type {
+                        Self::DIRECTORY_TYPE | Self::REGULAR_FILE_TYPE => {
+                            self.refresh_metadata(inode).await?
+                        }
+                        _ => {
+                            cursor += record_length;
+                            offset = next_offset;
+                            continue;
+                        }
+                    };
                     let node = match file_type {
                         Self::DIRECTORY_TYPE => Node::directory_with_metadata(
                             FuseDirectory {
                                 filesystem: self.clone(),
                                 node_id: inode,
                             },
-                            self.metadata_for_node(inode),
+                            metadata,
                         ),
                         Self::REGULAR_FILE_TYPE => Node::file_with_metadata(
                             FuseFile {
                                 filesystem: self.clone(),
                                 node_id: inode,
                             },
-                            self.metadata_for_node(inode),
+                            metadata,
                         ),
                         _ => {
                             cursor += record_length;
@@ -542,21 +593,28 @@ impl VirtioFs {
         }
     }
 
-    fn node_from_type(self: &Arc<Self>, node_id: u64, file_type: u32) -> VfsResult<Node> {
+    fn node_from_type(
+        self: &Arc<Self>,
+        node_id: u64,
+        file_type: u32,
+        owner: u32,
+        group: u32,
+    ) -> VfsResult<Node> {
+        let metadata = self.update_metadata_for_node(node_id, owner, group, file_type)?;
         match file_type & Self::MODE_TYPE_MASK {
             Self::MODE_DIRECTORY => Ok(Node::directory_with_metadata(
                 FuseDirectory {
                     filesystem: self.clone(),
                     node_id,
                 },
-                self.metadata_for_node(node_id),
+                metadata,
             )),
             Self::MODE_REGULAR_FILE => Ok(Node::file_with_metadata(
                 FuseFile {
                     filesystem: self.clone(),
                     node_id,
                 },
-                self.metadata_for_node(node_id),
+                metadata,
             )),
             _ => Err(Error::OpNotSupp),
         }
@@ -613,8 +671,10 @@ impl DirectoryPlugin for FuseDirectory {
                 return Err(Error::Proto);
             }
             let node_id = VirtioFs::read_u64(&response, 0)?;
-            let mode = VirtioFs::read_u32(&response, 100)?;
-            filesystem.node_from_type(node_id, mode)
+            let mode = VirtioFs::read_u32(&response, VirtioFs::FUSE_ENTRY_MODE_OFFSET)?;
+            let owner = VirtioFs::read_u32(&response, VirtioFs::FUSE_ENTRY_UID_OFFSET)?;
+            let group = VirtioFs::read_u32(&response, VirtioFs::FUSE_ENTRY_GID_OFFSET)?;
+            filesystem.node_from_type(node_id, mode, owner, group)
         })
     }
 

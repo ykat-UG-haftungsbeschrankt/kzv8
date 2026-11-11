@@ -16,6 +16,8 @@ use crate::kernel::error::Error;
 
 use super::{DirectoryEntry, DirectoryPlugin, FilePlugin, Node, VfsFuture, VfsResult};
 
+pub(crate) mod tun;
+
 struct Directory {
     entries: Vec<DirectoryEntry>,
 }
@@ -122,6 +124,10 @@ pub(crate) fn build_virtio_tree(virtio_fs_root: Option<Node>) -> (Node, usize) {
         + network_devices.len()
         + console_devices.len()
         + file_system_devices.len();
+    network_devices.push(DirectoryEntry {
+        name: String::from("tun"),
+        node: Node::file(tun::TunDevicePlugin),
+    });
     let devices = named_directory(vec![
         ("console", directory(console_devices)),
         ("net", directory(network_devices)),

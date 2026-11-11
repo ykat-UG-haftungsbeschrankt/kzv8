@@ -32,6 +32,7 @@ pub(crate) mod kernel_lib;
 pub(crate) use kernel_lib as lib;
 pub(crate) mod memory;
 pub(crate) mod net;
+pub(crate) mod namespace;
 pub(crate) mod process;
 pub(crate) mod syscall;
 #[path = "../runtime/run.rs"]
@@ -44,7 +45,7 @@ pub(crate) mod vfs;
 
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
-    pub(crate) use crate::{arch, block, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, process, runtime, scheduler, syscall, vfs};
+    pub(crate) use crate::{arch, block, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, namespace, process, runtime, scheduler, syscall, vfs};
     #[cfg(feature = "virtualization")]
     pub(crate) use crate::vm;
 }

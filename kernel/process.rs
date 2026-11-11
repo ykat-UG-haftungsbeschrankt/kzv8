@@ -14,11 +14,119 @@ use crate::kernel::ipc::{
     CallFuture, CallTicket, Capability, CapabilityRights, Endpoint, MessageBody, ReceivedMessage,
     ReplyCapability, SendFuture, SharedMemoryMapping, MAX_INLINE_BYTES,
 };
+use crate::kernel::lib::hashmap::HashMap;
+use crate::kernel::namespace::NamespaceSet;
 use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::vfs::FileHandle;
 
 const INITIAL_CAPABILITY_SLOTS: usize = 32;
 const MAX_CAPABILITY_SLOTS: usize = 4096;
 static NEXT_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserId(u32);
+
+impl UserId {
+    pub(crate) const ROOT: Self = Self(0);
+
+    pub(crate) const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GroupId(u32);
+
+impl GroupId {
+    pub(crate) const ROOT: Self = Self(0);
+
+    pub(crate) const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+pub(crate) struct Credentials {
+    real_user: UserId,
+    effective_user: UserId,
+    real_group: GroupId,
+    effective_group: GroupId,
+    supplementary_groups: Vec<GroupId>,
+}
+
+impl Credentials {
+    pub(crate) const fn root() -> Self {
+        Self {
+            real_user: UserId::ROOT,
+            effective_user: UserId::ROOT,
+            real_group: GroupId::ROOT,
+            effective_group: GroupId::ROOT,
+            supplementary_groups: Vec::new(),
+        }
+    }
+
+    pub(crate) fn new(
+        real_user: UserId,
+        effective_user: UserId,
+        real_group: GroupId,
+        effective_group: GroupId,
+        supplementary_groups: Vec<GroupId>,
+    ) -> Self {
+        Self {
+            real_user,
+            effective_user,
+            real_group,
+            effective_group,
+            supplementary_groups,
+        }
+    }
+
+    pub(crate) const fn real_user(&self) -> UserId {
+        self.real_user
+    }
+
+    pub(crate) const fn effective_user(&self) -> UserId {
+        self.effective_user
+    }
+
+    pub(crate) const fn real_group(&self) -> GroupId {
+        self.real_group
+    }
+
+    pub(crate) const fn effective_group(&self) -> GroupId {
+        self.effective_group
+    }
+
+    pub(crate) fn is_member_of(&self, group: GroupId) -> bool {
+        self.effective_group == group || self.supplementary_groups.contains(&group)
+    }
+
+    pub(crate) const fn is_root(&self) -> bool {
+        self.effective_user.0 == 0
+    }
+
+    fn try_clone(&self) -> Result<Self, Error> {
+        let mut supplementary_groups = Vec::new();
+        supplementary_groups
+            .try_reserve_exact(self.supplementary_groups.len())
+            .map_err(|_| Error::NoMem)?;
+        supplementary_groups.extend_from_slice(&self.supplementary_groups);
+        Ok(Self {
+            real_user: self.real_user,
+            effective_user: self.effective_user,
+            real_group: self.real_group,
+            effective_group: self.effective_group,
+            supplementary_groups,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CapabilityHandle(u64);
@@ -111,21 +219,129 @@ impl CapabilityTable {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct KernelObjectRef(u64);
+
+impl KernelObjectRef {
+    pub(crate) const fn from_raw(reference: u64) -> Self {
+        Self(reference)
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+
+    fn from_object(object: &Arc<KernelObject>) -> Self {
+        Self(Arc::as_ptr(object) as usize as u64)
+    }
+}
+
+pub(crate) struct KernelObject {
+    file: IrqSpinLock<FileHandle>,
+}
+
+impl KernelObject {
+    fn new(file: FileHandle) -> Self {
+        Self {
+            file: IrqSpinLock::new(file),
+        }
+    }
+
+    pub(crate) fn file(&self) -> &IrqSpinLock<FileHandle> {
+        &self.file
+    }
+}
+
+struct KernelObjectTable {
+    objects: HashMap<KernelObjectRef, Arc<KernelObject>>,
+}
+
+impl KernelObjectTable {
+    const fn new() -> Self {
+        Self {
+            objects: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, file: FileHandle) -> Result<KernelObjectRef, Error> {
+        let object = Arc::new(KernelObject::new(file));
+        let reference = KernelObjectRef::from_object(&object);
+        match self.objects.insert(reference, object) {
+            Ok(None) => Ok(reference),
+            Ok(Some(previous)) => {
+                let _ = self.objects.insert(reference, previous);
+                Err(Error::Exist)
+            }
+            Err((_reference, _object)) => Err(Error::NoMem),
+        }
+    }
+
+    fn get(&self, reference: KernelObjectRef) -> Result<Arc<KernelObject>, Error> {
+        self.objects.get(&reference).cloned().ok_or(Error::Badf)
+    }
+
+    fn remove(&mut self, reference: KernelObjectRef) -> Result<Arc<KernelObject>, Error> {
+        self.objects.remove(&reference).ok_or(Error::Badf)
+    }
+}
+
 pub(crate) struct Process {
     id: u64,
+    namespace_set: NamespaceSet,
+    credentials: IrqSpinLock<Credentials>,
     capabilities: IrqSpinLock<CapabilityTable>,
+    kernel_objects: IrqSpinLock<KernelObjectTable>,
 }
 
 impl Process {
     pub(crate) fn new() -> Result<Arc<Self>, Error> {
+        Self::new_in_namespace_set(NamespaceSet::root())
+    }
+
+    pub(crate) fn new_in_namespace_set(namespace_set: NamespaceSet) -> Result<Arc<Self>, Error> {
+        Self::new_in_namespace_set_with_credentials(namespace_set, Credentials::root())
+    }
+
+    pub(crate) fn new_in_namespace_set_with_credentials(
+        namespace_set: NamespaceSet,
+        credentials: Credentials,
+    ) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
             id: NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed),
+            namespace_set,
+            credentials: IrqSpinLock::new(credentials),
             capabilities: IrqSpinLock::new(CapabilityTable::new()?),
+            kernel_objects: IrqSpinLock::new(KernelObjectTable::new()),
         }))
     }
 
     pub(crate) const fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) fn namespace_set(&self) -> NamespaceSet {
+        self.namespace_set.clone()
+    }
+
+    pub(crate) fn credentials(&self) -> Result<Credentials, Error> {
+        self.credentials.lock().try_clone()
+    }
+
+    pub(crate) fn insert_file_object(&self, file: FileHandle) -> Result<KernelObjectRef, Error> {
+        self.kernel_objects.lock().insert(file)
+    }
+
+    pub(crate) fn kernel_object(
+        &self,
+        reference: KernelObjectRef,
+    ) -> Result<Arc<KernelObject>, Error> {
+        self.kernel_objects.lock().get(reference)
+    }
+
+    pub(crate) fn close_kernel_object(&self, reference: KernelObjectRef) -> Result<(), Error> {
+        let object = self.kernel_objects.lock().remove(reference)?;
+        drop(object);
+        Ok(())
     }
 
     pub(crate) fn insert_capability(&self, capability: Capability) -> Result<CapabilityHandle, Error> {
@@ -221,7 +437,7 @@ impl Process {
         body: MessageBody,
     ) -> Result<CallFuture, Error> {
         match self.capability(handle)? {
-            Capability::Endpoint(endpoint) => endpoint.call(body),
+            Capability::Endpoint(endpoint) => Ok(endpoint.call(body)),
             Capability::SharedMemory(_) => Err(Error::Badf),
         }
     }
