@@ -156,6 +156,10 @@ pub(crate) fn halt() -> ! {
 
 pub(crate) fn notify_executor() {}
 
+pub(crate) fn handle_tlb_shootdown_nmi() -> bool {
+    paging::handle_tlb_shootdown_nmi()
+}
+
 pub(crate) fn wait_for_interrupt() {
     unsafe { core::arch::asm!("sti", "hlt") };
 }

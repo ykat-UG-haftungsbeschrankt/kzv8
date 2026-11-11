@@ -95,6 +95,14 @@ impl VcpuContext {
 		loop {
 			let exit = unsafe { (&mut *context.as_ptr()).restore() };
 			match exit {
+				#[cfg(target_arch = "x86_64")]
+				Ok(exit)
+					if exit.reason
+						== crate::kernel::arch::VirtualMachineExitReason::ExceptionOrNmi
+						&& exit.interrupt_info & (1 << 31) != 0
+						&& (exit.interrupt_info >> 8) & 0x7 == 2
+						&& exit.interrupt_info & 0xff == 2
+						&& crate::kernel::arch::handle_tlb_shootdown_nmi() => {}
 				Ok(exit)
 					if matches!(
 						exit.reason,

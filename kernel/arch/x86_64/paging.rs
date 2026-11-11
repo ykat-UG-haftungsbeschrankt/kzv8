@@ -41,6 +41,7 @@ static NEXT_PAGE_TABLE: AtomicUsize = AtomicUsize::new(0);
 static PAGE_TABLE_FREE: [AtomicBool; PAGE_TABLE_COUNT] =
     [const { AtomicBool::new(false) }; PAGE_TABLE_COUNT];
 static NX_ENABLED: AtomicBool = AtomicBool::new(false);
+static TLB_GENERATION: AtomicUsize = AtomicUsize::new(0);
 static PAGE_TABLE_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 
 extern "C" {
@@ -78,6 +79,64 @@ pub(crate) fn initialize() {
         );
     }
     assert!(cr0 & (1 << 31) != 0, "x86 paging was not enabled by boot");
+}
+
+pub(crate) fn tlb_generation() -> usize {
+    TLB_GENERATION.load(Ordering::Acquire)
+}
+
+fn flush_local_tlb() {
+    let root: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {root}, cr3",
+            root = out(reg) root,
+            options(nomem, nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "mov cr3, {root}",
+            root = in(reg) root,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+fn shootdown_remote_tlbs() {
+    let previous_generation = TLB_GENERATION.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |generation| generation.checked_add(1),
+    );
+    let Ok(previous_generation) = previous_generation else {
+        crate::kernel::arch::CpuArchitecture::halt();
+    };
+    let generation = previous_generation + 1;
+    super::smp::acknowledge_tlb_shootdown(generation);
+    if !super::smp::send_tlb_shootdown(generation) {
+        crate::kernel::arch::CpuArchitecture::halt();
+    }
+    while !super::smp::all_online_cpus_acknowledged(generation) {
+        core::hint::spin_loop();
+    }
+}
+
+pub(crate) fn handle_tlb_shootdown_nmi() -> bool {
+    let Some(acknowledged_generation) = super::smp::current_tlb_generation() else {
+        return false;
+    };
+    if acknowledged_generation >= TLB_GENERATION.load(Ordering::Acquire) {
+        return false;
+    }
+    loop {
+        let generation = TLB_GENERATION.load(Ordering::Acquire);
+        flush_local_tlb();
+        if TLB_GENERATION.load(Ordering::Acquire) == generation {
+            super::smp::acknowledge_tlb_shootdown(generation);
+            if TLB_GENERATION.load(Ordering::Acquire) == generation {
+                return true;
+            }
+        }
+    }
 }
 
 pub(crate) fn create_address_space() -> Option<(usize, usize, usize)> {
@@ -204,18 +263,22 @@ fn set_page_permissions_inner(
     }
 
     let _guard = PAGE_TABLE_LOCK.lock();
+    let mut complete = true;
+    let mut changed = false;
     for offset in (0..length).step_by(PAGE_SIZE) {
         let Some(entry) = page_table_entry(address + offset, false, user) else {
-            return false;
+            complete = false;
+            break;
         };
         let current = unsafe { read_volatile(entry) };
         let user_access = user || current & USER_ACCESS != 0;
-        let Some(flags) = permission_flags(permissions, user_access) else {
-            return false;
-        };
         let address_bits = current & PAGE_ADDRESS_MASK;
         let preserved_flags =
             current & PAGE_FLAGS_MASK & !(PRESENT | WRITABLE | USER_ACCESS | NO_EXECUTE);
+        let Some(flags) = permission_flags(permissions, user_access) else {
+            complete = false;
+            break;
+        };
         unsafe {
             write_volatile(entry, address_bits | preserved_flags | flags);
             core::arch::asm!(
@@ -224,8 +287,12 @@ fn set_page_permissions_inner(
                 options(nostack, preserves_flags),
             );
         }
+        changed = true;
     }
-    true
+    if changed {
+        shootdown_remote_tlbs();
+    }
+    complete
 }
 
 pub(crate) fn map_page(virtual_address: usize, physical_address: usize, permissions: i32) -> bool {
@@ -289,6 +356,7 @@ fn with_uncached_mmio<T>(physical_address: usize, access: impl FnOnce(*const u8)
             options(nostack, preserves_flags),
         );
     }
+    shootdown_remote_tlbs();
     let value = access(physical_address as *const u8);
     unsafe {
         write_volatile(entry, original);
@@ -298,6 +366,7 @@ fn with_uncached_mmio<T>(physical_address: usize, access: impl FnOnce(*const u8)
             options(nostack, preserves_flags),
         );
     }
+    shootdown_remote_tlbs();
     Some(value)
 }
 
@@ -368,6 +437,7 @@ fn map_page_inner(
             options(nostack, preserves_flags),
         );
     }
+    shootdown_remote_tlbs();
     true
 }
 
@@ -389,6 +459,7 @@ pub(crate) fn unmap_page(virtual_address: usize) -> Option<usize> {
             options(nostack, preserves_flags),
         );
     }
+    shootdown_remote_tlbs();
     Some((current & PAGE_ADDRESS_MASK) as usize)
 }
 

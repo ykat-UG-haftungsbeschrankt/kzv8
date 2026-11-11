@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::x86_64::{__cpuid, __cpuid_count};
 use core::ptr::{addr_of, copy_nonoverlapping, write_volatile};
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use crate::kernel::arch::traits::{
     CpuArchitecture as _, DebugArchitecture as _, ThreadArchitecture as _,
@@ -23,6 +23,7 @@ const PAGE_SIZE: usize = 4096;
 const CPU_STACK_SIZE: usize = 16 * 1024;
 const INIT_IPI: u32 = 0x0000_c500;
 const STARTUP_IPI_BASE: u32 = 0x0000_0600;
+const NMI_IPI_COMMAND: u32 = 0x0000_0400;
 #[allow(dead_code)]
 const EXECUTOR_IPI_VECTOR: u8 = 0x41;
 const INIT_TO_SIPI_NS: u64 = 10_000_000;
@@ -37,6 +38,8 @@ struct CpuSlot {
     apic_id: u32,
     stack: Option<Box<CpuStack>>,
     online: AtomicBool,
+    tlb_generation: AtomicUsize,
+    next_tlb_slot: AtomicPtr<CpuSlot>,
 }
 
 #[repr(C)]
@@ -46,8 +49,9 @@ struct ApBootRecord {
     stack: u64,
 }
 
-static CPU_SLOTS: IrqSpinLock<Vec<CpuSlot>> = IrqSpinLock::new(Vec::new());
+static CPU_SLOTS: IrqSpinLock<Vec<Box<CpuSlot>>> = IrqSpinLock::new(Vec::new());
 static AP_BOOT_RECORDS: IrqSpinLock<Vec<ApBootRecord>> = IrqSpinLock::new(Vec::new());
+static CPU_SLOT_HEAD: AtomicPtr<CpuSlot> = AtomicPtr::new(core::ptr::null_mut());
 
 unsafe extern "C" {
     static ap_trampoline_start: u8;
@@ -69,14 +73,31 @@ pub(crate) fn start_secondary_cpus() -> usize {
     apic_ids.insert(0, bsp_apic_id);
 
     let mut cpu_slots = Vec::with_capacity(apic_ids.len());
+    let tlb_generation = super::paging::tlb_generation();
     for (slot, apic_id) in apic_ids.into_iter().enumerate() {
-        cpu_slots.push(CpuSlot {
+        cpu_slots.push(Box::new(CpuSlot {
             apic_id,
             stack: (slot != 0).then(|| Box::new(CpuStack([0; CPU_STACK_SIZE]))),
             online: AtomicBool::new(slot == 0),
-        });
+            tlb_generation: AtomicUsize::new(tlb_generation),
+            next_tlb_slot: AtomicPtr::new(core::ptr::null_mut()),
+        }));
     }
+    for slot in 0..cpu_slots.len() {
+        let next = cpu_slots
+            .get(slot + 1)
+            .map_or(core::ptr::null_mut(), |cpu| {
+                (&**cpu as *const CpuSlot).cast_mut()
+            });
+        cpu_slots[slot]
+            .next_tlb_slot
+            .store(next, Ordering::Relaxed);
+    }
+    let cpu_slot_head = cpu_slots
+        .first()
+        .map_or(core::ptr::null_mut(), |cpu| (&**cpu as *const CpuSlot).cast_mut());
     *CPU_SLOTS.lock() = cpu_slots;
+    CPU_SLOT_HEAD.store(cpu_slot_head, Ordering::Release);
     trace(b'c');
 
     let cpu_count = CPU_SLOTS.lock().len();
@@ -247,8 +268,89 @@ fn set_cpu_online(cpu_id: usize) -> bool {
     let Some(cpu) = cpus.get(cpu_id) else {
         return false;
     };
-    cpu.online.store(true, Ordering::Release);
+    loop {
+        let generation = super::paging::tlb_generation();
+        let root = super::paging::current_address_space();
+        if !super::paging::activate_address_space(root) {
+            cpu.online.store(false, Ordering::Release);
+            return false;
+        }
+        cpu.tlb_generation.fetch_max(generation, Ordering::AcqRel);
+        cpu.online.store(true, Ordering::Release);
+        if super::paging::tlb_generation() == generation {
+            return true;
+        }
+    }
+}
+
+pub(crate) fn send_tlb_shootdown(generation: usize) -> bool {
+    let current_apic_id = crate::kernel::arch::interrupts::current_apic_id();
+    let mut slot = CPU_SLOT_HEAD.load(Ordering::Acquire);
+    while !slot.is_null() {
+        // SAFETY: the published linked list points to CpuSlot boxes retained in CPU_SLOTS.
+        let cpu = unsafe { &*slot };
+        if cpu.apic_id != current_apic_id
+            && cpu.online.load(Ordering::Acquire)
+            && cpu.tlb_generation.load(Ordering::Acquire) < generation
+        {
+            while crate::kernel::arch::interrupts::ipi_pending() {
+                core::hint::spin_loop();
+            }
+            if !crate::kernel::arch::interrupts::send_ipi(cpu.apic_id, NMI_IPI_COMMAND) {
+                return false;
+            }
+            while crate::kernel::arch::interrupts::ipi_pending() {
+                core::hint::spin_loop();
+            }
+        }
+        slot = cpu.next_tlb_slot.load(Ordering::Acquire);
+    }
     true
+}
+
+pub(crate) fn all_online_cpus_acknowledged(generation: usize) -> bool {
+    let current_apic_id = crate::kernel::arch::interrupts::current_apic_id();
+    let mut slot = CPU_SLOT_HEAD.load(Ordering::Acquire);
+    while !slot.is_null() {
+        // SAFETY: the published linked list points to CpuSlot boxes retained in CPU_SLOTS.
+        let cpu = unsafe { &*slot };
+        if cpu.apic_id != current_apic_id
+            && cpu.online.load(Ordering::Acquire)
+            && cpu.tlb_generation.load(Ordering::Acquire) < generation
+        {
+            return false;
+        }
+        slot = cpu.next_tlb_slot.load(Ordering::Acquire);
+    }
+    true
+}
+
+pub(crate) fn acknowledge_tlb_shootdown(generation: usize) {
+    let current_apic_id = crate::kernel::arch::interrupts::current_apic_id();
+    let mut slot = CPU_SLOT_HEAD.load(Ordering::Acquire);
+    while !slot.is_null() {
+        // SAFETY: the published linked list points to CpuSlot boxes retained in CPU_SLOTS.
+        let cpu = unsafe { &*slot };
+        if cpu.apic_id == current_apic_id {
+            cpu.tlb_generation.fetch_max(generation, Ordering::Release);
+            return;
+        }
+        slot = cpu.next_tlb_slot.load(Ordering::Acquire);
+    }
+}
+
+pub(crate) fn current_tlb_generation() -> Option<usize> {
+    let current_apic_id = crate::kernel::arch::interrupts::current_apic_id();
+    let mut slot = CPU_SLOT_HEAD.load(Ordering::Acquire);
+    while !slot.is_null() {
+        // SAFETY: the published linked list points to CpuSlot boxes retained in CPU_SLOTS.
+        let cpu = unsafe { &*slot };
+        if cpu.apic_id == current_apic_id {
+            return Some(cpu.tlb_generation.load(Ordering::Acquire));
+        }
+        slot = cpu.next_tlb_slot.load(Ordering::Acquire);
+    }
+    None
 }
 
 fn all_started_cpus_online(started: &[bool]) -> bool {

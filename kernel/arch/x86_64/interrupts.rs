@@ -89,6 +89,69 @@ core::arch::global_asm!(
     "pop rbx",
     "pop rax",
     "iretq",
+    ".global x86_nmi_entry",
+    "x86_nmi_entry:",
+    "cld",
+    "push rax",
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rbp",
+    "push rsi",
+    "push rdi",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov r12, rsp",
+    ".if {fpu_mode} == 0",
+    "sub rsp, 128",
+    "and rsp, -16",
+    "fnsave [rsp]",
+    ".elseif {fpu_mode} == 1",
+    "sub rsp, 528",
+    "and rsp, -16",
+    "fxsave64 [rsp]",
+    ".else",
+    "sub rsp, 896",
+    "and rsp, -64",
+    "mov r8, rsp",
+    "mov eax, 7",
+    "xor edx, edx",
+    "xsave64 [r8]",
+    ".endif",
+    "call x86_nmi_dispatch",
+    ".if {fpu_mode} == 0",
+    "frstor [rsp]",
+    ".elseif {fpu_mode} == 1",
+    "fxrstor64 [rsp]",
+    ".else",
+    "mov r8, rsp",
+    "mov eax, 7",
+    "xor edx, edx",
+    "xrstor64 [r8]",
+    ".endif",
+    "mov rsp, r12",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rdi",
+    "pop rsi",
+    "pop rbp",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "iretq",
     ".global x86_page_fault_entry",
     "x86_page_fault_entry:",
     "cld",
@@ -166,6 +229,7 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn x86_unhandled_interrupt();
     fn x86_irq_entry();
+    fn x86_nmi_entry();
     fn x86_page_fault_entry();
     fn x86_spurious_interrupt();
 }
@@ -234,6 +298,9 @@ pub(crate) unsafe fn initialize() {
     entries
         .add(TIMER_VECTOR)
         .write(IdtEntry::interrupt(x86_irq_entry as *const () as usize));
+    entries
+        .add(2)
+        .write(IdtEntry::interrupt(x86_nmi_entry as *const () as usize));
     entries.add(14).write(IdtEntry::interrupt(
         x86_page_fault_entry as *const () as usize,
     ));
@@ -338,6 +405,11 @@ pub extern "C" fn x86_irq_dispatch() {
         crate::kz_handle_virtio_interrupt();
     }
     write_local_apic(0xb0, 0);
+}
+
+#[no_mangle]
+pub extern "C" fn x86_nmi_dispatch() {
+    let _handled = super::paging::handle_tlb_shootdown_nmi();
 }
 
 pub(crate) fn send_ipi(destination: u32, command: u32) -> bool {
