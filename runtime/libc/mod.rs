@@ -12,6 +12,7 @@ pub(crate) mod filesystem;
 pub(crate) mod format;
 pub(crate) mod math;
 pub(crate) mod mmap;
+pub(crate) mod network;
 pub(crate) mod posix;
 pub(crate) mod pthread;
 pub(crate) mod smoke;

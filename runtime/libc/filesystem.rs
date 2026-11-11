@@ -17,6 +17,7 @@ use super::errno::{
     E2BIG, EBADF, EBUSY, EEXIST, EFAULT, EFBIG, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT,
     ENOMEM, ENOTDIR, ENOTEMPTY, ENOTTY, EPERM, ERANGE,
 };
+use super::network;
 
 const O_ACCMODE: i32 = 0o3;
 const O_RDONLY: i32 = 0o0;
@@ -49,6 +50,7 @@ const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFREG: u32 = 0o100000;
+const S_IFSOCK: u32 = 0o140000;
 const PATH_MAX: usize = 4096;
 const DESCRIPTOR_COUNT: usize = 64;
 const FIRST_DESCRIPTOR: i32 = 3;
@@ -535,6 +537,48 @@ impl FileSystem {
 
 static FILESYSTEM: IrqSpinLock<FileSystem> = IrqSpinLock::new(FileSystem::new());
 
+pub(crate) fn poll_readiness(file_descriptor: i32, events: i16) -> i16 {
+    const POLLIN: i16 = 0x001;
+    const POLLOUT: i16 = 0x004;
+    const POLLNVAL: i16 = 0x020;
+
+    if network::is_socket_fd(file_descriptor) {
+        return match network::readiness(file_descriptor, events) {
+            Ok(readiness) => readiness,
+            Err(KernelError::BadFd) => POLLNVAL,
+            Err(_) => 0x008,
+        };
+    }
+    if network::is_packet_fd(file_descriptor) {
+        return match network::packet_readiness(file_descriptor, events) {
+            Ok(readiness) => readiness,
+            Err(KernelError::BadFd) => POLLNVAL,
+            Err(_) => 0x008,
+        };
+    }
+    if file_descriptor == 0 {
+        return 0;
+    }
+    if file_descriptor == 1 || file_descriptor == 2 {
+        return if events & POLLOUT != 0 { POLLOUT } else { 0 };
+    }
+    let filesystem = FILESYSTEM.lock();
+    let Ok(slot) = filesystem.descriptor_slot(file_descriptor) else {
+        return POLLNVAL;
+    };
+    let Some(descriptor) = filesystem.descriptors[slot] else {
+        return POLLNVAL;
+    };
+    let mut readiness = 0;
+    if events & POLLIN != 0 && descriptor.readable {
+        readiness |= POLLIN;
+    }
+    if events & POLLOUT != 0 && descriptor.writable {
+        readiness |= POLLOUT;
+    }
+    readiness
+}
+
 fn set_errno(error: i32) {
     unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
 }
@@ -599,7 +643,18 @@ fn with_path(path: *const c_char, operation: impl FnOnce(Vec<u8>) -> Result<i32,
 
 #[no_mangle]
 pub unsafe extern "C" fn kz_rust_open(path: *const c_char, flags: i32, mode: u32) -> i32 {
-    with_path(path, |path| FILESYSTEM.lock().open(path, flags, mode))
+    with_path(path, |path| {
+        if path.as_slice() == b"/dev/net/tun" {
+            if flags & O_ACCMODE != O_RDWR
+                || flags & !(O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY) != 0
+            {
+                return Err(EINVAL);
+            }
+            return network::open_tun_device(flags & O_NONBLOCK != 0)
+                .map_err(|error| -(error as i32));
+        }
+        FILESYSTEM.lock().open(path, flags, mode)
+    })
 }
 
 #[no_mangle]
@@ -614,6 +669,45 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
     }
     if file_descriptor == 0 {
         return 0;
+    }
+    if length == 0 {
+        return 0;
+    }
+    if network::is_socket_fd(file_descriptor) {
+        let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
+        return match network::receive(file_descriptor, output) {
+            Ok(amount) => amount as isize,
+            Err(error) => {
+                set_errno(-(error as i32));
+                -1
+            }
+        };
+    }
+    if network::is_packet_fd(file_descriptor) {
+        let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
+        loop {
+            network::pump_packet_network();
+            match network::read_packet_fd(file_descriptor, output) {
+                Ok(amount) => return amount as isize,
+                Err(KernelError::Again) => match network::packet_nonblocking(file_descriptor) {
+                    Ok(true) => {
+                        set_errno(-(KernelError::Again as i32));
+                        return -1;
+                    }
+                    Ok(false) => {
+                        crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+                    }
+                    Err(error) => {
+                        set_errno(-(error as i32));
+                        return -1;
+                    }
+                },
+                Err(error) => {
+                    set_errno(-(error as i32));
+                    return -1;
+                }
+            }
+        }
     }
     if file_descriptor < FIRST_DESCRIPTOR {
         set_errno(EBADF);
@@ -645,6 +739,9 @@ pub unsafe extern "C" fn write(
         set_errno(EINVAL);
         return -1;
     }
+    if length == 0 {
+        return 0;
+    }
     if file_descriptor == 1 || file_descriptor == 2 {
         let mut written = 0;
         while written < length {
@@ -665,6 +762,41 @@ pub unsafe extern "C" fn write(
             written += result as usize;
         }
         return written as isize;
+    }
+    if network::is_socket_fd(file_descriptor) {
+        let input = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), length) };
+        return match network::send(file_descriptor, input) {
+            Ok(amount) => amount as isize,
+            Err(error) => {
+                set_errno(-(error as i32));
+                -1
+            }
+        };
+    }
+    if network::is_packet_fd(file_descriptor) {
+        let input = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), length) };
+        loop {
+            match network::write_packet_fd(file_descriptor, input) {
+                Ok(amount) => return amount as isize,
+                Err(KernelError::Again) => match network::packet_nonblocking(file_descriptor) {
+                    Ok(true) => {
+                        set_errno(-(KernelError::Again as i32));
+                        return -1;
+                    }
+                    Ok(false) => {
+                        crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+                    }
+                    Err(error) => {
+                        set_errno(-(error as i32));
+                        return -1;
+                    }
+                },
+                Err(error) => {
+                    set_errno(-(error as i32));
+                    return -1;
+                }
+            }
+        }
     }
     if file_descriptor < FIRST_DESCRIPTOR {
         set_errno(EBADF);
@@ -687,6 +819,24 @@ pub extern "C" fn close(file_descriptor: i32) -> i32 {
     if (0..=2).contains(&file_descriptor) {
         return 0;
     }
+    if network::is_socket_fd(file_descriptor) {
+        return match network::close(file_descriptor) {
+            Ok(()) => 0,
+            Err(error) => {
+                set_errno(-(error as i32));
+                -1
+            }
+        };
+    }
+    if network::is_packet_fd(file_descriptor) {
+        return match network::close_packet_fd(file_descriptor) {
+            Ok(()) => 0,
+            Err(error) => {
+                set_errno(-(error as i32));
+                -1
+            }
+        };
+    }
     match FILESYSTEM.lock().close(file_descriptor) {
         Ok(()) => 0,
         Err(error) => fail(error),
@@ -695,6 +845,14 @@ pub extern "C" fn close(file_descriptor: i32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn lseek(file_descriptor: i32, offset: i64, origin: i32) -> i64 {
+    if network::is_socket_fd(file_descriptor) || network::is_packet_fd(file_descriptor) {
+        if network::has_socket_fd(file_descriptor) || network::has_packet_fd(file_descriptor) {
+            set_errno(-(KernelError::Spipe as i32));
+        } else {
+            set_errno(EBADF);
+        }
+        return -1;
+    }
     match FILESYSTEM.lock().seek(file_descriptor, offset, origin) {
         Ok(position) => position,
         Err(error) => {
@@ -742,7 +900,43 @@ pub unsafe extern "C" fn fstat(file_descriptor: i32, output: *mut c_void) -> i32
     if output.is_null() {
         return fail(EFAULT);
     }
-    let status = if (0..=2).contains(&file_descriptor) {
+    let status = if network::has_socket_fd(file_descriptor) {
+        Ok(CStat {
+            device: 1,
+            inode: file_descriptor as u64,
+            links: 1,
+            mode: S_IFSOCK | 0o777,
+            user: 0,
+            group: 0,
+            pad: 0,
+            special_device: 0,
+            size: 0,
+            block_size: 4096,
+            blocks: 0,
+            accessed: Timespec { seconds: 0, nanoseconds: 0 },
+            modified: Timespec { seconds: 0, nanoseconds: 0 },
+            changed: Timespec { seconds: 0, nanoseconds: 0 },
+            reserved: [0; 3],
+        })
+    } else if network::has_packet_fd(file_descriptor) {
+        Ok(CStat {
+            device: 1,
+            inode: file_descriptor as u64,
+            links: 1,
+            mode: S_IFCHR | 0o600,
+            user: 0,
+            group: 0,
+            pad: 0,
+            special_device: 0,
+            size: 0,
+            block_size: 4096,
+            blocks: 0,
+            accessed: Timespec { seconds: 0, nanoseconds: 0 },
+            modified: Timespec { seconds: 0, nanoseconds: 0 },
+            changed: Timespec { seconds: 0, nanoseconds: 0 },
+            reserved: [0; 3],
+        })
+    } else if (0..=2).contains(&file_descriptor) {
         Ok(CStat {
             device: 1,
             inode: file_descriptor as u64 + 1,
@@ -1203,6 +1397,22 @@ pub unsafe extern "C" fn kz_rust_ioctl(
     request: usize,
     argument: *mut c_void,
 ) -> i32 {
+    if network::is_packet_fd(file_descriptor) {
+        let result = match network::tun_ioctl(file_descriptor, request, argument) {
+            Err(KernelError::NoSys) => network::interface_ioctl(request, argument),
+            result => result,
+        };
+        return match result {
+            Ok(()) => 0,
+            Err(error) => fail(-(error as i32)),
+        };
+    }
+    if network::is_socket_fd(file_descriptor) {
+        return match network::interface_ioctl(request, argument) {
+            Ok(()) => 0,
+            Err(error) => fail(-(error as i32)),
+        };
+    }
     if request != FS_IOC_GETFLAGS && request != FS_IOC_SETFLAGS {
         return fail(ENOTTY);
     }

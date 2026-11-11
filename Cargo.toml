@@ -17,7 +17,6 @@ bench = false
 
 [dependencies]
 libm = "0.2"
-smoltcp = { version = "0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
 
 [features]
 default = ["fpu-sse"]

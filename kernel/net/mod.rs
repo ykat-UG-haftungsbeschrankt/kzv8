@@ -6,5 +6,9 @@
  */
 
 pub(crate) mod device;
+pub(crate) mod arp;
+pub(crate) mod icmp;
 pub(crate) mod stack;
 pub(crate) mod tcp;
+pub(crate) mod udp;
+pub(crate) mod wire;

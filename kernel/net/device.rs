@@ -6,17 +6,12 @@
  */
 
 use alloc::vec::Vec;
-
-use smoltcp::phy::{
-    Device, DeviceCapabilities, Medium, RxToken as SmolRxToken, TxToken as SmolTxToken,
-};
-use smoltcp::time::Instant;
 use crate::kernel::driver::virtio::net::VirtioNet;
+use crate::kernel::error::Error;
 
 pub(crate) struct EthernetDevice {
     device: VirtioNet,
     receive_frame: Vec<u8>,
-    transmit_frame: Vec<u8>,
 }
 
 impl EthernetDevice {
@@ -26,13 +21,9 @@ impl EthernetDevice {
         let mut receive_frame = Vec::new();
         receive_frame.try_reserve_exact(frame_size).ok()?;
         receive_frame.resize(frame_size, 0);
-        let mut transmit_frame = Vec::new();
-        transmit_frame.try_reserve_exact(frame_size).ok()?;
-        transmit_frame.resize(frame_size, 0);
         Some(Self {
             device,
             receive_frame,
-            transmit_frame,
         })
     }
 
@@ -40,89 +31,24 @@ impl EthernetDevice {
         self.device.mac_address()
     }
 
+    pub(crate) const fn mtu(&self) -> usize {
+        self.device.mtu()
+    }
+
+    pub(crate) fn poll_receive_frame(&mut self) -> Result<Option<usize>, Error> {
+        self.device.poll_receive(self.receive_frame.as_mut_slice())
+    }
+
+    pub(crate) fn received_frame(&self, length: usize) -> Option<&[u8]> {
+        self.receive_frame.get(..length)
+    }
+
+    pub(crate) fn transmit_frame(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.device.transmit(frame)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn interrupt_slot(&self) -> usize {
         self.device.interrupt_slot()
-    }
-}
-
-pub(crate) struct RxToken<'a> {
-    frame: &'a [u8],
-}
-
-impl SmolRxToken for RxToken<'_> {
-    fn consume<R, F>(self, function: F) -> R
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        function(self.frame)
-    }
-}
-
-pub(crate) struct TxToken<'a> {
-    device: &'a mut VirtioNet,
-    frame: &'a mut [u8],
-}
-
-impl SmolTxToken for TxToken<'_> {
-    fn consume<R, F>(self, length: usize, function: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        let length = length.min(self.frame.len());
-        let result = function(&mut self.frame[..length]);
-        let _ = self.device.transmit(&self.frame[..length]);
-        result
-    }
-}
-
-impl Device for EthernetDevice {
-    type RxToken<'a>
-        = RxToken<'a>
-    where
-        Self: 'a;
-    type TxToken<'a>
-        = TxToken<'a>
-    where
-        Self: 'a;
-
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let Self {
-            device,
-            receive_frame,
-            transmit_frame,
-        } = self;
-        let length = device
-            .poll_receive(receive_frame.as_mut_slice())
-            .ok()
-            .flatten()?;
-        Some((
-            RxToken {
-                frame: &receive_frame[..length],
-            },
-            TxToken {
-                device,
-                frame: transmit_frame.as_mut_slice(),
-            },
-        ))
-    }
-
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        let Self {
-            device,
-            transmit_frame,
-            ..
-        } = self;
-        Some(TxToken {
-            device,
-            frame: transmit_frame.as_mut_slice(),
-        })
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut capabilities = DeviceCapabilities::default();
-        capabilities.max_transmission_unit = self.device.mtu();
-        capabilities.medium = Medium::Ethernet;
-        capabilities
     }
 }

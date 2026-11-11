@@ -1,9 +1,20 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::ffi::{c_char, c_int};
-use super::errno::ENOSYS;
+use super::errno::{EINVAL, ENOSYS};
 
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
+const O_NONBLOCK: c_int = 0o4000;
+const O_ACCMODE: c_int = 0o3;
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
 
 unsafe extern "C" {
     fn kz_rust_open(path: *const c_char, flags: c_int, mode: u32) -> c_int;
@@ -20,13 +31,45 @@ pub unsafe extern "C" fn creat(path: *const c_char, mode: u32) -> c_int {
     unsafe { kz_rust_open(path, O_WRONLY | O_CREAT | O_TRUNC, mode) }
 }
 
-// FIXME: The kernel has no descriptor duplication, flag, or record-lock operations.
 #[no_mangle]
 pub unsafe extern "C" fn fcntl(
-    _file_descriptor: c_int,
-    _command: c_int,
-    _argument: usize,
+    file_descriptor: c_int,
+    command: c_int,
+    argument: usize,
 ) -> c_int {
+    if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor)
+        || crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor)
+    {
+        return match command {
+            F_GETFL => crate::kernel::runtime::runtime_libc::network::get_status_flags(
+                file_descriptor,
+            )
+            .unwrap_or_else(|error| {
+                set_errno(-(error as i32));
+                -1
+            }),
+            F_SETFL => {
+                if argument as c_int & !(O_NONBLOCK | O_ACCMODE) != 0 {
+                    set_errno(EINVAL);
+                    return -1;
+                }
+                match crate::kernel::runtime::runtime_libc::network::set_status_flags(
+                    file_descriptor,
+                    argument as c_int,
+                ) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        set_errno(-(error as i32));
+                        -1
+                    }
+                }
+            }
+            _ => {
+                set_errno(ENOSYS);
+                -1
+            }
+        };
+    }
     set_errno(ENOSYS);
     -1
 }

@@ -9,6 +9,8 @@ use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::vm::device::virtio::mmio::{QueueResult, VirtioMmio};
 use crate::kernel::vm::device::virtio::queue::GuestVirtQueue;
 use crate::kernel::vm::device::GuestMemory;
+use crate::kernel::net::wire::EthernetFrame;
+use crate::kernel::vfs::plugin::tun::{self, TunTapMode};
 
 pub(crate) const MMIO_BASE: u64 = 0x1000_3000;
 const DEVICE_ID: u32 = 1;
@@ -17,6 +19,7 @@ const MAX_FRAME_SIZE: usize = 1514;
 const HEADER_SIZE: usize = 12;
 const HUB_PEER_COUNT: usize = 8;
 const RX_RING_SIZE: usize = 8;
+const HOST_FRAME_RING_SIZE: usize = 16;
 const FEATURE_MTU: u32 = 1 << 3;
 const FEATURE_MAC: u32 = 1 << 5;
 const FEATURE_MRG_RXBUF: u32 = 1 << 15;
@@ -57,13 +60,34 @@ impl Peer {
 
 struct NetworkSwitch {
     peers: [Peer; HUB_PEER_COUNT],
+    host_active: bool,
+    host_mac: [u8; 6],
+    host_stack_frames: [Frame; HOST_FRAME_RING_SIZE],
+    host_stack_head: usize,
+    host_stack_length: usize,
+    host_transmit_frames: [Frame; HOST_FRAME_RING_SIZE],
+    host_transmit_head: usize,
+    host_transmit_length: usize,
 }
 
 impl NetworkSwitch {
     const fn new() -> Self {
         Self {
             peers: [Peer::EMPTY; HUB_PEER_COUNT],
+            host_active: false,
+            host_mac: [0; 6],
+            host_stack_frames: [Frame::EMPTY; HOST_FRAME_RING_SIZE],
+            host_stack_head: 0,
+            host_stack_length: 0,
+            host_transmit_frames: [Frame::EMPTY; HOST_FRAME_RING_SIZE],
+            host_transmit_head: 0,
+            host_transmit_length: 0,
         }
+    }
+
+    fn register_host(&mut self, mac: [u8; 6]) {
+        self.host_active = true;
+        self.host_mac = mac;
     }
 
     fn register(&mut self) -> Option<(u8, [u8; 6])> {
@@ -84,24 +108,88 @@ impl NetworkSwitch {
     }
 
     fn transmit(&mut self, source_id: u8, bytes: &[u8]) {
-        if bytes.len() < 14 || bytes.len() > MAX_FRAME_SIZE {
+        if bytes.len() > MAX_FRAME_SIZE {
             return;
         }
+        let Ok(frame) = EthernetFrame::parse(bytes) else {
+            return;
+        };
         let source = usize::from(source_id);
         if source >= self.peers.len() || !self.peers[source].active {
             return;
         }
-        let destination: [u8; 6] = match bytes.get(..6).and_then(|mac| mac.try_into().ok()) {
-            Some(mac) => mac,
-            None => return,
+        let destination = frame.destination.0;
+        let multicast = destination[0] & 1 != 0;
+        let destination_peer_exists = self
+            .peers
+            .iter()
+            .any(|peer| peer.active && peer.mac == destination);
+        let destination_tap_exists = self.tap_mac_exists(destination);
+        let destination_host = self.host_active && self.host_mac == destination;
+        self.forward_to_peers(
+            Some(source),
+            destination,
+            bytes,
+            !destination_peer_exists && !destination_tap_exists && !destination_host,
+        );
+        self.forward_to_taps(destination, None, bytes);
+        if multicast || destination_host {
+            self.enqueue_host_stack(bytes);
+        }
+        if multicast
+            || (!destination_peer_exists && !destination_tap_exists && !destination_host)
+        {
+            self.enqueue_host_transmit(bytes);
+        }
+        self.drain_tap_transmissions();
+    }
+
+    fn forward_tap_frame(&mut self, source_mac: [u8; 6], bytes: &[u8]) {
+        if bytes.len() > MAX_FRAME_SIZE {
+            return;
+        }
+        let Ok(frame) = EthernetFrame::parse(bytes) else {
+            return;
         };
+        let destination = frame.destination.0;
+        let multicast = destination[0] & 1 != 0;
+        let destination_peer_exists = self
+            .peers
+            .iter()
+            .any(|peer| peer.active && peer.mac == destination);
+        let destination_tap_exists = self.tap_mac_exists(destination);
+        let destination_host = self.host_active && self.host_mac == destination;
+        self.forward_to_peers(
+            None,
+            destination,
+            bytes,
+            !destination_peer_exists && !destination_tap_exists && !destination_host,
+        );
+        self.forward_to_taps(destination, Some(source_mac), bytes);
+        if multicast || destination_host {
+            self.enqueue_host_stack(bytes);
+        }
+        if multicast
+            || (!destination_peer_exists && !destination_tap_exists && !destination_host)
+        {
+            self.enqueue_host_transmit(bytes);
+        }
+    }
+
+    fn forward_to_peers(
+        &mut self,
+        source: Option<usize>,
+        destination: [u8; 6],
+        bytes: &[u8],
+        flood_unknown_unicast: bool,
+    ) {
         let multicast = destination[0] & 1 != 0;
         let destination_peer = self
             .peers
             .iter()
             .position(|peer| peer.active && peer.mac == destination);
         for index in 0..self.peers.len() {
-            if index == source || !self.peers[index].active {
+            if source == Some(index) || !self.peers[index].active {
                 continue;
             }
             let deliver = if multicast {
@@ -109,7 +197,7 @@ impl NetworkSwitch {
             } else if let Some(destination_peer) = destination_peer {
                 index == destination_peer
             } else {
-                true
+                flood_unknown_unicast
             };
             if !deliver {
                 continue;
@@ -126,6 +214,145 @@ impl NetworkSwitch {
         }
     }
 
+    fn forward_to_taps(
+        &mut self,
+        destination: [u8; 6],
+        source_mac: Option<[u8; 6]>,
+        bytes: &[u8],
+    ) {
+        let Ok(taps) = tun::open_devices() else {
+            return;
+        };
+        let destination_peer_exists = self
+            .peers
+            .iter()
+            .any(|peer| peer.active && peer.mac == destination);
+        let destination_tap_exists = taps.iter().any(|tap| {
+            tap.mode() == TunTapMode::Tap && tap.mac_address() == destination
+        });
+        let multicast = destination[0] & 1 != 0;
+        for tap in taps {
+            if !tap.is_configured()
+                || tap.mode() != TunTapMode::Tap
+                || source_mac == Some(tap.mac_address())
+            {
+                continue;
+            }
+            let deliver = multicast
+                || tap.mac_address() == destination
+                || (!destination_peer_exists && !destination_tap_exists);
+            if deliver {
+                let _ = tap.inject_packet(bytes);
+            }
+        }
+    }
+
+    fn drain_tap_transmissions(&mut self) {
+        let Ok(taps) = tun::open_devices() else {
+            return;
+        };
+        for tap in taps {
+            if !tap.is_configured() || tap.mode() != TunTapMode::Tap {
+                continue;
+            }
+            while let Ok(frame) = tap.dequeue_transmitted_packet() {
+                self.forward_tap_frame(tap.mac_address(), &frame);
+            }
+        }
+    }
+
+    fn host_ingress(&mut self, bytes: &[u8]) {
+        let Ok(frame) = EthernetFrame::parse(bytes) else {
+            return;
+        };
+        if self.host_active && frame.destination.0 == self.host_mac {
+            return;
+        }
+        let destination = frame.destination.0;
+        let peer_exists = self
+            .peers
+            .iter()
+            .any(|peer| peer.active && peer.mac == destination);
+        let tap_exists = self.tap_mac_exists(destination);
+        self.forward_to_peers(None, destination, bytes, !peer_exists && !tap_exists);
+        self.forward_to_taps(destination, None, bytes);
+    }
+
+    fn host_transmit(&mut self, bytes: &[u8]) {
+        if bytes.len() > MAX_FRAME_SIZE {
+            return;
+        }
+        let Ok(frame) = EthernetFrame::parse(bytes) else {
+            return;
+        };
+        let destination = frame.destination.0;
+        if self.host_active && destination == self.host_mac {
+            return;
+        }
+        let multicast = destination[0] & 1 != 0;
+        let destination_peer_exists = self
+            .peers
+            .iter()
+            .any(|peer| peer.active && peer.mac == destination);
+        let destination_tap_exists = self.tap_mac_exists(destination);
+        if multicast {
+            self.forward_to_peers(None, destination, bytes, true);
+            self.forward_to_taps(destination, None, bytes);
+            self.enqueue_host_transmit(bytes);
+        } else if destination_peer_exists {
+            self.forward_to_peers(None, destination, bytes, false);
+        } else if destination_tap_exists {
+            self.forward_to_taps(destination, None, bytes);
+        } else {
+            self.enqueue_host_transmit(bytes);
+        }
+        self.drain_tap_transmissions();
+    }
+
+    fn tap_mac_exists(&self, mac: [u8; 6]) -> bool {
+        tun::open_devices().is_ok_and(|devices| {
+            devices
+                .iter()
+                .any(|device| device.mode() == TunTapMode::Tap && device.mac_address() == mac)
+        })
+    }
+
+    fn enqueue_host_stack(&mut self, bytes: &[u8]) {
+        let _ = enqueue_frame(
+            &mut self.host_stack_frames,
+            &mut self.host_stack_head,
+            &mut self.host_stack_length,
+            bytes,
+        );
+    }
+
+    fn enqueue_host_transmit(&mut self, bytes: &[u8]) {
+        let _ = enqueue_frame(
+            &mut self.host_transmit_frames,
+            &mut self.host_transmit_head,
+            &mut self.host_transmit_length,
+            bytes,
+        );
+    }
+
+    fn receive_host_stack(&mut self, output: &mut [u8]) -> Option<usize> {
+        dequeue_frame(
+            &mut self.host_stack_frames,
+            &mut self.host_stack_head,
+            &mut self.host_stack_length,
+            output,
+        )
+    }
+
+    fn receive_host_transmit(&mut self, output: &mut [u8]) -> Option<usize> {
+        dequeue_frame(
+            &mut self.host_transmit_frames,
+            &mut self.host_transmit_head,
+            &mut self.host_transmit_length,
+            output,
+        )
+    }
+
     fn receive(&mut self, peer_id: u8) -> Option<Frame> {
         let peer = self.peers.get_mut(usize::from(peer_id))?;
         if !peer.active || peer.length == 0 {
@@ -136,6 +363,62 @@ impl NetworkSwitch {
         peer.length -= 1;
         Some(frame)
     }
+}
+
+fn enqueue_frame<const N: usize>(
+    frames: &mut [Frame; N],
+    head: &mut usize,
+    length: &mut usize,
+    bytes: &[u8],
+) -> bool {
+    if bytes.is_empty() || bytes.len() > MAX_FRAME_SIZE || *length == N {
+        return false;
+    }
+    let tail = (*head + *length) % N;
+    frames[tail].bytes[..bytes.len()].copy_from_slice(bytes);
+    frames[tail].length = bytes.len();
+    *length += 1;
+    true
+}
+
+fn dequeue_frame<const N: usize>(
+    frames: &mut [Frame; N],
+    head: &mut usize,
+    length: &mut usize,
+    output: &mut [u8],
+) -> Option<usize> {
+    if *length == 0 {
+        return None;
+    }
+    let frame = &frames[*head];
+    if output.len() < frame.length {
+        return None;
+    }
+    let frame_length = frame.length;
+    output[..frame_length].copy_from_slice(&frame.bytes[..frame_length]);
+    *head = (*head + 1) % N;
+    *length -= 1;
+    Some(frame_length)
+}
+
+pub(crate) fn register_host_interface(mac: [u8; 6]) {
+    NETWORK_SWITCH.lock().register_host(mac);
+}
+
+pub(crate) fn host_ingress_frame(bytes: &[u8]) {
+    NETWORK_SWITCH.lock().host_ingress(bytes);
+}
+
+pub(crate) fn host_transmit_frame(bytes: &[u8]) {
+    NETWORK_SWITCH.lock().host_transmit(bytes);
+}
+
+pub(crate) fn receive_host_stack_frame(output: &mut [u8]) -> Option<usize> {
+    NETWORK_SWITCH.lock().receive_host_stack(output)
+}
+
+pub(crate) fn receive_host_transmit_frame(output: &mut [u8]) -> Option<usize> {
+    NETWORK_SWITCH.lock().receive_host_transmit(output)
 }
 
 pub(crate) struct VirtioNet {
@@ -182,6 +465,7 @@ impl VirtioNet {
         if !Self::contains(address) {
             return None;
         }
+        poll_tap_devices();
         let peer_id = self.peer_id;
         let mmio = &mut self.mmio;
         let receive_result = mmio
@@ -293,6 +577,10 @@ impl VirtioNet {
             QueueResult::Pending
         }
     }
+}
+
+pub(crate) fn poll_tap_devices() {
+    NETWORK_SWITCH.lock().drain_tap_transmissions();
 }
 
 impl Drop for VirtioNet {

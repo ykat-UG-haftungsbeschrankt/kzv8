@@ -74,11 +74,14 @@ pub(crate) fn run(context: KernelContext<'_>) {
             .unwrap_or(core::ptr::null_mut());
         let mut tcp_context =
             runtime_ffi::TcpContext::new(events, network_stack, network_registration);
-        match runtime_v8::run_smoke(
+        tcp_context.install_active();
+        let result = runtime_v8::run_smoke(
             events,
             block_device,
             &mut tcp_context as *mut _ as *mut core::ffi::c_void,
-        ) {
+        );
+        tcp_context.clear_active();
+        match result {
             Some(0) => {}
             Some(_) => {
                 let _v8_error = Console::write(b"kz: V8 smoke failed\n");

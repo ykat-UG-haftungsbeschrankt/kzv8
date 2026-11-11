@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <linux/fs.h>
+#include <linux/if_tun.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -14,7 +15,12 @@
 extern int kz_rust_ioctl(int file_descriptor, unsigned long request, void *argument);
 
 int ioctl(int file_descriptor, unsigned long request, ...) {
-    if (request != FS_IOC_GETFLAGS && request != FS_IOC_SETFLAGS) {
+    if (request != FS_IOC_GETFLAGS && request != FS_IOC_SETFLAGS &&
+        request != TUNSETIFF && request != TUNGETIFF &&
+        request != SIOCGIFFLAGS && request != SIOCSIFFLAGS &&
+        request != SIOCGIFADDR && request != SIOCSIFADDR &&
+        request != SIOCGIFNETMASK && request != SIOCSIFNETMASK &&
+        request != SIOCGIFMTU && request != SIOCGIFHWADDR) {
         return kz_rust_ioctl(file_descriptor, request, NULL);
     }
     va_list arguments;
