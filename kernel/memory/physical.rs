@@ -15,6 +15,7 @@
  */
 
 use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::kernel::arch::traits::MemoryArchitecture as _;
 use crate::kernel::arch::MemoryArchitecture;
@@ -29,6 +30,9 @@ const PAGE_SIZE: usize = 4096;
 const NO_LINK: usize = usize::MAX;
 const MAX_FRAMES_PER_CHUNK: usize = 1916;
 const BITMAP_WORDS: usize = MAX_FRAMES_PER_CHUNK.div_ceil(u64::BITS as usize);
+static PAGE_TABLE_ALLOCATOR_READY: AtomicBool = AtomicBool::new(false);
+static PAGE_TABLE_SCRATCH_START: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TABLE_SCRATCH_END: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" {
     static __bss_end: u8;
@@ -344,6 +348,117 @@ impl PhysicalMemory {
                     range_base,
                     chunk_offset,
                     page_index,
+                },
+                list,
+            ))
+        })??;
+        if !self.move_chunk(chunk_offset, list) {
+            return None;
+        }
+        Some(frame)
+    }
+
+    fn allocate_frame_below(&mut self, address_limit: usize) -> Option<Frame> {
+        if self.base.as_usize() >= address_limit {
+            return None;
+        }
+        loop {
+            if self.available_head == NO_LINK {
+                let next_data_offset = self.virgin_chunk_cursor.checked_add(PAGE_SIZE)?;
+                let next_data_address = self.base.checked_add(next_data_offset)?.as_usize();
+                if next_data_address >= address_limit {
+                    return None;
+                }
+                self.activate_next_chunk()?;
+            }
+
+            let head = self.available_head;
+            let mut chunk_offset = head;
+            loop {
+                let next = self.with_chunk_mut(chunk_offset, |chunk| chunk.links.next())?;
+                if let Some(frame) = self.allocate_frame_from_chunk_below(chunk_offset, address_limit) {
+                    return Some(frame);
+                }
+                chunk_offset = next;
+                if chunk_offset == head {
+                    break;
+                }
+            }
+
+            let next_data_offset = self.virgin_chunk_cursor.checked_add(PAGE_SIZE)?;
+            let next_data_address = self.base.checked_add(next_data_offset)?.as_usize();
+            if next_data_address >= address_limit {
+                return None;
+            }
+            self.activate_next_chunk()?;
+        }
+    }
+
+    fn allocate_frame_from_chunk_below(
+        &mut self,
+        chunk_offset: usize,
+        address_limit: usize,
+    ) -> Option<Frame> {
+        let addresses = self.addresses;
+        let range_base = self.base;
+        let (frame, list) = self.with_chunk_mut(chunk_offset, |chunk| {
+            let data_offset = chunk_offset.checked_add(PAGE_SIZE)?;
+            let data_start = addresses.translate(data_offset)?.as_usize();
+            let available_bytes = address_limit.checked_sub(data_start)?;
+            let partial_page = if available_bytes % PAGE_SIZE == 0 { 0 } else { 1 };
+            let eligible_pages = available_bytes / PAGE_SIZE + partial_page;
+            let recycled = (0..chunk.free_stack.len()).rev().find_map(|stack_index| {
+                let page = usize::from(chunk.free_stack.at(stack_index)?);
+                (page < eligible_pages).then_some(page)
+            });
+            let (page_index, is_recycled) = match recycled {
+                Some(page_index) => (page_index, true),
+                None => {
+                    let page_index = usize::from(chunk.virgin_cursor);
+                    if page_index >= usize::from(chunk.page_count) || page_index >= eligible_pages {
+                        return None;
+                    }
+                    (page_index, false)
+                }
+            };
+            if chunk.allocated.get(page_index)? {
+                return None;
+            }
+            let page_offset = page_index.checked_mul(PAGE_SIZE)?;
+            let address = addresses.translate(data_offset.checked_add(page_offset)?)?;
+            if address.as_usize() >= address_limit
+                || !chunk.allocated.set(page_index, true)
+            {
+                return None;
+            }
+            if is_recycled {
+                let mut removed = false;
+                chunk.free_stack.retain(|page| {
+                    if !removed && usize::from(page) == page_index {
+                        removed = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if !removed {
+                    let _restored = chunk.allocated.set(page_index, false);
+                    return None;
+                }
+            } else {
+                chunk.virgin_cursor += 1;
+            }
+            let list = if chunk.free_pages() == 0 {
+                ChunkList::Full
+            } else {
+                ChunkList::Available
+            };
+            Some((
+                Frame {
+                    address: address.as_usize(),
+                    range_base,
+                    chunk_offset,
+                    page_index: page_index as u16,
                 },
                 list,
             ))
@@ -706,6 +821,7 @@ impl PhysicalAllocator {
     pub(crate) fn initialize() -> bool {
         let allocator = Self::get_instance();
         if allocator.state.lock().initialized {
+            PAGE_TABLE_ALLOCATOR_READY.store(true, Ordering::Release);
             return true;
         }
         let Some(range_window) = crate::kernel::memory::r#virtual::reserve(
@@ -718,6 +834,11 @@ impl PhysicalAllocator {
         let Some(chunk_window) = range_window.checked_add(PAGE_SIZE) else {
             return false;
         };
+        let Some(scratch_end) = chunk_window.checked_add(PAGE_SIZE) else {
+            return false;
+        };
+        PAGE_TABLE_SCRATCH_START.store(range_window, Ordering::Release);
+        PAGE_TABLE_SCRATCH_END.store(scratch_end, Ordering::Release);
         {
             let mut state = allocator.state.lock();
             state.range_window = range_window;
@@ -780,9 +901,13 @@ impl PhysicalAllocator {
             }
         }
 
-        let mut state = allocator.state.lock();
-        state.initialized = state.frame_count != 0;
-        state.initialized
+        let initialized = {
+            let mut state = allocator.state.lock();
+            state.initialized = state.frame_count != 0;
+            state.initialized
+        };
+        PAGE_TABLE_ALLOCATOR_READY.store(initialized, Ordering::Release);
+        initialized
     }
 
     unsafe fn add_memory_range(&self, base: PhysAddr, length: usize) -> bool {
@@ -793,6 +918,37 @@ impl PhysicalAllocator {
 
     pub(crate) fn allocate() -> Option<Frame> {
         Self::get_instance().state.lock().allocate()
+    }
+
+    pub(crate) fn page_table_allocator_ready() -> bool {
+        PAGE_TABLE_ALLOCATOR_READY.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_page_table_scratch_address(address: usize) -> bool {
+        let start = PAGE_TABLE_SCRATCH_START.load(Ordering::Acquire);
+        let end = PAGE_TABLE_SCRATCH_END.load(Ordering::Acquire);
+        start != 0 && address >= start && address < end
+    }
+
+    pub(crate) fn allocate_page_table_frame() -> Option<usize> {
+        if !Self::page_table_allocator_ready() {
+            return None;
+        }
+        // FIXME: Use a mapped page-table abstraction to support frames outside the identity map.
+        let identity_limit = <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::identity_mapped_limit()
+            as usize;
+        let mapping_limit = identity_limit.min(
+            <crate::kernel::arch::MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_BASE,
+        );
+        Self::get_instance()
+            .state
+            .lock()
+            .allocate_below(mapping_limit)
+            .map(Frame::address)
+    }
+
+    pub(crate) fn deallocate_page_table_frame(address: usize) -> bool {
+        Self::deallocate_contiguous(address, PAGE_SIZE)
     }
 
     #[allow(dead_code)]
@@ -965,6 +1121,30 @@ impl PhysicalAllocatorState {
         loop {
             let next = self.with_range_mut(current, |range| range.range_links.next())?;
             if let Some(frame) = self.with_range_mut(current, PhysicalMemory::allocate_frame)? {
+                self.free_frames -= 1;
+                return Some(frame);
+            }
+            current = next;
+            if current == head {
+                return None;
+            }
+        }
+    }
+
+    fn allocate_below(&mut self, address_limit: usize) -> Option<Frame> {
+        if !self.initialized || self.free_frames == 0 {
+            return None;
+        }
+        let head = self.range_head;
+        if head == NO_LINK {
+            return None;
+        }
+        let mut current = head;
+        loop {
+            let next = self.with_range_mut(current, |range| range.range_links.next())?;
+            if let Some(frame) = self.with_range_mut(current, |range| {
+                range.allocate_frame_below(address_limit)
+            })? {
                 self.free_frames -= 1;
                 return Some(frame);
             }
