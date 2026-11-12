@@ -11,6 +11,8 @@ use core::ptr;
 use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::error::Error;
 use crate::kernel::runtime::runtime_libc::filesystem;
+use crate::kernel::scheduler::thread::ThreadManager;
+use crate::kernel::signal::SignalSet;
 
 const MAX_POLL_DESCRIPTORS: usize = 1024;
 const POLLNVAL: i16 = 0x020;
@@ -71,12 +73,23 @@ fn poll_inner(
             }
         }
         if ready_count != 0 {
+            if crate::kernel::runtime::runtime_posix::signal::dispatch_pending_signals().is_some() {
+                set_errno(Error::Intr);
+                return -1;
+            }
             return ready_count;
+        }
+        if crate::kernel::runtime::runtime_posix::signal::dispatch_pending_signals().is_some() {
+            set_errno(Error::Intr);
+            return -1;
         }
         if let Some(timeout_ns) = timeout_ns {
             if now_ns().saturating_sub(started) >= timeout_ns {
                 return 0;
             }
+        }
+        if ThreadManager::current_signal_wake_pending() {
+            continue;
         }
         crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
     }
@@ -112,7 +125,7 @@ pub unsafe extern "C" fn ppoll(
     descriptors: *mut c_void,
     descriptor_count: u64,
     timeout: *const c_void,
-    _signal_mask: *const c_void,
+    signal_mask: *const c_void,
 ) -> c_int {
     let timeout_ns = if timeout.is_null() {
         None
@@ -130,17 +143,44 @@ pub unsafe extern "C" fn ppoll(
                 .saturating_add(timespec.nanoseconds as u64),
         )
     };
-    poll_inner(
+    let previous_mask = if signal_mask.is_null() {
+        None
+    } else {
+        let previous = match crate::kernel::runtime::runtime_posix::signal::current_signal_mask() {
+            Ok(mask) => mask,
+            Err(error) => {
+                set_errno(error);
+                return -1;
+            }
+        };
+        let replacement = SignalSet::from_bits(unsafe {
+            ptr::read_unaligned(signal_mask.cast::<u64>())
+        });
+        if let Err(error) = ThreadManager::set_current_signal_mask(replacement) {
+            set_errno(error);
+            return -1;
+        }
+        Some(previous)
+    };
+    let result = poll_inner(
         descriptors.cast::<PollFd>(),
         match usize::try_from(descriptor_count) {
             Ok(count) => count,
             Err(_) => {
+                if let Some(previous) = previous_mask {
+                    let _ = ThreadManager::set_current_signal_mask(previous);
+                }
                 set_errno(Error::Inval);
                 return -1;
             }
         },
         timeout_ns,
-    )
+    );
+    if let Some(previous) = previous_mask {
+        let _ = ThreadManager::set_current_signal_mask(previous);
+        let _ = crate::kernel::runtime::runtime_posix::signal::dispatch_pending_signals();
+    }
+    result
 }
 
 fn now_ns() -> u64 {

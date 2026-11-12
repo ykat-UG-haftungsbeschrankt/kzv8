@@ -22,6 +22,30 @@ impl Console {
         VirtioSerial::read(output)
     }
 
+    pub(crate) fn is_readable() -> bool {
+        VirtioSerial::input_ready()
+    }
+
+    pub(crate) fn is_available() -> bool {
+        VirtioSerial::is_available()
+    }
+
+    pub(crate) fn output_pending() -> bool {
+        VirtioSerial::output_pending()
+    }
+
+    pub(crate) fn is_writable() -> bool {
+        VirtioSerial::output_ready()
+    }
+
+    pub(crate) fn flush_input() {
+        VirtioSerial::flush_input();
+    }
+
+    pub(crate) fn flush_queued_output() {
+        VirtioSerial::flush_queued_output();
+    }
+
     pub(crate) fn handle_interrupt(pending: u64) {
         VirtioSerial::handle_interrupt(pending)
     }

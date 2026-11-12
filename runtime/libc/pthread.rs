@@ -5,12 +5,15 @@
  * free of charge, without warranty of any kind.
  */
 
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
+use core::ptr::read_unaligned;
 use core::sync::atomic::Ordering;
 
-use super::errno::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOMEM, ENOSYS, EPERM, ESRCH};
+use super::errno::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOMEM, ENOSYS, EPERM, ESRCH, ETIMEDOUT};
 #[allow(unused_imports)]
-use crate::kernel::arch::traits::{InterruptArchitecture as _, ThreadArchitecture as _};
+use crate::kernel::arch::traits::{
+    CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _, TimerArchitecture as _,
+};
 use crate::kernel::error::Error;
 use crate::kernel::scheduler::thread::{
     PthreadCondition, PthreadMutex, StartRoutine, ThreadAttributes, ThreadManager, ThreadStack,
@@ -19,6 +22,125 @@ use crate::kernel::scheduler::thread::{
 
 const JOINABLE: i32 = 0;
 const DETACHED: i32 = 1;
+const CLOCK_REALTIME: c_int = 0;
+const CLOCK_MONOTONIC: c_int = 1;
+const CLOCK_MONOTONIC_RAW: c_int = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CTimespec {
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+unsafe extern "C" {
+    fn clock_gettime(clock_id: c_int, output: *mut CTimespec) -> c_int;
+}
+
+fn monotonic_now_ns() -> u64 {
+    crate::kernel::arch::TimerArchitecture::now_ns()
+        .unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns)
+}
+
+unsafe fn absolute_deadline_ns(clock_id: c_int, timeout: *const c_void) -> Result<u64, i32> {
+    if !matches!(clock_id, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW)
+        || timeout.is_null()
+    {
+        return Err(EINVAL);
+    }
+    let timeout = unsafe { read_unaligned(timeout.cast::<CTimespec>()) };
+    if timeout.seconds < 0 || !(0..1_000_000_000).contains(&timeout.nanoseconds) {
+        return Err(EINVAL);
+    }
+    let mut now = CTimespec {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    if unsafe { clock_gettime(clock_id, &mut now) } != 0 {
+        return Err(unsafe { crate::kernel::scheduler::thread::__errno_location().read() });
+    }
+    let target_ns = i128::from(timeout.seconds) * 1_000_000_000
+        + i128::from(timeout.nanoseconds);
+    let now_ns = i128::from(now.seconds) * 1_000_000_000 + i128::from(now.nanoseconds);
+    let delay_ns = u64::try_from((target_ns - now_ns).max(0)).map_err(|_| EINVAL)?;
+    monotonic_now_ns().checked_add(delay_ns).ok_or(EINVAL)
+}
+
+fn mutex_lock_until(mutex: *mut c_void, deadline_ns: u64) -> i32 {
+    if mutex.is_null() {
+        return EINVAL;
+    }
+    let owner = unsafe { &(*mutex.cast::<PthreadMutex>()).owner };
+    let current_id = ThreadManager::current_thread_id();
+    if current_id == 0 {
+        return EAGAIN;
+    }
+    loop {
+        match owner.compare_exchange(0, current_id, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return 0,
+            Err(existing) if existing == current_id => return EDEADLK,
+            Err(_) if monotonic_now_ns() >= deadline_ns => return ETIMEDOUT,
+            Err(_) => {
+                if !ThreadManager::switch_current(ThreadState::Ready) {
+                    crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+                }
+            }
+        }
+    }
+}
+
+pub(crate) unsafe fn timed_mutex_lock(
+    mutex: *mut c_void,
+    clock_id: c_int,
+    timeout: *const c_void,
+) -> i32 {
+    let deadline_ns = match unsafe { absolute_deadline_ns(clock_id, timeout) } {
+        Ok(deadline_ns) => deadline_ns,
+        Err(error) => return error,
+    };
+    mutex_lock_until(mutex, deadline_ns)
+}
+
+pub(crate) unsafe fn timed_condition_wait(
+    condition: *mut c_void,
+    mutex: *mut c_void,
+    clock_id: c_int,
+    timeout: *const c_void,
+) -> i32 {
+    if condition.is_null() || mutex.is_null() {
+        return EINVAL;
+    }
+    let deadline_ns = match unsafe { absolute_deadline_ns(clock_id, timeout) } {
+        Ok(deadline_ns) => deadline_ns,
+        Err(error) => return error,
+    };
+    let generation = unsafe {
+        (*condition.cast::<PthreadCondition>())
+            .generation
+            .load(Ordering::Acquire)
+    };
+    let unlock_status = unsafe { pthread_mutex_unlock(mutex) };
+    if unlock_status != 0 {
+        return unlock_status;
+    }
+    let condition_generation = unsafe { &(*condition.cast::<PthreadCondition>()).generation };
+    loop {
+        if condition_generation.load(Ordering::Acquire) != generation {
+            return unsafe { pthread_mutex_lock(mutex) };
+        }
+        if monotonic_now_ns() >= deadline_ns {
+            let lock_status = unsafe { pthread_mutex_lock(mutex) };
+            return if lock_status == 0 {
+                ETIMEDOUT
+            } else {
+                lock_status
+            };
+        }
+        if !ThreadManager::switch_current(ThreadState::Ready) {
+            crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn pthread_self() -> usize {

@@ -14,13 +14,14 @@ use core::sync::atomic::AtomicUsize;
 
 use crate::kernel::arch::traits::{
     CpuArchitecture as _, InterruptArchitecture as _, MemoryArchitecture as _,
-    ThreadArchitecture as _,
+    ThreadArchitecture as _, TimerArchitecture as _,
 };
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
 use crate::kernel::process::Process;
 use crate::kernel::namespace::NamespaceSet;
+use crate::kernel::signal::{SignalInfo, SignalQueue, SignalSet};
 
 use super::sync::IrqSpinLock;
 
@@ -125,6 +126,13 @@ pub(crate) struct Thread {
     pub(crate) detached: bool,
     pub(crate) errno: i32,
     pub(crate) tls: [usize; ThreadManager::MAX_TLS_KEYS],
+    signal_mask: SignalSet,
+    pending_signals: SignalQueue,
+    signal_wait_set: Option<SignalSet>,
+    signal_wake_pending: bool,
+    sleep_deadline_ns: Option<u64>,
+    process_stop_wait: bool,
+    process_stop_wake: bool,
     stack: Option<ThreadStack>,
     external_stack_address: usize,
     external_stack_size: usize,
@@ -144,6 +152,13 @@ impl Thread {
             detached: false,
             errno: 0,
             tls: [0; ThreadManager::MAX_TLS_KEYS],
+            signal_mask: SignalSet::EMPTY,
+            pending_signals: SignalQueue::new(),
+            signal_wait_set: None,
+            signal_wake_pending: false,
+            sleep_deadline_ns: None,
+            process_stop_wait: false,
+            process_stop_wake: false,
             stack: None,
             external_stack_address: stack_address,
             external_stack_size: stack_size,
@@ -170,6 +185,13 @@ impl Thread {
             detached,
             errno: 0,
             tls: [0; ThreadManager::MAX_TLS_KEYS],
+            signal_mask: SignalSet::EMPTY,
+            pending_signals: SignalQueue::new(),
+            signal_wait_set: None,
+            signal_wake_pending: false,
+            sleep_deadline_ns: None,
+            process_stop_wait: false,
+            process_stop_wake: false,
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
@@ -194,6 +216,13 @@ impl Thread {
             detached,
             errno: 0,
             tls: [0; ThreadManager::MAX_TLS_KEYS],
+            signal_mask: SignalSet::EMPTY,
+            pending_signals: SignalQueue::new(),
+            signal_wait_set: None,
+            signal_wake_pending: false,
+            sleep_deadline_ns: None,
+            process_stop_wait: false,
+            process_stop_wake: false,
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
@@ -219,6 +248,13 @@ impl Thread {
             detached,
             errno: 0,
             tls: [0; ThreadManager::MAX_TLS_KEYS],
+            signal_mask: SignalSet::EMPTY,
+            pending_signals: SignalQueue::new(),
+            signal_wait_set: None,
+            signal_wake_pending: false,
+            sleep_deadline_ns: None,
+            process_stop_wait: false,
+            process_stop_wake: false,
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
@@ -363,6 +399,7 @@ impl ThreadManager {
         let Ok(process) = Process::new() else {
             return false;
         };
+        process.thread_started();
         let process_root = process.address_space().root();
         let (stack_address, stack_size) =
             crate::kernel::arch::ThreadArchitecture::current_thread_stack_bounds(
@@ -489,7 +526,7 @@ impl ThreadManager {
     ) -> Result<usize, Error> {
         let mut stack = ThreadStack::try_new(stack_size)?;
         let context = kernel::Context::load(stack.as_mut_slice(), Self::thread_trampoline);
-        let mut thread = Box::new(ListNode::new(Thread::new(
+        let thread = Box::new(ListNode::new(Thread::new(
             stack,
             context,
             process,
@@ -518,7 +555,8 @@ impl ThreadManager {
 
     pub(crate) fn create_process() -> Result<Arc<Process>, Error> {
         let parent = Self::current_process()?;
-        Process::new_in_namespace_set_with_credentials(
+        Process::new_child_in_namespace_set_with_credentials(
+            &parent,
             parent.namespace_set(),
             parent.credentials()?,
         )
@@ -527,7 +565,8 @@ impl ThreadManager {
     #[allow(dead_code)]
     pub(crate) fn create_container_process() -> Result<Arc<Process>, Error> {
         let parent = Self::current_process()?;
-        Process::new_in_namespace_set_with_credentials(
+        Process::new_child_in_namespace_set_with_credentials(
+            &parent,
             NamespaceSet::new_container(),
             parent.credentials()?,
         )
@@ -621,6 +660,14 @@ impl ThreadManager {
         if !manager.initialized {
             return Err(Error::Again);
         }
+        if let Some(mask) = manager
+            .busy
+            .front()
+            .filter(|current| current.process.pid() == thread.process.pid())
+            .map(|current| current.signal_mask)
+        {
+            thread.signal_mask = mask;
+        }
         match manager.thread_nodes.insert(id, node_address) {
             Ok(None) => {}
             Ok(Some(previous)) => {
@@ -629,11 +676,24 @@ impl ThreadManager {
             }
             Err(_) => return Err(Error::NoMem),
         }
+        thread.process.thread_started();
         manager.ready.push_back(thread);
         Ok(id)
     }
 
     pub(crate) fn switch_current(next_state: ThreadState) -> bool {
+        Self::switch_current_inner(next_state, false, true)
+    }
+
+    pub(crate) fn switch_current_for_signal() -> bool {
+        Self::switch_current_inner(ThreadState::Blocked, true, true)
+    }
+
+    fn switch_current_inner(
+        next_state: ThreadState,
+        check_signal_wake: bool,
+        check_process_stopped: bool,
+    ) -> bool {
         let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
         if !matches!(next_state, ThreadState::Ready | ThreadState::Blocked) {
             crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
@@ -642,7 +702,16 @@ impl ThreadManager {
 
         let context = {
             let mut manager = THREAD_MANAGER.lock();
-            if !manager.initialized || manager.ready.is_empty() {
+            if !manager.initialized
+                || manager.ready.is_empty()
+                || (check_signal_wake
+                    && manager
+                        .busy
+                        .front()
+                        .is_some_and(|thread| {
+                            thread.signal_wake_pending || thread.process_stop_wake
+                        }))
+            {
                 None
             } else if let Some(mut current) = manager.busy.pop_front() {
                 let old_context = current.context.kernel_mut() as *mut kernel::Context;
@@ -692,6 +761,10 @@ impl ThreadManager {
         unsafe { Self::switch_threads(context) };
         Self::reap_pending();
         crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+        Self::exit_if_process_terminated();
+        if check_process_stopped {
+            Self::wait_if_process_stopped();
+        }
         true
     }
 
@@ -702,7 +775,305 @@ impl ThreadManager {
     }
 
     pub(crate) fn timer_tick() {
+        let now_ns = crate::kernel::arch::TimerArchitecture::now_ns()
+            .unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns);
+        Process::tick_alarms(now_ns);
+        Self::wake_expired_sleepers(now_ns);
         let _ = Self::switch_current(ThreadState::Ready);
+    }
+
+    fn wake_expired_sleepers(now_ns: u64) {
+        loop {
+            let thread_id = {
+                let manager = THREAD_MANAGER.lock();
+                manager.busy.iter().find_map(|thread| {
+                    (thread.state == ThreadState::Blocked
+                        && thread.sleep_deadline_ns.is_some_and(|deadline| deadline <= now_ns))
+                    .then_some(thread.id)
+                })
+            };
+            let Some(thread_id) = thread_id else {
+                return;
+            };
+            let mut manager = THREAD_MANAGER.lock();
+            let Some(node) = manager.thread_node_by_id(thread_id) else {
+                continue;
+            };
+            manager.thread_mut(node).sleep_deadline_ns = None;
+            manager.wake_blocked(node);
+        }
+    }
+
+    pub(crate) fn current_signal_context() -> Result<(usize, SignalSet), Error> {
+        let manager = THREAD_MANAGER.lock();
+        if !manager.initialized {
+            return Err(Error::Again);
+        }
+        manager
+            .busy
+            .front()
+            .map(|thread| (thread.id, thread.signal_mask))
+            .ok_or(Error::Again)
+    }
+
+    pub(crate) fn set_current_signal_mask(mask: SignalSet) -> Result<SignalSet, Error> {
+        let mut manager = THREAD_MANAGER.lock();
+        if !manager.initialized {
+            return Err(Error::Again);
+        }
+        let thread = manager.busy.front_mut().ok_or(Error::Again)?;
+        let previous = thread.signal_mask;
+        thread.signal_mask = mask.without_uncatchable();
+        Ok(previous)
+    }
+
+    pub(crate) fn pending_current_signals() -> Result<SignalSet, Error> {
+        let manager = THREAD_MANAGER.lock();
+        if !manager.initialized {
+            return Err(Error::Again);
+        }
+        manager
+            .busy
+            .front()
+            .map(|thread| thread.pending_signals.pending_set())
+            .ok_or(Error::Again)
+    }
+
+    pub(crate) fn take_current_signal(signals: SignalSet) -> Option<SignalInfo> {
+        let mut manager = THREAD_MANAGER.lock();
+        let thread = manager.busy.front_mut()?;
+        let information = thread.pending_signals.take(signals);
+        if information.is_some() {
+            thread.signal_wake_pending = false;
+        }
+        information
+    }
+
+    pub(crate) fn take_current_signal_wake() -> bool {
+        let mut manager = THREAD_MANAGER.lock();
+        let Some(thread) = manager.busy.front_mut() else {
+            return false;
+        };
+        let pending = thread.signal_wake_pending;
+        thread.signal_wake_pending = false;
+        pending
+    }
+
+    fn take_current_process_stop_wake() -> bool {
+        let mut manager = THREAD_MANAGER.lock();
+        let Some(thread) = manager.busy.front_mut() else {
+            return false;
+        };
+        let pending = thread.process_stop_wake;
+        thread.process_stop_wake = false;
+        pending
+    }
+
+    pub(crate) fn current_signal_wake_pending() -> bool {
+        THREAD_MANAGER
+            .lock()
+            .busy
+            .front()
+            .is_some_and(|thread| thread.signal_wake_pending)
+    }
+
+    pub(crate) fn set_current_signal_wait_set(
+        signals: Option<SignalSet>,
+    ) -> Result<(), Error> {
+        let mut manager = THREAD_MANAGER.lock();
+        if !manager.initialized {
+            return Err(Error::Again);
+        }
+        manager.busy.front_mut().ok_or(Error::Again)?.signal_wait_set = signals;
+        Ok(())
+    }
+
+    pub(crate) fn queue_signal_by_id(
+        thread_id: usize,
+        information: SignalInfo,
+    ) -> Result<(), Error> {
+        let mut manager = THREAD_MANAGER.lock();
+        let node = manager.thread_node_by_id(thread_id).ok_or(Error::Srch)?;
+        let should_wake = {
+            let thread = manager.thread_mut(node);
+            if thread.state == ThreadState::Exited {
+                return Err(Error::Srch);
+            }
+            thread.pending_signals.push(information)?;
+            let signal = SignalSet::from_signal(information.signal_number);
+            let waiting_for_signal = thread
+                .signal_wait_set
+                .is_some_and(|wait_set| !wait_set.intersection(signal).is_empty());
+            let should_wake = thread.signal_mask.intersection(signal).is_empty()
+                || waiting_for_signal;
+            if should_wake {
+                thread.signal_wake_pending = true;
+                thread.sleep_deadline_ns = None;
+            }
+            should_wake
+        };
+        if should_wake {
+            manager.wake_blocked(node);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn notify_process_signals(process_id: i32, pending: SignalSet) {
+        if pending.is_empty() {
+            return;
+        }
+        let mut manager = THREAD_MANAGER.lock();
+        let target_id = manager
+            .busy
+            .iter()
+            .chain(manager.ready.iter())
+            .find_map(|thread| {
+                if thread.process.pid() != process_id || thread.state == ThreadState::Exited {
+                    return None;
+                }
+                let deliverable = pending
+                    .difference(thread.signal_mask)
+                    .union(pending.intersection(
+                        thread.signal_wait_set.unwrap_or(SignalSet::EMPTY),
+                    ));
+                (!deliverable.is_empty()).then_some(thread.id)
+            });
+        let Some(node) = target_id.and_then(|id| manager.thread_node_by_id(id)) else {
+            return;
+        };
+        let thread = manager.thread_mut(node);
+        thread.signal_wake_pending = true;
+        thread.sleep_deadline_ns = None;
+        manager.wake_blocked(node);
+    }
+
+    pub(crate) fn wake_process_threads(process_id: i32) {
+        let mut manager = THREAD_MANAGER.lock();
+        loop {
+            let thread_id = manager
+                .busy
+                .iter()
+                .chain(manager.ready.iter())
+                .find_map(|thread| {
+                    (thread.process.pid() == process_id
+                        && thread.state != ThreadState::Exited
+                        && !thread.signal_wake_pending)
+                    .then_some(thread.id)
+                });
+            let Some(thread_id) = thread_id else {
+                return;
+            };
+            let Some(node) = manager.thread_node_by_id(thread_id) else {
+                continue;
+            };
+            let thread = manager.thread_mut(node);
+            thread.signal_wake_pending = true;
+            thread.sleep_deadline_ns = None;
+            manager.wake_blocked(node);
+        }
+    }
+
+    pub(crate) fn wake_blocked_process_threads(process_id: i32) {
+        let mut manager = THREAD_MANAGER.lock();
+        loop {
+            let thread_id = manager.busy.iter().find_map(|thread| {
+                (thread.process.pid() == process_id && thread.state == ThreadState::Blocked)
+                    .then_some(thread.id)
+            });
+            let Some(thread_id) = thread_id else {
+                return;
+            };
+            let Some(node) = manager.thread_node_by_id(thread_id) else {
+                continue;
+            };
+            manager.wake_blocked(node);
+        }
+    }
+
+    fn exit_if_process_terminated() {
+        let Ok(process) = Self::current_process() else {
+            return;
+        };
+        if let Some(signal_number) = process.termination_signal() {
+            Self::exit_current(signal_number as usize as *mut c_void);
+        }
+    }
+
+    pub(crate) fn wait_if_process_stopped() {
+        loop {
+            let Ok(process) = Self::current_process() else {
+                return;
+            };
+            if process.stopped_by_signal().is_none() {
+                if let Some(thread) = THREAD_MANAGER.lock().busy.front_mut() {
+                    thread.process_stop_wait = false;
+                    thread.process_stop_wake = false;
+                }
+                return;
+            }
+            Self::take_current_signal_wake();
+            if let Some(thread) = THREAD_MANAGER.lock().busy.front_mut() {
+                thread.process_stop_wait = true;
+            }
+            if !Self::switch_current_inner(ThreadState::Blocked, true, false) {
+                if Self::take_current_process_stop_wake() || Self::take_current_signal_wake() {
+                    continue;
+                }
+                if process.stopped_by_signal().is_some() {
+                    crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn resume_process_threads(process_id: i32) {
+        let mut manager = THREAD_MANAGER.lock();
+        loop {
+            let thread_id = manager.busy.iter().find_map(|thread| {
+                (thread.process.pid() == process_id && thread.process_stop_wait)
+                    .then_some(thread.id)
+            });
+            let Some(thread_id) = thread_id else {
+                return;
+            };
+            let Some(node) = manager.thread_node_by_id(thread_id) else {
+                continue;
+            };
+            manager.thread_mut(node).process_stop_wake = true;
+            manager.thread_mut(node).process_stop_wait = false;
+            manager.wake_blocked(node);
+        }
+    }
+
+    pub(crate) fn sleep_current_until(deadline_ns: u64) -> bool {
+        loop {
+            let now_ns = crate::kernel::arch::TimerArchitecture::now_ns()
+                .unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns);
+            if now_ns >= deadline_ns {
+                break;
+            }
+            {
+                let mut manager = THREAD_MANAGER.lock();
+                let Some(thread) = manager.busy.front_mut() else {
+                    return false;
+                };
+                if thread.signal_wake_pending {
+                    thread.signal_wake_pending = false;
+                    thread.sleep_deadline_ns = None;
+                    return true;
+                }
+                thread.sleep_deadline_ns = Some(deadline_ns);
+            }
+            if !Self::switch_current_for_signal() {
+                crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+            }
+        }
+        let mut manager = THREAD_MANAGER.lock();
+        if let Some(thread) = manager.busy.front_mut() {
+            thread.sleep_deadline_ns = None;
+            thread.signal_wake_pending = false;
+        }
+        false
     }
 
     pub(crate) fn current_thread_id() -> usize {
@@ -728,6 +1099,15 @@ impl ThreadManager {
 
     pub(crate) fn contains_thread_by_id(id: usize) -> bool {
         THREAD_MANAGER.lock().thread_node_by_id(id).is_some()
+    }
+
+    pub(crate) fn thread_belongs_to_process(thread_id: usize, process_id: i32) -> bool {
+        let manager = THREAD_MANAGER.lock();
+        let Some(node) = manager.thread_node_by_id(thread_id) else {
+            return false;
+        };
+        let thread = manager.thread_ref(node);
+        thread.state != ThreadState::Exited && thread.process.pid() == process_id
     }
 
     fn thread_attributes(&self, thread: NonNull<Thread>) -> (*mut c_void, usize, bool) {
@@ -888,11 +1268,13 @@ impl ThreadManager {
     pub(crate) fn exit_current(result: *mut c_void) -> ! {
         let _interrupt_state =
             crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-        let context = {
+        let (context, exited_process, exit_status) = {
             let mut manager = THREAD_MANAGER.lock();
             if let Some(mut current) = manager.busy.pop_front() {
                 current.result = result as usize;
                 current.state = ThreadState::Exited;
+                let exited_process = Arc::clone(&current.process);
+                let exit_status = current.result;
                 if current.joiner != 0 {
                     if let Some(joiner) = manager.thread_node_by_id(current.joiner) {
                         manager.wake_blocked(joiner);
@@ -915,14 +1297,17 @@ impl ThreadManager {
                         new_address_space_root: next.process.address_space().root(),
                     };
                     manager.busy.push_front(next);
-                    Some(context)
+                    (Some(context), Some(exited_process), exit_status)
                 } else {
-                    None
+                    (None, Some(exited_process), exit_status)
                 }
             } else {
-                None
+                (None, None, 0)
             }
         };
+        if let Some(process) = exited_process {
+            process.thread_exited(exit_status);
+        }
         let Some(context) = context else {
             crate::kernel::arch::CpuArchitecture::halt();
         };
@@ -969,6 +1354,8 @@ impl ThreadManager {
         let Some(start) = start else {
             crate::kernel::arch::CpuArchitecture::halt();
         };
+        Self::exit_if_process_terminated();
+        Self::wait_if_process_stopped();
         if let Start::Userspace(context) = start {
             // SAFETY: the running thread stays owned by the busy queue while it enters userspace.
             unsafe { context.as_ref().restore() };
@@ -985,6 +1372,7 @@ impl ThreadManager {
         };
         crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
         crate::kernel::arch::InterruptArchitecture::enable_interrupts();
+        Self::exit_if_process_terminated();
 
         let result = unsafe { start_routine(argument) };
         Self::exit_current(result)

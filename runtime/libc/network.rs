@@ -20,6 +20,7 @@ use crate::kernel::runtime::runtime_ffi::{
     with_active_tcp_context, TcpContext,
 };
 use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::vfs::plugin::tun::{TunDevice, TunTapMode};
 
 pub(crate) const SOCKET_FD_BASE: i32 = 128;
@@ -57,6 +58,13 @@ const SIOCGIFNETMASK: usize = 0x891b;
 const SIOCSIFNETMASK: usize = 0x891c;
 const SIOCGIFMTU: usize = 0x8921;
 const SIOCGIFHWADDR: usize = 0x8927;
+
+pub(crate) fn ioctl_requires_admin(request: usize) -> bool {
+    matches!(
+        request,
+        TUNSETIFF | SIOCSIFFLAGS | SIOCSIFADDR | SIOCSIFNETMASK
+    )
+}
 const IFF_TUN: u16 = 0x0001;
 const IFF_TAP: u16 = 0x0002;
 const IFF_NO_PI: u16 = 0x1000;
@@ -716,7 +724,7 @@ pub(crate) fn bind(
     let (local_address, is_local_address) = active_context(|context| {
         (context.local_ipv4(), context.is_local_ipv4_address(address))
     })?;
-    let local_address = local_address.ok_or(Error::NoDev)?;
+    let _local_address = local_address.ok_or(Error::NoDev)?;
     if address != Ipv4Address([0; 4]) && !is_local_address {
         return Err(Error::Inval);
     }
@@ -822,7 +830,9 @@ pub(crate) fn accept(file_descriptor: i32) -> Result<(i32, Ipv4Address, u16), Er
         if now_ns().saturating_sub(started) >= CONNECT_TIMEOUT_NS {
             return Err(Error::TimedOut);
         }
-        wait_for_interrupt();
+        if wait_for_interrupt() && !restart_interrupted_io() {
+            return Err(Error::Intr);
+        }
     }
     Err(Error::TimedOut)
 }
@@ -917,7 +927,9 @@ pub(crate) fn connect(
             set_socket_descriptor(index, descriptor);
             return Err(Error::TimedOut);
         }
-        wait_for_interrupt();
+        if wait_for_interrupt() && !restart_interrupted_io() {
+            return Err(Error::Intr);
+        }
     }
     Err(Error::TimedOut)
 }
@@ -1020,7 +1032,9 @@ pub(crate) fn receive_from(
             if now_ns().saturating_sub(started) >= CONNECT_TIMEOUT_NS {
                 return Err(Error::TimedOut);
             }
-            wait_for_interrupt();
+            if wait_for_interrupt() && !restart_interrupted_io() {
+                return Err(Error::Intr);
+            }
         }
         return Err(Error::TimedOut);
     }
@@ -1057,7 +1071,9 @@ pub(crate) fn receive_from(
         if now_ns().saturating_sub(started) >= CONNECT_TIMEOUT_NS {
             return Err(Error::TimedOut);
         }
-        wait_for_interrupt();
+        if wait_for_interrupt() && !restart_interrupted_io() {
+            return Err(Error::Intr);
+        }
     }
     Err(Error::TimedOut)
 }
@@ -1380,6 +1396,14 @@ fn now_ns() -> u64 {
         .unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns)
 }
 
-fn wait_for_interrupt() {
+fn wait_for_interrupt() -> bool {
+    if ThreadManager::current_signal_wake_pending() {
+        return true;
+    }
     crate::kernel::runtime::runtime_ffi::kz_host_wait_for_interrupt();
+    ThreadManager::current_signal_wake_pending()
+}
+
+fn restart_interrupted_io() -> bool {
+    crate::kernel::runtime::runtime_posix::signal::dispatch_pending_signals().unwrap_or(true)
 }

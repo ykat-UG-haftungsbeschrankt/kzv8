@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 use core::ffi::{c_int, c_void};
 use super::errno::ENOSYS;
 
@@ -37,8 +44,32 @@ unsupported_pthread!(pthread_barrierattr_init(_attributes: *mut c_void));
 unsupported_pthread!(pthread_barrierattr_setpshared(_attributes: *mut c_void, _process_shared: c_int));
 
 unsupported_pthread!(pthread_cancel(_thread: usize));
-unsupported_pthread!(pthread_cond_clockwait(_condition: *mut c_void, _mutex: *mut c_void, _clock_id: c_int, _timeout: *const c_void));
-unsupported_pthread!(pthread_cond_timedwait(_condition: *mut c_void, _mutex: *mut c_void, _timeout: *const c_void));
+#[no_mangle]
+pub unsafe extern "C" fn pthread_cond_clockwait(
+    condition: *mut c_void,
+    mutex: *mut c_void,
+    clock_id: c_int,
+    timeout: *const c_void,
+) -> c_int {
+    unsafe {
+        crate::kernel::runtime::runtime_libc::pthread::timed_condition_wait(
+            condition, mutex, clock_id, timeout,
+        )
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_cond_timedwait(
+    condition: *mut c_void,
+    mutex: *mut c_void,
+    timeout: *const c_void,
+) -> c_int {
+    unsafe {
+        crate::kernel::runtime::runtime_libc::pthread::timed_condition_wait(
+            condition, mutex, 0, timeout,
+        )
+    }
+}
 unsupported_pthread!(pthread_condattr_destroy(_attributes: *mut c_void));
 unsupported_pthread!(pthread_condattr_getclock(_attributes: *const c_void, _clock_id: *mut c_int));
 unsupported_pthread!(pthread_condattr_getpshared(_attributes: *const c_void, _process_shared: *mut c_int));
@@ -52,11 +83,32 @@ unsupported_pthread!(pthread_setschedprio(_thread: usize, _priority: c_int));
 unsupported_pthread!(pthread_setconcurrency(_concurrency: c_int));
 unsupported_pthread!(pthread_getconcurrency());
 
-unsupported_pthread!(pthread_mutex_clocklock(_mutex: *mut c_void, _clock_id: c_int, _timeout: *const c_void));
+#[no_mangle]
+pub unsafe extern "C" fn pthread_mutex_clocklock(
+    mutex: *mut c_void,
+    clock_id: c_int,
+    timeout: *const c_void,
+) -> c_int {
+    unsafe {
+        crate::kernel::runtime::runtime_libc::pthread::timed_mutex_lock(
+            mutex, clock_id, timeout,
+        )
+    }
+}
 unsupported_pthread!(pthread_mutex_consistent(_mutex: *mut c_void));
 unsupported_pthread!(pthread_mutex_getprioceiling(_mutex: *const c_void, _priority_ceiling: *mut c_int));
 unsupported_pthread!(pthread_mutex_setprioceiling(_mutex: *mut c_void, _priority_ceiling: c_int, _old_priority_ceiling: *mut c_int));
-unsupported_pthread!(pthread_mutex_timedlock(_mutex: *mut c_void, _timeout: *const c_void));
+#[no_mangle]
+pub unsafe extern "C" fn pthread_mutex_timedlock(
+    mutex: *mut c_void,
+    timeout: *const c_void,
+) -> c_int {
+    unsafe {
+        crate::kernel::runtime::runtime_libc::pthread::timed_mutex_lock(
+            mutex, 0, timeout,
+        )
+    }
+}
 unsupported_pthread!(pthread_mutexattr_destroy(_attributes: *mut c_void));
 unsupported_pthread!(pthread_mutexattr_getprioceiling(_attributes: *const c_void, _priority_ceiling: *mut c_int));
 unsupported_pthread!(pthread_mutexattr_getprotocol(_attributes: *const c_void, _protocol: *mut c_int));

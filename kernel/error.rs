@@ -39,6 +39,8 @@ pub(crate) enum Error {
     NoMem = -12,
     /// Permission denied.
     Acces = -13,
+    /// Operation not permitted.
+    Perm = -1000,
     /// Bad address.
     Fault = -14,
     /// Block device required.

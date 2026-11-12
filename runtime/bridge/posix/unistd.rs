@@ -1,11 +1,26 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
+use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, c_long, c_void};
+use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile};
 
-use super::errno::{EBADF, EFAULT, EINVAL, ENAMETOOLONG, ENOSYS, ENOTTY};
+use crate::kernel::dl::AddressSpace;
+use crate::kernel::arch::traits::TimerArchitecture as _;
+use crate::kernel::error::Error as KernelError;
+use crate::kernel::process::{Process, MAX_SUPPLEMENTARY_GROUPS};
+use crate::kernel::scheduler::thread::ThreadManager;
 
-const AT_FDCWD: c_int = -100;
-const AT_REMOVEDIR: c_int = 0x200;
+use super::errno::{as_errno, EBADF, EFAULT, EINVAL, ENAMETOOLONG, ENOMEM, ENOSYS, ENOTTY, ERANGE};
+
 const CS_PATH: c_int = 0;
+const O_CLOEXEC: c_int = 0o2000000;
+const O_NONBLOCK: c_int = 0o4000;
 const POSIX_CLOSE_RESTART: c_int = 1;
 
 #[repr(C)]
@@ -27,10 +42,23 @@ struct Utsname {
 unsafe extern "C" {
     fn __errno_location() -> *mut c_int;
     fn close(file_descriptor: c_int) -> c_int;
+    fn kz_rust_chdir(path: *const c_char) -> c_int;
+    fn kz_rust_fchdir(file_descriptor: c_int) -> c_int;
+    fn kz_rust_unlinkat(
+        directory_descriptor: c_int,
+        path: *const c_char,
+        flags: c_int,
+    ) -> c_int;
+    fn kz_rust_chown(path: *const c_char, owner: u32, group: u32) -> c_int;
+    fn kz_rust_fchown(file_descriptor: c_int, owner: u32, group: u32) -> c_int;
+    fn kz_rust_chownat(
+        directory_descriptor: c_int,
+        path: *const c_char,
+        owner: u32,
+        group: u32,
+    ) -> c_int;
     fn nanosleep(request: *const Timespec, remaining: *mut Timespec) -> c_int;
-    fn rmdir(path: *const c_char) -> c_int;
     fn uname(output: *mut c_void) -> c_int;
-    fn unlink(path: *const c_char) -> c_int;
 }
 
 #[no_mangle]
@@ -53,6 +81,100 @@ static mut NEXT_OPTION_INDEX: c_int = 0;
 
 fn set_errno(error: c_int) {
     unsafe { __errno_location().write(error) };
+}
+
+fn set_kernel_errno(error: KernelError) {
+    if error == KernelError::Intr {
+        let _ = crate::kernel::runtime::runtime_posix::signal::dispatch_pending_signals();
+    }
+    set_errno(as_errno(error));
+}
+
+fn current_process_error() -> ProcessError {
+    match ThreadManager::current_process() {
+        Ok(process) => ProcessError::Current(process),
+        Err(error) => ProcessError::Failed(error),
+    }
+}
+
+enum ProcessError {
+    Current(alloc::sync::Arc<Process>),
+    Failed(KernelError),
+}
+
+fn credential_query(select: impl FnOnce(&Process) -> u32) -> u32 {
+    match current_process_error() {
+        ProcessError::Current(process) => select(&process),
+        ProcessError::Failed(error) => {
+            set_kernel_errno(error);
+            u32::MAX
+        }
+    }
+}
+
+fn credential_update(update: impl FnOnce(&Process) -> Result<(), KernelError>) -> c_int {
+    match current_process_error() {
+        ProcessError::Current(process) => match update(&process) {
+            Ok(()) => 0,
+            Err(error) => {
+                set_kernel_errno(error);
+                -1
+            }
+        },
+        ProcessError::Failed(error) => {
+            set_kernel_errno(error);
+            -1
+        }
+    }
+}
+
+fn process_arc_update(update: impl FnOnce(&alloc::sync::Arc<Process>) -> Result<(), KernelError>) -> c_int {
+    match current_process_error() {
+        ProcessError::Current(process) => match update(&process) {
+            Ok(()) => 0,
+            Err(error) => {
+                set_kernel_errno(error);
+                -1
+            }
+        },
+        ProcessError::Failed(error) => {
+            set_kernel_errno(error);
+            -1
+        }
+    }
+}
+
+fn process_query(query: impl FnOnce(&Process) -> Result<i32, KernelError>) -> i32 {
+    match current_process_error() {
+        ProcessError::Current(process) => match query(&process) {
+            Ok(value) => value,
+            Err(error) => {
+                set_kernel_errno(error);
+                -1
+            }
+        },
+        ProcessError::Failed(error) => {
+            set_kernel_errno(error);
+            -1
+        }
+    }
+}
+
+fn terminal_descriptor_status(file_descriptor: c_int) -> Result<bool, c_int> {
+    if file_descriptor < 0 {
+        return Err(EBADF);
+    }
+    match crate::kernel::runtime::runtime_libc::filesystem::is_terminal_descriptor(file_descriptor)
+    {
+        Ok(is_terminal) => Ok(is_terminal),
+        Err(EBADF)
+            if crate::kernel::runtime::runtime_libc::network::has_socket_fd(file_descriptor)
+                || crate::kernel::runtime::runtime_libc::network::has_packet_fd(file_descriptor) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn fail_int() -> c_int {
@@ -124,74 +246,154 @@ pub unsafe extern "C" fn faccessat(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn chdir(_path: *const c_char) -> c_int {
-    fail_int()
+pub unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
+    unsafe { kz_rust_chdir(path) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fchdir(_file_descriptor: c_int) -> c_int {
-    fail_int()
+pub extern "C" fn fchdir(file_descriptor: c_int) -> c_int {
+    unsafe { kz_rust_fchdir(file_descriptor) }
 }
 
-// FIXME: The runtime VFS has no user/group ownership metadata.
 #[no_mangle]
 pub unsafe extern "C" fn chown(
-    _path: *const c_char,
-    _owner: u32,
-    _group: u32,
+    path: *const c_char,
+    owner: u32,
+    group: u32,
 ) -> c_int {
-    fail_int()
+    unsafe { kz_rust_chown(path, owner, group) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fchown(_file_descriptor: c_int, _owner: u32, _group: u32) -> c_int {
-    fail_int()
+pub extern "C" fn fchown(file_descriptor: c_int, owner: u32, group: u32) -> c_int {
+    unsafe { kz_rust_fchown(file_descriptor, owner, group) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn fchownat(
-    _directory_descriptor: c_int,
-    _path: *const c_char,
-    _owner: u32,
-    _group: u32,
-    _flags: c_int,
+    directory_descriptor: c_int,
+    path: *const c_char,
+    owner: u32,
+    group: u32,
+    flags: c_int,
 ) -> c_int {
-    fail_int()
+    if flags & !0x100 != 0 {
+        set_errno(EINVAL);
+        return -1;
+    }
+    unsafe { kz_rust_chownat(directory_descriptor, path, owner, group) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lchown(_path: *const c_char, _owner: u32, _group: u32) -> c_int {
-    fail_int()
-}
-
-// FIXME: The runtime VFS has no descriptor duplication or pipe facility.
-#[no_mangle]
-pub extern "C" fn dup(_file_descriptor: c_int) -> c_int {
-    fail_int()
+pub unsafe extern "C" fn lchown(path: *const c_char, owner: u32, group: u32) -> c_int {
+    unsafe { kz_rust_chown(path, owner, group) }
 }
 
 #[no_mangle]
-pub extern "C" fn dup2(_file_descriptor: c_int, _new_descriptor: c_int) -> c_int {
-    fail_int()
+pub extern "C" fn dup(file_descriptor: c_int) -> c_int {
+    match crate::kernel::runtime::runtime_libc::filesystem::duplicate(
+        file_descriptor,
+        3,
+        false,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dup2(file_descriptor: c_int, new_descriptor: c_int) -> c_int {
+    match crate::kernel::runtime::runtime_libc::filesystem::duplicate_to(
+        file_descriptor,
+        new_descriptor,
+        false,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn dup3(
-    _file_descriptor: c_int,
-    _new_descriptor: c_int,
-    _flags: c_int,
+    file_descriptor: c_int,
+    new_descriptor: c_int,
+    flags: c_int,
 ) -> c_int {
-    fail_int()
+    if flags & !O_CLOEXEC != 0 || file_descriptor == new_descriptor {
+        set_errno(EINVAL);
+        return -1;
+    }
+    match crate::kernel::runtime::runtime_libc::filesystem::duplicate_to(
+        file_descriptor,
+        new_descriptor,
+        flags & O_CLOEXEC != 0,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
+}
+
+fn create_pipe(file_descriptors: *mut c_int, flags: c_int) -> c_int {
+    if file_descriptors.is_null() {
+        set_errno(EFAULT);
+        return -1;
+    }
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => {
+            set_kernel_errno(error);
+            return -1;
+        }
+    };
+    if !process
+        .address_space()
+        .user_range_accessible(file_descriptors as usize, 2 * size_of::<c_int>(), true)
+    {
+        set_errno(EFAULT);
+        return -1;
+    }
+    let (read_descriptor, write_descriptor) =
+        match crate::kernel::runtime::runtime_libc::filesystem::create_pipe(flags) {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                set_errno(error);
+                return -1;
+            }
+        };
+    let descriptors = [read_descriptor, write_descriptor];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(descriptors.as_ptr().cast::<u8>(), size_of::<[c_int; 2]>())
+    };
+    if let Err(error) = process.address_space().write(file_descriptors as usize, bytes) {
+        let _ = unsafe { close(read_descriptor) };
+        let _ = unsafe { close(write_descriptor) };
+        set_kernel_errno(error);
+        return -1;
+    }
+    0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pipe(_file_descriptors: *mut c_int) -> c_int {
-    fail_int()
+pub unsafe extern "C" fn pipe(file_descriptors: *mut c_int) -> c_int {
+    create_pipe(file_descriptors, 0)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pipe2(_file_descriptors: *mut c_int, _flags: c_int) -> c_int {
-    fail_int()
+pub unsafe extern "C" fn pipe2(file_descriptors: *mut c_int, flags: c_int) -> c_int {
+    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        set_errno(EINVAL);
+        return -1;
+    }
+    create_pipe(file_descriptors, flags)
 }
 
 #[no_mangle]
@@ -256,25 +458,74 @@ pub extern "C" fn fsync(_file_descriptor: c_int) -> c_int {
     fail_int()
 }
 
-// FIXME: The runtime VFS has no file-resize operation.
 #[no_mangle]
-pub extern "C" fn ftruncate(_file_descriptor: c_int, _length: i64) -> c_int {
-    fail_int()
+pub extern "C" fn ftruncate(file_descriptor: c_int, length: i64) -> c_int {
+    if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor)
+        || crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor)
+    {
+        set_kernel_errno(KernelError::Spipe);
+        return -1;
+    }
+    match crate::kernel::runtime::runtime_libc::filesystem::truncate_descriptor(
+        file_descriptor,
+        length,
+    ) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn truncate(_path: *const c_char, _length: i64) -> c_int {
-    fail_int()
+pub unsafe extern "C" fn truncate(path: *const c_char, length: i64) -> c_int {
+    match crate::kernel::runtime::runtime_libc::filesystem::truncate_path(path, length) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
 }
 
-// FIXME: The runtime has no kernel entropy source.
 #[no_mangle]
 pub unsafe extern "C" fn getentropy(buffer: *mut c_void, size: usize) -> c_int {
     if buffer.is_null() && size != 0 {
         set_errno(EFAULT);
         return -1;
     }
-    fail_int()
+    if size > 256 {
+        set_kernel_errno(KernelError::Io);
+        return -1;
+    }
+    if size == 0 {
+        return 0;
+    }
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => {
+            set_kernel_errno(error);
+            return -1;
+        }
+    };
+    let mut random = Vec::new();
+    if random.try_reserve_exact(size).is_err() {
+        set_errno(ENOMEM);
+        return -1;
+    }
+    random.resize(size, 0);
+    if let Err(error) = crate::random::fill(&mut random) {
+        set_kernel_errno(error);
+        return -1;
+    }
+    match process.address_space().write(buffer as usize, &random) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_kernel_errno(error);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
@@ -311,32 +562,59 @@ pub unsafe extern "C" fn gethostname(name: *mut c_char, size: usize) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn getegid() -> u32 {
-    0
+    credential_query(|process| process.group_ids()[1])
 }
 
 #[no_mangle]
 pub extern "C" fn geteuid() -> u32 {
-    0
+    credential_query(|process| process.user_ids()[1])
 }
 
 #[no_mangle]
 pub extern "C" fn getgid() -> u32 {
-    0
+    credential_query(|process| process.group_ids()[0])
 }
 
 #[no_mangle]
 pub extern "C" fn getuid() -> u32 {
-    0
+    credential_query(|process| process.user_ids()[0])
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn getgroups(group_count: c_int, _groups: *mut u32) -> c_int {
+pub unsafe extern "C" fn getgroups(group_count: c_int, groups: *mut u32) -> c_int {
     if group_count < 0 {
         set_errno(EINVAL);
-        -1
-    } else {
-        0
+        return -1;
     }
+    let process = match current_process_error() {
+        ProcessError::Current(process) => process,
+        ProcessError::Failed(error) => {
+            set_kernel_errno(error);
+            return -1;
+        }
+    };
+    let supplementary_groups = match process.supplementary_group_ids() {
+        Ok(groups) => groups,
+        Err(error) => {
+            set_kernel_errno(error);
+            return -1;
+        }
+    };
+    if group_count == 0 {
+        return supplementary_groups.len() as c_int;
+    }
+    if groups.is_null() {
+        set_errno(EFAULT);
+        return -1;
+    }
+    if (group_count as usize) < supplementary_groups.len() {
+        set_errno(EINVAL);
+        return -1;
+    }
+    for (index, group) in supplementary_groups.iter().copied().enumerate() {
+        unsafe { write_volatile(groups.add(index), group) };
+    }
+    supplementary_groups.len() as c_int
 }
 
 #[no_mangle]
@@ -349,12 +627,21 @@ pub unsafe extern "C" fn getresgid(
         set_errno(EFAULT);
         return -1;
     }
-    unsafe {
-        real_group.write(0);
-        effective_group.write(0);
-        saved_group.write(0);
+    match current_process_error() {
+        ProcessError::Current(process) => {
+            let [real, effective, saved] = process.group_ids();
+            unsafe {
+                write_volatile(real_group, real);
+                write_volatile(effective_group, effective);
+                write_volatile(saved_group, saved);
+            }
+            0
+        }
+        ProcessError::Failed(error) => {
+            set_kernel_errno(error);
+            -1
+        }
     }
-    0
 }
 
 #[no_mangle]
@@ -367,12 +654,53 @@ pub unsafe extern "C" fn getresuid(
         set_errno(EFAULT);
         return -1;
     }
-    unsafe {
-        real_user.write(0);
-        effective_user.write(0);
-        saved_user.write(0);
+    match current_process_error() {
+        ProcessError::Current(process) => {
+            let [real, effective, saved] = process.user_ids();
+            unsafe {
+                write_volatile(real_user, real);
+                write_volatile(effective_user, effective);
+                write_volatile(saved_user, saved);
+            }
+            0
+        }
+        ProcessError::Failed(error) => {
+            set_kernel_errno(error);
+            -1
+        }
     }
-    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn setgroups(group_count: usize, groups: *const u32) -> c_int {
+    if group_count > MAX_SUPPLEMENTARY_GROUPS {
+        set_errno(EINVAL);
+        return -1;
+    }
+    let process = match current_process_error() {
+        ProcessError::Current(process) => process,
+        ProcessError::Failed(error) => {
+            set_kernel_errno(error);
+            return -1;
+        }
+    };
+    if !process.effective_user_is_root() {
+        set_errno(super::errno::EPERM);
+        return -1;
+    }
+    if group_count != 0 && groups.is_null() {
+        set_errno(EFAULT);
+        return -1;
+    }
+    let mut group_ids = Vec::new();
+    if group_ids.try_reserve_exact(group_count).is_err() {
+        set_errno(ENOMEM);
+        return -1;
+    }
+    for index in 0..group_count {
+        group_ids.push(unsafe { read_volatile(groups.add(index)) });
+    }
+    credential_update(|process| process.set_supplementary_group_ids(&group_ids))
 }
 
 // FIXME: The runtime has no account database.
@@ -392,79 +720,111 @@ pub extern "C" fn gethostid() -> c_long {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn getpgid(_process: i32) -> i32 {
-    fail_int()
+pub unsafe extern "C" fn getpgid(process: i32) -> i32 {
+    process_query(|current| current.process_group_for(process))
 }
 
 #[no_mangle]
 pub extern "C" fn getpgrp() -> i32 {
-    fail_int()
+    process_query(|process| Ok(process.process_group_id()))
+}
+
+#[no_mangle]
+pub extern "C" fn umask(mask: u32) -> u32 {
+    match ThreadManager::current_process() {
+        Ok(process) => process.set_umask(mask),
+        Err(error) => {
+            set_kernel_errno(error);
+            u32::MAX
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn getppid() -> i32 {
-    fail_int()
+    process_query(|process| Ok(process.parent_pid()))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn getsid(_process: i32) -> i32 {
-    fail_int()
-}
-
-// FIXME: The kernel has no process credentials or process-group facility.
-#[no_mangle]
-pub extern "C" fn setegid(_group: u32) -> c_int {
-    fail_int()
+pub unsafe extern "C" fn getsid(process: i32) -> i32 {
+    process_query(|current| current.session_for(process))
 }
 
 #[no_mangle]
-pub extern "C" fn seteuid(_user: u32) -> c_int {
-    fail_int()
+pub extern "C" fn setegid(group: u32) -> c_int {
+    credential_update(|process| process.set_effective_group(group))
 }
 
 #[no_mangle]
-pub extern "C" fn setgid(_group: u32) -> c_int {
-    fail_int()
+pub extern "C" fn seteuid(user: u32) -> c_int {
+    credential_update(|process| process.set_effective_user(user))
 }
 
 #[no_mangle]
-pub extern "C" fn setpgid(_process: i32, _group: i32) -> c_int {
-    fail_int()
+pub extern "C" fn setgid(group: u32) -> c_int {
+    credential_update(|process| process.set_group_id(group))
+}
+
+#[no_mangle]
+pub extern "C" fn setpgid(process: i32, group: i32) -> c_int {
+    process_arc_update(|current| current.set_process_group(process, group))
 }
 
 #[no_mangle]
 pub extern "C" fn setpgrp() -> c_int {
-    fail_int()
+    process_arc_update(|current| current.set_process_group(0, 0))
 }
 
 #[no_mangle]
-pub extern "C" fn setregid(_real_group: u32, _effective_group: u32) -> c_int {
-    fail_int()
+pub extern "C" fn setregid(real_group: u32, effective_group: u32) -> c_int {
+    credential_update(|process| {
+        process.set_real_and_effective_group(
+            (real_group != u32::MAX).then_some(real_group),
+            (effective_group != u32::MAX).then_some(effective_group),
+        )
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn setresgid(_real_group: u32, _effective_group: u32, _saved_group: u32) -> c_int {
-    fail_int()
+pub extern "C" fn setresgid(real_group: u32, effective_group: u32, saved_group: u32) -> c_int {
+    credential_update(|process| {
+        process.set_all_group_ids(
+            (real_group != u32::MAX).then_some(real_group),
+            (effective_group != u32::MAX).then_some(effective_group),
+            (saved_group != u32::MAX).then_some(saved_group),
+        )
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn setresuid(_real_user: u32, _effective_user: u32, _saved_user: u32) -> c_int {
-    fail_int()
+pub extern "C" fn setresuid(real_user: u32, effective_user: u32, saved_user: u32) -> c_int {
+    credential_update(|process| {
+        process.set_all_user_ids(
+            (real_user != u32::MAX).then_some(real_user),
+            (effective_user != u32::MAX).then_some(effective_user),
+            (saved_user != u32::MAX).then_some(saved_user),
+        )
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn setreuid(_real_user: u32, _effective_user: u32) -> c_int {
-    fail_int()
+pub extern "C" fn setreuid(real_user: u32, effective_user: u32) -> c_int {
+    credential_update(|process| {
+        process.set_real_and_effective_user(
+            (real_user != u32::MAX).then_some(real_user),
+            (effective_user != u32::MAX).then_some(effective_user),
+        )
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn setsid() -> i32 {
-    fail_int()
+    process_query(|process| process.create_session())
 }
 
 #[no_mangle]
-pub extern "C" fn setuid(_user: u32) -> c_int {
-    fail_int()
+pub extern "C" fn setuid(user: u32) -> c_int {
+    credential_update(|process| process.set_user_id(user))
 }
 
 #[no_mangle]
@@ -580,55 +940,130 @@ pub unsafe extern "C" fn getopt(
     option as c_int
 }
 
-// FIXME: The kernel has no TTY line discipline or terminal process groups.
 #[no_mangle]
-pub extern "C" fn isatty(_file_descriptor: c_int) -> c_int {
-    set_errno(if _file_descriptor < 0 { EBADF } else { ENOTTY });
-    0
+pub extern "C" fn isatty(file_descriptor: c_int) -> c_int {
+    match terminal_descriptor_status(file_descriptor) {
+        Ok(true) => 1,
+        Ok(false) => {
+            set_errno(ENOTTY);
+            0
+        }
+        Err(error) => {
+            set_errno(error);
+            0
+        }
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn tcgetpgrp(_file_descriptor: c_int) -> i32 {
-    set_errno(ENOTTY);
-    -1
+pub extern "C" fn tcgetpgrp(file_descriptor: c_int) -> i32 {
+    match terminal_descriptor_status(file_descriptor) {
+        Ok(true) => {}
+        Ok(false) => {
+            set_errno(ENOTTY);
+            return -1;
+        }
+        Err(error) => {
+            set_errno(error);
+            return -1;
+        }
+    }
+    process_query(Process::terminal_foreground_process_group)
 }
 
 #[no_mangle]
-pub extern "C" fn tcsetpgrp(_file_descriptor: c_int, _process_group: i32) -> c_int {
-    set_errno(ENOTTY);
-    -1
+pub extern "C" fn tcsetpgrp(file_descriptor: c_int, process_group: i32) -> c_int {
+    match terminal_descriptor_status(file_descriptor) {
+        Ok(true) => {}
+        Ok(false) => {
+            set_errno(ENOTTY);
+            return -1;
+        }
+        Err(error) => {
+            set_errno(error);
+            return -1;
+        }
+    }
+    credential_update(|process| process.set_terminal_foreground_process_group(process_group))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ctermid(_buffer: *mut c_char) -> *mut c_char {
-    fail_pointer()
+pub unsafe extern "C" fn ctermid(buffer: *mut c_char) -> *mut c_char {
+    const TERMINAL_NAME: &[u8] = b"/dev/tty\0";
+    if buffer.is_null() {
+        return TERMINAL_NAME.as_ptr() as *mut c_char;
+    }
+    for (index, byte) in TERMINAL_NAME.iter().copied().enumerate() {
+        unsafe { write_volatile(buffer.cast::<u8>().add(index), byte) };
+    }
+    buffer
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ttyname(_file_descriptor: c_int) -> *mut c_char {
-    set_errno(ENOTTY);
+pub unsafe extern "C" fn ttyname(file_descriptor: c_int) -> *mut c_char {
+    const TERMINAL_NAME: &[u8] = b"/dev/console\0";
+    match terminal_descriptor_status(file_descriptor) {
+        Ok(true) => return TERMINAL_NAME.as_ptr() as *mut c_char,
+        Ok(false) => set_errno(ENOTTY),
+        Err(error) => set_errno(error),
+    }
     core::ptr::null_mut()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ttyname_r(
-    _file_descriptor: c_int,
-    _buffer: *mut c_char,
-    _size: usize,
+    file_descriptor: c_int,
+    buffer: *mut c_char,
+    size: usize,
 ) -> c_int {
-    ENOTTY
-}
-
-// FIXME: The kernel has no signal timer or interruptible signal-wait facility.
-#[no_mangle]
-pub extern "C" fn alarm(_seconds: u32) -> u32 {
-    set_errno(ENOSYS);
+    const TERMINAL_NAME: &[u8] = b"/dev/console\0";
+    match terminal_descriptor_status(file_descriptor) {
+        Ok(true) => {}
+        Ok(false) => return ENOTTY,
+        Err(error) => return error,
+    }
+    if buffer.is_null() {
+        return EFAULT;
+    }
+    if size < TERMINAL_NAME.len() {
+        return ERANGE;
+    }
+    for (index, byte) in TERMINAL_NAME.iter().copied().enumerate() {
+        unsafe { write_volatile(buffer.cast::<u8>().add(index), byte) };
+    }
     0
 }
 
 #[no_mangle]
+pub extern "C" fn alarm(seconds: u32) -> u32 {
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => {
+            set_kernel_errno(error);
+            return 0;
+        }
+    };
+    let now_ns = crate::kernel::arch::TimerArchitecture::now_ns()
+        .unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns);
+    process.set_alarm(now_ns, seconds)
+}
+
+#[no_mangle]
 pub extern "C" fn pause() -> c_int {
-    fail_int()
+    let mask = match crate::kernel::runtime::runtime_posix::signal::current_signal_mask() {
+        Ok(mask) => mask,
+        Err(error) => {
+            set_kernel_errno(error);
+            return -1;
+        }
+    };
+    let mut signal_set = [0u64; 16];
+    signal_set[0] = mask.bits();
+    unsafe {
+        crate::kernel::runtime::runtime_posix::signal::sigsuspend(
+            signal_set.as_ptr().cast::<c_void>(),
+        )
+    }
 }
 
 #[no_mangle]
@@ -644,7 +1079,8 @@ pub unsafe extern "C" fn sleep(seconds: u32) -> u32 {
     if unsafe { nanosleep(&request, &mut remaining) } == 0 {
         0
     } else {
-        remaining.seconds.max(0) as u32
+        (remaining.seconds.max(0) as u64 + u64::from(remaining.nanoseconds > 0))
+            .min(u32::MAX as u64) as u32
     }
 }
 
@@ -725,17 +1161,7 @@ pub unsafe extern "C" fn unlinkat(
     path: *const c_char,
     flags: c_int,
 ) -> c_int {
-    if directory_descriptor != AT_FDCWD {
-        return fail_int();
-    }
-    match flags {
-        0 => unsafe { unlink(path) },
-        AT_REMOVEDIR => unsafe { rmdir(path) },
-        _ => {
-            set_errno(EINVAL);
-            -1
-        }
-    }
+    unsafe { kz_rust_unlinkat(directory_descriptor, path, flags) }
 }
 
 // FIXME: The runtime VFS has no per-file configuration query interface.
@@ -756,24 +1182,72 @@ pub extern "C" fn lockf(_file_descriptor: c_int, _command: c_int, _length: i64) 
 
 #[no_mangle]
 pub unsafe extern "C" fn pread(
-    _file_descriptor: c_int,
-    _buffer: *mut c_void,
-    _size: usize,
-    _offset: i64,
+    file_descriptor: c_int,
+    buffer: *mut c_void,
+    size: usize,
+    offset: i64,
 ) -> isize {
-    set_errno(ENOSYS);
-    -1
+    if buffer.is_null() && size != 0 {
+        set_errno(EFAULT);
+        return -1;
+    }
+    if size > isize::MAX as usize {
+        set_errno(EINVAL);
+        return -1;
+    }
+    if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor)
+        || crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor)
+    {
+        set_kernel_errno(KernelError::Spipe);
+        return -1;
+    }
+    match crate::kernel::runtime::runtime_libc::filesystem::positioned_read(
+        file_descriptor,
+        buffer.cast(),
+        size,
+        offset,
+    ) {
+        Ok(amount) => amount as isize,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pwrite(
-    _file_descriptor: c_int,
-    _buffer: *const c_void,
-    _size: usize,
-    _offset: i64,
+    file_descriptor: c_int,
+    buffer: *const c_void,
+    size: usize,
+    offset: i64,
 ) -> isize {
-    set_errno(ENOSYS);
-    -1
+    if buffer.is_null() && size != 0 {
+        set_errno(EFAULT);
+        return -1;
+    }
+    if size > isize::MAX as usize {
+        set_errno(EINVAL);
+        return -1;
+    }
+    if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor)
+        || crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor)
+    {
+        set_kernel_errno(KernelError::Spipe);
+        return -1;
+    }
+    match crate::kernel::runtime::runtime_libc::filesystem::positioned_write(
+        file_descriptor,
+        buffer.cast(),
+        size,
+        offset,
+    ) {
+        Ok(amount) => amount as isize,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
 }
 
 // FIXME: The kernel has no process environment, account database, or password cipher.

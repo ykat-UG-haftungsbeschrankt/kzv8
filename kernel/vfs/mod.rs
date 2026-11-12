@@ -117,7 +117,7 @@ impl NodeMetadata {
         self.state.lock().mode
     }
 
-    fn check_access(
+    pub(crate) fn check_access(
         &self,
         credentials: &Credentials,
         requested: u16,
@@ -158,7 +158,7 @@ impl NodeMetadata {
         }
         let mut state = self.state.lock();
         if !credentials.is_root() && credentials.effective_user() != state.owner {
-            return Err(Error::Acces);
+            return Err(Error::Perm);
         }
         state.mode = mode;
         Ok(())
@@ -171,7 +171,7 @@ impl NodeMetadata {
         group: GroupId,
     ) -> VfsResult<()> {
         if !credentials.is_root() {
-            return Err(Error::Acces);
+            return Err(Error::Perm);
         }
         let mut state = self.state.lock();
         state.owner = owner;
@@ -199,7 +199,10 @@ impl NodeMetadata {
         self.state.lock().flags
     }
 
-    pub(crate) fn set_flags(&self, flags: u32) -> VfsResult<()> {
+    pub(crate) fn set_flags(&self, credentials: &Credentials, flags: u32) -> VfsResult<()> {
+        if !credentials.is_root() {
+            return Err(Error::Perm);
+        }
         if flags & !SUPPORTED_INODE_FLAGS != 0 {
             return Err(Error::Inval);
         }
@@ -238,7 +241,13 @@ impl NodeMetadata {
         Ok(names)
     }
 
-    pub(crate) fn set_xattr(&self, name: &[u8], value: &[u8], flags: i32) -> VfsResult<()> {
+    pub(crate) fn set_xattr(
+        &self,
+        credentials: &Credentials,
+        name: &[u8],
+        value: &[u8],
+        flags: i32,
+    ) -> VfsResult<()> {
         validate_xattr_name(name)?;
         if value.len() > XATTR_SIZE_MAX {
             return Err(Error::TooBig);
@@ -261,8 +270,14 @@ impl NodeMetadata {
         owned_value.extend_from_slice(value);
 
         let mut state = self.state.lock();
+        if !credentials.is_root() && credentials.effective_user() != state.owner {
+            return Err(Error::Perm);
+        }
+        if name.starts_with(b"trusted.") && !credentials.is_root() {
+            return Err(Error::Perm);
+        }
         if state.flags & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
-            return Err(Error::Error);
+            return Err(Error::Perm);
         }
         if let Some(index) = state
             .xattrs
@@ -286,11 +301,21 @@ impl NodeMetadata {
         Ok(())
     }
 
-    pub(crate) fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
+    pub(crate) fn remove_xattr(
+        &self,
+        credentials: &Credentials,
+        name: &[u8],
+    ) -> VfsResult<()> {
         validate_xattr_name(name)?;
         let mut state = self.state.lock();
+        if !credentials.is_root() && credentials.effective_user() != state.owner {
+            return Err(Error::Perm);
+        }
+        if name.starts_with(b"trusted.") && !credentials.is_root() {
+            return Err(Error::Perm);
+        }
         if state.flags & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
-            return Err(Error::Error);
+            return Err(Error::Perm);
         }
         let index = state
             .xattrs

@@ -6,6 +6,9 @@
  */
 
 use core::ffi::{c_char, c_int};
+
+use crate::kernel::runtime::runtime_libc::filesystem;
+
 use super::errno::{EINVAL, ENOSYS};
 
 const O_WRONLY: c_int = 1;
@@ -13,11 +16,22 @@ const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
 const O_NONBLOCK: c_int = 0o4000;
 const O_ACCMODE: c_int = 0o3;
+const O_APPEND: c_int = 0o2000;
+const F_DUPFD: c_int = 0;
+const F_GETFD: c_int = 1;
+const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
+const F_DUPFD_CLOEXEC: c_int = 1030;
 
 unsafe extern "C" {
     fn kz_rust_open(path: *const c_char, flags: c_int, mode: u32) -> c_int;
+    fn kz_rust_openat(
+        directory_descriptor: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: u32,
+    ) -> c_int;
 }
 
 fn set_errno(error: c_int) {
@@ -70,20 +84,74 @@ pub unsafe extern "C" fn fcntl(
             }
         };
     }
-    set_errno(ENOSYS);
-    -1
+    match command {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let Ok(minimum) = c_int::try_from(argument) else {
+                set_errno(EINVAL);
+                return -1;
+            };
+            match filesystem::duplicate(
+                file_descriptor,
+                minimum,
+                command == F_DUPFD_CLOEXEC,
+            ) {
+                Ok(duplicate) => duplicate,
+                Err(error) => {
+                    set_errno(error);
+                    -1
+                }
+            }
+        }
+        F_GETFD => match filesystem::descriptor_flags(file_descriptor) {
+            Ok(flags) => flags,
+            Err(error) => {
+                set_errno(error);
+                -1
+            }
+        },
+        F_SETFD => match filesystem::set_descriptor_flags(file_descriptor, argument as c_int) {
+            Ok(()) => 0,
+            Err(error) => {
+                set_errno(error);
+                -1
+            }
+        },
+        F_GETFL => match filesystem::status_flags(file_descriptor) {
+            Ok(flags) => flags,
+            Err(error) => {
+                set_errno(error);
+                -1
+            }
+        },
+        F_SETFL => {
+            let flags = argument as c_int;
+            if flags & !(O_NONBLOCK | O_APPEND | O_ACCMODE) != 0 {
+                set_errno(EINVAL);
+                return -1;
+            }
+            match filesystem::set_status_flags(file_descriptor, flags) {
+                Ok(()) => 0,
+                Err(error) => {
+                    set_errno(error);
+                    -1
+                }
+            }
+        }
+        _ => {
+            set_errno(ENOSYS);
+            -1
+        }
+    }
 }
 
-// FIXME: The filesystem has no directory-descriptor-relative path resolution.
 #[no_mangle]
 pub unsafe extern "C" fn openat(
-    _directory_descriptor: c_int,
-    _path: *const c_char,
-    _flags: c_int,
-    _mode: u32,
+    directory_descriptor: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: u32,
 ) -> c_int {
-    set_errno(ENOSYS);
-    -1
+    unsafe { kz_rust_openat(directory_descriptor, path, flags, mode) }
 }
 
 #[no_mangle]
@@ -98,9 +166,17 @@ pub extern "C" fn posix_fadvise(
 
 #[no_mangle]
 pub extern "C" fn posix_fallocate(
-    _file_descriptor: c_int,
-    _offset: i64,
-    _length: i64,
+    file_descriptor: c_int,
+    offset: i64,
+    length: i64,
 ) -> c_int {
-    ENOSYS
+    if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor)
+        || crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor)
+    {
+        return EINVAL;
+    }
+    match filesystem::posix_fallocate(file_descriptor, offset, length) {
+        Ok(()) => 0,
+        Err(error) => error,
+    }
 }

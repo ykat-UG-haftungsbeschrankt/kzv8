@@ -182,6 +182,55 @@ impl VirtioSerial {
         length
     }
 
+    pub(crate) fn input_ready() -> bool {
+        let serial = Self::get_instance();
+        serial.base.load(Ordering::Acquire) != 0 && serial.input.lock().length != 0
+    }
+
+    pub(crate) fn is_available() -> bool {
+        Self::get_instance().base.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn output_pending() -> bool {
+        let serial = Self::get_instance();
+        serial.base.load(Ordering::Acquire) != 0 && serial.output.lock().length != 0
+    }
+
+    pub(crate) fn output_ready() -> bool {
+        let serial = Self::get_instance();
+        serial.base.load(Ordering::Acquire) != 0
+            && serial.output.lock().length <= Self::OUTPUT_CAPACITY - Self::MAX_CHUNK_SIZE
+    }
+
+    pub(crate) fn flush_input() {
+        let serial = Self::get_instance();
+        let base = serial.base.load(Ordering::Acquire);
+        if base == 0 {
+            return;
+        }
+        let mut input = serial.input.lock();
+        input.head = 0;
+        input.length = 0;
+        let notify = serial.submit_receive(&mut input);
+        drop(input);
+        if notify {
+            if let Some(transport) = VirtioTransport::from_base(base) {
+                transport.notify(0);
+            }
+        }
+    }
+
+    pub(crate) fn flush_queued_output() {
+        let serial = Self::get_instance();
+        let mut output = serial.output.lock();
+        if output.active_head.is_some() {
+            output.length = output.active_length;
+        } else {
+            output.head = 0;
+            output.length = 0;
+        }
+    }
+
     pub(crate) fn handle_interrupt(pending: u64) {
         let serial = Self::get_instance();
         let slot = serial.slot.load(Ordering::Acquire);

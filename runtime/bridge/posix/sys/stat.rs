@@ -1,12 +1,32 @@
-use core::ffi::{c_char, c_int, c_void};
-use core::ptr::read_volatile;
-use super::super::errno::ENOSYS;
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
 
-const AT_FDCWD: c_int = -100;
+use core::ffi::{c_char, c_int, c_void};
+use super::super::errno::{EINVAL, ENOSYS};
 
 unsafe extern "C" {
     fn stat(path: *const c_char, status: *mut c_void) -> c_int;
-    fn mkdir(path: *const c_char, mode: u32) -> c_int;
+    fn kz_rust_statat(
+        directory_descriptor: c_int,
+        path: *const c_char,
+        status: *mut c_void,
+    ) -> c_int;
+    fn kz_rust_mkdirat(
+        directory_descriptor: c_int,
+        path: *const c_char,
+        mode: u32,
+    ) -> c_int;
+    fn kz_rust_chmod(path: *const c_char, mode: u32) -> c_int;
+    fn kz_rust_fchmod(file_descriptor: c_int, mode: u32) -> c_int;
+    fn kz_rust_chmodat(
+        directory_descriptor: c_int,
+        path: *const c_char,
+        mode: u32,
+    ) -> c_int;
 }
 
 fn set_errno(error: c_int) {
@@ -15,32 +35,28 @@ fn set_errno(error: c_int) {
     }
 }
 
-unsafe fn is_absolute(path: *const c_char) -> bool {
-    !path.is_null() && unsafe { read_volatile(path.cast::<u8>()) } == b'/'
-}
-
-// FIXME: The filesystem has no chmod, device-node, FIFO, or timestamp mutation API.
 #[no_mangle]
-pub unsafe extern "C" fn chmod(_path: *const c_char, _mode: u32) -> c_int {
-    set_errno(ENOSYS);
-    -1
+pub unsafe extern "C" fn chmod(path: *const c_char, mode: u32) -> c_int {
+    unsafe { kz_rust_chmod(path, mode) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fchmod(_file_descriptor: c_int, _mode: u32) -> c_int {
-    set_errno(ENOSYS);
-    -1
+pub extern "C" fn fchmod(file_descriptor: c_int, mode: u32) -> c_int {
+    unsafe { kz_rust_fchmod(file_descriptor, mode) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn fchmodat(
-    _directory_descriptor: c_int,
-    _path: *const c_char,
-    _mode: u32,
-    _flags: c_int,
+    directory_descriptor: c_int,
+    path: *const c_char,
+    mode: u32,
+    flags: c_int,
 ) -> c_int {
-    set_errno(ENOSYS);
-    -1
+    if flags & !0x100 != 0 {
+        set_errno(EINVAL);
+        return -1;
+    }
+    unsafe { kz_rust_chmodat(directory_descriptor, path, mode) }
 }
 
 #[no_mangle]
@@ -50,15 +66,11 @@ pub unsafe extern "C" fn fstatat(
     status: *mut c_void,
     flags: c_int,
 ) -> c_int {
-    if directory_descriptor == AT_FDCWD || unsafe { is_absolute(path) } {
-        if flags & !0x100 != 0 {
-            set_errno(ENOSYS);
-            return -1;
-        }
-        return unsafe { stat(path, status) };
+    if flags & !0x100 != 0 {
+        set_errno(super::super::errno::EINVAL);
+        return -1;
     }
-    set_errno(ENOSYS);
-    -1
+    unsafe { kz_rust_statat(directory_descriptor, path, status) }
 }
 
 #[no_mangle]
@@ -78,11 +90,7 @@ pub unsafe extern "C" fn mkdirat(
     path: *const c_char,
     mode: u32,
 ) -> c_int {
-    if directory_descriptor == AT_FDCWD || unsafe { is_absolute(path) } {
-        return unsafe { mkdir(path, mode) };
-    }
-    set_errno(ENOSYS);
-    -1
+    unsafe { kz_rust_mkdirat(directory_descriptor, path, mode) }
 }
 
 #[no_mangle]

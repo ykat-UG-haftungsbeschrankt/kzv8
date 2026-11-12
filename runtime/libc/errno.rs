@@ -7,8 +7,11 @@
 
 use crate::kernel::error::Error;
 
-const fn as_errno(error: Error) -> i32 {
-	-(error as i32)
+pub(crate) const fn as_errno(error: Error) -> i32 {
+	match error {
+		Error::Perm | Error::Error => 1,
+		_ => -(error as i32),
+	}
 }
 
 pub(crate) const EAGAIN: i32 = as_errno(Error::Again);
@@ -22,7 +25,7 @@ pub(crate) const EDEADLK: i32 = as_errno(Error::Deadlk);
 pub(crate) const EINVAL: i32 = as_errno(Error::Inval);
 pub(crate) const EIO: i32 = as_errno(Error::Io);
 pub(crate) const EACCES: i32 = as_errno(Error::Acces);
-pub(crate) const EPERM: i32 = as_errno(Error::Error);
+pub(crate) const EPERM: i32 = as_errno(Error::Perm);
 pub(crate) const EISDIR: i32 = as_errno(Error::IsDir);
 pub(crate) const EMFILE: i32 = as_errno(Error::Mfile);
 pub(crate) const ENAMETOOLONG: i32 = as_errno(Error::NameTooLong);
@@ -36,3 +39,4 @@ pub(crate) const ENOSYS: i32 = as_errno(Error::NoSys);
 pub(crate) const ENOTTY: i32 = as_errno(Error::NotTty);
 pub(crate) const EOVERFLOW: i32 = as_errno(Error::Overflow);
 pub(crate) const ERANGE: i32 = as_errno(Error::Range);
+pub(crate) const ETIMEDOUT: i32 = 110;

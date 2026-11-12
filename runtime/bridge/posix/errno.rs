@@ -7,8 +7,13 @@
 
 use crate::kernel::error::Error;
 
-const fn as_errno(error: Error) -> i32 {
-    -(error as i32)
+pub(crate) const EPERM: i32 = 1;
+
+pub(crate) const fn as_errno(error: Error) -> i32 {
+    match error {
+        Error::Perm => EPERM,
+        _ => -(error as i32),
+    }
 }
 
 #[allow(dead_code)]

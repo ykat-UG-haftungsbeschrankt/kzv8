@@ -8,12 +8,15 @@
 #[allow(unused_imports)]
 use core::ffi::{c_char, c_int, c_long, c_void};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+
+use crate::kernel::scheduler::thread::ThreadManager;
+use crate::kernel::signal::SignalSet;
 
 use super::variadic::{self, VA_INT, VA_POINTER, VA_UINT, VA_ULONG};
 
 use super::errno::{
-    EAGAIN, EBADF, EBUSY, EFAULT, EINVAL, EIO, ENOMEM, ENOSYS, EOVERFLOW, ERANGE,
+    as_errno, EAGAIN, EBADF, EBUSY, EFAULT, EINVAL, EIO, ENOMEM, ENOSYS, EOVERFLOW, ERANGE,
 };
 
 const CLOCK_REALTIME: i32 = 0;
@@ -35,6 +38,7 @@ const SC_PAGESIZE: i32 = 30;
 const SC_NPROCESSORS_CONF: i32 = 83;
 const SC_NPROCESSORS_ONLN: i32 = 84;
 const SC_CLK_TCK: i32 = 2;
+static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
 
 #[repr(C)]
 pub struct Timespec {
@@ -104,20 +108,29 @@ pub unsafe extern "C" fn clock_gettime(clock_id: i32, output: *mut Timespec) -> 
     let (seconds, nanoseconds) = match clock_id {
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW => {
             let now = unsafe { kz_host_time_ns() };
-            (now / 1_000_000_000, now % 1_000_000_000)
+            (i128::from(now / 1_000_000_000), i128::from(now % 1_000_000_000))
         }
         CLOCK_REALTIME => {
-            let milliseconds = unsafe { kz_host_wall_time_ms() }.max(0) as u64;
-            (milliseconds / 1000, milliseconds % 1000 * 1_000_000)
+            let milliseconds = unsafe { kz_host_wall_time_ms() };
+            let realtime_ns = i128::from(milliseconds) * 1_000_000
+                + i128::from(REALTIME_OFFSET_NS.load(Ordering::Acquire));
+            (
+                realtime_ns.div_euclid(1_000_000_000),
+                realtime_ns.rem_euclid(1_000_000_000),
+            )
         }
         _ => {
             set_errno(EINVAL);
             return -1;
         }
     };
+    let Ok(seconds) = c_long::try_from(seconds) else {
+        set_errno(EOVERFLOW);
+        return -1;
+    };
     unsafe {
         output.write(Timespec {
-            seconds: seconds as c_long,
+            seconds,
             nanoseconds: nanoseconds as c_long,
         });
     }
@@ -130,15 +143,40 @@ pub extern "C" fn getcwd(buffer: *mut c_char, size: usize) -> *mut c_char {
         set_errno(EFAULT);
         return core::ptr::null_mut();
     }
-    if size < 2 {
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => {
+            set_errno(as_errno(error));
+            return core::ptr::null_mut();
+        }
+    };
+    let path = match process.current_directory() {
+        Ok(path) => path,
+        Err(error) => {
+            set_errno(as_errno(error));
+            return core::ptr::null_mut();
+        }
+    };
+    let Some(required) = path.len().checked_add(1) else {
+        set_errno(ERANGE);
+        return core::ptr::null_mut();
+    };
+    if size < required {
         set_errno(ERANGE);
         return core::ptr::null_mut();
     }
-    unsafe {
-        buffer.write(b'/' as c_char);
-        buffer.add(1).write(0);
+    for (index, byte) in path.iter().copied().chain(core::iter::once(0)).enumerate() {
+        unsafe { write_volatile(buffer.add(index).cast::<u8>(), byte) };
     }
     buffer
+}
+
+pub(crate) fn set_realtime_clock(realtime_ns: i128) -> Result<(), crate::kernel::error::Error> {
+    let host_ns = i128::from(unsafe { kz_host_wall_time_ms() }) * 1_000_000;
+    let offset = i64::try_from(realtime_ns.checked_sub(host_ns).ok_or(crate::kernel::error::Error::Overflow)?)
+        .map_err(|_| crate::kernel::error::Error::Overflow)?;
+    REALTIME_OFFSET_NS.store(offset, Ordering::Release);
+    Ok(())
 }
 
 #[no_mangle]
@@ -166,17 +204,29 @@ pub extern "C" fn getpagesize() -> isize {
 
 #[no_mangle]
 pub extern "C" fn getpid() -> i32 {
-    1
+    match ThreadManager::current_process() {
+        Ok(process) => process.pid(),
+        Err(error) => {
+            set_errno(-(error as i32));
+            -1
+        }
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sigfillset(set: *mut c_void) -> i32 {
     if set.is_null() {
-        return EFAULT;
+        set_errno(EFAULT);
+        return -1;
     }
-    let bytes = set.cast::<u8>();
-    for index in 0..SIGSET_SIZE {
-        unsafe { write_volatile(bytes.add(index), 0xff) };
+    let words = set.cast::<u64>();
+    for index in 0..SIGSET_SIZE / core::mem::size_of::<u64>() {
+        unsafe {
+            write_volatile(
+                words.add(index),
+                if index == 0 { SignalSet::ALL.bits() } else { 0 },
+            )
+        };
     }
     0
 }
@@ -187,9 +237,9 @@ pub unsafe extern "C" fn sigemptyset(set: *mut c_void) -> i32 {
         set_errno(EFAULT);
         return -1;
     }
-    let bytes = set.cast::<u8>();
-    for index in 0..SIGSET_SIZE {
-        unsafe { write_volatile(bytes.add(index), 0) };
+    let words = set.cast::<u64>();
+    for index in 0..SIGSET_SIZE / core::mem::size_of::<u64>() {
+        unsafe { write_volatile(words.add(index), 0) };
     }
     0
 }
@@ -197,16 +247,33 @@ pub unsafe extern "C" fn sigemptyset(set: *mut c_void) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn pthread_sigmask(
     how: i32,
-    _set: *const c_void,
+    set: *const c_void,
     old_set: *mut c_void,
 ) -> i32 {
-    if !matches!(how, 0..=2) {
-        return EINVAL;
+    if !set.is_null() && !matches!(how, 0..=2) {
+        return as_errno(crate::kernel::error::Error::Inval);
     }
+    let previous = match crate::kernel::runtime::runtime_posix::signal::current_signal_mask() {
+        Ok(mask) => mask,
+        Err(error) => return as_errno(error),
+    };
     if !old_set.is_null() {
-        let bytes = old_set.cast::<u8>();
-        for index in 0..SIGSET_SIZE {
-            unsafe { write_volatile(bytes.add(index), 0) };
+        let words = old_set.cast::<u64>();
+        for index in 0..SIGSET_SIZE / core::mem::size_of::<u64>() {
+            unsafe {
+                write_volatile(
+                    words.add(index),
+                    if index == 0 { previous.bits() } else { 0 },
+                )
+            };
+        }
+    }
+    if !set.is_null() {
+        let signals = SignalSet::from_bits(unsafe { read_volatile(set.cast::<u64>()) });
+        if let Err(error) = crate::kernel::runtime::runtime_posix::signal::change_signal_mask(
+            how, signals,
+        ) {
+            return as_errno(error);
         }
     }
     0
@@ -231,18 +298,37 @@ pub unsafe extern "C" fn nanosleep(request: *const Timespec, remaining: *mut Tim
         .and_then(|seconds| seconds.checked_add(nanoseconds))
         .unwrap_or(u64::MAX);
     let deadline = now.saturating_add(duration);
-    while unsafe { kz_host_time_ns() } < deadline {
-        unsafe { pthread_yield() };
+    let mut interrupted = false;
+    loop {
+        if crate::kernel::runtime::runtime_posix::signal::dispatch_pending_signals().is_some() {
+            interrupted = true;
+            break;
+        }
+        let now = unsafe { kz_host_time_ns() };
+        if now >= deadline {
+            break;
+        }
+        let _ = ThreadManager::sleep_current_until(deadline);
     }
     if !remaining.is_null() {
+        let remaining_ns = if interrupted {
+            deadline.saturating_sub(unsafe { kz_host_time_ns() })
+        } else {
+            0
+        };
         unsafe {
             remaining.write(Timespec {
-                seconds: 0,
-                nanoseconds: 0,
+                seconds: (remaining_ns / 1_000_000_000) as c_long,
+                nanoseconds: (remaining_ns % 1_000_000_000) as c_long,
             });
         }
     }
-    0
+    if interrupted {
+        set_errno(as_errno(crate::kernel::error::Error::Intr));
+        -1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -400,7 +486,13 @@ pub unsafe extern "C" fn localtime_r(time: *const i64, result: *mut Tm) -> *mut 
 #[no_mangle]
 pub unsafe extern "C" fn kz_rust_syscall(number: i64, arguments: *mut c_void) -> isize {
     match number {
-        SYS_GETPID => 1,
+        SYS_GETPID => match ThreadManager::current_process() {
+            Ok(process) => process.pid() as isize,
+            Err(error) => {
+                set_errno(-(error as i32));
+                -1
+            }
+        },
         SYS_GETTID => unsafe { pthread_self() as isize },
         SYS_SCHED_YIELD => unsafe { pthread_yield() as isize },
         SYS_CLOCK_GETTIME => {

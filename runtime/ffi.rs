@@ -72,6 +72,21 @@ impl TcpContext {
         );
     }
 
+    fn schedule_timer_at(&mut self, deadline_ns: u64) -> Option<u64> {
+        let events = unsafe { &mut *self.event_loop };
+        let timer = events.schedule_timer(deadline_ns)?;
+        Some(KernelObjectRef::from_arc(&timer).raw())
+    }
+
+    fn cancel_timer(&mut self, timer_id: u64) -> bool {
+        let events = unsafe { &mut *self.event_loop };
+        let timer_reference = KernelObjectRef::from_raw(timer_id);
+        let Some(timer) = events.timer_by_address(timer_reference.raw()) else {
+            return false;
+        };
+        events.cancel_timer(&timer)
+    }
+
     pub(crate) fn poll_network(&mut self) -> bool {
         poll_tcp_context(self)
     }
@@ -376,6 +391,14 @@ pub(crate) fn with_active_tcp_context<R>(
     Some(operation(unsafe { &mut *context }))
 }
 
+pub(crate) fn schedule_active_timer_at(deadline_ns: u64) -> Option<u64> {
+    with_active_tcp_context(|context| context.schedule_timer_at(deadline_ns)).flatten()
+}
+
+pub(crate) fn cancel_active_timer(timer_id: u64) -> bool {
+    with_active_tcp_context(|context| context.cancel_timer(timer_id)).unwrap_or(false)
+}
+
 fn set_network_errno(error: Error) {
     unsafe { crate::kernel::scheduler::thread::__errno_location().write(-(error as i32)) };
 }
@@ -540,10 +563,10 @@ pub unsafe extern "C" fn kz_host_console_write(data: *const u8, length: usize) -
     } else {
         core::slice::from_raw_parts(data, length)
     };
-    if crate::kernel::driver::virtio::console::Console::write(bytes) {
-        length as i32
-    } else {
-        -1
+    match crate::kernel::tty::write_console(bytes, false) {
+        Ok(written) if written == length => length as i32,
+        Ok(written) => written as i32,
+        Err(_) => -1,
     }
 }
 
@@ -576,11 +599,17 @@ pub unsafe extern "C" fn kz_host_event_loop_poll(
         return 0;
     };
     let event = match event {
-        Event::Timer(timer) => RawEvent {
-            kind: 1,
-            id: KernelObjectRef::from_arc(&timer).raw(),
-            ..RawEvent::default()
-        },
+        Event::Timer(timer) => {
+            let timer_id = KernelObjectRef::from_arc(&timer).raw();
+            crate::kernel::runtime::runtime_posix::time::dispatch_posix_timer_event(
+                events, timer_id, now_ns,
+            );
+            RawEvent {
+                kind: 1,
+                id: timer_id,
+                ..RawEvent::default()
+            }
+        }
         Event::Completion(completion) => RawEvent {
             kind: 2,
             id: completion.id,
