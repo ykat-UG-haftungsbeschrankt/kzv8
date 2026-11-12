@@ -26,6 +26,7 @@ const INITIAL_RETRANSMIT_TIMEOUT_NS: u64 = 1_000_000_000;
 const MAXIMUM_RETRANSMIT_TIMEOUT_NS: u64 = 60_000_000_000;
 const MAXIMUM_RETRANSMISSIONS: u8 = 5;
 const TCP_CLOSE_TIMEOUT_NS: u64 = 120_000_000_000;
+const TCP_TIME_WAIT_NS: u64 = 60_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TcpState {
@@ -37,6 +38,8 @@ pub(crate) enum TcpState {
     FinWait1,
     FinWait2,
     CloseWait,
+    Closing,
+    TimeWait,
     LastAck,
 }
 
@@ -44,6 +47,29 @@ pub(crate) enum TcpState {
 pub(crate) struct TcpSocketHandle {
     index: usize,
     generation: u32,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct TcpFlowKey {
+    local_address: Ipv4Address,
+    remote_address: Ipv4Address,
+    local_port: u16,
+    remote_port: u16,
+}
+
+struct TcpFlowBucket {
+    key: TcpFlowKey,
+    handles: Vec<TcpSocketHandle>,
+}
+
+struct TcpListener {
+    address: Ipv4Address,
+    handle: TcpSocketHandle,
+}
+
+struct TcpListenerBucket {
+    port: u16,
+    listeners: Vec<TcpListener>,
 }
 
 struct OutstandingSegment {
@@ -83,6 +109,8 @@ struct TcpSocket {
     retransmissions: u8,
     close_requested: bool,
     orphaned: bool,
+    flow_indexed: bool,
+    listener_indexed: bool,
     close_deadline_ns: Option<u64>,
     parent_listener: Option<TcpSocketHandle>,
     accept_queue: VecDeque<TcpSocketHandle>,
@@ -108,6 +136,9 @@ pub(crate) struct TcpTransmission {
 
 pub(crate) struct TcpSocketTable {
     slots: Vec<SocketSlot>,
+    flows: Vec<TcpFlowBucket>,
+    listeners: Vec<TcpListenerBucket>,
+    removed_indexes: Vec<(TcpSocketHandle, Option<TcpFlowKey>, Option<u16>)>,
     maximum_segment_size: usize,
     queued_send_bytes: usize,
 }
@@ -117,11 +148,142 @@ impl TcpSocketTable {
         let maximum_segment_size = interface_mtu
             .saturating_sub(20 + TCP_HEADER_LENGTH)
             .min(usize::from(u16::MAX));
-        (maximum_segment_size != 0).then_some(Self {
+        if maximum_segment_size == 0 {
+            return None;
+        }
+        let mut removed_indexes = Vec::new();
+        removed_indexes.try_reserve_exact(MAX_TCP_SOCKETS).ok()?;
+        Some(Self {
             slots: Vec::new(),
+            flows: Vec::new(),
+            listeners: Vec::new(),
+            removed_indexes,
             maximum_segment_size,
             queued_send_bytes: 0,
         })
+    }
+
+    fn add_flow(&mut self, key: TcpFlowKey, handle: TcpSocketHandle) -> Result<(), Error> {
+        match self.flows.binary_search_by_key(&key, |bucket| bucket.key) {
+            Ok(index) => {
+                if self.flows[index].handles.iter().copied().any(|existing| {
+                    existing != handle
+                        && self.slots.get(existing.index).is_some_and(|slot| {
+                            slot.generation == existing.generation
+                                && slot.socket.as_ref().is_some_and(|socket| {
+                                    socket.state != TcpState::Closed
+                                        && socket.state != TcpState::Listen
+                                })
+                        })
+                }) {
+                    return Err(Error::AddrInUse);
+                }
+                self.flows[index]
+                    .handles
+                    .try_reserve(1)
+                    .map_err(|_| Error::NoMem)?;
+                self.flows[index].handles.push(handle);
+            }
+            Err(index) => {
+                let mut handles = Vec::new();
+                handles.try_reserve_exact(1).map_err(|_| Error::NoMem)?;
+                handles.push(handle);
+                self.flows.try_reserve(1).map_err(|_| Error::NoMem)?;
+                self.flows.insert(index, TcpFlowBucket { key, handles });
+            }
+        }
+        if let Some(socket) = self.socket_mut(handle) {
+            socket.flow_indexed = true;
+        }
+        Ok(())
+    }
+
+    fn remove_flow(&mut self, key: TcpFlowKey, handle: TcpSocketHandle) {
+        let Ok(bucket_index) = self.flows.binary_search_by_key(&key, |bucket| bucket.key) else {
+            return;
+        };
+        let bucket = &mut self.flows[bucket_index];
+        if let Some(index) = bucket.handles.iter().position(|candidate| *candidate == handle) {
+            bucket.handles.remove(index);
+        }
+        if bucket.handles.is_empty() {
+            self.flows.remove(bucket_index);
+        }
+        if let Some(socket) = self.socket_mut(handle) {
+            socket.flow_indexed = false;
+        }
+    }
+
+    fn flow_handle(&self, key: TcpFlowKey) -> Option<TcpSocketHandle> {
+        let bucket_index = self.flows.binary_search_by_key(&key, |bucket| bucket.key).ok()?;
+        self.flows[bucket_index].handles.iter().copied().find(|handle| {
+            self.slots.get(handle.index).is_some_and(|slot| {
+                slot.generation == handle.generation
+                    && slot.socket.as_ref().is_some_and(|socket| {
+                        socket.state != TcpState::Listen && socket.state != TcpState::Closed
+                    })
+            })
+        })
+    }
+
+    fn listener_conflicts(&self, address: Ipv4Address, port: u16) -> bool {
+        let Ok(bucket_index) = self.listeners.binary_search_by_key(&port, |bucket| bucket.port) else {
+            return false;
+        };
+        self.listeners[bucket_index].listeners.iter().any(|listener| {
+            address == Ipv4Address([0; 4])
+                || listener.address == Ipv4Address([0; 4])
+                || listener.address == address
+        })
+    }
+
+    fn add_listener(&mut self, address: Ipv4Address, port: u16, handle: TcpSocketHandle) -> Result<(), Error> {
+        match self.listeners.binary_search_by_key(&port, |bucket| bucket.port) {
+            Ok(index) => {
+                self.listeners[index]
+                    .listeners
+                    .try_reserve(1)
+                    .map_err(|_| Error::NoMem)?;
+                self.listeners[index].listeners.push(TcpListener { address, handle });
+            }
+            Err(index) => {
+                let mut listeners = Vec::new();
+                listeners.try_reserve_exact(1).map_err(|_| Error::NoMem)?;
+                listeners.push(TcpListener { address, handle });
+                self.listeners.try_reserve(1).map_err(|_| Error::NoMem)?;
+                self.listeners.insert(index, TcpListenerBucket { port, listeners });
+            }
+        }
+        if let Some(socket) = self.socket_mut(handle) {
+            socket.listener_indexed = true;
+        }
+        Ok(())
+    }
+
+    fn remove_listener(&mut self, port: u16, handle: TcpSocketHandle) {
+        let Ok(bucket_index) = self.listeners.binary_search_by_key(&port, |bucket| bucket.port) else {
+            return;
+        };
+        let bucket = &mut self.listeners[bucket_index];
+        if let Some(index) = bucket.listeners.iter().position(|listener| listener.handle == handle) {
+            bucket.listeners.remove(index);
+        }
+        if bucket.listeners.is_empty() {
+            self.listeners.remove(bucket_index);
+        }
+        if let Some(socket) = self.socket_mut(handle) {
+            socket.listener_indexed = false;
+        }
+    }
+
+    fn listener_handle(&self, address: Ipv4Address, port: u16) -> Option<TcpSocketHandle> {
+        let bucket_index = self.listeners.binary_search_by_key(&port, |bucket| bucket.port).ok()?;
+        let listeners = &self.listeners[bucket_index].listeners;
+        listeners
+            .iter()
+            .find(|listener| listener.address == address)
+            .or_else(|| listeners.iter().find(|listener| listener.address == Ipv4Address([0; 4])))
+            .map(|listener| listener.handle)
     }
 
     fn allocate_slot(&mut self) -> Result<(usize, u32), Error> {
@@ -193,7 +355,20 @@ impl TcpSocketTable {
             self.maximum_segment_size,
         )?;
         self.slots[index].socket = Some(socket);
-        Ok(TcpSocketHandle { index, generation })
+        let handle = TcpSocketHandle { index, generation };
+        if let Err(error) = self.add_flow(
+            TcpFlowKey {
+                local_address,
+                remote_address,
+                local_port,
+                remote_port,
+            },
+            handle,
+        ) {
+            self.slots[index].socket = None;
+            return Err(error);
+        }
+        Ok(handle)
     }
 
     pub(crate) fn listen(
@@ -206,15 +381,7 @@ impl TcpSocketTable {
         if local_port == 0 {
             return Err(Error::Inval);
         }
-        if self.slots.iter().any(|slot| {
-            slot.socket.as_ref().is_some_and(|socket| {
-                socket.state == TcpState::Listen
-                    && socket.local_port == local_port
-                    && (socket.local_address == local_address
-                        || socket.local_address == Ipv4Address([0; 4])
-                        || local_address == Ipv4Address([0; 4]))
-            })
-        }) {
+        if self.listener_conflicts(local_address, local_port) {
             return Err(Error::Exist);
         }
         let (index, generation) = self.allocate_slot()?;
@@ -233,24 +400,38 @@ impl TcpSocketTable {
             .try_reserve_exact(socket.backlog)
             .map_err(|_| Error::NoMem)?;
         self.slots[index].socket = Some(socket);
-        Ok(TcpSocketHandle { index, generation })
+        let handle = TcpSocketHandle { index, generation };
+        if let Err(error) = self.add_listener(local_address, local_port, handle) {
+            self.slots[index].socket = None;
+            return Err(error);
+        }
+        Ok(handle)
     }
 
     pub(crate) fn accept(
         &mut self,
         listener: TcpSocketHandle,
     ) -> Result<Option<TcpSocketHandle>, Error> {
-        let socket = self.socket_mut(listener).ok_or(Error::BadFd)?;
-        if socket.state != TcpState::Listen {
-            return Err(Error::Inval);
-        }
-        let Some(child) = socket.accept_queue.pop_front() else {
-            return Ok(None);
-        };
-        if let Some(socket) = self.socket_mut(child) {
+        loop {
+            let child = {
+                let socket = self.socket_mut(listener).ok_or(Error::BadFd)?;
+                if socket.state != TcpState::Listen {
+                    return Err(Error::Inval);
+                }
+                socket.accept_queue.pop_front()
+            };
+            let Some(child) = child else {
+                return Ok(None);
+            };
+            let Some(socket) = self.socket_mut(child) else {
+                continue;
+            };
+            if socket.state == TcpState::Closed {
+                continue;
+            }
             socket.parent_listener = None;
+            return Ok(Some(child));
         }
-        Ok(Some(child))
     }
 
     pub(crate) fn state(&self, handle: TcpSocketHandle) -> Option<TcpState> {
@@ -262,8 +443,13 @@ impl TcpSocketTable {
             return false;
         };
         match socket.state {
-            TcpState::Listen => !socket.accept_queue.is_empty(),
-            TcpState::CloseWait | TcpState::Closed => true,
+            TcpState::Listen => socket.accept_queue.iter().any(|child_handle| {
+                self.socket(*child_handle).is_some_and(|child| {
+                    child.state != TcpState::Closed
+                        && child.parent_listener == Some(handle)
+                })
+            }),
+            TcpState::CloseWait | TcpState::Closing | TcpState::TimeWait | TcpState::Closed => true,
             _ => !socket.receive_buffer.is_empty(),
         }
     }
@@ -350,10 +536,35 @@ impl TcpSocketTable {
     }
 
     pub(crate) fn close(&mut self, handle: TcpSocketHandle, now_ns: u64) -> Result<(), Error> {
+        let index = self.slot_index(handle).ok_or(Error::BadFd)?;
+        let (port, is_listener) = {
+            let socket = self.slots[index].socket.as_ref().ok_or(Error::BadFd)?;
+            (socket.local_port, socket.state == TcpState::Listen)
+        };
         let socket = self.socket_mut(handle).ok_or(Error::BadFd)?;
         socket.orphaned = true;
-        socket.close_deadline_ns = Some(now_ns.saturating_add(TCP_CLOSE_TIMEOUT_NS));
+        let close_timeout = if socket.state == TcpState::TimeWait {
+            TCP_TIME_WAIT_NS
+        } else {
+            TCP_CLOSE_TIMEOUT_NS
+        };
+        socket.close_deadline_ns = Some(now_ns.saturating_add(close_timeout));
         Self::request_close(socket);
+        if is_listener {
+            self.remove_listener(port, handle);
+            for slot in &mut self.slots {
+                let Some(child) = slot.socket.as_mut() else {
+                    continue;
+                };
+                if child.parent_listener == Some(handle) {
+                    child.state = TcpState::Closed;
+                    child.orphaned = true;
+                    child.close_deadline_ns = Some(now_ns);
+                    child.outstanding.clear();
+                    child.outstanding_payload_bytes = 0;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -372,20 +583,46 @@ impl TcpSocketTable {
     }
 
     pub(crate) fn remove(&mut self, handle: TcpSocketHandle) -> bool {
-        let buffered_send_bytes = {
+        let (buffered_send_bytes, flow_key, listener_port, is_listener) = {
             let Some(slot) = self.slots.get_mut(handle.index) else {
                 return false;
             };
             if slot.generation != handle.generation || slot.socket.is_none() {
                 return false;
             }
-            let buffered_send_bytes = slot
-                .socket
-                .as_ref()
-                .map_or(0, |socket| socket.send_buffer.len());
+            let socket = slot.socket.as_ref().unwrap();
+            let buffered_send_bytes = socket.send_buffer.len();
+            let flow_key = (socket.remote_port != 0).then_some(TcpFlowKey {
+                local_address: socket.local_address,
+                remote_address: socket.remote_address,
+                local_port: socket.local_port,
+                remote_port: socket.remote_port,
+            });
+            let listener_port = (socket.state == TcpState::Listen || socket.remote_port == 0)
+                .then_some(socket.local_port);
+            let is_listener = socket.state == TcpState::Listen || socket.remote_port == 0;
             slot.socket = None;
-            buffered_send_bytes
+            (buffered_send_bytes, flow_key, listener_port, is_listener)
         };
+        if let Some(key) = flow_key {
+            self.remove_flow(key, handle);
+        }
+        if let Some(port) = listener_port {
+            self.remove_listener(port, handle);
+        }
+        if is_listener {
+            for slot in &mut self.slots {
+                let Some(child) = slot.socket.as_mut() else {
+                    continue;
+                };
+                if child.parent_listener == Some(handle) {
+                    child.state = TcpState::Closed;
+                    child.orphaned = true;
+                    child.outstanding.clear();
+                    child.outstanding_payload_bytes = 0;
+                }
+            }
+        }
         self.queued_send_bytes = self.queued_send_bytes.saturating_sub(buffered_send_bytes);
         true
     }
@@ -399,10 +636,11 @@ impl TcpSocketTable {
         transmissions
             .try_reserve(self.slots.len())
             .map_err(|_| Error::NoMem)?;
+        let mut removed_indexes = core::mem::take(&mut self.removed_indexes);
         let mut changed = false;
         let mut removed_send_bytes = 0usize;
         let poll_result = (|| -> Result<(), Error> {
-            for slot in &mut self.slots {
+            for (slot_index, slot) in self.slots.iter_mut().enumerate() {
                 let Some(socket) = slot.socket.as_mut() else {
                     continue;
                 };
@@ -415,7 +653,38 @@ impl TcpSocketTable {
                     socket.outstanding.clear();
                     socket.outstanding_payload_bytes = 0;
                 }
+                if socket.state == TcpState::TimeWait
+                    && socket
+                        .close_deadline_ns
+                        .is_some_and(|deadline| now_ns >= deadline)
+                {
+                    socket.state = TcpState::Closed;
+                }
                 if socket.state == TcpState::Closed {
+                    let handle = TcpSocketHandle {
+                        index: slot_index,
+                        generation: slot.generation,
+                    };
+                    let flow_key = if socket.flow_indexed {
+                        socket.flow_indexed = false;
+                        Some(TcpFlowKey {
+                            local_address: socket.local_address,
+                            remote_address: socket.remote_address,
+                            local_port: socket.local_port,
+                            remote_port: socket.remote_port,
+                        })
+                    } else {
+                        None
+                    };
+                    let listener_port = if socket.listener_indexed {
+                        socket.listener_indexed = false;
+                        Some(socket.local_port)
+                    } else {
+                        None
+                    };
+                    if flow_key.is_some() || listener_port.is_some() || socket.orphaned {
+                        removed_indexes.push((handle, flow_key, listener_port));
+                    }
                     if socket.orphaned {
                         removed_send_bytes =
                             removed_send_bytes.saturating_add(socket.send_buffer.len());
@@ -426,6 +695,10 @@ impl TcpSocketTable {
                 if !socket.outstanding.is_empty() && now_ns >= socket.retransmit_at_ns {
                     if socket.retransmissions == MAXIMUM_RETRANSMISSIONS {
                         socket.state = TcpState::Closed;
+                        if socket.parent_listener.is_some() {
+                            socket.orphaned = true;
+                            socket.close_deadline_ns = Some(now_ns);
+                        }
                         socket.outstanding.clear();
                         socket.outstanding_payload_bytes = 0;
                         changed = true;
@@ -504,6 +777,8 @@ impl TcpSocketTable {
                     | TcpState::SynReceived
                     | TcpState::FinWait1
                     | TcpState::FinWait2
+                    | TcpState::Closing
+                    | TcpState::TimeWait
                     | TcpState::LastAck
                     | TcpState::Closed => {}
                 }
@@ -511,6 +786,16 @@ impl TcpSocketTable {
             Ok(())
         })();
         self.queued_send_bytes = self.queued_send_bytes.saturating_sub(removed_send_bytes);
+        for (handle, flow_key, listener_port) in removed_indexes.drain(..) {
+            if let Some(key) = flow_key {
+                self.remove_flow(key, handle);
+            }
+            if let Some(port) = listener_port {
+                self.remove_listener(port, handle);
+            }
+        }
+        removed_indexes.clear();
+        self.removed_indexes = removed_indexes;
         poll_result?;
         Ok(changed)
     }
@@ -524,21 +809,14 @@ impl TcpSocketTable {
         transmissions: &mut Vec<TcpTransmission>,
     ) -> Result<bool, Error> {
         transmissions.try_reserve(1).map_err(|_| Error::NoMem)?;
-        let connection_index = self.slots.iter().position(|slot| {
-            slot.socket.as_ref().is_some_and(|socket| {
-                socket.state != TcpState::Listen
-                    && socket.state != TcpState::Closed
-                    && socket.local_address == destination_address
-                    && socket.remote_address == source_address
-                    && socket.local_port == segment.destination_port
-                    && socket.remote_port == segment.source_port
-            })
-        });
-        if let Some(index) = connection_index {
-            let handle = TcpSocketHandle {
-                index,
-                generation: self.slots[index].generation,
-            };
+        let flow_key = TcpFlowKey {
+            local_address: destination_address,
+            remote_address: source_address,
+            local_port: segment.destination_port,
+            remote_port: segment.source_port,
+        };
+        if let Some(handle) = self.flow_handle(flow_key) {
+            let index = handle.index;
             let mut accepted_listener = None;
             let changed = {
                 let socket = self.slots[index]
@@ -546,7 +824,31 @@ impl TcpSocketTable {
                     .as_mut()
                     .ok_or(Error::Proto)?;
                 if segment.flags & TCP_FLAG_RST != 0 {
+                    let valid_reset = match socket.state {
+                        TcpState::SynSent => {
+                            segment.flags & TCP_FLAG_ACK != 0
+                                && segment.acknowledgment_number == socket.send_next
+                        }
+                        TcpState::SynReceived
+                        | TcpState::Established
+                        | TcpState::FinWait1
+                        | TcpState::FinWait2
+                        | TcpState::CloseWait
+                        | TcpState::Closing
+                        | TcpState::TimeWait
+                        | TcpState::LastAck => {
+                            socket.receive_next == Some(segment.sequence_number)
+                        }
+                        TcpState::Closed | TcpState::Listen => false,
+                    };
+                    if !valid_reset {
+                        return Ok(false);
+                    }
                     socket.state = TcpState::Closed;
+                    if socket.parent_listener.is_some() {
+                        socket.orphaned = true;
+                        socket.close_deadline_ns = Some(now_ns);
+                    }
                     socket.outstanding.clear();
                     socket.outstanding_payload_bytes = 0;
                     return Ok(true);
@@ -574,7 +876,27 @@ impl TcpSocketTable {
                         }
                     }
                     TcpState::SynReceived => {
-                        if segment.flags & TCP_FLAG_ACK == 0
+                        if segment.flags & TCP_FLAG_SYN != 0 {
+                            if let Some(outstanding) = socket
+                                .outstanding
+                                .iter()
+                                .find(|outstanding| outstanding.flags & TCP_FLAG_SYN != 0)
+                            {
+                                transmissions.push(socket.transmission(
+                                    outstanding.sequence_number,
+                                    outstanding.flags,
+                                    &outstanding.payload,
+                                )?);
+                            } else {
+                                transmissions.push(socket.transmission(
+                                    socket.send_next,
+                                    TCP_FLAG_ACK,
+                                    &[],
+                                )?);
+                            }
+                            false
+                        } else if segment.flags & TCP_FLAG_ACK == 0
+                            || socket.receive_next != Some(segment.sequence_number)
                             || segment.acknowledgment_number != socket.send_next
                         {
                             false
@@ -583,6 +905,12 @@ impl TcpSocketTable {
                             socket.peer_window = segment.window;
                             socket.state = TcpState::Established;
                             accepted_listener = socket.parent_listener;
+                            let _segment_changed = Self::receive_connected_segment(
+                                socket,
+                                segment,
+                                now_ns,
+                                transmissions,
+                            )?;
                             true
                         }
                     }
@@ -590,6 +918,8 @@ impl TcpSocketTable {
                     | TcpState::FinWait1
                     | TcpState::FinWait2
                     | TcpState::CloseWait
+                    | TcpState::Closing
+                    | TcpState::TimeWait
                     | TcpState::LastAck => {
                         Self::receive_connected_segment(socket, segment, now_ns, transmissions)?
                     }
@@ -605,20 +935,13 @@ impl TcpSocketTable {
         if segment.flags & TCP_FLAG_SYN == 0 || segment.flags & TCP_FLAG_ACK != 0 {
             return Ok(false);
         }
-        let Some(listener_index) = self.slots.iter().position(|slot| {
-            slot.socket.as_ref().is_some_and(|socket| {
-                socket.state == TcpState::Listen
-                    && socket.local_port == segment.destination_port
-                    && (socket.local_address == destination_address
-                        || socket.local_address == Ipv4Address([0; 4]))
-            })
-        }) else {
+        let Some(listener) = self.listener_handle(destination_address, segment.destination_port) else {
             return Ok(false);
         };
-        let listener = TcpSocketHandle {
-            index: listener_index,
-            generation: self.slots[listener_index].generation,
-        };
+        let listener_index = listener.index;
+        if self.socket(listener).is_none_or(|socket| socket.state != TcpState::Listen) {
+            return Ok(false);
+        }
         let backlog = self.slots[listener_index]
             .socket
             .as_ref()
@@ -651,6 +974,7 @@ impl TcpSocketTable {
         child.parent_listener = Some(listener);
         child.receive_next = Some(segment.sequence_number.wrapping_add(1));
         child.peer_window = segment.window;
+        let transmission_count = transmissions.len();
         child.start_outstanding(
             TCP_FLAG_SYN | TCP_FLAG_ACK,
             &[],
@@ -658,6 +982,23 @@ impl TcpSocketTable {
             transmissions,
         )?;
         self.slots[child_index].socket = Some(child);
+        let child_handle = TcpSocketHandle {
+            index: child_index,
+            generation: child_generation,
+        };
+        if let Err(error) = self.add_flow(
+            TcpFlowKey {
+                local_address: destination_address,
+                remote_address: source_address,
+                local_port: segment.destination_port,
+                remote_port: segment.source_port,
+            },
+            child_handle,
+        ) {
+            self.slots[child_index].socket = None;
+            transmissions.truncate(transmission_count);
+            return Err(error);
+        }
         Ok(true)
     }
 
@@ -666,8 +1007,33 @@ impl TcpSocketTable {
         listener: TcpSocketHandle,
         child: TcpSocketHandle,
     ) -> Result<(), Error> {
-        let socket = self.socket_mut(listener).ok_or(Error::BadFd)?;
-        if socket.state != TcpState::Listen || socket.accept_queue.len() >= socket.backlog {
+        let listener_index = self.slot_index(listener).map_err(|_| Error::BadFd)?;
+        let (before, current_and_after) = self.slots.split_at_mut(listener_index);
+        let (listener_slot, after) = current_and_after.split_first_mut().ok_or(Error::BadFd)?;
+        if listener_slot.generation != listener.generation {
+            return Err(Error::BadFd);
+        }
+        let socket = listener_slot.socket.as_mut().ok_or(Error::BadFd)?;
+        if socket.state != TcpState::Listen {
+            return Err(Error::Inval);
+        }
+        socket.accept_queue.retain(|handle| {
+            let child_slot = if handle.index < listener_index {
+                before.get(handle.index)
+            } else if handle.index > listener_index {
+                after.get(handle.index - listener_index - 1)
+            } else {
+                None
+            };
+            child_slot.is_some_and(|slot| {
+                slot.generation == handle.generation
+                    && slot.socket.as_ref().is_some_and(|child| {
+                        child.state != TcpState::Closed
+                            && child.parent_listener == Some(listener)
+                    })
+            })
+        });
+        if socket.accept_queue.len() >= socket.backlog {
             return Err(Error::NoBufs);
         }
         socket.accept_queue.push_back(child);
@@ -680,8 +1046,41 @@ impl TcpSocketTable {
         now_ns: u64,
         transmissions: &mut Vec<TcpTransmission>,
     ) -> Result<bool, Error> {
+        if segment.flags & TCP_FLAG_SYN != 0 {
+            transmissions.push(socket.transmission(socket.send_next, TCP_FLAG_ACK, &[])?);
+            return Ok(false);
+        }
+        if segment.flags & TCP_FLAG_ACK == 0 {
+            return Ok(false);
+        }
+        if !Self::sequence_is_acceptable(socket, segment) {
+            let duplicate_fin_end = segment
+                .sequence_number
+                .wrapping_add(segment.payload.len() as u32)
+                .wrapping_add(1);
+            if socket.state == TcpState::TimeWait
+                && segment.flags & TCP_FLAG_FIN != 0
+                && socket.receive_next == Some(duplicate_fin_end)
+            {
+                socket.close_deadline_ns = Some(now_ns.saturating_add(TCP_TIME_WAIT_NS));
+            }
+            transmissions.push(socket.transmission(socket.send_next, TCP_FLAG_ACK, &[])?);
+            return Ok(false);
+        }
+        let acceptable_acknowledgment = if segment.flags & TCP_FLAG_ACK != 0 {
+            let acknowledgment_distance =
+                segment.acknowledgment_number.wrapping_sub(socket.send_unacknowledged) as i32;
+            let flight_distance = socket.send_next.wrapping_sub(socket.send_unacknowledged) as i32;
+            if acknowledgment_distance > flight_distance {
+                transmissions.push(socket.transmission(socket.send_next, TCP_FLAG_ACK, &[])?);
+                return Ok(false);
+            }
+            acknowledgment_distance >= 0
+        } else {
+            false
+        };
         let mut changed = false;
-        if segment.flags & TCP_FLAG_ACK != 0 {
+        if acceptable_acknowledgment {
             socket.peer_window = segment.window;
             changed |= socket.acknowledge_outstanding(segment.acknowledgment_number, now_ns);
         }
@@ -689,7 +1088,13 @@ impl TcpSocketTable {
         let fin = segment.flags & TCP_FLAG_FIN != 0;
         if !segment.payload.is_empty() || fin {
             send_ack = true;
-            changed |= Self::receive_sequence(socket, segment.sequence_number, segment.payload, fin)?;
+            changed |= Self::receive_sequence(
+                socket,
+                segment.sequence_number,
+                segment.payload,
+                fin,
+                now_ns,
+            )?;
         }
         if send_ack {
             transmissions.push(socket.transmission(
@@ -701,11 +1106,40 @@ impl TcpSocketTable {
         Ok(changed)
     }
 
+    fn sequence_is_acceptable(socket: &TcpSocket, segment: &TcpSegment<'_>) -> bool {
+        if segment.flags & TCP_FLAG_SYN != 0 {
+            return false;
+        }
+        let Some(expected_sequence) = socket.receive_next else {
+            return false;
+        };
+        let occupied = socket
+            .receive_buffer
+            .len()
+            .saturating_add(socket.out_of_order_bytes);
+        let receive_window = MAX_TCP_RECEIVE_WINDOW.saturating_sub(occupied);
+        let segment_length = segment
+            .payload
+            .len()
+            .saturating_add(usize::from(segment.flags & TCP_FLAG_FIN != 0));
+        let sequence_delta = segment.sequence_number.wrapping_sub(expected_sequence) as i32;
+        if receive_window == 0 {
+            return segment_length == 0 && sequence_delta == 0;
+        }
+        if segment_length == 0 {
+            return sequence_delta >= 0 && (sequence_delta as usize) < receive_window;
+        }
+        let start = i64::from(sequence_delta);
+        let end = start.saturating_add(segment_length as i64);
+        end > 0 && start < receive_window as i64
+    }
+
     fn receive_sequence(
         socket: &mut TcpSocket,
         sequence_number: u32,
         payload: &[u8],
         fin: bool,
+        now_ns: u64,
     ) -> Result<bool, Error> {
         let Some(expected_sequence) = socket.receive_next else {
             return Ok(false);
@@ -753,7 +1187,7 @@ impl TcpSocketTable {
             }
             let mut changed = accepted_length != 0;
             if fin && accepted_length == payload.len() && accepted_length < available {
-                Self::accept_fin(socket);
+                Self::accept_fin(socket, now_ns);
                 return Ok(true);
             }
             changed |= Self::drain_out_of_order(socket)?;
@@ -830,18 +1264,26 @@ impl TcpSocketTable {
             socket.receive_next = Some(expected_sequence.wrapping_add(payload_length as u32));
             changed = true;
             if queued.fin {
-                Self::accept_fin(socket);
+                Self::accept_fin(socket, now_ns);
                 return Ok(true);
             }
         }
         Ok(changed)
     }
 
-    fn accept_fin(socket: &mut TcpSocket) {
+    fn accept_fin(socket: &mut TcpSocket, now_ns: u64) {
         socket.receive_next = socket.receive_next.map(|sequence| sequence.wrapping_add(1));
         socket.state = match socket.state {
             TcpState::Established => TcpState::CloseWait,
-            TcpState::FinWait1 | TcpState::FinWait2 => TcpState::Closed,
+            TcpState::FinWait1 => TcpState::Closing,
+            TcpState::FinWait2 => {
+                socket.close_deadline_ns = Some(now_ns.saturating_add(TCP_TIME_WAIT_NS));
+                TcpState::TimeWait
+            }
+            TcpState::Closing => {
+                socket.close_deadline_ns = Some(now_ns.saturating_add(TCP_TIME_WAIT_NS));
+                TcpState::TimeWait
+            }
             state => state,
         };
         socket.out_of_order.clear();
@@ -898,6 +1340,8 @@ impl TcpSocket {
             retransmissions: 0,
             close_requested: false,
             orphaned: false,
+            flow_indexed: false,
+            listener_indexed: false,
             close_deadline_ns: None,
             parent_listener: None,
             accept_queue: VecDeque::new(),
@@ -1039,6 +1483,10 @@ impl TcpSocket {
         if acknowledged_fin {
             self.state = match self.state {
                 TcpState::FinWait1 => TcpState::FinWait2,
+                TcpState::Closing => {
+                    self.close_deadline_ns = Some(now_ns.saturating_add(TCP_TIME_WAIT_NS));
+                    TcpState::TimeWait
+                }
                 TcpState::LastAck => TcpState::Closed,
                 state => state,
             };
@@ -1086,11 +1534,12 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        TcpSocketTable, TcpState, TcpTransmission, MAX_TCP_SEND_BUFFER_PER_SOCKET,
+        TcpSocket, TcpSocketTable, TcpState, TcpTransmission, MAX_TCP_SEND_BUFFER_PER_SOCKET,
         MAX_TCP_SEND_BUFFER_TOTAL, MAX_TCP_SOCKETS, MAX_TCP_RECEIVE_WINDOW,
     };
     use crate::kernel::net::tcp::segment::{
-        write_segment, TcpSegment, TCP_FLAG_ACK, TCP_FLAG_PSH, TCP_FLAG_SYN, TCP_HEADER_LENGTH,
+        write_segment, TcpSegment, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST,
+        TCP_FLAG_SYN, TCP_HEADER_LENGTH,
     };
     use crate::kernel::net::wire::Ipv4Address;
 
@@ -1153,6 +1602,265 @@ mod tests {
     }
 
     #[test]
+    fn passive_final_ack_payload_is_delivered() {
+        let local = Ipv4Address([192, 0, 2, 1]);
+        let remote = Ipv4Address([192, 0, 2, 2]);
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
+        let listener = sockets.listen(local, 8080, 1, 0).unwrap();
+        let (index, generation) = sockets.allocate_slot().unwrap();
+        let mut child = TcpSocket::new(
+            local,
+            remote,
+            8080,
+            49152,
+            100,
+            TcpState::SynReceived,
+            sockets.maximum_segment_size,
+        )
+        .unwrap();
+        child.parent_listener = Some(listener);
+        child.receive_next = Some(501);
+        let mut transmissions = Vec::new();
+        child
+            .start_outstanding(TCP_FLAG_SYN | TCP_FLAG_ACK, &[], 0, &mut transmissions)
+            .unwrap();
+        sockets.slots[index].socket = Some(child);
+        let child_handle = TcpSocketHandle { index, generation };
+        sockets
+            .add_flow(
+                TcpFlowKey {
+                    local_address: local,
+                    remote_address: remote,
+                    local_port: 8080,
+                    remote_port: 49152,
+                },
+                child_handle,
+            )
+            .unwrap();
+        transmissions.clear();
+
+        let mut bytes = [0; TCP_HEADER_LENGTH + 4];
+        let initial_peer_window = sockets.socket(child_handle).unwrap().peer_window;
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            49152,
+            8080,
+            501,
+            101,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            1,
+            &[],
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        assert!(!sockets
+            .receive_segment(remote, local, &segment, 1, &mut transmissions)
+            .unwrap());
+        assert_eq!(sockets.state(child_handle), Some(TcpState::SynReceived));
+        assert_eq!(
+            sockets.socket(child_handle).unwrap().peer_window,
+            initial_peer_window
+        );
+        assert_eq!(sockets.socket(child_handle).unwrap().outstanding.len(), 1);
+        assert_eq!(transmissions.len(), 1);
+        assert_eq!(transmissions[0].flags, TCP_FLAG_SYN | TCP_FLAG_ACK);
+        transmissions.clear();
+
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            49152,
+            8080,
+            501,
+            101,
+            TCP_FLAG_ACK | TCP_FLAG_PSH,
+            4096,
+            b"data",
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        assert!(sockets
+            .receive_segment(remote, local, &segment, 1, &mut transmissions)
+            .unwrap());
+        let accepted = sockets.accept(listener).unwrap().unwrap();
+        let mut output = [0; 4];
+        assert_eq!(sockets.receive(accepted, &mut output).unwrap(), 4);
+        assert_eq!(&output, b"data");
+
+        let peer_window = sockets.socket(accepted).unwrap().peer_window;
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            49152,
+            8080,
+            505,
+            0,
+            TCP_FLAG_SYN,
+            1,
+            &[],
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        assert!(!sockets
+            .receive_segment(remote, local, &segment, 2, &mut transmissions)
+            .unwrap());
+        assert_eq!(sockets.state(accepted), Some(TcpState::Established));
+        assert_eq!(sockets.socket(accepted).unwrap().peer_window, peer_window);
+        assert_eq!(transmissions.len(), 1);
+        assert_eq!(transmissions[0].flags, TCP_FLAG_ACK);
+        assert_eq!(transmissions[0].acknowledgment_number, 505);
+    }
+
+    #[test]
+    fn simultaneous_close_waits_for_local_fin_ack() {
+        let local = Ipv4Address([192, 0, 2, 1]);
+        let remote = Ipv4Address([192, 0, 2, 2]);
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
+        let handle = sockets
+            .connect_with_initial_sequence(local, remote, 49152, 443, 100)
+            .unwrap();
+        let mut transmissions = Vec::new();
+        {
+            let socket = sockets.socket_mut(handle).unwrap();
+            socket.state = TcpState::FinWait1;
+            socket.receive_next = Some(500);
+            socket
+                .start_outstanding(TCP_FLAG_ACK | TCP_FLAG_FIN, &[], 0, &mut transmissions)
+                .unwrap();
+        }
+        transmissions.clear();
+
+        let mut bytes = [0; TCP_HEADER_LENGTH];
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            443,
+            49152,
+            500,
+            100,
+            TCP_FLAG_ACK | TCP_FLAG_FIN,
+            4096,
+            &[],
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        assert!(sockets
+            .receive_segment(remote, local, &segment, 1, &mut transmissions)
+            .unwrap());
+        assert_eq!(sockets.state(handle), Some(TcpState::Closing));
+        assert_eq!(sockets.socket(handle).unwrap().outstanding.len(), 1);
+
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            443,
+            49152,
+            501,
+            101,
+            TCP_FLAG_ACK,
+            4096,
+            &[],
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        assert!(sockets
+            .receive_segment(remote, local, &segment, 2, &mut transmissions)
+            .unwrap());
+        assert_eq!(sockets.state(handle), Some(TcpState::TimeWait));
+        assert!(sockets.socket(handle).unwrap().outstanding.is_empty());
+        let flow_key = TcpFlowKey {
+            local_address: local,
+            remote_address: remote,
+            local_port: 49152,
+            remote_port: 443,
+        };
+        assert_eq!(sockets.flow_handle(flow_key), Some(handle));
+
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            443,
+            49152,
+            500,
+            101,
+            TCP_FLAG_ACK | TCP_FLAG_FIN,
+            4096,
+            &[],
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        transmissions.clear();
+        assert!(!sockets
+            .receive_segment(remote, local, &segment, 10, &mut transmissions)
+            .unwrap());
+        assert_eq!(transmissions.len(), 1);
+        assert_eq!(transmissions[0].flags, TCP_FLAG_ACK);
+        assert_eq!(
+            sockets.socket(handle).unwrap().close_deadline_ns,
+            Some(60_000_000_010)
+        );
+
+        sockets.poll(60_000_000_009, &mut transmissions).unwrap();
+        assert_eq!(sockets.state(handle), Some(TcpState::TimeWait));
+        sockets.poll(60_000_000_010, &mut transmissions).unwrap();
+        assert_eq!(sockets.state(handle), Some(TcpState::Closed));
+        assert_eq!(sockets.flow_handle(flow_key), None);
+    }
+
+    #[test]
+    fn syn_sent_rejects_rst_with_invalid_acknowledgment() {
+        let local = Ipv4Address([192, 0, 2, 1]);
+        let remote = Ipv4Address([192, 0, 2, 2]);
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
+        let initial_sequence = 0x1020_3040;
+        let handle = sockets
+            .connect_with_initial_sequence(local, remote, 49152, 443, initial_sequence)
+            .unwrap();
+        let mut bytes = [0; TCP_HEADER_LENGTH];
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            443,
+            49152,
+            1234,
+            initial_sequence.wrapping_add(2),
+            TCP_FLAG_RST | TCP_FLAG_ACK,
+            4096,
+            &[],
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+
+        assert!(!sockets
+            .receive_segment(remote, local, &segment, 1, &mut transmissions)
+            .unwrap());
+        assert_eq!(sockets.state(handle), Some(TcpState::SynSent));
+    }
+
+    #[test]
+    fn duplicate_live_flow_tuple_is_rejected() {
+        let local = Ipv4Address([192, 0, 2, 1]);
+        let remote = Ipv4Address([192, 0, 2, 2]);
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
+        sockets
+            .connect_with_initial_sequence(local, remote, 49152, 443, 100)
+            .unwrap();
+        assert!(matches!(
+            sockets.connect_with_initial_sequence(local, remote, 49152, 443, 200),
+            Err(crate::kernel::error::Error::AddrInUse)
+        ));
+        assert_eq!(sockets.slots.iter().filter(|slot| slot.socket.is_some()).count(), 1);
+    }
+
+    #[test]
     fn stale_socket_handle_is_rejected() {
         let local = Ipv4Address([192, 0, 2, 1]);
         let remote = Ipv4Address([192, 0, 2, 2]);
@@ -1162,6 +1870,192 @@ mod tests {
             .unwrap();
         assert!(sockets.remove(handle));
         assert_eq!(sockets.state(handle), None);
+    }
+
+    #[test]
+    fn reset_unaccepted_child_is_reaped_and_skipped_by_accept() {
+        let local = Ipv4Address([192, 0, 2, 1]);
+        let remote = Ipv4Address([192, 0, 2, 2]);
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
+        let listener = sockets.listen(local, 8080, 1, 0).unwrap();
+        let (index, generation) = sockets.allocate_slot().unwrap();
+        let mut child = TcpSocket::new(
+            local,
+            remote,
+            8080,
+            49152,
+            100,
+            TcpState::Established,
+            sockets.maximum_segment_size,
+        )
+        .unwrap();
+        child.parent_listener = Some(listener);
+        child.receive_next = Some(101);
+        sockets.slots[index].socket = Some(child);
+        let child_handle = TcpSocketHandle { index, generation };
+        sockets
+            .add_flow(
+                TcpFlowKey {
+                    local_address: local,
+                    remote_address: remote,
+                    local_port: 8080,
+                    remote_port: 49152,
+                },
+                child_handle,
+            )
+            .unwrap();
+        sockets.enqueue_accepted(listener, child_handle).unwrap();
+
+        let mut bytes = [0; TCP_HEADER_LENGTH];
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            49152,
+            8080,
+            101,
+            0,
+            TCP_FLAG_RST,
+            4096,
+            &[],
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        let mut transmissions = Vec::new();
+        assert!(sockets
+            .receive_segment(remote, local, &segment, 10, &mut transmissions)
+            .unwrap());
+        sockets.poll(10, &mut transmissions).unwrap();
+
+        assert_eq!(sockets.state(child_handle), None);
+        assert!(!sockets.readable(listener));
+        let (next_index, next_generation) = sockets.allocate_slot().unwrap();
+        let mut next_child = TcpSocket::new(
+            local,
+            remote,
+            8080,
+            49153,
+            200,
+            TcpState::Established,
+            sockets.maximum_segment_size,
+        )
+        .unwrap();
+        next_child.parent_listener = Some(listener);
+        sockets.slots[next_index].socket = Some(next_child);
+        let next_handle = TcpSocketHandle {
+            index: next_index,
+            generation: next_generation,
+        };
+        sockets
+            .add_flow(
+                TcpFlowKey {
+                    local_address: local,
+                    remote_address: remote,
+                    local_port: 8080,
+                    remote_port: 49153,
+                },
+                next_handle,
+            )
+            .unwrap();
+        sockets.enqueue_accepted(listener, next_handle).unwrap();
+        assert_eq!(sockets.accept(listener).unwrap(), Some(next_handle));
+    }
+
+    #[test]
+    fn out_of_window_segment_and_future_ack_do_not_mutate_socket_state() {
+        let local = Ipv4Address([192, 0, 2, 1]);
+        let remote = Ipv4Address([192, 0, 2, 2]);
+        let mut sockets = TcpSocketTable::new(1500).unwrap();
+        let handle = sockets
+            .connect_with_initial_sequence(local, remote, 49152, 443, 100)
+            .unwrap();
+        let mut initial_transmissions = Vec::new();
+        {
+            let socket = sockets.socket_mut(handle).unwrap();
+            socket.state = TcpState::Established;
+            socket.receive_next = Some(1000);
+            socket.peer_window = 4096;
+            socket
+                .start_outstanding(
+                    TCP_FLAG_ACK | TCP_FLAG_PSH,
+                    b"x",
+                    0,
+                    &mut initial_transmissions,
+                )
+                .unwrap();
+        }
+        let acknowledgment_number = sockets.socket(handle).unwrap().send_next;
+        let mut bytes = [0; TCP_HEADER_LENGTH + 1];
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            443,
+            49152,
+            1000,
+            acknowledgment_number,
+            TCP_FLAG_PSH,
+            8192,
+            b"x",
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        let mut transmissions = Vec::new();
+        assert!(!sockets
+            .receive_segment(remote, local, &segment, 1, &mut transmissions)
+            .unwrap());
+        assert_eq!(sockets.socket(handle).unwrap().peer_window, 4096);
+        assert!(sockets.socket(handle).unwrap().receive_buffer.is_empty());
+
+        let mut bytes = [0; TCP_HEADER_LENGTH];
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            443,
+            49152,
+            1000 + MAX_TCP_RECEIVE_WINDOW as u32,
+            acknowledgment_number,
+            TCP_FLAG_ACK,
+            8192,
+            &[],
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+
+        assert!(!sockets
+            .receive_segment(remote, local, &segment, 1, &mut transmissions)
+            .unwrap());
+        let socket = sockets.socket(handle).unwrap();
+        assert_eq!(socket.peer_window, 4096);
+        assert_eq!(socket.outstanding.len(), 1);
+
+        transmissions.clear();
+        let length = write_segment(
+            &mut bytes,
+            remote,
+            local,
+            443,
+            49152,
+            1000,
+            acknowledgment_number.wrapping_add(1),
+            TCP_FLAG_ACK,
+            8192,
+            &[],
+        )
+        .unwrap();
+        let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        assert!(!sockets
+            .receive_segment(remote, local, &segment, 2, &mut transmissions)
+            .unwrap());
+        let socket = sockets.socket(handle).unwrap();
+        assert_eq!(socket.peer_window, 4096);
+        assert_eq!(socket.outstanding.len(), 1);
+        assert_eq!(socket.send_unacknowledged, 100);
+        assert_eq!(transmissions.len(), 1);
+        assert_eq!(transmissions[0].flags, TCP_FLAG_ACK);
+        assert_eq!(transmissions[0].sequence_number, acknowledgment_number);
+        assert_eq!(transmissions[0].acknowledgment_number, 1000);
     }
 
     #[test]

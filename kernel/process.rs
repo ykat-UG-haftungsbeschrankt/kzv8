@@ -161,6 +161,7 @@ impl CapabilitySlot {
 
 struct CapabilityTable {
     slots: Vec<CapabilitySlot>,
+    free_slots: Vec<usize>,
 }
 
 impl CapabilityTable {
@@ -170,22 +171,23 @@ impl CapabilityTable {
             .try_reserve_exact(INITIAL_CAPABILITY_SLOTS)
             .map_err(|_| Error::NoMem)?;
         slots.resize_with(INITIAL_CAPABILITY_SLOTS, CapabilitySlot::empty);
-        Ok(Self { slots })
+        let mut free_slots = Vec::new();
+        free_slots
+            .try_reserve_exact(INITIAL_CAPABILITY_SLOTS)
+            .map_err(|_| Error::NoMem)?;
+        free_slots.extend((0..INITIAL_CAPABILITY_SLOTS).rev());
+        Ok(Self { slots, free_slots })
     }
 
     fn insert(&mut self, capability: Capability) -> Result<CapabilityHandle, Error> {
-        let index = if let Some(index) = self
-            .slots
-            .iter()
-            .position(|slot| slot.capability.is_none())
-        {
-            index
-        } else {
+        if self.free_slots.is_empty() {
             self.slots.try_reserve(1).map_err(|_| Error::NoMem)?;
+            self.free_slots.try_reserve(1).map_err(|_| Error::NoMem)?;
             let index = self.slots.len();
             self.slots.push(CapabilitySlot::empty());
-            index
-        };
+            self.free_slots.push(index);
+        }
+        let index = self.free_slots.pop().ok_or(Error::Proto)?;
         let slot = &mut self.slots[index];
         let generation = slot.generation.wrapping_add(1).max(1);
         let handle = CapabilityHandle::new(index, generation)?;
@@ -209,7 +211,10 @@ impl CapabilityTable {
         if slot.generation != generation {
             return Err(Error::Badf);
         }
-        slot.capability.take().ok_or(Error::Badf)
+        self.free_slots.try_reserve(1).map_err(|_| Error::NoMem)?;
+        let capability = slot.capability.take().ok_or(Error::Badf)?;
+        self.free_slots.push(index);
+        Ok(capability)
     }
 }
 
@@ -642,6 +647,20 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(table.slots.len(), 4100);
+    }
+
+    #[test]
+    fn capability_table_reuses_removed_slot_with_new_generation() {
+        let (endpoint, _receiver) = Endpoint::channel(1).unwrap();
+        let mut table = CapabilityTable::new().unwrap();
+        let first = table
+            .insert(Capability::Endpoint(endpoint.clone()))
+            .unwrap();
+        let removed = table.remove(first).unwrap();
+        drop(removed);
+        let second = table.insert(Capability::Endpoint(endpoint)).unwrap();
+        assert_eq!(first.raw() as u32, second.raw() as u32);
+        assert_ne!(first, second);
     }
 
     #[test]

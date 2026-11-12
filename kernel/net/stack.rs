@@ -2,7 +2,21 @@
  * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
  *
  * Permission for non-commercial use is hereby granted,
- * free of charge, without warranty of any kind.
+            let Some(index) = self
+                .tunnel_peers
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, peer)| peer.expires_at_ns)
+                .map(|(index, _)| index)
+            else {
+                return false;
+            };
+            self.tunnel_peers[index] = TunnelPeer {
+                address,
+                device,
+                expires_at_ns,
+            };
+            return true;
  */
 
 use alloc::collections::VecDeque;
@@ -14,21 +28,26 @@ use crate::kernel::event::r#loop::{EventFlags, EventLoop, EventSourceId, EventSo
 use crate::kernel::net::arp::{ArpOperation, ArpPacket, ARP_PACKET_LENGTH};
 use crate::kernel::net::device::EthernetDevice;
 use crate::kernel::net::icmp::{
-    write_destination_unreachable, write_echo_reply, write_time_exceeded,
+    write_destination_unreachable, write_echo_reply, write_fragmentation_needed,
+    write_time_exceeded,
 };
+use crate::kernel::net::ipv4_fragments::Ipv4FragmentReassembler;
 use crate::kernel::net::tcp::connection::{TcpSocketTable, TcpTransmission};
 use crate::kernel::net::tcp::segment::{write_segment, TcpSegment};
 use crate::kernel::net::udp::{
     write_datagram, UdpDatagram, UdpSocketTable, UdpTransmission, UDP_HEADER_LENGTH,
 };
 use crate::kernel::net::wire::{
-    rewrite_forwarded_ipv4_header, write_ethernet_header, write_ipv4_header, EthernetFrame,
+    fragment_ipv4_packet, rewrite_forwarded_ipv4_header, write_ethernet_header, write_ipv4_header, EthernetFrame,
     Ipv4Address, MacAddress, Ipv4Packet,
     ETHERNET_HEADER_LENGTH, ETHER_TYPE_ARP, ETHER_TYPE_IPV4, IPV4_MINIMUM_HEADER_LENGTH,
     IPV4_PROTOCOL_ICMP, IPV4_PROTOCOL_TCP, IPV4_PROTOCOL_UDP,
 };
 use crate::kernel::vfs::plugin::tun::{self, TunDevice, TunTapMode};
 
+// Supported networking is Ethernet/ARP with IPv4, TCP, UDP, and ICMP echo/errors.
+// Local IPv4 fragments are reassembled; forwarded fragments remain fragmented.
+// IPv6, DHCP/DNS services, NAT, and raw sockets are outside this contract.
 pub(crate) const NETWORK_EVENT_SOURCE: EventSourceId = EventSourceId::new(1);
 const INITIAL_ROUTE_CAPACITY: usize = 2;
 const INITIAL_RECEIVE_BUDGET: usize = 16;
@@ -37,6 +56,10 @@ const MAX_PENDING_ROUTE_ENTRIES: usize = 256;
 const MAX_PENDING_ROUTE_BYTES: usize = 1024 * 1024;
 const MAX_NEIGHBORS: usize = 256;
 const MAX_TUNNEL_PEERS: usize = 256;
+const TUN_INTERFACE_MTU: usize = 1500;
+const ARP_RETRY_INTERVAL_NS: u64 = 1_000_000_000;
+const MAX_ARP_RETRY_INTERVAL_NS: u64 = 8_000_000_000;
+const MAX_ARP_REQUEST_ATTEMPTS: u8 = 5;
 const NEIGHBOR_LIFETIME_NS: u64 = 60_000_000_000;
 const INITIAL_TTL: u8 = 64;
 const INITIAL_LOCAL_ADDRESS: Ipv4Address = Ipv4Address([10, 0, 2, 15]);
@@ -56,6 +79,12 @@ struct TunnelPeer {
     expires_at_ns: u64,
 }
 
+struct PendingArpRequest {
+    address: Ipv4Address,
+    next_attempt_ns: u64,
+    attempts: u8,
+}
+
 #[derive(Clone)]
 struct Ipv4Route {
     network: Ipv4Address,
@@ -65,7 +94,7 @@ struct Ipv4Route {
 }
 
 struct Ipv4RouteTable {
-    routes: Vec<Ipv4Route>,
+    by_prefix: Vec<Vec<Ipv4Route>>,
 }
 
 impl Ipv4RouteTable {
@@ -74,21 +103,17 @@ impl Ipv4RouteTable {
         prefix_length: u8,
         default_gateway: Ipv4Address,
     ) -> Option<Self> {
-        let mut routes = Vec::new();
-        routes.try_reserve_exact(INITIAL_ROUTE_CAPACITY).ok()?;
-        routes.push(Ipv4Route {
-            network: mask_ipv4(local_address, prefix_length),
-            prefix_length,
-            gateway: None,
-            tunnel: None,
-        });
-        routes.push(Ipv4Route {
-            network: Ipv4Address([0; 4]),
-            prefix_length: 0,
-            gateway: Some(default_gateway),
-            tunnel: None,
-        });
-        Some(Self { routes })
+        let mut by_prefix = Vec::new();
+        by_prefix.try_reserve_exact(33).ok()?;
+        for _ in 0..=32 {
+            let mut routes = Vec::new();
+            routes.try_reserve_exact(INITIAL_ROUTE_CAPACITY).ok()?;
+            by_prefix.push(routes);
+        }
+        let mut table = Self { by_prefix };
+        table.add(local_address, prefix_length, None).ok()?;
+        table.add(Ipv4Address([0; 4]), 0, Some(default_gateway)).ok()?;
+        Some(table)
     }
 
     fn add(
@@ -100,24 +125,37 @@ impl Ipv4RouteTable {
         if prefix_length > 32 {
             return Err(Error::Inval);
         }
-        let network = mask_ipv4(network, prefix_length);
-        if let Some(route) = self
-            .routes
-            .iter_mut()
-            .find(|route| route.network == network && route.prefix_length == prefix_length)
-        {
-            route.gateway = gateway;
-            route.tunnel = None;
-            return Ok(());
-        }
-        self.routes.try_reserve(1).map_err(|_| Error::NoMem)?;
-        self.routes.push(Ipv4Route {
-            network,
+        self.upsert(Ipv4Route {
+            network: mask_ipv4(network, prefix_length),
             prefix_length,
             gateway,
             tunnel: None,
-        });
+        })
+    }
+
+    fn upsert(&mut self, route: Ipv4Route) -> Result<(), Error> {
+        let routes = self
+            .by_prefix
+            .get_mut(usize::from(route.prefix_length))
+            .ok_or(Error::Inval)?;
+        match routes.binary_search_by_key(&route.network, |entry| entry.network) {
+            Ok(index) => routes[index] = route,
+            Err(index) => {
+                routes.try_reserve(1).map_err(|_| Error::NoMem)?;
+                routes.insert(index, route);
+            }
+        }
         Ok(())
+    }
+
+    fn remove_exact(
+        &mut self,
+        network: Ipv4Address,
+        prefix_length: u8,
+    ) -> Option<Ipv4Route> {
+        let routes = self.by_prefix.get_mut(usize::from(prefix_length))?;
+        let index = routes.binary_search_by_key(&network, |route| route.network).ok()?;
+        Some(routes.remove(index))
     }
 
     fn update_connected_route(
@@ -132,18 +170,14 @@ impl Ipv4RouteTable {
         if old_network == new_network && old_prefix_length == new_prefix_length {
             return Ok(());
         }
-        self.add(new_network, new_prefix_length, None)?;
-        if let Some(index) = self.routes.iter().position(|route| {
-            route.network == old_network
-                && route.prefix_length == old_prefix_length
-                && route.gateway.is_none()
-                && route.tunnel.is_none()
-        }) {
-            if self.routes[index].network != new_network
-                || self.routes[index].prefix_length != new_prefix_length
-            {
-                self.routes.remove(index);
-            }
+        let old_connected_route = self
+            .by_prefix
+            .get(usize::from(old_prefix_length))
+            .and_then(|routes| routes.binary_search_by_key(&old_network, |route| route.network).ok().map(|index| &routes[index]))
+            .is_some_and(|route| route.gateway.is_none() && route.tunnel.is_none());
+        self.add(new_address, new_prefix_length, None)?;
+        if old_connected_route {
+            let _removed = self.remove_exact(old_network, old_prefix_length);
         }
         Ok(())
     }
@@ -162,23 +196,12 @@ impl Ipv4RouteTable {
             return Err(Error::Inval);
         }
         let network = mask_ipv4(network, prefix_length);
-        if let Some(route) = self
-            .routes
-            .iter_mut()
-            .find(|route| route.network == network && route.prefix_length == prefix_length)
-        {
-            route.gateway = None;
-            route.tunnel = Some(device);
-            return Ok(());
-        }
-        self.routes.try_reserve(1).map_err(|_| Error::NoMem)?;
-        self.routes.push(Ipv4Route {
+        self.upsert(Ipv4Route {
             network,
             prefix_length,
             gateway: None,
             tunnel: Some(device),
-        });
-        Ok(())
+        })
     }
 
     fn remove(&mut self, network: Ipv4Address, prefix_length: u8) -> Result<(), Error> {
@@ -186,60 +209,78 @@ impl Ipv4RouteTable {
             return Err(Error::Inval);
         }
         let network = mask_ipv4(network, prefix_length);
-        let index = self
-            .routes
-            .iter()
-            .position(|route| route.network == network && route.prefix_length == prefix_length)
-            .ok_or(Error::NoEnt)?;
-        self.routes.remove(index);
-        Ok(())
+        self.remove_exact(network, prefix_length)
+            .map(|_| ())
+            .ok_or(Error::NoEnt)
     }
 
     fn next_hop(&self, destination: Ipv4Address) -> Option<Ipv4Address> {
-        self.routes
-            .iter()
-            .filter(|route| mask_ipv4(destination, route.prefix_length) == route.network)
-            .max_by_key(|route| route.prefix_length)
-            .filter(|route| route.tunnel.is_none())
-            .map(|route| route.gateway.unwrap_or(destination))
+        for prefix_length in (0..=32).rev() {
+            let network = mask_ipv4(destination, prefix_length);
+            let routes = &self.by_prefix[usize::from(prefix_length)];
+            if let Ok(index) = routes.binary_search_by_key(&network, |route| route.network) {
+                let route = &routes[index];
+                return route.tunnel.is_none().then_some(route.gateway.unwrap_or(destination));
+            }
+        }
+        None
     }
 
     fn tunnel_device(&self, destination: Ipv4Address) -> Option<Arc<TunDevice>> {
-        self.routes
-            .iter()
-            .filter(|route| mask_ipv4(destination, route.prefix_length) == route.network)
-            .max_by_key(|route| route.prefix_length)
-            .and_then(|route| {
-                route
+        for prefix_length in (0..=32).rev() {
+            let network = mask_ipv4(destination, prefix_length);
+            let routes = &self.by_prefix[usize::from(prefix_length)];
+            if let Ok(index) = routes.binary_search_by_key(&network, |route| route.network) {
+                return routes[index]
                     .tunnel
                     .as_ref()
                     .filter(|device| device.is_up())
-                    .map(Arc::clone)
-            })
+                    .map(Arc::clone);
+            }
+        }
+        None
+    }
+
+    fn uses_tunnel(&self, destination: Ipv4Address) -> bool {
+        for prefix_length in (0..=32).rev() {
+            let network = mask_ipv4(destination, prefix_length);
+            let routes = &self.by_prefix[usize::from(prefix_length)];
+            if let Ok(index) = routes.binary_search_by_key(&network, |route| route.network) {
+                return routes[index].tunnel.is_some();
+            }
+        }
+        false
     }
 
     fn is_broadcast_address(&self, address: Ipv4Address) -> bool {
-        address == Ipv4Address([255; 4])
-            || self.routes.iter().any(|route| {
-                if route.gateway.is_some() || route.tunnel.is_some() || route.prefix_length == 32 {
-                    return false;
-                }
-                let mask = mask_ipv4(Ipv4Address([255; 4]), route.prefix_length);
-                route
-                    .network
-                    .0
-                    .iter()
-                    .zip(mask.0)
-                    .zip(address.0)
-                    .all(|((&network_octet, mask_octet), address_octet)| {
-                        address_octet == (network_octet | !mask_octet)
-                    })
-            })
+        if address == Ipv4Address([255; 4]) {
+            return true;
+        }
+        for prefix_length in (0..=32).rev() {
+            let network = mask_ipv4(address, prefix_length);
+            let routes = &self.by_prefix[usize::from(prefix_length)];
+            let Ok(index) = routes.binary_search_by_key(&network, |route| route.network) else {
+                continue;
+            };
+            let route = &routes[index];
+            if prefix_length >= 31 || route.gateway.is_some() {
+                return false;
+            }
+            let mask = mask_ipv4(Ipv4Address([255; 4]), prefix_length);
+            let broadcast = Ipv4Address(core::array::from_fn(|octet| {
+                route.network.0[octet] | !mask.0[octet]
+            }));
+            if broadcast == address {
+                return true;
+            }
+        }
+        false
     }
 }
 
 struct PendingIpv4Transmission {
     next_hop: Ipv4Address,
+    destination: Ipv4Address,
     packet: Vec<u8>,
 }
 
@@ -274,12 +315,12 @@ pub(crate) struct NetStack {
     local_prefix_length: u8,
     default_ttl: u8,
     receive_budget: usize,
+    fragment_reassembler: Ipv4FragmentReassembler,
     neighbors: Vec<NeighborEntry>,
     tunnel_peers: Vec<TunnelPeer>,
+    arp_requests: Vec<PendingArpRequest>,
     routes: Ipv4RouteTable,
     ipv4_forwarding_enabled: bool,
-    pending_transmissions: VecDeque<TcpTransmission>,
-    pending_udp_transmissions: VecDeque<UdpTransmission>,
     pending_ipv4_transmissions: VecDeque<PendingIpv4Transmission>,
     pending_route_bytes: usize,
     next_ipv4_identification: u16,
@@ -297,14 +338,8 @@ impl NetStack {
         neighbors.try_reserve_exact(INITIAL_PENDING_CAPACITY).ok()?;
         let mut tunnel_peers = Vec::new();
         tunnel_peers.try_reserve_exact(INITIAL_PENDING_CAPACITY).ok()?;
-        let mut pending_transmissions = VecDeque::new();
-        pending_transmissions
-            .try_reserve_exact(INITIAL_PENDING_CAPACITY)
-            .ok()?;
-        let mut pending_udp_transmissions = VecDeque::new();
-        pending_udp_transmissions
-            .try_reserve_exact(INITIAL_PENDING_CAPACITY)
-            .ok()?;
+        let mut arp_requests = Vec::new();
+        arp_requests.try_reserve_exact(MAX_PENDING_ROUTE_ENTRIES).ok()?;
         let mut pending_ipv4_transmissions = VecDeque::new();
         pending_ipv4_transmissions
             .try_reserve_exact(INITIAL_PENDING_CAPACITY)
@@ -321,16 +356,16 @@ impl NetStack {
             local_prefix_length,
             default_ttl: INITIAL_TTL,
             receive_budget: INITIAL_RECEIVE_BUDGET,
+            fragment_reassembler: Ipv4FragmentReassembler::new(),
             neighbors,
             tunnel_peers,
+            arp_requests,
             routes: Ipv4RouteTable::new(
                 local_address,
                 local_prefix_length,
                 INITIAL_DEFAULT_GATEWAY,
             )?,
             ipv4_forwarding_enabled: false,
-            pending_transmissions,
-            pending_udp_transmissions,
             pending_ipv4_transmissions,
             pending_route_bytes: 0,
             next_ipv4_identification: 1,
@@ -368,10 +403,15 @@ impl NetStack {
             ) else {
                 break;
             };
+            if length == 0 {
+                continue;
+            }
             changed |= self.process_frame(&input[..length], now_ns);
         }
         self.expire_neighbors(now_ns);
         self.expire_tunnel_peers(now_ns);
+        self.fragment_reassembler.expire(now_ns);
+        self.retry_pending_arp_requests(now_ns);
 
         let mut transmissions = Vec::new();
         if self
@@ -384,8 +424,6 @@ impl NetStack {
         for transmission in transmissions {
             self.queue_tcp_transmission(transmission, now_ns);
         }
-        self.flush_pending_transmissions(now_ns);
-        self.flush_pending_udp_transmissions(now_ns);
         self.flush_pending_ipv4_transmissions(now_ns);
         self.flush_host_transmissions();
         if changed {
@@ -504,7 +542,7 @@ impl NetStack {
         };
         let mut changed = false;
         for device in devices {
-            if !device.is_configured() || device.mode() != TunTapMode::Tun {
+            if !device.is_configured() || !device.is_up() || device.mode() != TunTapMode::Tun {
                 continue;
             }
             for _ in 0..receive_budget {
@@ -521,20 +559,56 @@ impl NetStack {
         let Ok(packet) = Ipv4Packet::parse(bytes) else {
             return false;
         };
+        self.process_ipv4_packet(&packet, now_ns, None, Some(device))
+    }
+
+    fn process_ipv4_packet(
+        &mut self,
+        packet: &Ipv4Packet<'_>,
+        now_ns: u64,
+        ethernet_source: Option<MacAddress>,
+        tunnel: Option<&Arc<TunDevice>>,
+    ) -> bool {
+        if let Some(mac_address) = ethernet_source {
+            self.remember_neighbor(packet.source, mac_address, now_ns);
+        }
+        if let Some(device) = tunnel {
+            if !self.remember_tunnel_peer(packet.source, Arc::clone(device), now_ns) {
+                return false;
+            }
+        }
         let local_destination = self.is_local_ipv4_address(packet.destination)
             || (packet.protocol == IPV4_PROTOCOL_UDP
                 && self.is_broadcast_address(packet.destination));
+        let response_source = if self.is_local_ipv4_address(packet.destination) {
+            packet.destination
+        } else {
+            self.local_address
+        };
         if !local_destination {
-            self.remember_tunnel_peer(packet.source, Arc::clone(device), now_ns);
-            let ingress_address = device
-                .ipv4_configuration()
+            let ingress_address = tunnel
+                .and_then(|device| device.ipv4_configuration())
                 .map_or(self.local_address, |(address, _)| address);
-            return self.forward_ipv4_packet(&packet, now_ns, ingress_address);
+            return self.forward_ipv4_packet(packet, now_ns, ingress_address);
         }
         if packet.more_fragments || packet.fragment_offset != 0 {
-            return false;
+            let Ok(Some(reassembled)) = self.fragment_reassembler.insert(packet, now_ns) else {
+                return false;
+            };
+            let Ok(packet) = Ipv4Packet::parse(&reassembled) else {
+                return false;
+            };
+            return self.dispatch_local_ipv4(&packet, now_ns, response_source);
         }
-        self.remember_tunnel_peer(packet.source, Arc::clone(device), now_ns);
+        self.dispatch_local_ipv4(packet, now_ns, response_source)
+    }
+
+    fn dispatch_local_ipv4(
+        &mut self,
+        packet: &Ipv4Packet<'_>,
+        now_ns: u64,
+        response_source: Ipv4Address,
+    ) -> bool {
         if packet.protocol == IPV4_PROTOCOL_UDP {
             let Ok(datagram) = UdpDatagram::parse(packet.payload, packet.source, packet.destination)
             else {
@@ -546,29 +620,10 @@ impl NetStack {
                 .unwrap_or(false);
         }
         if packet.protocol == IPV4_PROTOCOL_ICMP {
-            let Some(mut response) = allocate_zeroed(self.frame_size) else {
-                return false;
-            };
-            let Ok(icmp_length) = write_echo_reply(packet.payload, &mut response[20..]) else {
-                return false;
-            };
-            let Ok(ipv4_length) = write_ipv4_header(
-                &mut response,
-                self.local_address,
-                packet.source,
-                IPV4_PROTOCOL_ICMP,
-                self.default_ttl,
-                self.next_ipv4_identification,
-                0,
-                icmp_length,
-            ) else {
-                return false;
-            };
-            self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
-            let _ = device.inject_packet(&response[..ipv4_length]);
-            return true;
+            return self.send_icmp_echo_reply(packet, response_source, now_ns);
         }
         if packet.protocol != IPV4_PROTOCOL_TCP {
+            self.send_icmp_error(packet, response_source, now_ns, false, 2);
             return false;
         }
         let Ok(segment) = TcpSegment::parse(packet.payload, packet.source, packet.destination)
@@ -587,7 +642,7 @@ impl NetStack {
             )
             .unwrap_or(false);
         for transmission in transmissions {
-            self.transmit_tcp_tun(transmission, device);
+            self.queue_tcp_transmission(transmission, now_ns);
         }
         changed
     }
@@ -616,7 +671,6 @@ impl NetStack {
         let replied = packet.operation == ArpOperation::Request
             && is_local_address
             && self.send_arp_reply(packet.sender_mac, packet.sender_ipv4, packet.target_ipv4);
-        self.flush_pending_transmissions(now_ns);
         replied
     }
 
@@ -624,88 +678,7 @@ impl NetStack {
         let Ok(packet) = Ipv4Packet::parse(frame.payload) else {
             return false;
         };
-        let local_destination = self.is_local_ipv4_address(packet.destination)
-            || (packet.protocol == IPV4_PROTOCOL_UDP
-                && self.is_broadcast_address(packet.destination));
-        if !local_destination {
-            self.remember_neighbor(packet.source, frame.source, now_ns);
-            return self.forward_ipv4_packet(&packet, now_ns, self.local_address);
-        }
-        if packet.more_fragments || packet.fragment_offset != 0 {
-            return false;
-        }
-        self.remember_neighbor(packet.source, frame.source, now_ns);
-        if packet.protocol == IPV4_PROTOCOL_UDP {
-            let Ok(datagram) = UdpDatagram::parse(packet.payload, packet.source, packet.destination)
-            else {
-                return false;
-            };
-            return self
-                .udp_sockets
-                .receive_datagram(packet.source, packet.destination, &datagram)
-                .unwrap_or(false);
-        }
-        if packet.protocol == IPV4_PROTOCOL_ICMP {
-            let Some(mut frame_bytes) = allocate_zeroed(self.frame_size) else {
-                return false;
-            };
-            let icmp_offset = ETHERNET_HEADER_LENGTH + IPV4_MINIMUM_HEADER_LENGTH;
-            let Ok(icmp_length) = write_echo_reply(
-                packet.payload,
-                &mut frame_bytes[icmp_offset..],
-            ) else {
-                return false;
-            };
-            let Ok(ipv4_length) = write_ipv4_header(
-                &mut frame_bytes[ETHERNET_HEADER_LENGTH..],
-                self.local_address,
-                packet.source,
-                IPV4_PROTOCOL_ICMP,
-                self.default_ttl,
-                self.next_ipv4_identification,
-                0,
-                icmp_length,
-            ) else {
-                return false;
-            };
-            self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
-            if write_ethernet_header(
-                &mut frame_bytes[..ETHERNET_HEADER_LENGTH],
-                frame.source,
-                self.mac_address,
-                ETHER_TYPE_IPV4,
-            )
-            .is_err()
-            {
-                return false;
-            }
-            crate::kernel::vm::device::virtio::net::host_transmit_frame(
-                &frame_bytes[..ETHERNET_HEADER_LENGTH + ipv4_length],
-            );
-            return true;
-        }
-        if packet.protocol != IPV4_PROTOCOL_TCP {
-            return false;
-        }
-        let Ok(segment) = TcpSegment::parse(packet.payload, packet.source, packet.destination)
-        else {
-            return false;
-        };
-        let mut transmissions = Vec::new();
-        let changed = self
-            .tcp_sockets
-            .receive_segment(
-                packet.source,
-                packet.destination,
-                &segment,
-                now_ns,
-                &mut transmissions,
-            )
-            .unwrap_or(false);
-        for transmission in transmissions {
-            self.transmit_tcp(transmission, frame.source);
-        }
-        changed
+        self.process_ipv4_packet(&packet, now_ns, Some(frame.source), None)
     }
 
     fn forward_ipv4_packet(
@@ -714,22 +687,21 @@ impl NetStack {
         now_ns: u64,
         ingress_address: Ipv4Address,
     ) -> bool {
-        if !self.ipv4_forwarding_enabled {
+        if !self.ipv4_forwarding_enabled || self.is_broadcast_address(packet.destination) {
             return false;
         }
+        let may_send_icmp_error = packet.fragment_offset == 0
+            && !(packet.protocol == IPV4_PROTOCOL_ICMP
+                && crate::kernel::net::icmp::is_error_message(packet.payload));
         if packet.ttl <= 1 {
-            self.send_icmp_error(packet, ingress_address, now_ns, true, 0);
+            if may_send_icmp_error {
+                self.send_icmp_error(packet, ingress_address, now_ns, true, 0);
+            }
             return false;
         }
         let Some(packet_length) = packet.header.len().checked_add(packet.payload.len()) else {
             return false;
         };
-        if packet_length > self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH) {
-            if packet.dont_fragment {
-                self.send_icmp_error(packet, ingress_address, now_ns, false, 4);
-            }
-            return false;
-        }
         let mut forwarded_packet = Vec::new();
         if forwarded_packet.try_reserve_exact(packet_length).is_err() {
             return false;
@@ -741,16 +713,20 @@ impl NetStack {
             return false;
         };
         forwarded_packet[header_length..].copy_from_slice(packet.payload);
-        if self.queue_ipv4_packet(packet.destination, forwarded_packet, now_ns) {
-            return true;
+        match self.queue_ipv4_packet(packet.destination, forwarded_packet, now_ns) {
+            Ok(()) => true,
+            Err(Error::NetUnreach) => {
+                if may_send_icmp_error {
+                    self.send_icmp_error(packet, ingress_address, now_ns, false, 0);
+                }
+                false
+            }
+            Err(Error::MsgSize) if packet.dont_fragment && may_send_icmp_error => {
+                self.send_icmp_error(packet, ingress_address, now_ns, false, 4);
+                false
+            }
+            Err(_) => false,
         }
-        if self.tunnel_peer(packet.destination, now_ns).is_none()
-            && self.routes.tunnel_device(packet.destination).is_none()
-            && self.next_hop(packet.destination).is_none()
-        {
-            self.send_icmp_error(packet, ingress_address, now_ns, false, 0);
-        }
-        false
     }
 
     fn send_icmp_error(
@@ -761,9 +737,29 @@ impl NetStack {
         time_exceeded: bool,
         unreachable_code: u8,
     ) {
+        let source = packet.source.0;
+        let destination = packet.destination.0;
+        if packet.fragment_offset != 0
+            || source == [0; 4]
+            || source == [u8::MAX; 4]
+            || (224..=239).contains(&source[0])
+            || (224..=239).contains(&destination[0])
+            || self.is_broadcast_address(packet.source)
+            || self.is_broadcast_address(packet.destination)
+            || (packet.protocol == IPV4_PROTOCOL_ICMP
+                && crate::kernel::net::icmp::is_error_message(packet.payload))
+        {
+            return;
+        }
         let mut icmp = [0; 8 + 60 + 8];
+        let next_hop_mtu = (!time_exceeded && unreachable_code == 4).then(|| {
+            self.egress_mtu(packet.destination, now_ns)
+                .min(usize::from(u16::MAX)) as u16
+        });
         let icmp_length = if time_exceeded {
             write_time_exceeded(packet.header, packet.payload, &mut icmp)
+        } else if let Some(mtu) = next_hop_mtu {
+            write_fragmentation_needed(packet.header, packet.payload, mtu, &mut icmp)
         } else {
             write_destination_unreachable(
                 unreachable_code,
@@ -795,7 +791,12 @@ impl NetStack {
             return;
         }
         response.extend_from_slice(&ip_packet[..ip_length]);
-        let _queued = self.queue_ipv4_packet(packet.source, response, now_ns);
+        let _queued = self.queue_ipv4_packet_from_source(
+            source_address,
+            packet.source,
+            response,
+            now_ns,
+        );
     }
 
     fn queue_ipv4_packet(
@@ -803,121 +804,158 @@ impl NetStack {
         destination: Ipv4Address,
         packet: Vec<u8>,
         now_ns: u64,
-    ) -> bool {
-        if let Some(device) = self.tunnel_peer(destination, now_ns) {
-            return device.inject_packet(&packet).is_ok();
+    ) -> Result<(), Error> {
+        let broadcast = self.is_broadcast_address(destination);
+        if broadcast && destination != Ipv4Address([255; 4]) {
+            if self.routes.uses_tunnel(destination) {
+                let device = self
+                    .routes
+                    .tunnel_device(destination)
+                    .ok_or(Error::NetDown)?;
+                return self.inject_tun_ipv4(&device, &packet);
+            }
         }
-        if let Some(device) = self.routes.tunnel_device(destination) {
-            return device.inject_packet(&packet).is_ok();
+        if !broadcast {
+            if let Some(device) = self.tunnel_peer(destination, now_ns) {
+                return self.inject_tun_ipv4(&device, &packet);
+            }
+            if let Some(device) = self.routes.tunnel_device(destination) {
+                return self.inject_tun_ipv4(&device, &packet);
+            }
         }
-        let Some(next_hop) = self.next_hop(destination) else {
-            return false;
+        let next_hop = if broadcast {
+            None
+        } else {
+            Some(self.next_hop(destination).ok_or(Error::NetUnreach)?)
         };
+        let mtu = self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH);
+        let packets = if packet.len() > mtu {
+            let parsed = Ipv4Packet::parse(&packet).map_err(|_| Error::Proto)?;
+            fragment_ipv4_packet(&parsed, mtu)?
+        } else {
+            let mut packets = Vec::new();
+            packets.try_reserve_exact(1).map_err(|_| Error::NoMem)?;
+            packets.push(packet);
+            packets
+        };
+        if broadcast {
+            for packet in packets {
+                self.transmit_ipv4_packet(&packet, MacAddress::BROADCAST)?;
+            }
+            return Ok(());
+        }
+        let next_hop = next_hop.ok_or(Error::NetUnreach)?;
         if let Some(mac_address) = self.neighbor_mac(next_hop, now_ns) {
-            self.transmit_forwarded_ipv4(&packet, mac_address);
-            return true;
+            for packet in packets {
+                self.transmit_ipv4_packet(&packet, mac_address)?;
+            }
+            return Ok(());
         }
-        if !self.can_queue_pending_route(packet.len()) {
-            return false;
+        let queued_bytes = packets.iter().try_fold(0usize, |total, packet| {
+            total.checked_add(packet.len())
+        }).ok_or(Error::MsgSize)?;
+        if !self.can_queue_pending_route(packets.len(), queued_bytes) {
+            return Err(Error::NoBufs);
         }
-        if self.pending_ipv4_transmissions.try_reserve(1).is_err() {
-            return false;
+        if self.pending_ipv4_transmissions.try_reserve(packets.len()).is_err() {
+            return Err(Error::NoMem);
         }
-        let request_pending = self
-            .pending_ipv4_transmissions
-            .iter()
-            .any(|pending| pending.next_hop == next_hop);
-        let packet_bytes = packet.len();
-        self.pending_ipv4_transmissions
-            .push_back(PendingIpv4Transmission {
+        for packet in packets {
+            self.pending_ipv4_transmissions.push_back(PendingIpv4Transmission {
                 next_hop,
+                destination,
                 packet,
             });
-        self.pending_route_bytes += packet_bytes;
-        if !request_pending {
-            self.send_arp_request(next_hop);
         }
-        true
+        self.pending_route_bytes += queued_bytes;
+        self.request_arp(next_hop, now_ns);
+        Ok(())
     }
 
-    fn transmit_forwarded_ipv4(&mut self, packet: &[u8], destination_mac: MacAddress) {
-        if packet.len() > self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH) {
-            return;
+    fn inject_tun_ipv4(&self, device: &TunDevice, packet: &[u8]) -> Result<(), Error> {
+        if packet.len() <= TUN_INTERFACE_MTU {
+            return device.inject_packet(packet).map_err(|_| Error::Io);
         }
-        let Some(mut frame) = allocate_zeroed(self.frame_size) else {
-            return;
-        };
-        if write_ethernet_header(
-            &mut frame[..ETHERNET_HEADER_LENGTH],
-            destination_mac,
-            self.mac_address,
-            ETHER_TYPE_IPV4,
-        )
-        .is_err()
+        let parsed = Ipv4Packet::parse(packet).map_err(|_| Error::Proto)?;
+        for fragment in fragment_ipv4_packet(&parsed, TUN_INTERFACE_MTU)? {
+            device.inject_packet(&fragment).map_err(|_| Error::Io)?;
+        }
+        Ok(())
+    }
+
+    fn egress_mtu(&self, destination: Ipv4Address, now_ns: u64) -> usize {
+        let broadcast = self.is_broadcast_address(destination);
+        if (broadcast
+            && destination != Ipv4Address([255; 4])
+            && self.routes.tunnel_device(destination).is_some())
+            || (!broadcast
+                && (self.tunnel_peer(destination, now_ns).is_some()
+                    || self.routes.tunnel_device(destination).is_some()))
         {
-            return;
+            TUN_INTERFACE_MTU
+        } else {
+            self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH)
         }
-        frame[ETHERNET_HEADER_LENGTH..ETHERNET_HEADER_LENGTH + packet.len()]
-            .copy_from_slice(packet);
-        crate::kernel::vm::device::virtio::net::host_transmit_frame(
-            &frame[..ETHERNET_HEADER_LENGTH + packet.len()],
-        );
+    }
+
+    fn queue_ipv4_packet_from_source(
+        &mut self,
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        packet: Vec<u8>,
+        now_ns: u64,
+    ) -> Result<(), Error> {
+        if let Some(device) = self.tunnel_device_for_address(source) {
+            return self.inject_tun_ipv4(&device, &packet);
+        }
+        if source != self.local_address {
+            return Err(Error::NetDown);
+        }
+        self.queue_ipv4_packet(destination, packet, now_ns)
     }
 
     fn queue_tcp_transmission(&mut self, transmission: TcpTransmission, now_ns: u64) {
-        if let Some(device) = self.tunnel_peer(transmission.destination_address, now_ns) {
-            self.transmit_tcp_tun(transmission, &device);
-            return;
-        }
-        if let Some(device) = self.routes.tunnel_device(transmission.destination_address) {
-            self.transmit_tcp_tun(transmission, &device);
-            return;
-        }
-        let Some(next_hop) = self.next_hop(transmission.destination_address) else {
+        let Some(mut packet) = allocate_zeroed(
+            self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH),
+        ) else {
             return;
         };
-        if let Some(mac_address) = self.neighbor_mac(next_hop, now_ns) {
-            self.transmit_tcp(transmission, mac_address);
-            return;
-        }
-        let payload_bytes = transmission.payload.len();
-        if !self.can_queue_pending_route(payload_bytes) {
-            return;
-        }
-        let request_pending = self
-            .pending_transmissions
-            .iter()
-            .any(|pending| self.next_hop(pending.destination_address) == Some(next_hop));
-        if self.pending_transmissions.try_reserve(1).is_err() {
-            return;
-        }
-        self.pending_transmissions.push_back(transmission);
-        self.pending_route_bytes += payload_bytes;
-        if !request_pending {
-            self.send_arp_request(next_hop);
-        }
-    }
-
-    fn flush_pending_transmissions(&mut self, now_ns: u64) {
-        let pending_count = self.pending_transmissions.len();
-        for _ in 0..pending_count {
-            let Some(transmission) = self.pending_transmissions.pop_front() else {
-                break;
-            };
-            let payload_bytes = transmission.payload.len();
-            let Some(next_hop) = self.next_hop(transmission.destination_address) else {
-                self.pending_route_bytes =
-                    self.pending_route_bytes.saturating_sub(payload_bytes);
-                continue;
-            };
-            if let Some(mac_address) = self.neighbor_mac(next_hop, now_ns) {
-                self.pending_route_bytes =
-                    self.pending_route_bytes.saturating_sub(payload_bytes);
-                self.transmit_tcp(transmission, mac_address);
-            } else {
-                self.pending_transmissions.push_back(transmission);
-            }
-        }
+        let tcp_length = match write_segment(
+            &mut packet[IPV4_MINIMUM_HEADER_LENGTH..],
+            transmission.source_address,
+            transmission.destination_address,
+            transmission.source_port,
+            transmission.destination_port,
+            transmission.sequence_number,
+            transmission.acknowledgment_number,
+            transmission.flags,
+            transmission.window,
+            &transmission.payload,
+        ) {
+            Ok(length) => length,
+            Err(_) => return,
+        };
+        let ipv4_length = match write_ipv4_header(
+            &mut packet,
+            transmission.source_address,
+            transmission.destination_address,
+            IPV4_PROTOCOL_TCP,
+            self.default_ttl,
+            self.next_ipv4_identification,
+            0,
+            tcp_length,
+        ) {
+            Ok(length) => length,
+            Err(_) => return,
+        };
+        self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
+        packet.truncate(ipv4_length);
+        let _queued = self.queue_ipv4_packet_from_source(
+            transmission.source_address,
+            transmission.destination_address,
+            packet,
+            now_ns,
+        );
     }
 
     pub(crate) fn send_udp(
@@ -928,9 +966,8 @@ impl NetStack {
         payload: &[u8],
         now_ns: u64,
     ) -> Result<usize, Error> {
-        let maximum_payload_length = self
-            .frame_size
-            .saturating_sub(ETHERNET_HEADER_LENGTH + IPV4_MINIMUM_HEADER_LENGTH + UDP_HEADER_LENGTH);
+        let maximum_payload_length = usize::from(u16::MAX)
+            .saturating_sub(IPV4_MINIMUM_HEADER_LENGTH + UDP_HEADER_LENGTH);
         if payload.len() > maximum_payload_length {
             return Err(Error::MsgSize);
         }
@@ -951,111 +988,141 @@ impl NetStack {
         transmission: UdpTransmission,
         now_ns: u64,
     ) -> Result<(), Error> {
-        if let Some(device) = self.routes.tunnel_device(transmission.destination_address) {
-            self.transmit_udp_tun(transmission, &device);
-            return Ok(());
-        }
-        if self.is_broadcast_address(transmission.destination_address) {
-            self.transmit_udp(transmission, MacAddress::BROADCAST);
-            return Ok(());
-        }
-        if let Some(device) = self.tunnel_peer(transmission.destination_address, now_ns) {
-            self.transmit_udp_tun(transmission, &device);
-            return Ok(());
-        }
-        let Some(next_hop) = self.next_hop(transmission.destination_address) else {
-            return Ok(());
-        };
-        if let Some(mac_address) = self.neighbor_mac(next_hop, now_ns) {
-            self.transmit_udp(transmission, mac_address);
-            return Ok(());
-        }
-        let payload_bytes = transmission.payload.len();
-        if !self.can_queue_pending_route(payload_bytes) {
-            return Err(Error::NoBufs);
-        }
-        let request_pending = self
-            .pending_udp_transmissions
-            .iter()
-            .any(|pending| self.next_hop(pending.destination_address) == Some(next_hop));
-        if self.pending_udp_transmissions.try_reserve(1).is_err() {
+        let packet_length = IPV4_MINIMUM_HEADER_LENGTH
+            .checked_add(UDP_HEADER_LENGTH)
+            .and_then(|length| length.checked_add(transmission.payload.len()))
+            .ok_or(Error::MsgSize)?;
+        let Some(mut packet) = allocate_zeroed(packet_length) else {
             return Err(Error::NoMem);
-        }
-        self.pending_udp_transmissions.push_back(transmission);
-        self.pending_route_bytes += payload_bytes;
-        if !request_pending {
-            self.send_arp_request(next_hop);
-        }
-        Ok(())
-    }
-
-    fn flush_pending_udp_transmissions(&mut self, now_ns: u64) {
-        let pending_count = self.pending_udp_transmissions.len();
-        for _ in 0..pending_count {
-            let Some(transmission) = self.pending_udp_transmissions.pop_front() else {
-                break;
-            };
-            let payload_bytes = transmission.payload.len();
-            let Some(next_hop) = self.next_hop(transmission.destination_address) else {
-                self.pending_route_bytes =
-                    self.pending_route_bytes.saturating_sub(payload_bytes);
-                continue;
-            };
-            if let Some(mac_address) = self.neighbor_mac(next_hop, now_ns) {
-                self.pending_route_bytes =
-                    self.pending_route_bytes.saturating_sub(payload_bytes);
-                self.transmit_udp(transmission, mac_address);
-            } else {
-                self.pending_udp_transmissions.push_back(transmission);
-            }
-        }
+        };
+        let udp_length = write_datagram(
+            &mut packet[IPV4_MINIMUM_HEADER_LENGTH..],
+            transmission.source_address,
+            transmission.destination_address,
+            transmission.source_port,
+            transmission.destination_port,
+            &transmission.payload,
+        )
+        .map_err(|_| Error::MsgSize)?;
+        let ipv4_length = write_ipv4_header(
+            &mut packet,
+            transmission.source_address,
+            transmission.destination_address,
+            IPV4_PROTOCOL_UDP,
+            self.default_ttl,
+            self.next_ipv4_identification,
+            0,
+            udp_length,
+        )
+        .map_err(|_| Error::MsgSize)?;
+        self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
+        packet.truncate(ipv4_length);
+        self.queue_ipv4_packet_from_source(
+            transmission.source_address,
+            transmission.destination_address,
+            packet,
+            now_ns,
+        )
     }
 
     fn flush_pending_ipv4_transmissions(&mut self, now_ns: u64) {
         let pending_count = self.pending_ipv4_transmissions.len();
         for _ in 0..pending_count {
-            let Some(pending) = self.pending_ipv4_transmissions.pop_front() else {
+            let Some(mut pending) = self.pending_ipv4_transmissions.pop_front() else {
                 break;
             };
             let packet_bytes = pending.packet.len();
-            if let Some(mac_address) = self.neighbor_mac(pending.next_hop, now_ns) {
+            if self.is_broadcast_address(pending.destination) {
                 self.pending_route_bytes =
                     self.pending_route_bytes.saturating_sub(packet_bytes);
-                self.transmit_forwarded_ipv4(&pending.packet, mac_address);
+                if pending.destination != Ipv4Address([255; 4]) {
+                    if self.routes.uses_tunnel(pending.destination) {
+                        if let Some(device) = self.routes.tunnel_device(pending.destination) {
+                            let _ = self.inject_tun_ipv4(&device, &pending.packet);
+                        }
+                        continue;
+                    }
+                }
+                let _ = self.transmit_ipv4_packet(&pending.packet, MacAddress::BROADCAST);
+                continue;
+            }
+            if let Some(device) = self.tunnel_peer(pending.destination, now_ns) {
+                self.pending_route_bytes =
+                    self.pending_route_bytes.saturating_sub(packet_bytes);
+                let _ = self.inject_tun_ipv4(&device, &pending.packet);
+                continue;
+            }
+            if let Some(device) = self.routes.tunnel_device(pending.destination) {
+                self.pending_route_bytes =
+                    self.pending_route_bytes.saturating_sub(packet_bytes);
+                let _ = self.inject_tun_ipv4(&device, &pending.packet);
+                continue;
+            }
+            let Some(next_hop) = self.next_hop(pending.destination) else {
+                self.pending_route_bytes =
+                    self.pending_route_bytes.saturating_sub(packet_bytes);
+                continue;
+            };
+            pending.next_hop = next_hop;
+            if let Some(mac_address) = self.neighbor_mac(next_hop, now_ns) {
+                self.pending_route_bytes =
+                    self.pending_route_bytes.saturating_sub(packet_bytes);
+                let _ = self.transmit_ipv4_packet(&pending.packet, mac_address);
             } else {
                 self.pending_ipv4_transmissions.push_back(pending);
+                self.request_arp(next_hop, now_ns);
             }
         }
     }
 
-    fn transmit_udp(&mut self, transmission: UdpTransmission, destination_mac: MacAddress) {
-        let Some(mut frame) = allocate_zeroed(self.frame_size) else {
-            return;
+    fn send_icmp_echo_reply(
+        &mut self,
+        packet: &Ipv4Packet<'_>,
+        response_source: Ipv4Address,
+        now_ns: u64,
+    ) -> bool {
+        let Some(response_length) = IPV4_MINIMUM_HEADER_LENGTH.checked_add(packet.payload.len()) else {
+            return false;
         };
-        let udp_offset = ETHERNET_HEADER_LENGTH + IPV4_MINIMUM_HEADER_LENGTH;
-        let Ok(udp_length) = write_datagram(
-            &mut frame[udp_offset..],
-            transmission.source_address,
-            transmission.destination_address,
-            transmission.source_port,
-            transmission.destination_port,
-            &transmission.payload,
+        let Some(mut response) = allocate_zeroed(response_length) else {
+            return false;
+        };
+        let Ok(icmp_length) = write_echo_reply(
+            packet.payload,
+            &mut response[IPV4_MINIMUM_HEADER_LENGTH..],
         ) else {
-            return;
+            return false;
         };
         let Ok(ipv4_length) = write_ipv4_header(
-            &mut frame[ETHERNET_HEADER_LENGTH..],
-            transmission.source_address,
-            transmission.destination_address,
-            IPV4_PROTOCOL_UDP,
+            &mut response,
+            response_source,
+            packet.source,
+            IPV4_PROTOCOL_ICMP,
             self.default_ttl,
             self.next_ipv4_identification,
             0,
-            udp_length,
+            icmp_length,
         ) else {
-            return;
+            return false;
         };
         self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
+        response.truncate(ipv4_length);
+        self.queue_ipv4_packet_from_source(response_source, packet.source, response, now_ns)
+            .is_ok()
+    }
+
+    fn transmit_ipv4_packet(
+        &mut self,
+        packet: &[u8],
+        destination_mac: MacAddress,
+    ) -> Result<(), Error> {
+        if packet.len() > self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH) {
+            return Err(Error::MsgSize);
+        }
+        let frame_length = ETHERNET_HEADER_LENGTH
+            .checked_add(packet.len())
+            .ok_or(Error::MsgSize)?;
+        let mut frame = allocate_zeroed(frame_length).ok_or(Error::NoMem)?;
         if write_ethernet_header(
             &mut frame[..ETHERNET_HEADER_LENGTH],
             destination_mac,
@@ -1064,125 +1131,11 @@ impl NetStack {
         )
         .is_err()
         {
-            return;
+            return Err(Error::Proto);
         }
-        crate::kernel::vm::device::virtio::net::host_transmit_frame(
-            &frame[..ETHERNET_HEADER_LENGTH + ipv4_length],
-        );
-    }
-
-    fn transmit_tcp_tun(&mut self, transmission: TcpTransmission, device: &TunDevice) {
-        let packet_size = self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH);
-        let Some(mut packet) = allocate_zeroed(packet_size) else {
-            return;
-        };
-        let tcp_offset = IPV4_MINIMUM_HEADER_LENGTH;
-        let Ok(tcp_length) = write_segment(
-            &mut packet[tcp_offset..],
-            transmission.source_address,
-            transmission.destination_address,
-            transmission.source_port,
-            transmission.destination_port,
-            transmission.sequence_number,
-            transmission.acknowledgment_number,
-            transmission.flags,
-            transmission.window,
-            &transmission.payload,
-        ) else {
-            return;
-        };
-        let Ok(ipv4_length) = write_ipv4_header(
-            &mut packet,
-            transmission.source_address,
-            transmission.destination_address,
-            IPV4_PROTOCOL_TCP,
-            self.default_ttl,
-            self.next_ipv4_identification,
-            0,
-            tcp_length,
-        ) else {
-            return;
-        };
-        self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
-        let _ = device.inject_packet(&packet[..ipv4_length]);
-    }
-
-    fn transmit_udp_tun(&mut self, transmission: UdpTransmission, device: &TunDevice) {
-        let packet_size = self.frame_size.saturating_sub(ETHERNET_HEADER_LENGTH);
-        let Some(mut packet) = allocate_zeroed(packet_size) else {
-            return;
-        };
-        let udp_offset = IPV4_MINIMUM_HEADER_LENGTH;
-        let Ok(udp_length) = write_datagram(
-            &mut packet[udp_offset..],
-            transmission.source_address,
-            transmission.destination_address,
-            transmission.source_port,
-            transmission.destination_port,
-            &transmission.payload,
-        ) else {
-            return;
-        };
-        let Ok(ipv4_length) = write_ipv4_header(
-            &mut packet,
-            transmission.source_address,
-            transmission.destination_address,
-            IPV4_PROTOCOL_UDP,
-            self.default_ttl,
-            self.next_ipv4_identification,
-            0,
-            udp_length,
-        ) else {
-            return;
-        };
-        self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
-        let _ = device.inject_packet(&packet[..ipv4_length]);
-    }
-
-    fn transmit_tcp(&mut self, transmission: TcpTransmission, destination_mac: MacAddress) {
-        let Some(mut frame) = allocate_zeroed(self.frame_size) else {
-            return;
-        };
-        let tcp_offset = ETHERNET_HEADER_LENGTH + IPV4_MINIMUM_HEADER_LENGTH;
-        let Ok(tcp_length) = write_segment(
-            &mut frame[tcp_offset..],
-            transmission.source_address,
-            transmission.destination_address,
-            transmission.source_port,
-            transmission.destination_port,
-            transmission.sequence_number,
-            transmission.acknowledgment_number,
-            transmission.flags,
-            transmission.window,
-            &transmission.payload,
-        ) else {
-            return;
-        };
-        let Ok(ipv4_length) = write_ipv4_header(
-            &mut frame[ETHERNET_HEADER_LENGTH..],
-            transmission.source_address,
-            transmission.destination_address,
-            IPV4_PROTOCOL_TCP,
-            self.default_ttl,
-            self.next_ipv4_identification,
-            0,
-            tcp_length,
-        ) else {
-            return;
-        };
-        self.next_ipv4_identification = self.next_ipv4_identification.wrapping_add(1);
-        if write_ethernet_header(
-            &mut frame[..ETHERNET_HEADER_LENGTH],
-            destination_mac,
-            self.mac_address,
-            ETHER_TYPE_IPV4,
-        )
-        .is_err()
-        {
-            return;
-        }
-        let frame_length = ETHERNET_HEADER_LENGTH + ipv4_length;
-        crate::kernel::vm::device::virtio::net::host_transmit_frame(&frame[..frame_length]);
+        frame[ETHERNET_HEADER_LENGTH..].copy_from_slice(packet);
+        crate::kernel::vm::device::virtio::net::host_transmit_frame(&frame);
+        Ok(())
     }
 
     fn send_arp_request(&mut self, target_address: Ipv4Address) {
@@ -1194,6 +1147,83 @@ impl NetStack {
             target_ipv4: target_address,
         };
         self.transmit_arp(MacAddress::BROADCAST, packet);
+    }
+
+    fn request_arp(&mut self, address: Ipv4Address, now_ns: u64) {
+        if self.arp_requests.iter().any(|request| request.address == address) {
+            return;
+        }
+        if self.arp_requests.len() >= MAX_PENDING_ROUTE_ENTRIES
+            || self.arp_requests.try_reserve(1).is_err()
+        {
+            return;
+        }
+        self.arp_requests.push(PendingArpRequest {
+            address,
+            next_attempt_ns: now_ns.saturating_add(ARP_RETRY_INTERVAL_NS),
+            attempts: 1,
+        });
+        self.send_arp_request(address);
+    }
+
+    fn retry_pending_arp_requests(&mut self, now_ns: u64) {
+        let mut index = 0;
+        while index < self.arp_requests.len() {
+            let request = &self.arp_requests[index];
+            if !self
+                .pending_ipv4_transmissions
+                .iter()
+                .any(|pending| pending.next_hop == request.address)
+            {
+                self.arp_requests.remove(index);
+                continue;
+            }
+            if now_ns < request.next_attempt_ns {
+                index += 1;
+                continue;
+            }
+            if request.attempts < MAX_ARP_REQUEST_ATTEMPTS {
+                let address = request.address;
+                let request = &mut self.arp_requests[index];
+                request.attempts += 1;
+                let shift = u32::from(request.attempts.saturating_sub(1)).min(3);
+                let retry_delay = ARP_RETRY_INTERVAL_NS
+                    .saturating_mul(1u64 << shift)
+                    .min(MAX_ARP_RETRY_INTERVAL_NS);
+                request.next_attempt_ns = now_ns.saturating_add(retry_delay);
+                self.send_arp_request(address);
+                index += 1;
+                continue;
+            }
+
+            let address = self.arp_requests.remove(index).address;
+            let mut dropped_bytes = 0usize;
+            let pending_count = self.pending_ipv4_transmissions.len();
+            for _ in 0..pending_count {
+                let Some(mut pending) = self.pending_ipv4_transmissions.pop_front() else {
+                    break;
+                };
+                if pending.next_hop != address {
+                    self.pending_ipv4_transmissions.push_back(pending);
+                    continue;
+                }
+                let has_alternate_egress = self.tunnel_peer(pending.destination, now_ns).is_some()
+                    || self.routes.tunnel_device(pending.destination).is_some()
+                    || self.is_broadcast_address(pending.destination);
+                let routed_next_hop = self.next_hop(pending.destination);
+                let changed_next_hop = routed_next_hop.filter(|next_hop| *next_hop != address);
+                if has_alternate_egress || changed_next_hop.is_some() {
+                    pending.next_hop = routed_next_hop.unwrap_or(address);
+                    self.pending_ipv4_transmissions.push_back(pending);
+                    if let Some(next_hop) = changed_next_hop {
+                        self.request_arp(next_hop, now_ns);
+                    }
+                } else {
+                    dropped_bytes = dropped_bytes.saturating_add(pending.packet.len());
+                }
+            }
+            self.pending_route_bytes = self.pending_route_bytes.saturating_sub(dropped_bytes);
+        }
     }
 
     fn send_arp_reply(
@@ -1242,19 +1272,35 @@ impl NetStack {
         {
             entry.mac = mac;
             entry.expires_at_ns = expires_at_ns;
+            self.arp_requests.retain(|request| request.address != address);
             return;
         }
         if self.neighbors.len() >= MAX_NEIGHBORS {
-            return;
+            let Some(index) = self
+                .neighbors
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.expires_at_ns)
+                .map(|(index, _)| index)
+            else {
+                return;
+            };
+            self.neighbors[index] = NeighborEntry {
+                address,
+                mac,
+                expires_at_ns,
+            };
+        } else {
+            if self.neighbors.try_reserve(1).is_err() {
+                return;
+            }
+            self.neighbors.push(NeighborEntry {
+                address,
+                mac,
+                expires_at_ns,
+            });
         }
-        if self.neighbors.try_reserve(1).is_err() {
-            return;
-        }
-        self.neighbors.push(NeighborEntry {
-            address,
-            mac,
-            expires_at_ns,
-        });
+        self.arp_requests.retain(|request| request.address != address);
     }
 
     fn neighbor_mac(&self, address: Ipv4Address, now_ns: u64) -> Option<MacAddress> {
@@ -1274,7 +1320,7 @@ impl NetStack {
         address: Ipv4Address,
         device: Arc<TunDevice>,
         now_ns: u64,
-    ) {
+    ) -> bool {
         self.expire_tunnel_peers(now_ns);
         let expires_at_ns = now_ns.saturating_add(NEIGHBOR_LIFETIME_NS);
         if let Some(peer) = self
@@ -1284,26 +1330,58 @@ impl NetStack {
         {
             peer.device = device;
             peer.expires_at_ns = expires_at_ns;
-            return;
+            return true;
         }
         if self.tunnel_peers.len() >= MAX_TUNNEL_PEERS {
-            return;
+            if let Some(index) = self
+                .tunnel_peers
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, peer)| peer.expires_at_ns)
+                .map(|(index, _)| index)
+            {
+                self.tunnel_peers[index] = TunnelPeer {
+                    address,
+                    device,
+                    expires_at_ns,
+                };
+                return true;
+            }
+            return false;
         }
         if self.tunnel_peers.try_reserve(1).is_err() {
-            return;
+            return false;
         }
         self.tunnel_peers.push(TunnelPeer {
             address,
             device,
             expires_at_ns,
         });
+        true
     }
 
     fn tunnel_peer(&self, address: Ipv4Address, now_ns: u64) -> Option<Arc<TunDevice>> {
         self.tunnel_peers
             .iter()
-            .find(|peer| peer.address == address && peer.expires_at_ns > now_ns)
+            .find(|peer| {
+                peer.address == address
+                    && peer.expires_at_ns > now_ns
+                    && peer.device.mode() == TunTapMode::Tun
+                    && peer.device.is_configured()
+                    && peer.device.is_up()
+            })
             .map(|peer| Arc::clone(&peer.device))
+    }
+
+    fn tunnel_device_for_address(&self, address: Ipv4Address) -> Option<Arc<TunDevice>> {
+        tun::open_devices().ok()?.into_iter().find(|device| {
+            device.mode() == TunTapMode::Tun
+                && device.is_configured()
+                && device.is_up()
+                && device
+                    .ipv4_configuration()
+                    .is_some_and(|(interface_address, _)| interface_address == address)
+        })
     }
 
     fn expire_tunnel_peers(&mut self, now_ns: u64) {
@@ -1311,13 +1389,9 @@ impl NetStack {
             .retain(|peer| peer.expires_at_ns > now_ns);
     }
 
-    fn can_queue_pending_route(&self, payload_bytes: usize) -> bool {
-        let queued_entries = self
-            .pending_transmissions
-            .len()
-            .saturating_add(self.pending_udp_transmissions.len())
-            .saturating_add(self.pending_ipv4_transmissions.len());
-        queued_entries < MAX_PENDING_ROUTE_ENTRIES
+    fn can_queue_pending_route(&self, entries: usize, payload_bytes: usize) -> bool {
+        self.pending_ipv4_transmissions.len().saturating_add(entries)
+            <= MAX_PENDING_ROUTE_ENTRIES
             && self
                 .pending_route_bytes
                 .checked_add(payload_bytes)
@@ -1330,11 +1404,24 @@ impl NetStack {
         };
         for _ in 0..self.receive_budget {
             let Some(length) =
-                crate::kernel::vm::device::virtio::net::receive_host_transmit_frame(&mut frame)
+                crate::kernel::vm::device::virtio::net::peek_host_transmit_frame(&mut frame)
             else {
                 break;
             };
-            let _ = self.device.transmit_frame(&frame[..length]);
+            if length == 0 {
+                continue;
+            }
+            match self.device.transmit_frame(&frame[..length]) {
+                Ok(()) => {
+                    let _consumed =
+                        crate::kernel::vm::device::virtio::net::consume_host_transmit_frame(length);
+                }
+                Err(Error::Busy) => break,
+                Err(_) => {
+                    let _dropped =
+                        crate::kernel::vm::device::virtio::net::drop_host_transmit_frame(length);
+                }
+            }
         }
     }
 
@@ -1342,18 +1429,26 @@ impl NetStack {
         self.routes.next_hop(destination)
     }
 
-    fn is_broadcast_address(&self, address: Ipv4Address) -> bool {
+    pub(crate) fn is_broadcast_address(&self, address: Ipv4Address) -> bool {
         self.routes.is_broadcast_address(address)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Ipv4Address, Ipv4RouteTable, INITIAL_DEFAULT_GATEWAY};
+    use super::{
+        Ipv4Address, Ipv4RouteTable, TunDevice, TunTapMode, INITIAL_DEFAULT_GATEWAY,
+        INITIAL_LOCAL_ADDRESS, INITIAL_PREFIX_LENGTH,
+    };
 
     #[test]
     fn route_lookup_prefers_the_longest_prefix() {
-        let mut routes = Ipv4RouteTable::new().unwrap();
+        let mut routes = Ipv4RouteTable::new(
+            INITIAL_LOCAL_ADDRESS,
+            INITIAL_PREFIX_LENGTH,
+            INITIAL_DEFAULT_GATEWAY,
+        )
+        .unwrap();
         routes
             .add(
                 Ipv4Address([10, 0, 2, 0]),
@@ -1380,8 +1475,62 @@ mod tests {
 
     #[test]
     fn deleted_default_route_stops_fallback_routing() {
-        let mut routes = Ipv4RouteTable::new().unwrap();
+        let mut routes = Ipv4RouteTable::new(
+            INITIAL_LOCAL_ADDRESS,
+            INITIAL_PREFIX_LENGTH,
+            INITIAL_DEFAULT_GATEWAY,
+        )
+        .unwrap();
         routes.remove(Ipv4Address([0; 4]), 0).unwrap();
         assert_eq!(routes.next_hop(Ipv4Address([203, 0, 113, 1])), None);
+    }
+
+    #[test]
+    fn directed_broadcast_lookup_uses_connected_prefix_routes() {
+        let mut routes = Ipv4RouteTable::new(
+            INITIAL_LOCAL_ADDRESS,
+            INITIAL_PREFIX_LENGTH,
+            INITIAL_DEFAULT_GATEWAY,
+        )
+        .unwrap();
+        assert!(routes.is_broadcast_address(Ipv4Address([10, 0, 2, 255])));
+        assert!(!routes.is_broadcast_address(Ipv4Address([10, 0, 2, 254])));
+        routes.add(Ipv4Address([10, 0, 0, 0]), 8, None).unwrap();
+        routes
+            .add(
+                Ipv4Address([10, 255, 0, 0]),
+                16,
+                Some(Ipv4Address([192, 0, 2, 1])),
+            )
+            .unwrap();
+        assert!(!routes.is_broadcast_address(Ipv4Address([10, 255, 255, 255])));
+    }
+
+    #[test]
+    fn directed_broadcast_retains_tunnel_route_when_device_is_down() {
+        let mut routes = Ipv4RouteTable::new(
+            INITIAL_LOCAL_ADDRESS,
+            INITIAL_PREFIX_LENGTH,
+            INITIAL_DEFAULT_GATEWAY,
+        )
+        .unwrap();
+        let device = TunDevice::new().unwrap();
+        device.configure(TunTapMode::Tun).unwrap();
+        device.set_ipv4_address(Ipv4Address([198, 51, 100, 1]));
+        device.set_ipv4_prefix_length(24);
+        device.set_up(true);
+        routes
+            .add_tunnel(Ipv4Address([198, 51, 100, 0]), 24, device.clone())
+            .unwrap();
+
+        let broadcast = Ipv4Address([198, 51, 100, 255]);
+        assert!(routes.is_broadcast_address(broadcast));
+        assert!(routes.uses_tunnel(broadcast));
+        assert!(routes.tunnel_device(broadcast).is_some());
+
+        device.set_up(false);
+        assert!(routes.is_broadcast_address(broadcast));
+        assert!(routes.uses_tunnel(broadcast));
+        assert!(routes.tunnel_device(broadcast).is_none());
     }
 }

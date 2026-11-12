@@ -114,6 +114,11 @@ impl TcpContext {
             && unsafe { &*self.network_stack }.is_local_ipv4_address(address)
     }
 
+    pub(crate) fn is_ipv4_broadcast_address(&self, address: Ipv4Address) -> bool {
+        !self.network_stack.is_null()
+            && unsafe { &*self.network_stack }.is_broadcast_address(address)
+    }
+
     pub(crate) fn ethernet_mac_address(&self) -> Option<[u8; 6]> {
         if self.network_stack.is_null() {
             None

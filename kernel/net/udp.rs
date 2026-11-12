@@ -120,33 +120,50 @@ struct UdpSocketSlot {
     socket: Option<UdpSocket>,
 }
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct UdpFlowKey {
+    local_port: u16,
+    local_address: Ipv4Address,
+    remote_endpoint: Option<(Ipv4Address, u16)>,
+}
+
+struct UdpFlowBucket {
+    key: UdpFlowKey,
+    slots: Vec<usize>,
+}
+
 pub(crate) struct UdpSocketTable {
     slots: Vec<UdpSocketSlot>,
+    free_slots: Vec<usize>,
+    flows: Vec<UdpFlowBucket>,
     queued_datagrams: usize,
     queued_bytes: usize,
 }
 
 impl UdpSocketTable {
     pub(crate) fn new() -> Option<Self> {
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(MAX_UDP_SOCKETS).ok()?;
+        let mut free_slots = Vec::new();
+        free_slots.try_reserve_exact(MAX_UDP_SOCKETS).ok()?;
+        let mut flows = Vec::new();
+        flows.try_reserve_exact(MAX_UDP_SOCKETS).ok()?;
         Some(Self {
-            slots: Vec::new(),
+            slots,
+            free_slots,
+            flows,
             queued_datagrams: 0,
             queued_bytes: 0,
         })
     }
 
     pub(crate) fn create(&mut self) -> Result<UdpSocketHandle, Error> {
-        let index = if let Some(index) = self
-            .slots
-            .iter()
-            .position(|slot| slot.socket.is_none())
-        {
+        let index = if let Some(index) = self.free_slots.pop() {
             index
         } else {
             if self.slots.len() >= MAX_UDP_SOCKETS {
                 return Err(Error::NoBufs);
             }
-            self.slots.try_reserve(1).map_err(|_| Error::NoMem)?;
             self.slots.push(UdpSocketSlot {
                 generation: 0,
                 socket: None,
@@ -175,10 +192,29 @@ impl UdpSocketTable {
             return Err(Error::Inval);
         }
         let index = self.slot_index(handle)?;
-        let socket = self.slots[index].socket.as_mut().ok_or(Error::BadFd)?;
-        if socket.local_port != 0 {
+        if self.slots[index]
+            .socket
+            .as_ref()
+            .ok_or(Error::BadFd)?
+            .local_port
+            != 0
+        {
             return Err(Error::Inval);
         }
+        let remote_endpoint = self.slots[index]
+            .socket
+            .as_ref()
+            .ok_or(Error::BadFd)?
+            .remote_endpoint;
+        self.add_flow(
+            UdpFlowKey {
+                local_port: port,
+                local_address: address,
+                remote_endpoint,
+            },
+            index,
+        )?;
+        let socket = self.slots[index].socket.as_mut().ok_or(Error::BadFd)?;
         socket.local_address = address;
         socket.local_port = port;
         Ok(())
@@ -193,7 +229,29 @@ impl UdpSocketTable {
         if port == 0 {
             return Err(Error::Inval);
         }
-        self.socket_mut(handle)?.remote_endpoint = Some((address, port));
+        let index = self.slot_index(handle)?;
+        let socket = self.slots[index].socket.as_ref().ok_or(Error::BadFd)?;
+        let old_endpoint = socket.remote_endpoint;
+        if socket.local_port != 0 {
+            let old_key = UdpFlowKey {
+                local_port: socket.local_port,
+                local_address: socket.local_address,
+                remote_endpoint: old_endpoint,
+            };
+            let new_key = UdpFlowKey {
+                remote_endpoint: Some((address, port)),
+                ..old_key
+            };
+            if old_key != new_key {
+                self.add_flow(new_key, index)?;
+                self.remove_flow(old_key, index);
+            }
+        }
+        self.slots[index]
+            .socket
+            .as_mut()
+            .ok_or(Error::BadFd)?
+            .remote_endpoint = Some((address, port));
         Ok(())
     }
 
@@ -245,43 +303,54 @@ impl UdpSocketTable {
         let mut queued_datagrams = self.queued_datagrams;
         let mut queued_bytes = self.queued_bytes;
         let payload_length = datagram.payload.len();
-        for socket in self.slots.iter_mut().filter_map(|slot| slot.socket.as_mut()) {
-            if socket.local_port != datagram.destination_port
-                || !(socket.local_address == destination_address
-                    || socket.local_address == Ipv4Address([0; 4]))
-                || !socket.remote_endpoint.map_or(true, |peer| {
-                    peer == (source_address, datagram.source_port)
-                })
-            {
+        let wildcard_address = Ipv4Address([0; 4]);
+        let remote = Some((source_address, datagram.source_port));
+        for local_address in [destination_address, wildcard_address] {
+            if local_address == wildcard_address && destination_address == wildcard_address {
                 continue;
             }
-            if socket.received.len() >= MAX_UDP_RECEIVE_DATAGRAMS_PER_SOCKET
-                || socket.received_bytes.saturating_add(payload_length)
-                    > MAX_UDP_RECEIVE_BYTES_PER_SOCKET
-                || queued_datagrams >= MAX_UDP_RECEIVE_DATAGRAMS_TOTAL
-                || queued_bytes
-                    .checked_add(payload_length)
-                    .is_none_or(|bytes| bytes > MAX_UDP_RECEIVE_BYTES_TOTAL)
-            {
-                continue;
+            for remote_endpoint in [remote, None] {
+                let key = UdpFlowKey {
+                    local_port: datagram.destination_port,
+                    local_address,
+                    remote_endpoint,
+                };
+                let Ok(bucket_index) = self.flows.binary_search_by_key(&key, |bucket| bucket.key) else {
+                    continue;
+                };
+                for &index in &self.flows[bucket_index].slots {
+                    let Some(socket) = self.slots[index].socket.as_mut() else {
+                        continue;
+                    };
+                    if socket.received.len() >= MAX_UDP_RECEIVE_DATAGRAMS_PER_SOCKET
+                        || socket.received_bytes.saturating_add(payload_length)
+                            > MAX_UDP_RECEIVE_BYTES_PER_SOCKET
+                        || queued_datagrams >= MAX_UDP_RECEIVE_DATAGRAMS_TOTAL
+                        || queued_bytes
+                            .checked_add(payload_length)
+                            .is_none_or(|bytes| bytes > MAX_UDP_RECEIVE_BYTES_TOTAL)
+                    {
+                        continue;
+                    }
+                    let mut payload = Vec::new();
+                    if payload.try_reserve_exact(payload_length).is_err() {
+                        continue;
+                    }
+                    payload.extend_from_slice(datagram.payload);
+                    if socket.received.try_reserve(1).is_err() {
+                        continue;
+                    }
+                    socket.received.push_back(ReceivedDatagram {
+                        source_address,
+                        source_port: datagram.source_port,
+                        payload,
+                    });
+                    socket.received_bytes += payload_length;
+                    queued_datagrams += 1;
+                    queued_bytes += payload_length;
+                    delivered = true;
+                }
             }
-            let mut payload = Vec::new();
-            if payload.try_reserve_exact(payload_length).is_err() {
-                continue;
-            }
-            payload.extend_from_slice(datagram.payload);
-            if socket.received.try_reserve(1).is_err() {
-                continue;
-            }
-            socket.received.push_back(ReceivedDatagram {
-                source_address,
-                source_port: datagram.source_port,
-                payload,
-            });
-            socket.received_bytes += payload_length;
-            queued_datagrams += 1;
-            queued_bytes += payload_length;
-            delivered = true;
         }
         self.queued_datagrams = queued_datagrams;
         self.queued_bytes = queued_bytes;
@@ -319,8 +388,19 @@ impl UdpSocketTable {
         let Some(socket) = self.slots[index].socket.take() else {
             return false;
         };
+        if socket.local_port != 0 {
+            self.remove_flow(
+                UdpFlowKey {
+                    local_port: socket.local_port,
+                    local_address: socket.local_address,
+                    remote_endpoint: socket.remote_endpoint,
+                },
+                index,
+            );
+        }
         self.queued_datagrams = self.queued_datagrams.saturating_sub(socket.received.len());
         self.queued_bytes = self.queued_bytes.saturating_sub(socket.received_bytes);
+        self.free_slots.push(index);
         true
     }
 
@@ -343,6 +423,39 @@ impl UdpSocketTable {
             Ok(handle.index)
         } else {
             Err(Error::BadFd)
+        }
+    }
+
+    fn add_flow(&mut self, key: UdpFlowKey, index: usize) -> Result<(), Error> {
+        match self.flows.binary_search_by_key(&key, |bucket| bucket.key) {
+            Ok(bucket_index) => {
+                self.flows[bucket_index]
+                    .slots
+                    .try_reserve(1)
+                    .map_err(|_| Error::NoMem)?;
+                self.flows[bucket_index].slots.push(index);
+            }
+            Err(bucket_index) => {
+                let mut slots = Vec::new();
+                slots.try_reserve_exact(1).map_err(|_| Error::NoMem)?;
+                slots.push(index);
+                self.flows.try_reserve(1).map_err(|_| Error::NoMem)?;
+                self.flows.insert(bucket_index, UdpFlowBucket { key, slots });
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_flow(&mut self, key: UdpFlowKey, index: usize) {
+        let Ok(bucket_index) = self.flows.binary_search_by_key(&key, |bucket| bucket.key) else {
+            return;
+        };
+        let bucket = &mut self.flows[bucket_index];
+        if let Some(slot_index) = bucket.slots.iter().position(|slot| *slot == index) {
+            bucket.slots.remove(slot_index);
+        }
+        if bucket.slots.is_empty() {
+            self.flows.remove(bucket_index);
         }
     }
 
@@ -400,6 +513,34 @@ mod tests {
         let received = sockets.receive(socket, &mut output).unwrap().unwrap();
         assert_eq!(received, (5, client, 49152));
         assert_eq!(&output[..5], b"query");
+    }
+
+    #[test]
+    fn flow_index_matches_connected_and_wildcard_sockets_only() {
+        let client = Ipv4Address([192, 0, 2, 1]);
+        let other_client = Ipv4Address([192, 0, 2, 3]);
+        let server = Ipv4Address([192, 0, 2, 2]);
+        let mut sockets = UdpSocketTable::new().unwrap();
+        let connected = sockets.create().unwrap();
+        let wildcard = sockets.create().unwrap();
+        let other = sockets.create().unwrap();
+        sockets.bind(connected, server, 53).unwrap();
+        sockets.connect(connected, client, 49152).unwrap();
+        sockets.bind(wildcard, Ipv4Address([0; 4]), 53).unwrap();
+        sockets.bind(other, server, 53).unwrap();
+        sockets.connect(other, other_client, 49152).unwrap();
+
+        let datagram = UdpDatagram {
+            source_port: 49152,
+            destination_port: 53,
+            payload: b"query",
+        };
+        assert!(sockets
+            .receive_datagram(client, server, &datagram)
+            .unwrap());
+        assert!(sockets.readable(connected));
+        assert!(sockets.readable(wildcard));
+        assert!(!sockets.readable(other));
     }
 
     #[test]

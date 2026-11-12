@@ -5,6 +5,9 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::vm::device::virtio::mmio::{QueueResult, VirtioMmio};
 use crate::kernel::vm::device::virtio::queue::GuestVirtQueue;
@@ -17,71 +20,58 @@ const DEVICE_ID: u32 = 1;
 const VENDOR_ID: u32 = 0x4b5a;
 const MAX_FRAME_SIZE: usize = 1514;
 const HEADER_SIZE: usize = 12;
-const HUB_PEER_COUNT: usize = 8;
-const RX_RING_SIZE: usize = 8;
-const HOST_FRAME_RING_SIZE: usize = 16;
+const MAX_HUB_PEERS: usize = 256;
+const MAX_PEER_QUEUE_BYTES: usize = 256 * 1024;
+const MAX_HOST_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SWITCH_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const FEATURE_MTU: u32 = 1 << 3;
 const FEATURE_MAC: u32 = 1 << 5;
 const FEATURE_MRG_RXBUF: u32 = 1 << 15;
 
 static NETWORK_SWITCH: IrqSpinLock<NetworkSwitch> = IrqSpinLock::new(NetworkSwitch::new());
 
-#[derive(Clone, Copy)]
-struct Frame {
-    length: usize,
-    bytes: [u8; MAX_FRAME_SIZE],
-}
-
-impl Frame {
-    const EMPTY: Self = Self {
-        length: 0,
-        bytes: [0; MAX_FRAME_SIZE],
-    };
-}
-
-#[derive(Clone, Copy)]
 struct Peer {
     active: bool,
     mac: [u8; 6],
-    frames: [Frame; RX_RING_SIZE],
-    head: usize,
-    length: usize,
+    frames: VecDeque<Vec<u8>>,
+    queued_bytes: usize,
 }
 
 impl Peer {
-    const EMPTY: Self = Self {
-        active: false,
-        mac: [0; 6],
-        frames: [Frame::EMPTY; RX_RING_SIZE],
-        head: 0,
-        length: 0,
-    };
+    fn new() -> Self {
+        Self {
+            active: false,
+            mac: [0; 6],
+            frames: VecDeque::new(),
+            queued_bytes: 0,
+        }
+    }
 }
 
 struct NetworkSwitch {
-    peers: [Peer; HUB_PEER_COUNT],
+    peers: Vec<Peer>,
     host_active: bool,
     host_mac: [u8; 6],
-    host_stack_frames: [Frame; HOST_FRAME_RING_SIZE],
-    host_stack_head: usize,
-    host_stack_length: usize,
-    host_transmit_frames: [Frame; HOST_FRAME_RING_SIZE],
-    host_transmit_head: usize,
-    host_transmit_length: usize,
+    host_stack_frames: VecDeque<Vec<u8>>,
+    host_stack_bytes: usize,
+    host_transmit_frames: VecDeque<Vec<u8>>,
+    host_transmit_bytes: usize,
+    queued_frame_bytes: usize,
+    dropped_frames: u64,
 }
 
 impl NetworkSwitch {
     const fn new() -> Self {
         Self {
-            peers: [Peer::EMPTY; HUB_PEER_COUNT],
+            peers: Vec::new(),
             host_active: false,
             host_mac: [0; 6],
-            host_stack_frames: [Frame::EMPTY; HOST_FRAME_RING_SIZE],
-            host_stack_head: 0,
-            host_stack_length: 0,
-            host_transmit_frames: [Frame::EMPTY; HOST_FRAME_RING_SIZE],
-            host_transmit_head: 0,
-            host_transmit_length: 0,
+            host_stack_frames: VecDeque::new(),
+            host_stack_bytes: 0,
+            host_transmit_frames: VecDeque::new(),
+            host_transmit_bytes: 0,
+            queued_frame_bytes: 0,
+            dropped_frames: 0,
         }
     }
 
@@ -90,31 +80,44 @@ impl NetworkSwitch {
         self.host_mac = mac;
     }
 
-    fn register(&mut self) -> Option<(u8, [u8; 6])> {
-        let index = self.peers.iter().position(|peer| !peer.active)?;
-        let mac = [0x02, 0x4b, 0x5a, 0x00, 0x00, index as u8 + 1];
-        self.peers[index] = Peer {
-            active: true,
-            mac,
-            ..Peer::EMPTY
+    fn register(&mut self) -> Option<(usize, [u8; 6])> {
+        let index = if let Some(index) = self.peers.iter().position(|peer| !peer.active) {
+            index
+        } else {
+            if self.peers.len() >= MAX_HUB_PEERS {
+                return None;
+            }
+            self.peers.try_reserve(1).ok()?;
+            self.peers.push(Peer::new());
+            self.peers.len() - 1
         };
-        Some((index as u8, mac))
+        let identifier = u16::try_from(index + 1).ok()?;
+        let mac = [0x02, 0x4b, 0x5a, 0, (identifier >> 8) as u8, identifier as u8];
+        self.peers[index].active = true;
+        self.peers[index].mac = mac;
+        Some((index, mac))
     }
 
-    fn unregister(&mut self, peer_id: u8) {
-        if let Some(peer) = self.peers.get_mut(usize::from(peer_id)) {
-            *peer = Peer::EMPTY;
-        }
+    fn unregister(&mut self, peer_id: usize) {
+        let Some(peer) = self.peers.get(peer_id) else {
+            return;
+        };
+        let queued_bytes = peer.queued_bytes;
+        let queued_frames = peer.frames.len() as u64;
+        self.queued_frame_bytes = self.queued_frame_bytes.saturating_sub(queued_bytes);
+        self.dropped_frames = self.dropped_frames.saturating_add(queued_frames);
+        self.peers[peer_id] = Peer::new();
     }
 
-    fn transmit(&mut self, source_id: u8, bytes: &[u8]) {
+    fn transmit(&mut self, source_id: usize, bytes: &[u8]) {
         if bytes.len() > MAX_FRAME_SIZE {
+            self.record_dropped_frame();
             return;
         }
         let Ok(frame) = EthernetFrame::parse(bytes) else {
             return;
         };
-        let source = usize::from(source_id);
+        let source = source_id;
         if source >= self.peers.len() || !self.peers[source].active {
             return;
         }
@@ -146,6 +149,7 @@ impl NetworkSwitch {
 
     fn forward_tap_frame(&mut self, source_mac: [u8; 6], bytes: &[u8]) {
         if bytes.len() > MAX_FRAME_SIZE {
+            self.record_dropped_frame();
             return;
         }
         let Ok(frame) = EthernetFrame::parse(bytes) else {
@@ -202,15 +206,7 @@ impl NetworkSwitch {
             if !deliver {
                 continue;
             }
-            let peer = &mut self.peers[index];
-            if peer.length == RX_RING_SIZE {
-                continue;
-            }
-            let tail = (peer.head + peer.length) % RX_RING_SIZE;
-            let frame = &mut peer.frames[tail];
-            frame.bytes[..bytes.len()].copy_from_slice(bytes);
-            frame.length = bytes.len();
-            peer.length += 1;
+            self.enqueue_peer_frame(index, bytes);
         }
     }
 
@@ -241,8 +237,8 @@ impl NetworkSwitch {
             let deliver = multicast
                 || tap.mac_address() == destination
                 || (!destination_peer_exists && !destination_tap_exists);
-            if deliver {
-                let _ = tap.inject_packet(bytes);
+            if deliver && tap.inject_packet(bytes).is_err() {
+                self.dropped_frames = self.dropped_frames.saturating_add(1);
             }
         }
     }
@@ -262,6 +258,10 @@ impl NetworkSwitch {
     }
 
     fn host_ingress(&mut self, bytes: &[u8]) {
+        if bytes.len() > MAX_FRAME_SIZE {
+            self.record_dropped_frame();
+            return;
+        }
         let Ok(frame) = EthernetFrame::parse(bytes) else {
             return;
         };
@@ -280,6 +280,7 @@ impl NetworkSwitch {
 
     fn host_transmit(&mut self, bytes: &[u8]) {
         if bytes.len() > MAX_FRAME_SIZE {
+            self.record_dropped_frame();
             return;
         }
         let Ok(frame) = EthernetFrame::parse(bytes) else {
@@ -318,86 +319,174 @@ impl NetworkSwitch {
     }
 
     fn enqueue_host_stack(&mut self, bytes: &[u8]) {
-        let _ = enqueue_frame(
-            &mut self.host_stack_frames,
-            &mut self.host_stack_head,
-            &mut self.host_stack_length,
-            bytes,
-        );
+        self.enqueue_host_frame(true, bytes);
     }
 
     fn enqueue_host_transmit(&mut self, bytes: &[u8]) {
-        let _ = enqueue_frame(
-            &mut self.host_transmit_frames,
-            &mut self.host_transmit_head,
-            &mut self.host_transmit_length,
-            bytes,
-        );
+        self.enqueue_host_frame(false, bytes);
     }
 
     fn receive_host_stack(&mut self, output: &mut [u8]) -> Option<usize> {
-        dequeue_frame(
-            &mut self.host_stack_frames,
-            &mut self.host_stack_head,
-            &mut self.host_stack_length,
-            output,
-        )
+        if self
+            .host_stack_frames
+            .front()
+            .is_some_and(|frame| frame.len() > output.len())
+        {
+            let frame = self.host_stack_frames.pop_front()?;
+            let length = frame.len();
+            self.host_stack_bytes = self.host_stack_bytes.saturating_sub(length);
+            self.queued_frame_bytes = self.queued_frame_bytes.saturating_sub(length);
+            self.record_dropped_frame();
+            return Some(0);
+        }
+        let length = dequeue_frame(&mut self.host_stack_frames, output)?;
+        self.host_stack_bytes = self.host_stack_bytes.saturating_sub(length);
+        self.queued_frame_bytes = self.queued_frame_bytes.saturating_sub(length);
+        Some(length)
     }
 
-    fn receive_host_transmit(&mut self, output: &mut [u8]) -> Option<usize> {
-        dequeue_frame(
-            &mut self.host_transmit_frames,
-            &mut self.host_transmit_head,
-            &mut self.host_transmit_length,
-            output,
-        )
+    fn peek_host_transmit(&mut self, output: &mut [u8]) -> Option<usize> {
+        if self
+            .host_transmit_frames
+            .front()
+            .is_some_and(|frame| frame.len() > output.len())
+        {
+            let frame = self.host_transmit_frames.pop_front()?;
+            let length = frame.len();
+            self.host_transmit_bytes = self.host_transmit_bytes.saturating_sub(length);
+            self.queued_frame_bytes = self.queued_frame_bytes.saturating_sub(length);
+            self.record_dropped_frame();
+            return Some(0);
+        }
+        let frame = self.host_transmit_frames.front()?;
+        let length = frame.len();
+        output[..length].copy_from_slice(frame);
+        Some(length)
     }
 
-    fn receive(&mut self, peer_id: u8) -> Option<Frame> {
-        let peer = self.peers.get_mut(usize::from(peer_id))?;
-        if !peer.active || peer.length == 0 {
+    fn consume_host_transmit(&mut self, expected_length: usize, dropped: bool) -> bool {
+        let Some(frame) = self.host_transmit_frames.front() else {
+            return false;
+        };
+        if frame.len() != expected_length {
+            return false;
+        }
+        let Some(frame) = self.host_transmit_frames.pop_front() else {
+            return false;
+        };
+        let length = frame.len();
+        self.host_transmit_bytes = self.host_transmit_bytes.saturating_sub(length);
+        self.queued_frame_bytes = self.queued_frame_bytes.saturating_sub(length);
+        if dropped {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+        }
+        true
+    }
+
+    fn enqueue_peer_frame(&mut self, peer_id: usize, bytes: &[u8]) {
+        if bytes.is_empty()
+            || bytes.len() > MAX_FRAME_SIZE
+            || self.queued_frame_bytes.saturating_add(bytes.len()) > MAX_SWITCH_QUEUE_BYTES
+        {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+            return;
+        }
+        let mut frame = Vec::new();
+        if frame.try_reserve_exact(bytes.len()).is_err() {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+            return;
+        }
+        frame.extend_from_slice(bytes);
+        let enqueued = if let Some(peer) = self.peers.get_mut(peer_id) {
+            if peer.active
+                && peer.queued_bytes.saturating_add(bytes.len()) <= MAX_PEER_QUEUE_BYTES
+                && peer.frames.try_reserve(1).is_ok()
+            {
+                peer.frames.push_back(frame);
+                peer.queued_bytes += bytes.len();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if enqueued {
+            self.queued_frame_bytes += bytes.len();
+        } else {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+        }
+    }
+
+    fn enqueue_host_frame(&mut self, to_stack: bool, bytes: &[u8]) {
+        if bytes.is_empty()
+            || bytes.len() > MAX_FRAME_SIZE
+            || self.queued_frame_bytes.saturating_add(bytes.len()) > MAX_SWITCH_QUEUE_BYTES
+        {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+            return;
+        }
+        let mut frame = Vec::new();
+        if frame.try_reserve_exact(bytes.len()).is_err() {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+            return;
+        }
+        frame.extend_from_slice(bytes);
+        let enqueued = if to_stack {
+            if self.host_stack_bytes.saturating_add(bytes.len()) > MAX_HOST_QUEUE_BYTES
+                || self.host_stack_frames.try_reserve(1).is_err()
+            {
+                false
+            } else {
+                self.host_stack_frames.push_back(frame);
+                self.host_stack_bytes += bytes.len();
+                true
+            }
+        } else if self.host_transmit_bytes.saturating_add(bytes.len()) > MAX_HOST_QUEUE_BYTES
+            || self.host_transmit_frames.try_reserve(1).is_err()
+        {
+            false
+        } else {
+            self.host_transmit_frames.push_back(frame);
+            self.host_transmit_bytes += bytes.len();
+            true
+        };
+        if enqueued {
+            self.queued_frame_bytes += bytes.len();
+        } else {
+            self.dropped_frames = self.dropped_frames.saturating_add(1);
+        }
+    }
+
+    fn receive(&mut self, peer_id: usize) -> Option<Vec<u8>> {
+        let peer = self.peers.get_mut(peer_id)?;
+        if !peer.active {
             return None;
         }
-        let frame = peer.frames[peer.head];
-        peer.head = (peer.head + 1) % RX_RING_SIZE;
-        peer.length -= 1;
+        let frame = peer.frames.pop_front()?;
+        let length = frame.len();
+        peer.queued_bytes = peer.queued_bytes.saturating_sub(length);
+        self.queued_frame_bytes = self.queued_frame_bytes.saturating_sub(length);
         Some(frame)
     }
+
+    fn dropped_frame_count(&self) -> u64 {
+        self.dropped_frames
+    }
+
+    fn record_dropped_frame(&mut self) {
+        self.dropped_frames = self.dropped_frames.saturating_add(1);
+    }
 }
 
-fn enqueue_frame<const N: usize>(
-    frames: &mut [Frame; N],
-    head: &mut usize,
-    length: &mut usize,
-    bytes: &[u8],
-) -> bool {
-    if bytes.is_empty() || bytes.len() > MAX_FRAME_SIZE || *length == N {
-        return false;
-    }
-    let tail = (*head + *length) % N;
-    frames[tail].bytes[..bytes.len()].copy_from_slice(bytes);
-    frames[tail].length = bytes.len();
-    *length += 1;
-    true
-}
-
-fn dequeue_frame<const N: usize>(
-    frames: &mut [Frame; N],
-    head: &mut usize,
-    length: &mut usize,
-    output: &mut [u8],
-) -> Option<usize> {
-    if *length == 0 {
+fn dequeue_frame(frames: &mut VecDeque<Vec<u8>>, output: &mut [u8]) -> Option<usize> {
+    let frame = frames.front()?;
+    if output.len() < frame.len() {
         return None;
     }
-    let frame = &frames[*head];
-    if output.len() < frame.length {
-        return None;
-    }
-    let frame_length = frame.length;
-    output[..frame_length].copy_from_slice(&frame.bytes[..frame_length]);
-    *head = (*head + 1) % N;
-    *length -= 1;
+    let frame = frames.pop_front()?;
+    let frame_length = frame.len();
+    output[..frame_length].copy_from_slice(&frame);
     Some(frame_length)
 }
 
@@ -417,13 +506,26 @@ pub(crate) fn receive_host_stack_frame(output: &mut [u8]) -> Option<usize> {
     NETWORK_SWITCH.lock().receive_host_stack(output)
 }
 
-pub(crate) fn receive_host_transmit_frame(output: &mut [u8]) -> Option<usize> {
-    NETWORK_SWITCH.lock().receive_host_transmit(output)
+pub(crate) fn peek_host_transmit_frame(output: &mut [u8]) -> Option<usize> {
+    NETWORK_SWITCH.lock().peek_host_transmit(output)
+}
+
+pub(crate) fn consume_host_transmit_frame(length: usize) -> bool {
+    NETWORK_SWITCH.lock().consume_host_transmit(length, false)
+}
+
+pub(crate) fn drop_host_transmit_frame(length: usize) -> bool {
+    NETWORK_SWITCH.lock().consume_host_transmit(length, true)
+}
+
+#[allow(dead_code)]
+pub(crate) fn dropped_frame_count() -> u64 {
+    NETWORK_SWITCH.lock().dropped_frame_count()
 }
 
 pub(crate) struct VirtioNet {
     mmio: VirtioMmio,
-    peer_id: u8,
+    peer_id: usize,
 }
 
 impl VirtioNet {
@@ -482,7 +584,7 @@ impl VirtioNet {
     }
 
     fn notify_queue(
-        peer_id: u8,
+        peer_id: usize,
         queue_index: usize,
         queue: &mut GuestVirtQueue,
         memory: &mut GuestMemory<'_>,
@@ -495,7 +597,7 @@ impl VirtioNet {
     }
 
     fn receive_available(
-        peer_id: u8,
+        peer_id: usize,
         queue: &mut GuestVirtQueue,
         memory: &mut GuestMemory<'_>,
     ) -> QueueResult {
@@ -513,8 +615,9 @@ impl VirtioNet {
             let Some(frame) = frame else {
                 break;
             };
-            let total_length = HEADER_SIZE + frame.length;
+            let total_length = HEADER_SIZE + frame.len();
             if capacity < total_length {
+                NETWORK_SWITCH.lock().record_dropped_frame();
                 if !queue.complete(memory, &chain, 0) {
                     return QueueResult::Invalid;
                 }
@@ -523,7 +626,7 @@ impl VirtioNet {
             }
             let mut packet = [0; HEADER_SIZE + MAX_FRAME_SIZE];
             packet[10..12].copy_from_slice(&1u16.to_le_bytes());
-            packet[HEADER_SIZE..total_length].copy_from_slice(&frame.bytes[..frame.length]);
+            packet[HEADER_SIZE..total_length].copy_from_slice(&frame);
             let Some(written) = chain.write_device_data(memory, &packet[..total_length]) else {
                 return QueueResult::Invalid;
             };
@@ -540,7 +643,7 @@ impl VirtioNet {
     }
 
     fn transmit_available(
-        peer_id: u8,
+        peer_id: usize,
         queue: &mut GuestVirtQueue,
         memory: &mut GuestMemory<'_>,
     ) -> QueueResult {
@@ -587,5 +690,63 @@ pub(crate) fn poll_tap_devices() {
 impl Drop for VirtioNet {
     fn drop(&mut self) {
         NETWORK_SWITCH.lock().unregister(self.peer_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NetworkSwitch, MAX_FRAME_SIZE, MAX_HOST_QUEUE_BYTES};
+
+    #[test]
+    fn peer_list_grows_beyond_the_old_fixed_capacity() {
+        let mut switch = NetworkSwitch::new();
+        for _ in 0..9 {
+            assert!(switch.register().is_some());
+        }
+        assert_eq!(switch.peers.len(), 9);
+    }
+
+    #[test]
+    fn host_queue_byte_quota_counts_dropped_frames() {
+        let mut switch = NetworkSwitch::new();
+        let host_mac = [0x02, 0x4b, 0x5a, 0, 0, 0xff];
+        switch.register_host(host_mac);
+        let (peer, source_mac) = switch.register().unwrap();
+        let mut frame = [0; MAX_FRAME_SIZE];
+        frame[..6].copy_from_slice(&host_mac);
+        frame[6..12].copy_from_slice(&source_mac);
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+
+        for _ in 0..(MAX_HOST_QUEUE_BYTES / MAX_FRAME_SIZE + 2) {
+            switch.transmit(peer, &frame);
+        }
+        assert!(switch.dropped_frame_count() > 0);
+        assert!(switch.host_stack_bytes <= MAX_HOST_QUEUE_BYTES);
+    }
+
+    #[test]
+    fn undersized_host_stack_buffer_drops_head_without_blocking_queue() {
+        let mut switch = NetworkSwitch::new();
+        let frame = [0x5a; MAX_FRAME_SIZE];
+        switch.enqueue_host_stack(&frame);
+        switch.enqueue_host_stack(&frame[..32]);
+        let mut output = [0; 64];
+
+        assert_eq!(switch.receive_host_stack(&mut output), Some(0));
+        assert_eq!(switch.dropped_frame_count(), 1);
+        assert_eq!(switch.receive_host_stack(&mut output), Some(32));
+    }
+
+    #[test]
+    fn undersized_host_transmit_buffer_drops_head_without_blocking_queue() {
+        let mut switch = NetworkSwitch::new();
+        let frame = [0x5a; MAX_FRAME_SIZE];
+        switch.enqueue_host_transmit(&frame);
+        switch.enqueue_host_transmit(&frame[..32]);
+        let mut output = [0; 64];
+
+        assert_eq!(switch.peek_host_transmit(&mut output), Some(0));
+        assert_eq!(switch.dropped_frame_count(), 1);
+        assert_eq!(switch.peek_host_transmit(&mut output), Some(32));
     }
 }

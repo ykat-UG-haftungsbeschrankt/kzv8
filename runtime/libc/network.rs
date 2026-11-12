@@ -26,6 +26,7 @@ const SOCKET_COUNT: usize = 32;
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
+const SOCK_RAW: i32 = 3;
 const SOCK_NONBLOCK: i32 = 0x0000_0800;
 const SOCK_CLOEXEC: i32 = 0x0008_0000;
 const SOCK_CLOFORK: i32 = 0x0010_0000;
@@ -612,8 +613,9 @@ pub(crate) fn pump_packet_network() {
 
 pub(crate) fn close_packet_fd(file_descriptor: i32) -> Result<(), Error> {
     let index = packet_index(file_descriptor)?;
-    let removed = PACKET_DEVICES.lock()[index].take();
-    removed.map(|_| ()).ok_or(Error::BadFd)
+    let descriptor = PACKET_DEVICES.lock()[index].take().ok_or(Error::BadFd)?;
+    descriptor.device.set_up(false);
+    Ok(())
 }
 
 pub(crate) fn packet_readiness(file_descriptor: i32, events: i16) -> Result<i16, Error> {
@@ -657,11 +659,17 @@ pub(crate) fn create_socket(
     }
     let nonblocking = socket_type & SOCK_NONBLOCK != 0;
     let socket_type = socket_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC | SOCK_CLOFORK);
+    if socket_type == SOCK_RAW {
+        return Err(Error::SockTypeNoSupport);
+    }
     let socket_type = match socket_type {
         SOCK_STREAM if protocol == 0 || protocol == IPPROTO_TCP => SocketType::Stream,
         SOCK_DGRAM if protocol == 0 || protocol == IPPROTO_UDP => SocketType::Datagram,
-        SOCK_STREAM | SOCK_DGRAM => return Err(Error::NoProtoOpt),
-        _ => return Err(Error::Prototype),
+        SOCK_STREAM | SOCK_DGRAM if protocol == IPPROTO_TCP || protocol == IPPROTO_UDP => {
+            return Err(Error::Prototype);
+        }
+        SOCK_STREAM | SOCK_DGRAM => return Err(Error::ProtoNoSupport),
+        _ => return Err(Error::SockTypeNoSupport),
     };
     let udp_handle = if socket_type == SocketType::Datagram {
         Some(active_context(|context| context.udp_create())??)
@@ -962,6 +970,13 @@ pub(crate) fn send_to(
     if port == 0 {
         return Err(Error::DestAddrReq);
     }
+    let is_broadcast = with_active_tcp_context(|context| {
+        context.is_ipv4_broadcast_address(address)
+    })
+    .ok_or(Error::NoDev)?;
+    if is_broadcast && !descriptor.broadcast {
+        return Err(Error::Acces);
+    }
     descriptor = ensure_udp_binding(index, descriptor)?;
     let handle = descriptor.udp_handle.ok_or(Error::BadFd)?;
     active_context(|context| context.udp_send(handle, address, port, bytes))?
@@ -1027,7 +1042,10 @@ pub(crate) fn receive_from(
         if result.0 != 0 {
             return Ok((result.0, None));
         }
-        if matches!(result.1, Some(TcpState::CloseWait | TcpState::Closed)) {
+        if matches!(
+            result.1,
+            Some(TcpState::CloseWait | TcpState::Closing | TcpState::TimeWait | TcpState::Closed)
+        ) {
             return Ok((0, None));
         }
         if descriptor.nonblocking {
@@ -1249,7 +1267,7 @@ pub(crate) fn readiness(file_descriptor: i32, events: i16) -> Result<i16, Error>
     if events & 0x004 != 0 && readiness.1 {
         flags |= 0x004;
     }
-    if matches!(readiness.2, Some(TcpState::Closed))
+    if matches!(readiness.2, Some(TcpState::Closing | TcpState::TimeWait | TcpState::Closed))
         || descriptor.state == SocketState::Failed
     {
         flags |= 0x008 | 0x010;

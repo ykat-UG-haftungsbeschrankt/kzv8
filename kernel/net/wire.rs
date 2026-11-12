@@ -5,9 +5,14 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::vec::Vec;
+
+use crate::kernel::error::Error;
+
 pub(crate) const ETHERNET_HEADER_LENGTH: usize = 14;
 pub(crate) const IPV4_MINIMUM_HEADER_LENGTH: usize = 20;
 pub(crate) const IPV4_MAXIMUM_HEADER_LENGTH: usize = 60;
+const MAX_IPV4_FRAGMENT_COUNT: usize = (u16::MAX as usize - IPV4_MINIMUM_HEADER_LENGTH + 7) / 8;
 pub(crate) const ETHER_TYPE_IPV4: u16 = 0x0800;
 pub(crate) const ETHER_TYPE_ARP: u16 = 0x0806;
 pub(crate) const IPV4_PROTOCOL_ICMP: u8 = 1;
@@ -25,7 +30,7 @@ impl MacAddress {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Ipv4Address(pub(crate) [u8; 4]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +158,125 @@ pub(crate) fn rewrite_forwarded_ipv4_header(
     Ok(header_length)
 }
 
+pub(crate) fn fragment_ipv4_packet(packet: &Ipv4Packet<'_>, mtu: usize) -> Result<Vec<Vec<u8>>, Error> {
+    if packet.dont_fragment
+        || packet.payload.is_empty()
+        || packet.more_fragments && packet.payload.len() % 8 != 0
+        || mtu <= IPV4_MINIMUM_HEADER_LENGTH
+    {
+        return Err(Error::MsgSize);
+    }
+    let copied_options = copied_ipv4_options(packet.header)?;
+    let base_offset = usize::from(packet.fragment_offset)
+        .checked_mul(8)
+        .ok_or(Error::MsgSize)?;
+    let total_payload_end = base_offset
+        .checked_add(packet.payload.len())
+        .ok_or(Error::MsgSize)?;
+    if total_payload_end > usize::from(u16::MAX) - IPV4_MINIMUM_HEADER_LENGTH {
+        return Err(Error::MsgSize);
+    }
+
+    let mut fragments = Vec::new();
+    let mut payload_offset = 0usize;
+    while payload_offset < packet.payload.len() {
+        if fragments.len() >= MAX_IPV4_FRAGMENT_COUNT {
+            return Err(Error::MsgSize);
+        }
+        let fragment_offset = base_offset
+            .checked_add(payload_offset)
+            .ok_or(Error::MsgSize)?;
+        let offset_units = fragment_offset / 8;
+        if fragment_offset % 8 != 0 || offset_units > 0x1fff {
+            return Err(Error::MsgSize);
+        }
+        let use_full_header = fragment_offset == 0;
+        let options = if use_full_header {
+            &packet.header[IPV4_MINIMUM_HEADER_LENGTH..]
+        } else {
+            copied_options.as_slice()
+        };
+        let header_length = IPV4_MINIMUM_HEADER_LENGTH
+            .checked_add(options.len())
+            .ok_or(Error::MsgSize)?;
+        let maximum_payload = mtu.checked_sub(header_length).ok_or(Error::MsgSize)?;
+        if maximum_payload == 0 {
+            return Err(Error::MsgSize);
+        }
+        let remaining = packet.payload.len() - payload_offset;
+        let mut fragment_payload_length = remaining.min(maximum_payload);
+        if fragment_payload_length < remaining {
+            fragment_payload_length &= !7;
+            if fragment_payload_length == 0 {
+                return Err(Error::MsgSize);
+            }
+        }
+        let more_fragments = fragment_payload_length < remaining || packet.more_fragments;
+        let fragment_length = header_length
+            .checked_add(fragment_payload_length)
+            .ok_or(Error::MsgSize)?;
+        let fragment_length_u16 = u16::try_from(fragment_length).map_err(|_| Error::MsgSize)?;
+        let mut fragment = Vec::new();
+        fragment
+            .try_reserve_exact(fragment_length)
+            .map_err(|_| Error::NoMem)?;
+        fragment.resize(fragment_length, 0);
+        fragment[..IPV4_MINIMUM_HEADER_LENGTH]
+            .copy_from_slice(&packet.header[..IPV4_MINIMUM_HEADER_LENGTH]);
+        fragment[0] = (packet.header[0] & 0xf0) | (header_length as u8 / 4);
+        fragment[IPV4_MINIMUM_HEADER_LENGTH..header_length].copy_from_slice(options);
+        fragment[header_length..]
+            .copy_from_slice(&packet.payload[payload_offset..payload_offset + fragment_payload_length]);
+        fragment[2..4].copy_from_slice(&fragment_length_u16.to_be_bytes());
+        let reserved = u16::from_be_bytes([packet.header[6], packet.header[7]]) & 0x8000;
+        let fragment_field = reserved
+            | if more_fragments { 0x2000 } else { 0 }
+            | u16::try_from(offset_units).map_err(|_| Error::MsgSize)?;
+        fragment[6..8].copy_from_slice(&fragment_field.to_be_bytes());
+        fragment[10..12].fill(0);
+        let checksum = internet_checksum(&fragment[..header_length]);
+        fragment[10..12].copy_from_slice(&checksum.to_be_bytes());
+        fragments.try_reserve(1).map_err(|_| Error::NoMem)?;
+        fragments.push(fragment);
+        payload_offset = payload_offset
+            .checked_add(fragment_payload_length)
+            .ok_or(Error::MsgSize)?;
+    }
+    Ok(fragments)
+}
+
+fn copied_ipv4_options(header: &[u8]) -> Result<Vec<u8>, Error> {
+    if header.len() < IPV4_MINIMUM_HEADER_LENGTH {
+        return Err(Error::Proto);
+    }
+    let options = &header[IPV4_MINIMUM_HEADER_LENGTH..];
+    let mut copied = Vec::new();
+    copied.try_reserve_exact(options.len()).map_err(|_| Error::NoMem)?;
+    let mut offset = 0usize;
+    while offset < options.len() {
+        let kind = options[offset];
+        if kind == 0 {
+            break;
+        }
+        if kind == 1 {
+            offset += 1;
+            continue;
+        }
+        let length = usize::from(*options.get(offset + 1).ok_or(Error::Proto)?);
+        if length < 2 || offset.checked_add(length).is_none_or(|end| end > options.len()) {
+            return Err(Error::Proto);
+        }
+        if kind & 0x80 != 0 {
+            copied.extend_from_slice(&options[offset..offset + length]);
+        }
+        offset += length;
+    }
+    while copied.len() % 4 != 0 {
+        copied.push(0);
+    }
+    Ok(copied)
+}
+
 pub(crate) fn write_ethernet_header(
     output: &mut [u8],
     destination: MacAddress,
@@ -241,9 +365,11 @@ fn fold_checksum(mut sum: u64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        rewrite_forwarded_ipv4_header, write_ipv4_header, Ipv4Address, Ipv4Packet,
-        IPV4_PROTOCOL_UDP,
+        fragment_ipv4_packet, rewrite_forwarded_ipv4_header, write_ipv4_header, Ipv4Address,
+        Ipv4Packet, IPV4_PROTOCOL_UDP,
     };
+    use crate::kernel::error::Error;
+    use crate::kernel::net::ipv4_fragments::Ipv4FragmentReassembler;
 
     #[test]
     fn forwarding_decrements_ttl_and_repairs_checksum() {
@@ -267,5 +393,104 @@ mod tests {
         assert_eq!(packet.ttl, 63);
         assert_eq!(packet.source, source);
         assert_eq!(packet.destination, destination);
+    }
+
+    #[test]
+    fn ipv4_fragments_reassemble_out_of_order() {
+        let source = Ipv4Address([192, 0, 2, 1]);
+        let destination = Ipv4Address([198, 51, 100, 8]);
+        let mut original = [0; 60];
+        write_ipv4_header(
+            &mut original,
+            source,
+            destination,
+            IPV4_PROTOCOL_UDP,
+            64,
+            41,
+            0,
+            40,
+        )
+        .unwrap();
+        for (index, byte) in original[20..].iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let packet = Ipv4Packet::parse(&original).unwrap();
+        let fragments = fragment_ipv4_packet(&packet, 36).unwrap();
+        assert_eq!(fragments.len(), 3);
+
+        let mut reassembler = Ipv4FragmentReassembler::new();
+        let mut complete = None;
+        for (index, bytes) in fragments.iter().rev().enumerate() {
+            let fragment = Ipv4Packet::parse(bytes).unwrap();
+            complete = reassembler
+                .insert(&fragment, index as u64)
+                .unwrap()
+                .or(complete);
+        }
+        let reassembled = complete.unwrap();
+        let parsed = Ipv4Packet::parse(&reassembled).unwrap();
+        assert_eq!(parsed.source, source);
+        assert_eq!(parsed.destination, destination);
+        assert_eq!(parsed.identification, 41);
+        assert_eq!(parsed.fragment_offset, 0);
+        assert!(!parsed.more_fragments);
+        assert_eq!(parsed.payload, &original[20..]);
+    }
+
+    #[test]
+    fn ipv4_fragmenter_honors_dont_fragment() {
+        let source = Ipv4Address([192, 0, 2, 1]);
+        let destination = Ipv4Address([198, 51, 100, 8]);
+        let mut original = [0; 60];
+        write_ipv4_header(
+            &mut original,
+            source,
+            destination,
+            IPV4_PROTOCOL_UDP,
+            64,
+            42,
+            0x4000,
+            40,
+        )
+        .unwrap();
+        let packet = Ipv4Packet::parse(&original).unwrap();
+        assert_eq!(
+            fragment_ipv4_packet(&packet, 36),
+            Err(Error::MsgSize)
+        );
+    }
+
+    #[test]
+    fn fragment_reassembly_expires_from_first_arrival() {
+        let source = Ipv4Address([192, 0, 2, 1]);
+        let destination = Ipv4Address([198, 51, 100, 8]);
+        let mut original = [0; 60];
+        write_ipv4_header(
+            &mut original,
+            source,
+            destination,
+            IPV4_PROTOCOL_UDP,
+            64,
+            43,
+            0,
+            40,
+        )
+        .unwrap();
+        let packet = Ipv4Packet::parse(&original).unwrap();
+        let fragments = fragment_ipv4_packet(&packet, 36).unwrap();
+        let first = Ipv4Packet::parse(&fragments[0]).unwrap();
+        let middle = Ipv4Packet::parse(&fragments[1]).unwrap();
+        let last = Ipv4Packet::parse(fragments.last().unwrap()).unwrap();
+        let mut reassembler = Ipv4FragmentReassembler::new();
+
+        assert!(reassembler.insert(&first, 0).unwrap().is_none());
+        assert!(reassembler
+            .insert(&middle, 20_000_000_000)
+            .unwrap()
+            .is_none());
+        assert!(reassembler
+            .insert(&last, 31_000_000_000)
+            .unwrap()
+            .is_none());
     }
 }

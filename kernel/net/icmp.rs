@@ -14,6 +14,10 @@ pub(crate) const ICMP_DESTINATION_UNREACHABLE: u8 = 3;
 pub(crate) const ICMP_TIME_EXCEEDED: u8 = 11;
 const ICMP_ECHO_HEADER_LENGTH: usize = 8;
 
+pub(crate) fn is_error_message(message: &[u8]) -> bool {
+    matches!(message.first().copied(), Some(3 | 4 | 5 | 11 | 12))
+}
+
 pub(crate) fn write_echo_reply(request: &[u8], output: &mut [u8]) -> Result<usize, Error> {
     if request.len() < ICMP_ECHO_HEADER_LENGTH || output.len() < request.len() {
         return Err(Error::MsgSize);
@@ -62,6 +66,26 @@ pub(crate) fn write_destination_unreachable(
     )
 }
 
+pub(crate) fn write_fragmentation_needed(
+    original_header: &[u8],
+    original_payload: &[u8],
+    next_hop_mtu: u16,
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    let length = write_error(
+        ICMP_DESTINATION_UNREACHABLE,
+        4,
+        original_header,
+        original_payload,
+        output,
+    )?;
+    output[6..8].copy_from_slice(&next_hop_mtu.to_be_bytes());
+    output[2..4].fill(0);
+    let checksum = internet_checksum(&output[..length]);
+    output[2..4].copy_from_slice(&checksum.to_be_bytes());
+    Ok(length)
+}
+
 fn write_error(
     message_type: u8,
     code: u8,
@@ -86,4 +110,28 @@ fn write_error(
     let checksum = internet_checksum(&output[..length]);
     output[2..4].copy_from_slice(&checksum.to_be_bytes());
     Ok(length)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_fragmentation_needed;
+    use crate::kernel::net::wire::internet_checksum;
+
+    #[test]
+    fn fragmentation_needed_checksum_covers_next_hop_mtu() {
+        let mut original_header = [0; 20];
+        original_header[0] = 0x45;
+        let mut output = [0; 36];
+        let length = write_fragmentation_needed(
+            &original_header,
+            &[0; 8],
+            1400,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output[0], 3);
+        assert_eq!(output[1], 4);
+        assert_eq!(u16::from_be_bytes([output[6], output[7]]), 1400);
+        assert_eq!(internet_checksum(&output[..length]), 0);
+    }
 }
