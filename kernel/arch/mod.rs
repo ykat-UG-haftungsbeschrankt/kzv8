@@ -265,6 +265,7 @@ pub(crate) mod traits {
 
     pub(crate) trait DebugArchitecture {
         fn decommit_debug(code: u8);
+        fn write_early(bytes: &[u8]);
     }
 
     #[cfg(feature = "virtualization")]

@@ -5,13 +5,10 @@
  * free of charge, without warranty of any kind.
  */
 
-#[cfg(test)]
-mod tests {
-    use alloc::sync::Arc;
+use alloc::sync::Arc;
 
-    use super::{Event, EventFlags, EventLoop, EventSourceId};
-    use crate::kernel::error::Error;
-    use crate::kernel::event::completion::Completion;
+use super::{Completion, Event, EventFlags, EventLoop, EventSourceId};
+use crate::kernel::error::Error;
 
     #[test]
     fn readiness_is_filtered_and_level_triggered() {
@@ -27,7 +24,7 @@ mod tests {
             flags: EventFlags::READABLE,
             data: 17,
         };
-        assert_eq!(events.wait(0), Some(ready));
+        assert_eq!(events.wait(0), Some(ready.clone()));
         assert_eq!(events.wait(0), Some(ready));
         events.set_readiness(token, EventFlags::NONE).unwrap();
         assert_eq!(events.wait(0), None);
@@ -129,4 +126,3 @@ mod tests {
         assert_eq!(events.wait(0), Some(Event::DeviceInterrupt { slot: 9 }));
         assert_eq!(events.wait(0), None);
     }
-}

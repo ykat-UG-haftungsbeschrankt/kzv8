@@ -60,11 +60,18 @@ pub(crate) fn vm_smoke() -> bool {
         return false;
     };
     let mut address_space = process.address_space();
-    if !matches!(address_space.allocate_stack(0), Err(Error::NoExec)) {
+    if !matches!(
+        address_space.reserve(None, 0, PAGE_SIZE, 0, false),
+        Err(Error::NoExec)
+    ) {
         return false;
     }
 
-    let Ok((stack_address, stack_pointer)) = address_space.allocate_stack(PAGE_SIZE + 1) else {
+    let Ok(stack_address) = address_space.reserve(None, PAGE_SIZE + 1, PAGE_SIZE, 0, false) else {
+        return false;
+    };
+    let Some(stack_pointer) = stack_address.checked_add(MAPPING_LENGTH) else {
+        address_space.release(stack_address, MAPPING_LENGTH);
         return false;
     };
     let read_write = Permissions::from_bits(Permissions::READ.bits() | Permissions::WRITE.bits());

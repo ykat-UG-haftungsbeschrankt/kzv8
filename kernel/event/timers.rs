@@ -90,3 +90,7 @@ impl<const N: usize> TimerQueue<N> {
         self.deadlines.first().map(|((deadline_ns, _), _)| *deadline_ns)
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/kernel/event/timers.rs"]
+mod tests;

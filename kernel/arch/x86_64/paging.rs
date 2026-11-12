@@ -8,7 +8,7 @@
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::kernel::arch::traits::MemoryArchitecture as _;
+use crate::kernel::arch::traits::{CpuArchitecture as _, MemoryArchitecture as _};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 const PAGE_SIZE: usize = 4096;

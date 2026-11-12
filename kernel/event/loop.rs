@@ -474,3 +474,7 @@ impl<const N: usize> EventLoop<N> {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/kernel/event/loop.rs"]
+mod tests;

@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use core::ffi::{c_char, c_void, CStr};
 use core::ptr::{read_volatile, write_volatile};
 
+use crate::kernel::arch::traits::CpuArchitecture as _;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::error::Error as KernelError;
 use crate::kernel::vfs::{NodeMetadata, INODE_FLAG_APPEND, INODE_FLAG_IMMUTABLE};

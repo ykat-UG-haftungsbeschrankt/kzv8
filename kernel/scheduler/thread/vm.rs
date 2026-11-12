@@ -274,10 +274,16 @@ struct UserAddressSpaceInner {
 	base: usize,
 	length: usize,
 	areas: IrqSpinLock<UserAreas>,
+	#[cfg(test)]
+	test_stub: bool,
 }
 
 impl Drop for UserAddressSpaceInner {
 	fn drop(&mut self) {
+		#[cfg(test)]
+		if self.test_stub {
+			return;
+		}
 		let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
 		let previous_root = crate::kernel::arch::MemoryArchitecture::current_address_space();
 		if previous_root == self.root
@@ -333,8 +339,23 @@ impl UserAddressSpace {
 				base,
 				length,
 				areas: IrqSpinLock::new(UserAreas::new()),
+				#[cfg(test)]
+				test_stub: false,
 			}),
 		})
+	}
+
+	#[cfg(test)]
+	pub(crate) fn new_test_stub() -> Self {
+		Self {
+			inner: Arc::new(UserAddressSpaceInner {
+				root: 0,
+				base: 0,
+				length: 0,
+				areas: IrqSpinLock::new(UserAreas::new()),
+				test_stub: true,
+			}),
+		}
 	}
 
 	pub(crate) fn root(&self) -> usize {

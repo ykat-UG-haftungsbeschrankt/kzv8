@@ -448,7 +448,7 @@ pub(crate) fn find_guest_mmio_bar(address: PciAddress, maximum_length: u64) -> O
                         .start
                         .checked_add(region.length)
                         .is_some_and(|region_end| {
-                            region.start < end as usize && bar.address as usize < region_end
+                            region.start < end as usize && (bar.address as usize) < region_end
                         })
                 })
             {

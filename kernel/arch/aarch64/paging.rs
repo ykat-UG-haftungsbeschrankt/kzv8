@@ -32,9 +32,9 @@ const TCR_EL1_VALUE: u64 = 25
     | (0b10 << 32);
 
 #[repr(C, align(4096))]
-struct Level1Table([u64; TABLE_ENTRIES]);
+pub(super) struct Level1Table(pub(super) [u64; TABLE_ENTRIES]);
 
-static mut TTBR0_TABLE: Level1Table = Level1Table([0; TABLE_ENTRIES]);
+pub(super) static mut TTBR0_TABLE: Level1Table = Level1Table([0; TABLE_ENTRIES]);
 
 pub(crate) unsafe fn initialize() {
     let table = addr_of_mut!(TTBR0_TABLE.0).cast::<u64>();

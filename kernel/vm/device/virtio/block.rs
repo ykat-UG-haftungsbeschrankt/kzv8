@@ -240,4 +240,3 @@ impl VirtioBlock {
                 .is_some_and(|end| end <= disk.len())
     }
 }
-*** End Patch

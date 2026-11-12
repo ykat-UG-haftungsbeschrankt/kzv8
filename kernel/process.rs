@@ -527,7 +527,7 @@ impl Process {
         body: MessageBody,
     ) -> Result<CallFuture, Error> {
         match self.capability(handle)? {
-            Capability::Endpoint(endpoint) => Ok(endpoint.call(body)),
+            Capability::Endpoint(endpoint) => endpoint.call(body),
             Capability::SharedMemory(_) => Err(Error::Badf),
         }
     }
@@ -633,9 +633,11 @@ mod tests {
     use alloc::sync::Arc;
 
     use super::{
-        Capability, CapabilityTable, FileDescriptorTable, KernelObjectRef, Process,
+        Capability, CapabilityTable, Credentials, FileDescriptorTable, KernelObjectRef,
+        KernelObjectTable, NamespaceSet, Process, UserAddressSpace,
     };
     use crate::kernel::ipc::Endpoint;
+    use crate::kernel::scheduler::sync::IrqSpinLock;
 
     #[test]
     fn capability_table_grows_past_previous_limit() {
@@ -665,7 +667,14 @@ mod tests {
 
     #[test]
     fn process_identity_is_its_arc_allocation_address() {
-        let process = Process::new().unwrap();
+        let process = Arc::new(Process {
+            namespace_set: NamespaceSet::root(),
+            address_space: UserAddressSpace::new_test_stub(),
+            credentials: IrqSpinLock::new(Credentials::root()),
+            capabilities: IrqSpinLock::new(CapabilityTable::new().unwrap()),
+            kernel_objects: IrqSpinLock::new(KernelObjectTable::new()),
+            file_descriptors: IrqSpinLock::new(FileDescriptorTable::new()),
+        });
         assert_eq!(process.id(), Arc::as_ptr(&process) as usize as u64);
     }
 

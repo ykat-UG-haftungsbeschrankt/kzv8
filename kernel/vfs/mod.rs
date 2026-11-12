@@ -14,6 +14,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
+use crate::kernel::arch::traits::CpuArchitecture as _;
 use crate::kernel::error::Error;
 use crate::kernel::process::{Credentials, GroupId, UserId};
 use crate::kernel::scheduler::thread::{ThreadManager, ThreadState};

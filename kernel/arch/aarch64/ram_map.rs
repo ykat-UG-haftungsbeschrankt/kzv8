@@ -8,6 +8,7 @@
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use super::paging::TTBR0_TABLE;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 const TABLE_ENTRIES: usize = 512;
@@ -243,7 +244,8 @@ pub(crate) fn create_address_space() -> Option<(usize, usize, usize)> {
 
     let mut tables = PageTableReservation::<65>::new(0);
     let _guard = PAGE_TABLE_LOCK.lock();
-    let kernel_root = addr_of_mut!(TTBR0_TABLE.0).cast::<u64>();
+    // SAFETY: PAGE_TABLE_LOCK serializes software mutations of the bootstrap root table.
+    let kernel_root = unsafe { addr_of_mut!(TTBR0_TABLE.0).cast::<u64>() };
     for index in KERNEL_VM_START..TABLE_ENTRIES {
         unsafe { split_l1_block(kernel_root.add(index), true, &mut tables)? };
     }

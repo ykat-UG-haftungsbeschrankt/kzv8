@@ -8,6 +8,7 @@
 use core::ffi::{c_int, c_void};
 use core::ptr;
 
+use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::error::Error;
 use crate::kernel::runtime::runtime_libc::filesystem;
 

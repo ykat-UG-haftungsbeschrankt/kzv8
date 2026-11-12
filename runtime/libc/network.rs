@@ -7,10 +7,11 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::ffi::c_int;
+use core::ffi::{c_int, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicU16, Ordering};
 
+use crate::kernel::arch::traits::TimerArchitecture as _;
 use crate::kernel::error::Error;
 use crate::kernel::net::tcp::connection::{TcpSocketHandle, TcpState};
 use crate::kernel::net::udp::UdpSocketHandle;
@@ -600,6 +601,7 @@ pub(crate) fn write_packet_fd(
             let _progress = with_active_tcp_context(TcpContext::poll_network);
         }
         TunTapMode::Tap => {
+            #[cfg(feature = "virtualization")]
             crate::kernel::vm::device::virtio::net::poll_tap_devices();
         }
     }
@@ -608,6 +610,7 @@ pub(crate) fn write_packet_fd(
 
 pub(crate) fn pump_packet_network() {
     let _progress = with_active_tcp_context(TcpContext::poll_network);
+    #[cfg(feature = "virtualization")]
     crate::kernel::vm::device::virtio::net::poll_tap_devices();
 }
 
@@ -1137,6 +1140,14 @@ pub(crate) fn nonblocking(file_descriptor: i32) -> Result<bool, Error> {
     Ok(socket_descriptor(socket_index(file_descriptor)?)?.nonblocking)
 }
 
+pub(crate) fn set_nonblocking(file_descriptor: i32, nonblocking: bool) -> Result<(), Error> {
+    let index = socket_index(file_descriptor)?;
+    let mut descriptor = socket_descriptor(index)?;
+    descriptor.nonblocking = nonblocking;
+    set_socket_descriptor(index, descriptor);
+    Ok(())
+}
+
 pub(crate) fn get_status_flags(file_descriptor: i32) -> Result<i32, Error> {
     let nonblocking = if is_socket_fd(file_descriptor) {
         nonblocking(file_descriptor)?
@@ -1258,8 +1269,7 @@ pub(crate) fn readiness(file_descriptor: i32, events: i16) -> Result<i16, Error>
             context.tcp_writable(handle),
             context.tcp_state(handle),
         )
-    })?
-    .ok_or(Error::NoDev)?;
+    })?;
     let mut flags = 0;
     if events & 0x001 != 0 && readiness.0 {
         flags |= 0x001;

@@ -12,7 +12,7 @@ build = "build.rs"
 [[bin]]
 name = "kernel"
 path = "kernel/main.rs"
-test = false
+test = true
 bench = false
 
 [dependencies]

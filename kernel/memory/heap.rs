@@ -722,7 +722,7 @@ pub(crate) struct Heap {
     pub(crate) state: IrqSpinLock<HeapState>,
 }
 
-#[global_allocator]
+#[cfg_attr(not(test), global_allocator)]
 static GLOBAL_ALLOCATOR: Heap = Heap::new();
 
 impl Heap {

@@ -262,4 +262,3 @@ impl VirtioScsi {
         data_length + RESPONSE_HEADER_SIZE
     }
 }
-*** End Patch

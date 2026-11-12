@@ -275,7 +275,10 @@ pub unsafe extern "C" fn recv(
     length: usize,
     flags: c_int,
 ) -> isize {
-    if flags & !MSG_SUPPORTED != 0 || (buffer.is_null() && length != 0) {
+    if length > isize::MAX as usize
+        || flags & !MSG_SUPPORTED != 0
+        || (buffer.is_null() && length != 0)
+    {
         return fail_io(Error::Inval);
     }
     let output = if length == 0 {
@@ -284,7 +287,10 @@ pub unsafe extern "C" fn recv(
         unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) }
     };
     match network::receive(socket, output) {
-        Ok(amount) => amount as isize,
+        Ok(amount) => match isize::try_from(amount) {
+            Ok(amount) => amount,
+            Err(_) => fail_io(Error::Inval),
+        },
         Err(error) => fail_io(error),
     }
 }
@@ -303,7 +309,10 @@ pub unsafe extern "C" fn recvfrom(
     {
         return fail_io(Error::Fault);
     }
-    if flags & !MSG_SUPPORTED != 0 || (buffer.is_null() && length != 0) {
+    if length > isize::MAX as usize
+        || flags & !MSG_SUPPORTED != 0
+        || (buffer.is_null() && length != 0)
+    {
         return fail_io(Error::Inval);
     }
     let output = if length == 0 {
@@ -326,7 +335,10 @@ pub unsafe extern "C" fn recvfrom(
             return fail_io(error);
         }
     }
-    received
+    match isize::try_from(received) {
+        Ok(received) => received,
+        Err(_) => fail_io(Error::Inval),
+    }
 }
 
 #[no_mangle]

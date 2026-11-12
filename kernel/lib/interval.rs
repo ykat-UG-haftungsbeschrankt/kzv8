@@ -13,10 +13,12 @@
  *       [lower]  [higher]
  */
 
+use alloc::vec::Vec;
 use core::cmp::Ordering;
-use core::ops::Range;
+use core::ops::{Index, IndexMut, Range};
 
-const NO_NODE: u32 = u32::MAX;
+const NO_NODE: u32 = 0;
+const INLINE_NODE_CAPACITY: usize = 16;
 
 struct IntervalNode<T> {
 	range: Range<usize>,
@@ -55,33 +57,112 @@ impl<T> IntervalNode<T> {
 	}
 }
 
-/// A fixed-capacity AVL index of non-empty, half-open intervals keyed by `(start, end)`.
+pub(crate) struct IntervalTreeStorage<T> {
+	nodes: Vec<IntervalNode<T>>,
+}
+
+struct NodeStorage<T, const N: usize> {
+	inline_nodes: [IntervalNode<T>; INLINE_NODE_CAPACITY],
+	heap_nodes: Option<Vec<IntervalNode<T>>>,
+}
+
+impl<T, const N: usize> NodeStorage<T, N> {
+	const fn new() -> Self {
+		Self {
+			inline_nodes: [const { IntervalNode::empty() }; INLINE_NODE_CAPACITY],
+			heap_nodes: None,
+		}
+	}
+
+	const fn inline_capacity() -> usize {
+		if N < INLINE_NODE_CAPACITY {
+			N
+		} else {
+			INLINE_NODE_CAPACITY
+		}
+	}
+
+	fn capacity(&self) -> usize {
+		if self.heap_nodes.is_some() {
+			N
+		} else {
+			Self::inline_capacity()
+		}
+	}
+
+	fn install_heap_storage(&mut self, storage: IntervalTreeStorage<T>) {
+		debug_assert!(self.heap_nodes.is_none());
+		debug_assert_eq!(storage.nodes.len(), N);
+		let mut nodes = storage.nodes;
+		for index in 0..Self::inline_capacity() {
+			nodes[index] = core::mem::replace(
+				&mut self.inline_nodes[index],
+				IntervalNode::empty(),
+			);
+		}
+		self.heap_nodes = Some(nodes);
+	}
+}
+
+impl<T, const N: usize> Index<usize> for NodeStorage<T, N> {
+	type Output = IntervalNode<T>;
+
+	fn index(&self, encoded_index: usize) -> &Self::Output {
+		let index = encoded_index
+			.checked_sub(1)
+			.expect("invalid interval tree node index");
+		if let Some(nodes) = &self.heap_nodes {
+			&nodes[index]
+		} else {
+			&self.inline_nodes[index]
+		}
+	}
+}
+
+impl<T, const N: usize> IndexMut<usize> for NodeStorage<T, N> {
+	fn index_mut(&mut self, encoded_index: usize) -> &mut Self::Output {
+		let index = encoded_index
+			.checked_sub(1)
+			.expect("invalid interval tree node index");
+		if let Some(nodes) = &mut self.heap_nodes {
+			&mut nodes[index]
+		} else {
+			&mut self.inline_nodes[index]
+		}
+	}
+}
+
+/// A bounded AVL index of non-empty, half-open intervals keyed by `(start, end)`.
 /// Intervals may overlap; inserting the same bounds replaces its value.
 pub(crate) struct IntervalTree<T, const N: usize> {
-	nodes: [IntervalNode<T>; N],
+	nodes: NodeStorage<T, N>,
 	root: u32,
 	free_head: u32,
+	next_unused: usize,
 	len: usize,
 }
 
 impl<T, const N: usize> IntervalTree<T, N> {
 	pub(crate) const fn new() -> Self {
-		let mut nodes = [const { IntervalNode::empty() }; N];
-		let mut index = 0;
-		while index < N {
-			nodes[index].free_next = if index + 1 < N {
-				(index + 1) as u32
-			} else {
-				NO_NODE
-			};
-			index += 1;
-		}
 		Self {
-			nodes,
+			nodes: NodeStorage::new(),
 			root: NO_NODE,
-			free_head: if N == 0 { NO_NODE } else { 0 },
+			free_head: NO_NODE,
+			next_unused: 0,
 			len: 0,
 		}
+	}
+
+	pub(crate) fn allocate_heap_storage() -> Option<IntervalTreeStorage<T>> {
+		let mut nodes = Vec::new();
+		nodes.try_reserve_exact(N).ok()?;
+		nodes.resize_with(N, IntervalNode::empty);
+		Some(IntervalTreeStorage { nodes })
+	}
+
+	pub(crate) fn install_heap_storage(&mut self, storage: IntervalTreeStorage<T>) {
+		self.nodes.install_heap_storage(storage);
+		self.next_unused = NodeStorage::<T, N>::inline_capacity();
 	}
 
 	pub(crate) fn len(&self) -> usize {
@@ -97,7 +178,7 @@ impl<T, const N: usize> IntervalTree<T, N> {
 	}
 
 	pub(crate) fn is_full(&self) -> bool {
-		self.len == N
+		self.free_head == NO_NODE && self.next_unused >= self.nodes.capacity()
 	}
 
 	/// Inserts an interval, returning its previous value if its bounds existed.
@@ -205,18 +286,12 @@ impl<T, const N: usize> IntervalTree<T, N> {
 
 	pub(crate) fn clear(&mut self) {
 		self.root = NO_NODE;
-		self.free_head = if N == 0 { NO_NODE } else { 0 };
+		self.free_head = NO_NODE;
 		self.len = 0;
-		let mut index = 0;
-		while index < N {
-			self.nodes[index] = IntervalNode::empty();
-			self.nodes[index].free_next = if index + 1 < N {
-				(index + 1) as u32
-			} else {
-				NO_NODE
-			};
-			index += 1;
+		for index in 0..self.next_unused {
+			self.nodes[index + 1] = IntervalNode::empty();
 		}
+		self.next_unused = 0;
 	}
 
 	fn insert_node(
@@ -226,11 +301,24 @@ impl<T, const N: usize> IntervalTree<T, N> {
 		value: T,
 	) -> Result<(u32, Option<T>, bool), T> {
 		if node_index == NO_NODE {
-			if self.free_head == NO_NODE {
-				return Err(value);
-			}
-			let new_index = self.free_head;
-			self.free_head = self.nodes[new_index as usize].free_next;
+			let new_index = if self.free_head != NO_NODE {
+				let new_index = self.free_head;
+				self.free_head = self.nodes[new_index as usize].free_next;
+				new_index
+			} else {
+				if self.next_unused >= self.nodes.capacity() {
+					return Err(value);
+				}
+				let Some(new_index) = self
+					.next_unused
+					.checked_add(1)
+					.and_then(|index| u32::try_from(index).ok())
+				else {
+					return Err(value);
+				};
+				self.next_unused += 1;
+				new_index
+			};
 			self.nodes[new_index as usize] = IntervalNode::new(range, value);
 			return Ok((new_index, None, true));
 		}

@@ -6,6 +6,7 @@
  */
 
 mod device_tree;
+mod debug;
 mod entry;
 pub(crate) mod interrupts;
 mod paging;
@@ -185,7 +186,7 @@ pub(crate) fn random_u32() -> Option<u32> {
         // SAFETY: ID_AA64ISAR0_EL1 reports FEAT_RNG; RNDR failure is detected through NZCV.
         unsafe {
             core::arch::asm!(
-                "mrs {value}, rndr",
+                "mrs {value}, S3_3_C2_C4_0",
                 "cset {success:w}, ne",
                 value = out(reg) value,
                 success = lateout(reg) success,
@@ -446,6 +447,10 @@ impl crate::kernel::arch::traits::CpuArchitecture for super::CpuArchitecture {
 impl crate::kernel::arch::traits::DebugArchitecture for super::DebugArchitecture {
     fn decommit_debug(code: u8) {
         self::decommit_debug(code);
+    }
+
+    fn write_early(bytes: &[u8]) {
+        self::debug::write_early(bytes);
     }
 }
 

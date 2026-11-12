@@ -8,6 +8,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
+use crate::kernel::arch::traits::CpuArchitecture as _;
 use crate::kernel::error::Error;
 use crate::kernel::net::tcp::segment::{
     TcpSegment, TCP_HEADER_LENGTH, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST,
@@ -536,7 +537,7 @@ impl TcpSocketTable {
     }
 
     pub(crate) fn close(&mut self, handle: TcpSocketHandle, now_ns: u64) -> Result<(), Error> {
-        let index = self.slot_index(handle).ok_or(Error::BadFd)?;
+        let index = self.slot_index(handle)?;
         let (port, is_listener) = {
             let socket = self.slots[index].socket.as_ref().ok_or(Error::BadFd)?;
             (socket.local_port, socket.state == TcpState::Listen)
@@ -1190,7 +1191,7 @@ impl TcpSocketTable {
                 Self::accept_fin(socket, now_ns);
                 return Ok(true);
             }
-            changed |= Self::drain_out_of_order(socket)?;
+            changed |= Self::drain_out_of_order(socket, now_ns)?;
             return Ok(changed);
         }
 
@@ -1236,7 +1237,7 @@ impl TcpSocketTable {
         Ok(true)
     }
 
-    fn drain_out_of_order(socket: &mut TcpSocket) -> Result<bool, Error> {
+    fn drain_out_of_order(socket: &mut TcpSocket, now_ns: u64) -> Result<bool, Error> {
         let mut changed = false;
         loop {
             let Some(expected_sequence) = socket.receive_next else {
@@ -1288,6 +1289,14 @@ impl TcpSocketTable {
         };
         socket.out_of_order.clear();
         socket.out_of_order_bytes = 0;
+    }
+
+    fn slot_index(&self, handle: TcpSocketHandle) -> Result<usize, Error> {
+        let slot = self.slots.get(handle.index).ok_or(Error::BadFd)?;
+        if slot.generation != handle.generation || slot.socket.is_none() {
+            return Err(Error::BadFd);
+        }
+        Ok(handle.index)
     }
 
     fn socket(&self, handle: TcpSocketHandle) -> Option<&TcpSocket> {
@@ -1533,9 +1542,11 @@ impl TcpSocket {
 mod tests {
     use alloc::vec::Vec;
 
+    use crate::kernel::arch::traits::CpuArchitecture as _;
     use super::{
-        TcpSocket, TcpSocketTable, TcpState, TcpTransmission, MAX_TCP_SEND_BUFFER_PER_SOCKET,
-        MAX_TCP_SEND_BUFFER_TOTAL, MAX_TCP_SOCKETS, MAX_TCP_RECEIVE_WINDOW,
+        TcpFlowKey, TcpSocket, TcpSocketHandle, TcpSocketTable, TcpState, TcpTransmission,
+        MAX_TCP_SEND_BUFFER_PER_SOCKET, MAX_TCP_SEND_BUFFER_TOTAL, MAX_TCP_SOCKETS,
+        MAX_TCP_RECEIVE_WINDOW,
     };
     use crate::kernel::net::tcp::segment::{
         write_segment, TcpSegment, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST,
@@ -1690,6 +1701,7 @@ mod tests {
         assert_eq!(sockets.receive(accepted, &mut output).unwrap(), 4);
         assert_eq!(&output, b"data");
 
+        transmissions.clear();
         let peer_window = sockets.socket(accepted).unwrap().peer_window;
         let length = write_segment(
             &mut bytes,
@@ -1838,6 +1850,7 @@ mod tests {
         )
         .unwrap();
         let segment = TcpSegment::parse(&bytes[..length], remote, local).unwrap();
+        let mut transmissions = Vec::new();
 
         assert!(!sockets
             .receive_segment(remote, local, &segment, 1, &mut transmissions)
@@ -2259,6 +2272,7 @@ mod tests {
         let maximum_segment_size = sockets.maximum_segment_size;
         let socket = sockets.socket_mut(handle).unwrap();
         socket.state = TcpState::Established;
+        socket.receive_next = Some(0);
         socket.congestion_window_bytes = maximum_segment_size * 3;
         let mut payload = Vec::new();
         payload.resize(maximum_segment_size * 4, 0x3c);

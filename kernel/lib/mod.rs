@@ -14,7 +14,6 @@
 pub(crate) mod address;
 pub(crate) mod alignment;
 pub(crate) mod bitfield;
-pub(crate) mod bitindex;
 pub(crate) mod endian;
 #[allow(dead_code)]
 pub(crate) mod btree;

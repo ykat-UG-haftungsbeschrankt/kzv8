@@ -350,26 +350,56 @@ impl crate::kernel::arch::traits::ThreadArchitecture for super::ThreadArchitectu
 }
 
 impl crate::kernel::arch::traits::InterruptArchitecture for super::InterruptArchitecture {
+    #[cfg(test)]
+    unsafe fn initialize_interrupts() {}
+
+    #[cfg(not(test))]
     unsafe fn initialize_interrupts() {
         unsafe { interrupts::initialize() };
     }
 
+    #[cfg(test)]
+    fn initialize_interrupt_controller() -> bool {
+        true
+    }
+
+    #[cfg(not(test))]
     fn initialize_interrupt_controller() -> bool {
         interrupts::initialize_controller()
     }
 
+    #[cfg(test)]
+    fn disable_interrupts() -> u64 {
+        0
+    }
+
+    #[cfg(not(test))]
     fn disable_interrupts() -> u64 {
         interrupts::disable()
     }
 
+    #[cfg(test)]
+    fn enable_interrupts() {}
+
+    #[cfg(not(test))]
     fn enable_interrupts() {
         interrupts::enable();
     }
 
+    #[cfg(test)]
+    fn restore_interrupts(_flags: u64) {}
+
+    #[cfg(not(test))]
     fn restore_interrupts(flags: u64) {
         interrupts::restore(flags);
     }
 
+    #[cfg(test)]
+    fn interrupts_enabled() -> bool {
+        false
+    }
+
+    #[cfg(not(test))]
     fn interrupts_enabled() -> bool {
         interrupts::enabled()
     }
@@ -410,6 +440,10 @@ impl crate::kernel::arch::traits::CpuArchitecture for super::CpuArchitecture {
 impl crate::kernel::arch::traits::DebugArchitecture for super::DebugArchitecture {
     fn decommit_debug(code: u8) {
         self::decommit_debug(code);
+    }
+
+    fn write_early(bytes: &[u8]) {
+        self::debug::write_early(bytes);
     }
 }
 

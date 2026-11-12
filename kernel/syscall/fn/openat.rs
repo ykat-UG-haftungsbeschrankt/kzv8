@@ -13,7 +13,7 @@ use crate::kernel::dl::AddressSpace;
 use crate::kernel::error::Error;
 use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::scheduler::thread::vm::UserAddressSpace;
-use crate::kernel::vfs::{OpenMode, Vfs};
+use crate::kernel::vfs::OpenMode;
 
 const AT_FDCWD: i64 = -100;
 const OPEN_ACCESS_MODE_MASK: u64 = 0x3;
@@ -49,7 +49,7 @@ impl OpenAt {
         let process = ThreadManager::current_process()?;
         let address_space = process.address_space();
         let path = copy_user_path(&address_space, path_address)?;
-        let vfs = Vfs::mounted().ok_or(Error::NoDev)?;
+        let vfs = crate::kernel::vfs::mounted().ok_or(Error::NoDev)?;
         let file = vfs.open_blocking(&path, open_mode, process.credentials()?)?;
         let descriptor = process.insert_file_descriptor(file)?;
         let _ = arguments.mode;

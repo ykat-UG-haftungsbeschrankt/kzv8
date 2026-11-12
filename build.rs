@@ -44,6 +44,10 @@ fn main() {
     let repository_dir = package_dir.clone();
     let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    if target_os != "none" {
+        return;
+    }
     let runtime_v8_enabled = env::var_os("CARGO_FEATURE_RUNTIME_V8").is_some();
     let aarch64_stage2_enabled = env::var_os("CARGO_FEATURE_AARCH64_STAGE2").is_some();
     let v8_target = if target_arch == "aarch64" {

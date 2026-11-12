@@ -333,6 +333,7 @@ impl NetStack {
         let frame_size = device.max_frame_size();
         let local_address = INITIAL_LOCAL_ADDRESS;
         let local_prefix_length = INITIAL_PREFIX_LENGTH;
+        #[cfg(feature = "virtualization")]
         crate::kernel::vm::device::virtio::net::register_host_interface(mac_address.0);
         let mut neighbors = Vec::new();
         neighbors.try_reserve_exact(INITIAL_PENDING_CAPACITY).ok()?;
@@ -378,6 +379,7 @@ impl NetStack {
         events: &mut EventLoop<N>,
         source: EventSourceToken,
     ) -> bool {
+        #[cfg(feature = "virtualization")]
         crate::kernel::vm::device::virtio::net::poll_tap_devices();
         let mut changed = false;
         let Some(mut input) = allocate_zeroed(self.frame_size) else {
@@ -394,9 +396,11 @@ impl NetStack {
                 continue;
             };
             input[..length].copy_from_slice(frame);
+            #[cfg(feature = "virtualization")]
             crate::kernel::vm::device::virtio::net::host_ingress_frame(&input[..length]);
             changed |= self.process_frame(&input[..length], now_ns);
         }
+        #[cfg(feature = "virtualization")]
         for _ in 0..self.receive_budget {
             let Some(length) = crate::kernel::vm::device::virtio::net::receive_host_stack_frame(
                 &mut input,
@@ -425,6 +429,7 @@ impl NetStack {
             self.queue_tcp_transmission(transmission, now_ns);
         }
         self.flush_pending_ipv4_transmissions(now_ns);
+        #[cfg(feature = "virtualization")]
         self.flush_host_transmissions();
         if changed {
             let _ = events.set_readiness(source, EventFlags::READABLE);
@@ -1134,7 +1139,10 @@ impl NetStack {
             return Err(Error::Proto);
         }
         frame[ETHERNET_HEADER_LENGTH..].copy_from_slice(packet);
+        #[cfg(feature = "virtualization")]
         crate::kernel::vm::device::virtio::net::host_transmit_frame(&frame);
+        #[cfg(not(feature = "virtualization"))]
+        self.device.transmit_frame(&frame)?;
         Ok(())
     }
 
@@ -1255,8 +1263,15 @@ impl NetStack {
         {
             return false;
         }
-        crate::kernel::vm::device::virtio::net::host_transmit_frame(&frame);
-        true
+        #[cfg(feature = "virtualization")]
+        {
+            crate::kernel::vm::device::virtio::net::host_transmit_frame(&frame);
+            true
+        }
+        #[cfg(not(feature = "virtualization"))]
+        {
+            self.device.transmit_frame(&frame).is_ok()
+        }
     }
 
     fn remember_neighbor(&mut self, address: Ipv4Address, mac: MacAddress, now_ns: u64) {
@@ -1398,6 +1413,7 @@ impl NetStack {
                 .is_some_and(|bytes| bytes <= MAX_PENDING_ROUTE_BYTES)
     }
 
+    #[cfg(feature = "virtualization")]
     fn flush_host_transmissions(&mut self) {
         let Some(mut frame) = allocate_zeroed(self.frame_size) else {
             return;

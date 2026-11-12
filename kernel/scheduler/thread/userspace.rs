@@ -5,7 +5,9 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::kernel::arch::traits::{CpuArchitecture as _, ThreadArchitecture as _};
+use crate::kernel::arch::traits::{
+	CpuArchitecture as _, MemoryArchitecture as _, ThreadArchitecture as _,
+};
 use crate::kernel::error::Error;
 use crate::kernel::scheduler::thread::vm::UserAddressSpace;
 

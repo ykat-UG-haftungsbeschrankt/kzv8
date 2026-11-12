@@ -5,10 +5,18 @@
  * free of charge, without warranty of any kind.
  */
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
 extern crate alloc;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[export_name = "pml4"]
+static mut TEST_PML4: u64 = 0;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[export_name = "__bss_end"]
+static mut TEST_BSS_END: u8 = 0;
 
 use crate::arch::traits::{
     BootArchitecture as _, CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
@@ -37,8 +45,13 @@ pub(crate) mod net;
 pub(crate) mod namespace;
 pub(crate) mod process;
 pub(crate) mod syscall;
+#[cfg(not(test))]
 #[path = "../runtime/run.rs"]
 pub(crate) mod runtime;
+#[cfg(test)]
+pub(crate) mod runtime {
+    pub(crate) fn run(_context: super::KernelContext<'_>) {}
+}
 pub(crate) mod scheduler;
 #[cfg(feature = "virtualization")]
 pub(crate) mod vm;
@@ -198,6 +211,7 @@ pub extern "C" fn kz_kernel_main(boot_info: usize, boot_magic: usize) -> ! {
     Kernel::main(boot_info, boot_magic);
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     Kernel::halt()

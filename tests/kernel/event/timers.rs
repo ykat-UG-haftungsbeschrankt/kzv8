@@ -6,12 +6,10 @@
  * free of charge, without warranty of any kind.
  */
 
-#[cfg(test)]
-mod tests {
-    use alloc::sync::Arc;
+use alloc::sync::Arc;
 
-    use super::TimerQueue;
-    use crate::kernel::process::KernelObjectRef;
+use super::TimerQueue;
+use crate::kernel::process::KernelObjectRef;
 
     fn timer_ref(timer: &Arc<super::Timer>) -> KernelObjectRef {
         KernelObjectRef::from_arc(timer)
@@ -24,14 +22,14 @@ mod tests {
         let first = queue.schedule(10).unwrap();
         let middle = queue.schedule(20).unwrap();
         let extra = queue.schedule(40).unwrap();
-        assert_eq!(queue.schedule(50), None);
+        assert!(queue.schedule(50).is_none());
         let late_ref = timer_ref(&late);
         let first_ref = timer_ref(&first);
         let middle_ref = timer_ref(&middle);
         let extra_ref = timer_ref(&extra);
 
         assert_eq!(queue.next_deadline(), Some(10));
-        assert_eq!(queue.pop_expired(9), None);
+        assert!(queue.pop_expired(9).is_none());
         assert_eq!(
             queue.pop_expired(10).map(|timer| timer_ref(&timer)),
             Some(first_ref)
@@ -40,7 +38,7 @@ mod tests {
             queue.pop_expired(20).map(|timer| timer_ref(&timer)),
             Some(middle_ref)
         );
-        assert_eq!(queue.pop_expired(29), None);
+        assert!(queue.pop_expired(29).is_none());
         assert_eq!(
             queue.pop_expired(30).map(|timer| timer_ref(&timer)),
             Some(late_ref)
@@ -103,4 +101,3 @@ mod tests {
             Some(later_ref)
         );
     }
-}

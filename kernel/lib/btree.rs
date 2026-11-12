@@ -86,6 +86,26 @@ impl<K, V> BinaryTree<K, V> {
         self.len == 0
     }
 
+    pub(crate) fn find_key_by<F>(&self, mut predicate: F) -> Option<&K>
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        fn find<'a, K, V, F>(
+            node: Option<&'a BinaryTreeNode<K, V>>,
+            predicate: &mut F,
+        ) -> Option<&'a K>
+        where
+            F: FnMut(&K, &V) -> bool,
+        {
+            let node = node?;
+            find(node.left.as_deref(), predicate)
+                .or_else(|| predicate(&node.key, &node.value).then_some(&node.key))
+                .or_else(|| find(node.right.as_deref(), predicate))
+        }
+
+        find(self.root.as_deref(), &mut predicate)
+    }
+
     pub(crate) fn clear(&mut self) {
         self.root = None;
         self.len = 0;

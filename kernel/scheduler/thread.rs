@@ -991,7 +991,7 @@ impl ThreadManager {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub extern "C" fn __errno_location() -> *mut i32 {
     ThreadManager::errno_location()
 }
