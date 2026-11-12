@@ -8,10 +8,10 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::kernel::driver::virtio::queue::{Descriptor, DmaQueue};
 use crate::kernel::driver::virtio::transport::VirtioTransport;
@@ -20,7 +20,8 @@ use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 use crate::kernel::process::{GroupId, UserId};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::vfs::{
-    DirectoryEntry, DirectoryPlugin, FilePlugin, Node, NodeMetadata, VfsFuture, VfsResult,
+    AppendResult, DirectoryEntry, DirectoryPlugin, FilePlugin, Node, NodeMetadata, VfsFuture,
+    VfsResult,
 };
 
 struct FuseDirectory {
@@ -38,6 +39,7 @@ pub(crate) struct VirtioFs {
     _high_priority_queue: IrqSpinLock<DmaQueue<{ Self::QUEUE_SIZE }>>,
     request_state: IrqSpinLock<RequestState>,
     node_metadata: IrqSpinLock<BTreeMap<u64, NodeMetadata>>,
+    write_locks: IrqSpinLock<BTreeMap<u64, Weak<AtomicBool>>>,
     next_unique: AtomicU64,
     tag: String,
     max_write: usize,
@@ -54,6 +56,24 @@ struct InFlightRequest<'a> {
     filesystem: &'a VirtioFs,
     head: u16,
     completed: bool,
+}
+
+struct FileWriteGuard<'a>(&'a AtomicBool);
+
+impl Drop for FileWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+async fn acquire_file_write_lock(lock: &AtomicBool) -> FileWriteGuard<'_> {
+    while lock
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        crate::kernel::scheduler::future::yield_now().await;
+    }
+    FileWriteGuard(lock)
 }
 
 impl Drop for InFlightRequest<'_> {
@@ -155,6 +175,7 @@ impl VirtioFs {
                 orphaned: false,
             }),
             node_metadata: IrqSpinLock::new(BTreeMap::new()),
+            write_locks: IrqSpinLock::new(BTreeMap::new()),
             next_unique: AtomicU64::new(1),
             tag,
             max_write: Self::MAX_REQUEST_SIZE - Self::FUSE_IN_HEADER_SIZE,
@@ -166,6 +187,17 @@ impl VirtioFs {
 
     pub(crate) fn tag(&self) -> &str {
         &self.tag
+    }
+
+    fn write_lock(&self, node_id: u64) -> Arc<AtomicBool> {
+        let mut write_locks = self.write_locks.lock();
+        if let Some(lock) = write_locks.get(&node_id).and_then(|lock| lock.upgrade()) {
+            return lock;
+        }
+        write_locks.retain(|_, lock| lock.strong_count() != 0);
+        let lock = Arc::new(AtomicBool::new(false));
+        write_locks.insert(node_id, Arc::downgrade(&lock));
+        lock
     }
 
     pub(crate) fn root(self: &Arc<Self>) -> Node {
@@ -408,6 +440,33 @@ impl VirtioFs {
     }
 
     async fn write_at(&self, node_id: u64, offset: u64, buffer: &[u8]) -> VfsResult<usize> {
+        let lock = self.write_lock(node_id);
+        let _guard = acquire_file_write_lock(&lock).await;
+        self.write_at_unlocked(node_id, offset, buffer).await
+    }
+
+    async fn append(&self, node_id: u64, buffer: &[u8]) -> VfsResult<AppendResult> {
+        let lock = self.write_lock(node_id);
+        let _guard = acquire_file_write_lock(&lock).await;
+        let offset = self.file_size(node_id).await?;
+        let requested = u64::try_from(buffer.len()).map_err(|_| Error::Fbig)?;
+        offset.checked_add(requested).ok_or(Error::Fbig)?;
+        let written = self.write_at_unlocked(node_id, offset, buffer).await?;
+        let end_offset = offset
+            .checked_add(u64::try_from(written).map_err(|_| Error::Fbig)?)
+            .ok_or(Error::Fbig)?;
+        Ok(AppendResult {
+            end_offset,
+            written,
+        })
+    }
+
+    async fn write_at_unlocked(
+        &self,
+        node_id: u64,
+        offset: u64,
+        buffer: &[u8],
+    ) -> VfsResult<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -702,5 +761,11 @@ impl FilePlugin for FuseFile {
         let filesystem = self.filesystem.clone();
         let node_id = self.node_id;
         Box::pin(async move { filesystem.write_at(node_id, offset, buffer).await })
+    }
+
+    fn append<'a>(&'a self, buffer: &'a [u8]) -> VfsFuture<'a, VfsResult<AppendResult>> {
+        let filesystem = self.filesystem.clone();
+        let node_id = self.node_id;
+        Box::pin(async move { filesystem.append(node_id, buffer).await })
     }
 }

@@ -24,6 +24,13 @@ pub(crate) mod plugin;
 pub(crate) type VfsResult<T> = Result<T, Error>;
 pub(crate) type VfsFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Result of an atomic append, including the resulting file offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AppendResult {
+    pub(crate) end_offset: u64,
+    pub(crate) written: usize,
+}
+
 pub(crate) const INODE_FLAG_IMMUTABLE: u32 = 0x0000_0010;
 pub(crate) const INODE_FLAG_APPEND: u32 = 0x0000_0020;
 pub(crate) const INODE_FLAG_NODUMP: u32 = 0x0000_0040;
@@ -358,6 +365,11 @@ pub(crate) trait FilePlugin: Send + Sync {
     fn write_at<'a>(&'a self, _offset: u64, _buffer: &'a [u8]) -> VfsFuture<'a, VfsResult<usize>> {
         Box::pin(async { Err(Error::Rofs) })
     }
+
+    /// Appends at EOF atomically with other writes to this file.
+    fn append<'a>(&'a self, _buffer: &'a [u8]) -> VfsFuture<'a, VfsResult<AppendResult>> {
+        Box::pin(async { Err(Error::NoSys) })
+    }
 }
 
 #[derive(Clone)]
@@ -469,6 +481,26 @@ impl Node {
             Self::Directory { .. } => Box::pin(async { Err(Error::IsDir) }),
         }
     }
+
+    pub(crate) fn append<'a>(
+        &'a self,
+        opened_plugin: Option<&'a Arc<dyn FilePlugin>>,
+        buffer: &'a [u8],
+    ) -> VfsFuture<'a, VfsResult<AppendResult>> {
+        match self {
+            Self::File { plugin, metadata } => {
+                let plugin = opened_plugin.cloned().unwrap_or_else(|| Arc::clone(plugin));
+                let metadata = metadata.clone();
+                Box::pin(async move {
+                    if metadata.flags() & INODE_FLAG_IMMUTABLE != 0 {
+                        return Err(Error::Error);
+                    }
+                    plugin.append(buffer).await
+                })
+            }
+            Self::Directory { .. } => Box::pin(async { Err(Error::IsDir) }),
+        }
+    }
 }
 
 pub(crate) struct FileHandle {
@@ -512,15 +544,20 @@ impl FileHandle {
                 return Err(Error::Badf);
             }
             let requested = u64::try_from(buffer.len()).map_err(|_| Error::Fbig)?;
-            self.offset.checked_add(requested).ok_or(Error::Fbig)?;
+            let append = self.node.flags() & INODE_FLAG_APPEND != 0;
+            if !append {
+                self.offset.checked_add(requested).ok_or(Error::Fbig)?;
+            }
             if requested == 0 {
                 return Ok(0);
             }
-            if self.node.flags() & INODE_FLAG_APPEND != 0 {
-                self.offset = match &self.opened_plugin {
-                    Some(plugin) => plugin.size().await?,
-                    None => self.node.size().await?,
-                };
+            if append {
+                let result = self.node.append(self.opened_plugin.as_ref(), buffer).await?;
+                if result.written > buffer.len() {
+                    return Err(Error::Proto);
+                }
+                self.offset = result.end_offset;
+                return Ok(result.written);
             }
             let count = match &self.opened_plugin {
                 Some(plugin) => plugin.write_at(self.offset, buffer).await?,
