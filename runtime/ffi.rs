@@ -15,9 +15,9 @@ use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::block::service::BlockClient;
 use crate::kernel::error::Error;
 use crate::kernel::event::r#loop::{
-    Completion, EventFlags, EventLoop, EventSourceId, EventSourceToken, RawEvent,
+    Completion, Event, EventFlags, EventLoop, EventSourceId, EventSourceToken,
 };
-use crate::kernel::event::timers::TimerId;
+use crate::kernel::process::KernelObjectRef;
 use crate::kernel::net::tcp::connection::{TcpSocketHandle, TcpState};
 use crate::kernel::net::stack::NetStack;
 use crate::kernel::net::tcp::Tcp;
@@ -26,6 +26,17 @@ use crate::kernel::net::wire::Ipv4Address;
 use crate::kernel::vfs::plugin::tun::TunDevice;
 
 static ACTIVE_TCP_CONTEXT: AtomicPtr<TcpContext> = AtomicPtr::new(core::ptr::null_mut());
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RawEvent {
+    kind: u32,
+    flags: u32,
+    id: u64,
+    status: i32,
+    reserved: u32,
+    data: u64,
+}
 
 pub(crate) struct TcpContext {
     event_loop: *mut EventLoop<16>,
@@ -556,8 +567,37 @@ pub unsafe extern "C" fn kz_host_event_loop_poll(
     let events = unsafe { &mut *context.cast::<EventLoop<16>>() };
     let now_ns =
         crate::kernel::arch::TimerArchitecture::now_ns().unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns);
-    let Some(event) = events.poll_raw(now_ns) else {
+    let Some(event) = events.wait(now_ns) else {
         return 0;
+    };
+    let event = match event {
+        Event::Timer(timer) => RawEvent {
+            kind: 1,
+            id: KernelObjectRef::from_arc(&timer).raw(),
+            ..RawEvent::default()
+        },
+        Event::Completion(completion) => RawEvent {
+            kind: 2,
+            id: completion.id,
+            status: completion.status,
+            ..RawEvent::default()
+        },
+        Event::Readiness {
+            source,
+            flags,
+            data,
+        } => RawEvent {
+            kind: 3,
+            flags: u32::from(flags.bits()),
+            id: source.raw(),
+            data,
+            ..RawEvent::default()
+        },
+        Event::DeviceInterrupt { slot } => RawEvent {
+            kind: 4,
+            id: u64::from(slot),
+            ..RawEvent::default()
+        },
     };
     unsafe { output.write(event) };
     1
@@ -581,7 +621,7 @@ pub unsafe extern "C" fn kz_host_event_loop_schedule_timer(
     let Some(timer) = events.schedule_timer(deadline_ns) else {
         return 0;
     };
-    unsafe { timer_id.write(timer.raw()) };
+    unsafe { timer_id.write(KernelObjectRef::from_arc(&timer).raw()) };
     1
 }
 
@@ -594,7 +634,11 @@ pub unsafe extern "C" fn kz_host_event_loop_cancel_timer(
         return 0;
     }
     let events = unsafe { &mut *context.cast::<EventLoop<16>>() };
-    events.cancel_timer(TimerId::from_raw(timer_id)) as i32
+    let timer_reference = KernelObjectRef::from_raw(timer_id);
+    let Some(timer) = events.timer_by_address(timer_reference.raw()) else {
+        return 0;
+    };
+    events.cancel_timer(&timer) as i32
 }
 
 #[no_mangle]

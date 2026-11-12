@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #include "v8_engine.h"
 
 #include <array>
@@ -459,7 +466,7 @@ void event_loop_schedule_timer(const v8::FunctionCallbackInfo<v8::Value>& args) 
 	}
 	uint64_t timer_id = 0;
 	if (!kz_host_event_loop_schedule_timer(context, static_cast<uint64_t>(delay),
-											   &timer_id)) {
+													   &timer_id)) {
 		throw_range_error(isolate, "event loop timer capacity exhausted");
 		return;
 	}
@@ -475,7 +482,8 @@ void event_loop_cancel_timer(const v8::FunctionCallbackInfo<v8::Value>& args) {
 		throw_type_error(isolate, "cancelTimer expects a timer id");
 		return;
 	}
-	args.GetReturnValue().Set(kz_host_event_loop_cancel_timer(context, timer_id) != 0);
+	args.GetReturnValue().Set(
+			kz_host_event_loop_cancel_timer(context, timer_id) != 0);
 }
 
 void event_loop_register(const v8::FunctionCallbackInfo<v8::Value>& args) {

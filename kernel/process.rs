@@ -225,7 +225,7 @@ impl KernelObjectRef {
         self.0
     }
 
-    fn from_object(object: &Arc<KernelObject>) -> Self {
+    pub(crate) fn from_arc<T>(object: &Arc<T>) -> Self {
         Self(Arc::as_ptr(object) as usize as u64)
     }
 }
@@ -268,7 +268,7 @@ impl KernelObjectTable {
 
     fn insert(&mut self, file: FileHandle) -> Result<KernelObjectRef, Error> {
         let object = Arc::new(KernelObject::new(file));
-        let reference = KernelObjectRef::from_object(&object);
+        let reference = KernelObjectRef::from_arc(&object);
         match self.objects.insert(reference, object) {
             Ok(None) => Ok(reference),
             Ok(Some(previous)) => {

@@ -7,6 +7,8 @@
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+
     use super::{Event, EventFlags, EventLoop, EventSourceId};
     use crate::kernel::error::Error;
     use crate::kernel::event::completion::Completion;
@@ -65,7 +67,7 @@ mod tests {
         let completion = Completion { id: 2, status: 0 };
         assert_eq!(events.complete(completion), Ok(()));
         assert_eq!(events.wait(9), Some(Event::Completion(completion)));
-        assert_eq!(events.wait(10), Some(Event::Timer(timer)));
+        assert_eq!(events.wait(10), Some(Event::Timer(Arc::clone(&timer))));
         assert!(events
             .register(EventSourceId::new(1), EventFlags::NONE, 0)
             .is_ok());

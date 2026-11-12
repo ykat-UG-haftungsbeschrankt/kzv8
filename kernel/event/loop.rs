@@ -10,7 +10,7 @@
  *
  * Timers --------\
  * Completions ----+--> event queue --\
- * Readiness ----------> ready queue ---+--> fair poll --> Event / RawEvent
+ * Readiness ----------> ready queue ---+--> fair poll --> Event
  * Device IRQs -------> pending bits --/
  */
 
@@ -18,9 +18,9 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 use crate::kernel::error::Error;
-use crate::kernel::event::timers::{TimerId, TimerQueue};
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
+use crate::kernel::event::timers::{Timer, TimerQueue};
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -35,6 +35,10 @@ pub(crate) struct EventSourceId(u64);
 impl EventSourceId {
     pub(crate) const fn new(id: u64) -> Self {
         Self(id)
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
     }
 }
 
@@ -83,7 +87,7 @@ impl EventFlags {
         }
     }
 
-    const fn bits(self) -> u8 {
+    pub(crate) const fn bits(self) -> u8 {
         self.0
     }
 
@@ -122,9 +126,9 @@ impl EventSignal {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum Event {
-    Timer(TimerId),
+    Timer(Arc<Timer>),
     Completion(Completion),
     Readiness {
         source: EventSourceId,
@@ -136,16 +140,36 @@ pub(crate) enum Event {
     },
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RawEvent {
-    pub(crate) kind: u32,
-    pub(crate) flags: u32,
-    pub(crate) id: u64,
-    pub(crate) status: i32,
-    pub(crate) reserved: u32,
-    pub(crate) data: u64,
+impl PartialEq for Event {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Timer(left), Self::Timer(right)) => Arc::ptr_eq(left, right),
+            (Self::Completion(left), Self::Completion(right)) => left == right,
+            (
+                Self::Readiness {
+                    source: left_source,
+                    flags: left_flags,
+                    data: left_data,
+                },
+                Self::Readiness {
+                    source: right_source,
+                    flags: right_flags,
+                    data: right_data,
+                },
+            ) => {
+                left_source == right_source
+                    && left_flags == right_flags
+                    && left_data == right_data
+            }
+            (Self::DeviceInterrupt { slot: left }, Self::DeviceInterrupt { slot: right }) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
 }
+
+impl Eq for Event {}
 
 #[derive(Clone)]
 struct SourceWatch {
@@ -214,11 +238,18 @@ impl<const N: usize> EventLoop<N> {
         }
     }
 
-    pub(crate) fn schedule_timer(&mut self, deadline_ns: u64) -> Option<TimerId> {
+    pub(crate) fn schedule_timer(
+        &mut self,
+        deadline_ns: u64,
+    ) -> Option<Arc<Timer>> {
         self.timers.schedule(deadline_ns)
     }
 
-    pub(crate) fn cancel_timer(&mut self, timer: TimerId) -> bool {
+    pub(crate) fn timer_by_address(&self, address: u64) -> Option<Arc<Timer>> {
+        self.timers.timer_by_address(address)
+    }
+
+    pub(crate) fn cancel_timer(&mut self, timer: &Arc<Timer>) -> bool {
         self.timers.cancel(timer)
     }
 
@@ -358,38 +389,6 @@ impl<const N: usize> EventLoop<N> {
     pub(crate) fn poll_readiness(&mut self) -> Option<Event> {
         self.refresh_signals();
         self.next_readiness()
-    }
-
-    pub(crate) fn poll_raw(&mut self, now_ns: u64) -> Option<RawEvent> {
-        self.wait(now_ns).map(|event| match event {
-            Event::Timer(timer) => RawEvent {
-                kind: 1,
-                id: timer.raw(),
-                ..RawEvent::default()
-            },
-            Event::Completion(completion) => RawEvent {
-                kind: 2,
-                id: completion.id,
-                status: completion.status,
-                ..RawEvent::default()
-            },
-            Event::Readiness {
-                source,
-                flags,
-                data,
-            } => RawEvent {
-                kind: 3,
-                flags: u32::from(flags.0),
-                id: source.0,
-                data,
-                ..RawEvent::default()
-            },
-            Event::DeviceInterrupt { slot } => RawEvent {
-                kind: 4,
-                id: u64::from(slot),
-                ..RawEvent::default()
-            },
-        })
     }
 
     fn next_device_interrupt(&mut self) -> Option<Event> {
