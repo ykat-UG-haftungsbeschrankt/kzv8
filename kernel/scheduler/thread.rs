@@ -350,6 +350,7 @@ pub(crate) struct Thread {
     stack: Option<ThreadStack>,
     external_stack_address: usize,
     external_stack_size: usize,
+    retired_stacks: Vec<ThreadStack>,
 }
 
 #[derive(Clone, Copy)]
@@ -432,6 +433,7 @@ impl Thread {
             stack: None,
             external_stack_address: stack_address,
             external_stack_size: stack_size,
+            retired_stacks: Vec::new(),
         }
     }
 
@@ -475,6 +477,7 @@ impl Thread {
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
+            retired_stacks: Vec::new(),
         }
     }
 
@@ -516,6 +519,7 @@ impl Thread {
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
+            retired_stacks: Vec::new(),
         }
     }
 
@@ -558,6 +562,7 @@ impl Thread {
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
+            retired_stacks: Vec::new(),
         }
     }
 
@@ -969,6 +974,42 @@ impl ThreadManager {
         user_stack_pointer: usize,
         detached: bool,
     ) -> Result<usize, Error> {
+        Self::create_userspace_thread_in_process_with_mask(
+            process,
+            stack_size,
+            entry,
+            user_stack_pointer,
+            detached,
+            None,
+        )
+    }
+
+    pub(crate) fn create_userspace_thread_in_process_with_signal_mask(
+        process: Arc<Process>,
+        stack_size: usize,
+        entry: usize,
+        user_stack_pointer: usize,
+        detached: bool,
+        signal_mask: SignalSet,
+    ) -> Result<usize, Error> {
+        Self::create_userspace_thread_in_process_with_mask(
+            process,
+            stack_size,
+            entry,
+            user_stack_pointer,
+            detached,
+            Some(signal_mask),
+        )
+    }
+
+    fn create_userspace_thread_in_process_with_mask(
+        process: Arc<Process>,
+        stack_size: usize,
+        entry: usize,
+        user_stack_pointer: usize,
+        detached: bool,
+        signal_mask: Option<SignalSet>,
+    ) -> Result<usize, Error> {
         let mut stack = ThreadStack::try_new(stack_size)?;
         let address_space = process.address_space();
         let context = userspace::Context::load(
@@ -978,10 +1019,107 @@ impl ThreadManager {
             entry,
             user_stack_pointer,
         )?;
-        let thread = Box::new(ListNode::new(Thread::new_userspace(
+        let mut thread = Box::new(ListNode::new(Thread::new_userspace(
             stack, context, process, detached,
         )));
+        if let Some(signal_mask) = signal_mask {
+            thread.signal_mask = signal_mask;
+        }
         Self::enqueue_thread(thread)
+    }
+
+    pub(crate) fn exec_current(
+        address_space: vm::UserAddressSpace,
+        entry: usize,
+        stack_pointer: usize,
+    ) -> Result<(), Error> {
+        let process = Self::current_process()?;
+        let old_address_space = process.address_space();
+        let mut kernel_stack = ThreadStack::try_new(ThreadStack::DEFAULT_SIZE)?;
+        let user_context = userspace::Context::load(
+            kernel_stack.as_mut_slice(),
+            Self::thread_trampoline,
+            address_space.clone(),
+            entry,
+            stack_pointer,
+        )?;
+        let new_kernel_stack_pointer = user_context.kernel_stack_pointer();
+        let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
+        let now_ns = scheduler_time_ns();
+        let mut manager = THREAD_MANAGER.lock();
+        if !manager.initialized {
+            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+            return Err(Error::Again);
+        }
+        let Some(current_id) = manager.busy.front().map(|thread| thread.id) else {
+            drop(manager);
+            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+            return Err(Error::Again);
+        };
+        manager.account_current_cpu_time(now_ns);
+        if !crate::kernel::arch::MemoryArchitecture::activate_address_space(address_space.root()) {
+            let _ = crate::kernel::arch::MemoryArchitecture::activate_address_space(
+                old_address_space.root(),
+            );
+            crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+            return Err(Error::NoMem);
+        }
+        if let Some(current) = manager.busy.front_mut() {
+            if current.process.pid() != process.pid() {
+                crate::kernel::arch::CpuArchitecture::halt();
+            }
+            if current.retired_stacks.try_reserve(1).is_err() {
+                let _ = crate::kernel::arch::MemoryArchitecture::activate_address_space(
+                    old_address_space.root(),
+                );
+                crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+                return Err(Error::NoMem);
+            }
+            if let Some(old_stack) = current.stack.take() {
+                current.retired_stacks.push(old_stack);
+            }
+            current.context = ExecutionContext::Userspace(user_context);
+            current.stack = Some(kernel_stack);
+            current.cancellation_requested = false;
+            current.cancellation_enabled = true;
+            current.cancellation_asynchronous = false;
+            current.cleanup_handlers.clear();
+            current.tls.fill(0);
+        }
+        process.replace_address_space(address_space);
+        process.reset_caught_signal_actions_for_exec();
+        let mut terminated_siblings = 0usize;
+        loop {
+            let sibling = manager
+                .ready
+                .find(|thread| thread.process.pid() == process.pid() && thread.id != current_id)
+                .or_else(|| {
+                    manager
+                        .busy
+                        .find(|thread| thread.process.pid() == process.pid() && thread.id != current_id)
+                });
+            let Some(sibling) = sibling else {
+                break;
+            };
+            let Some(removed) = manager.remove_thread(sibling) else {
+                crate::kernel::arch::CpuArchitecture::halt();
+            };
+            let was_active = removed.state != ThreadState::Exited;
+            drop(removed);
+            if was_active {
+                terminated_siblings = terminated_siblings.saturating_add(1);
+            }
+        }
+        drop(manager);
+        for _ in 0..terminated_siblings {
+            process.thread_exited(usize::MAX);
+        }
+        if !crate::kernel::arch::ThreadArchitecture::set_user_kernel_stack(new_kernel_stack_pointer) {
+            crate::kernel::arch::CpuArchitecture::halt();
+        }
+        crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+        drop(old_address_space);
+        Ok(())
     }
 
     #[cfg(feature = "virtualization")]

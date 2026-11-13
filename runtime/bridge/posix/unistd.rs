@@ -617,7 +617,6 @@ pub extern "C" fn posix_close(file_descriptor: c_int, flags: c_int) -> c_int {
     }
 }
 
-// FIXME: The kernel has no process table, process-creation API, or executable loader.
 #[no_mangle]
 pub extern "C" fn fork() -> i32 {
     fail_int()
@@ -629,31 +628,39 @@ pub extern "C" fn _Fork() -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn execv(_path: *const c_char, _arguments: *const *mut c_char) -> c_int {
-    fail_int()
+pub unsafe extern "C" fn execv(path: *const c_char, arguments: *const *mut c_char) -> c_int {
+    unsafe { crate::kernel::runtime::runtime_posix::exec::execve(path, arguments, environ) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn execve(
-    _path: *const c_char,
-    _arguments: *const *mut c_char,
-    _environment: *const *mut c_char,
+    path: *const c_char,
+    arguments: *const *mut c_char,
+    environment: *const *mut c_char,
 ) -> c_int {
-    fail_int()
+    unsafe { crate::kernel::runtime::runtime_posix::exec::execve(path, arguments, environment) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn execvp(_file: *const c_char, _arguments: *const *mut c_char) -> c_int {
-    fail_int()
+pub unsafe extern "C" fn execvp(file: *const c_char, arguments: *const *mut c_char) -> c_int {
+    unsafe {
+        crate::kernel::runtime::runtime_posix::exec::execvpe(file, arguments, environ, true)
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn fexecve(
-    _file_descriptor: c_int,
-    _arguments: *const *mut c_char,
-    _environment: *const *mut c_char,
+    file_descriptor: c_int,
+    arguments: *const *mut c_char,
+    environment: *const *mut c_char,
 ) -> c_int {
-    fail_int()
+    unsafe {
+        crate::kernel::runtime::runtime_posix::exec::fexecve(
+            file_descriptor,
+            arguments,
+            environment,
+        )
+    }
 }
 
 #[no_mangle]

@@ -383,6 +383,13 @@ impl Credentials {
         }
     }
 
+    pub(crate) fn reset_effective_ids(&mut self) {
+        self.effective_user = self.real_user;
+        self.saved_user = self.real_user;
+        self.effective_group = self.real_group;
+        self.saved_group = self.real_group;
+    }
+
     pub(crate) const fn real_user(&self) -> UserId {
         self.real_user
     }
@@ -848,7 +855,7 @@ pub(crate) struct Process {
     control: IrqSpinLock<ProcessControlState>,
     pty_terminal: IrqSpinLock<Option<Arc<crate::kernel::tty::Pty>>>,
     namespace_set: NamespaceSet,
-    address_space: UserAddressSpace,
+    address_space: IrqSpinLock<UserAddressSpace>,
     signals: IrqSpinLock<SignalState>,
     credentials: IrqSpinLock<Credentials>,
     capabilities: IrqSpinLock<CapabilityTable>,
@@ -871,7 +878,7 @@ impl Process {
         namespace_set: NamespaceSet,
         credentials: Credentials,
     ) -> Result<Arc<Self>, Error> {
-        Self::new_with_control(namespace_set, credentials, None, None, None)
+        Self::new_with_control(namespace_set, credentials, None, None, None, None)
     }
 
     pub(crate) fn new_child_in_namespace_set_with_credentials(
@@ -891,6 +898,31 @@ impl Process {
             }),
             Some(filesystem_context),
             pty_terminal,
+            None,
+        )?;
+        parent.register_child(&child)?;
+        Ok(child)
+    }
+
+    pub(crate) fn new_child_with_address_space(
+        parent: &Arc<Self>,
+        namespace_set: NamespaceSet,
+        credentials: Credentials,
+        address_space: UserAddressSpace,
+    ) -> Result<Arc<Self>, Error> {
+        let parent_control = *parent.control.lock();
+        let filesystem_context = parent.filesystem.lock().try_clone()?;
+        let pty_terminal = parent.pty_terminal.lock().as_ref().map(Arc::clone);
+        let child = Self::new_with_control(
+            namespace_set,
+            credentials,
+            Some(ProcessControlState {
+                parent_pid: Some(parent.pid),
+                ..parent_control
+            }),
+            Some(filesystem_context),
+            pty_terminal,
+            Some(address_space),
         )?;
         parent.register_child(&child)?;
         Ok(child)
@@ -902,6 +934,7 @@ impl Process {
         inherited_control: Option<ProcessControlState>,
         inherited_filesystem: Option<FilesystemContext>,
         inherited_pty_terminal: Option<Arc<crate::kernel::tty::Pty>>,
+        prepared_address_space: Option<UserAddressSpace>,
     ) -> Result<Arc<Self>, Error> {
         let pid = Self::allocate_pid()?;
         let control = inherited_control.unwrap_or(ProcessControlState {
@@ -913,7 +946,10 @@ impl Process {
             nice_priority: 0,
             resource_limits: DEFAULT_RESOURCE_LIMITS,
         });
-        let address_space = UserAddressSpace::new()?;
+        let address_space = match prepared_address_space {
+            Some(address_space) => address_space,
+            None => UserAddressSpace::new()?,
+        };
         let capabilities = CapabilityTable::new()?;
         let filesystem = match inherited_filesystem {
             Some(filesystem) => filesystem,
@@ -927,7 +963,7 @@ impl Process {
             control: IrqSpinLock::new(control),
             pty_terminal: IrqSpinLock::new(inherited_pty_terminal),
             namespace_set,
-            address_space,
+            address_space: IrqSpinLock::new(address_space),
             signals: IrqSpinLock::new(SignalState::new()),
             credentials: IrqSpinLock::new(credentials),
             capabilities: IrqSpinLock::new(capabilities),
@@ -976,7 +1012,7 @@ impl Process {
             control: IrqSpinLock::new(control),
             pty_terminal: IrqSpinLock::new(None),
             namespace_set: parent.map_or_else(NamespaceSet::root, |parent| parent.namespace_set()),
-            address_space: UserAddressSpace::new_test_stub(),
+            address_space: IrqSpinLock::new(UserAddressSpace::new_test_stub()),
             signals: IrqSpinLock::new(SignalState::new()),
             credentials: IrqSpinLock::new(credentials),
             capabilities: IrqSpinLock::new(CapabilityTable::new()?),
@@ -1220,6 +1256,18 @@ impl Process {
 
     pub(crate) fn set_scheduling_configuration(&self, scheduling: SchedulingParameters) {
         self.control.lock().scheduling = scheduling;
+    }
+
+    pub(crate) fn inherit_spawn_signal_state(
+        &self,
+        parent: &Process,
+        default_signals: SignalSet,
+    ) {
+        *self.signals.lock() = parent.signals.lock().for_spawn(default_signals);
+    }
+
+    pub(crate) fn reset_caught_signal_actions_for_exec(&self) {
+        self.signals.lock().reset_caught_actions_for_exec();
     }
 
     pub(crate) fn nice_priority(&self) -> i32 {
@@ -1969,7 +2017,18 @@ impl Process {
     }
 
     pub(crate) fn address_space(&self) -> UserAddressSpace {
-        self.address_space.clone()
+        self.address_space.lock().clone()
+    }
+
+    pub(crate) fn replace_address_space(&self, address_space: UserAddressSpace) {
+        *self.address_space.lock() = address_space;
+    }
+
+    pub(crate) fn discard_unstarted_child(&self, process_id: i32) {
+        self.children
+            .lock()
+            .retain(|child| child.process_id != process_id);
+        PROCESS_REGISTRY.lock().retain(|entry| entry.pid != process_id);
     }
 
     pub(crate) fn current_directory(&self) -> Result<Vec<u8>, Error> {
@@ -2265,7 +2324,7 @@ impl Process {
         handle: CapabilityHandle,
     ) -> Result<SharedMemoryMapping, Error> {
         match self.capability(handle)? {
-            Capability::SharedMemory(grant) => grant.map_user(self.address_space.clone()),
+            Capability::SharedMemory(grant) => grant.map_user(self.address_space()),
             Capability::Endpoint(_) => Err(Error::Badf),
         }
     }
@@ -2422,7 +2481,7 @@ mod tests {
             }),
             pty_terminal: IrqSpinLock::new(None),
             namespace_set: NamespaceSet::root(),
-            address_space: UserAddressSpace::new_test_stub(),
+            address_space: IrqSpinLock::new(UserAddressSpace::new_test_stub()),
             signals: IrqSpinLock::new(SignalState::new()),
             credentials: IrqSpinLock::new(Credentials::root()),
             capabilities: IrqSpinLock::new(CapabilityTable::new().unwrap()),

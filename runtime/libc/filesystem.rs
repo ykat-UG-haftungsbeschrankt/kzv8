@@ -212,6 +212,7 @@ struct FileSystem {
     shared_offsets: [Option<Arc<IrqSpinLock<i64>>>; DESCRIPTOR_COUNT],
     shared_flags: [Option<Arc<IrqSpinLock<SharedDescriptorFlags>>>; DESCRIPTOR_COUNT],
     standard_descriptors: [bool; 3],
+    standard_close_on_exec: [bool; 3],
     pipes: Vec<Option<PipeBuffer>>,
     record_locks: Vec<RecordLock>,
     root_metadata: Option<NodeMetadata>,
@@ -247,6 +248,7 @@ impl FileSystem {
             shared_offsets: [const { None }; DESCRIPTOR_COUNT],
             shared_flags: [const { None }; DESCRIPTOR_COUNT],
             standard_descriptors: [true; 3],
+            standard_close_on_exec: [false; 3],
             pipes: Vec::new(),
             record_locks: Vec::new(),
             root_metadata: None,
@@ -1563,6 +1565,7 @@ impl FileSystem {
                 return Err(EBADF);
             }
             *descriptor = false;
+            self.standard_close_on_exec[file_descriptor as usize] = false;
             return Ok(());
         }
         let slot = self.descriptor_slot(file_descriptor)?;
@@ -1813,6 +1816,10 @@ impl FileSystem {
     }
 
     fn descriptor_flags(&self, file_descriptor: i32) -> Result<i32, i32> {
+        if (0..3).contains(&file_descriptor) {
+            self.standard_descriptor_is_open(file_descriptor)?;
+            return Ok(i32::from(self.standard_close_on_exec[file_descriptor as usize]));
+        }
         let slot = self.descriptor_slot(file_descriptor)?;
         let descriptor = self.descriptors[slot].ok_or(EBADF)?;
         Ok(i32::from(descriptor.close_on_exec))
@@ -1821,6 +1828,11 @@ impl FileSystem {
     fn set_descriptor_flags(&mut self, file_descriptor: i32, flags: i32) -> Result<(), i32> {
         if flags & !1 != 0 {
             return Err(EINVAL);
+        }
+        if (0..3).contains(&file_descriptor) {
+            self.standard_descriptor_is_open(file_descriptor)?;
+            self.standard_close_on_exec[file_descriptor as usize] = flags & 1 != 0;
+            return Ok(());
         }
         let slot = self.descriptor_slot(file_descriptor)?;
         let mut descriptor = self.descriptors[slot].ok_or(EBADF)?;
@@ -2580,6 +2592,57 @@ pub(crate) fn file_identity(path: *const c_char) -> Result<(u64, u64), i32> {
     let node = filesystem.find_node(&path).ok_or(ENOENT)?;
     let status = filesystem.stat_node(node)?;
     Ok((status.device, status.inode))
+}
+
+pub(crate) fn executable_snapshot(path: *const c_char) -> Result<Vec<u8>, i32> {
+    let path = unsafe { normalize_path(path) }?;
+    let credentials = current_credentials()?;
+    let mut filesystem = FILESYSTEM.lock();
+    filesystem.check_search_permissions(&path, &credentials)?;
+    let node_index = filesystem.find_node(&path).ok_or(ENOENT)?;
+    let node = filesystem
+        .nodes
+        .get(node_index)
+        .and_then(Option::as_ref)
+        .ok_or(ENOENT)?;
+    if node.mode & S_IFMT != S_IFREG {
+        return Err(-(KernelError::Acces as i32));
+    }
+    node.metadata
+        .check_access(&credentials, 0o1, false)
+        .map_err(metadata_errno)?;
+    let mut snapshot = Vec::new();
+    snapshot
+        .try_reserve_exact(node.data.len())
+        .map_err(|_| ENOMEM)?;
+    snapshot.extend_from_slice(&node.data);
+    Ok(snapshot)
+}
+
+pub(crate) fn executable_descriptor_snapshot(file_descriptor: i32) -> Result<Vec<u8>, i32> {
+    let credentials = current_credentials()?;
+    let filesystem = FILESYSTEM.lock();
+    let slot = filesystem.descriptor_slot(file_descriptor)?;
+    let descriptor = filesystem.descriptors[slot].ok_or(EBADF)?;
+    if descriptor.pipe_id.is_some()
+        || filesystem.node_mode(descriptor.node).ok_or(EBADF)? & S_IFMT != S_IFREG
+    {
+        return Err(-(KernelError::Acces as i32));
+    }
+    let node = filesystem
+        .nodes
+        .get(descriptor.node)
+        .and_then(Option::as_ref)
+        .ok_or(EBADF)?;
+    node.metadata
+        .check_access(&credentials, 0o1, false)
+        .map_err(metadata_errno)?;
+    let mut snapshot = Vec::new();
+    snapshot
+        .try_reserve_exact(node.data.len())
+        .map_err(|_| ENOMEM)?;
+    snapshot.extend_from_slice(&node.data);
+    Ok(snapshot)
 }
 
 pub(crate) fn normalize_local_socket_path(path: &[u8]) -> Result<Vec<u8>, i32> {
@@ -3779,6 +3842,53 @@ pub(crate) fn close_descriptor(file_descriptor: i32) -> Result<(), i32> {
         wake_pipe_waiters();
     }
     result
+}
+
+pub(crate) fn close_on_exec_descriptors() -> Result<(), i32> {
+    let aliases = crate::kernel::runtime::runtime_libc::fd_alias::close_on_exec_targets()
+        .map_err(|error| -(error as i32))?;
+    for file_descriptor in aliases {
+        let _ = close_descriptor(file_descriptor);
+    }
+    let file_descriptors = {
+        let filesystem = FILESYSTEM.lock();
+        let count = filesystem
+            .descriptors
+            .iter()
+            .flatten()
+            .filter(|descriptor| descriptor.close_on_exec)
+            .count()
+            + filesystem.standard_close_on_exec.iter().filter(|enabled| **enabled).count();
+        let mut file_descriptors = Vec::new();
+        file_descriptors.try_reserve_exact(count).map_err(|_| ENOMEM)?;
+        file_descriptors.extend(
+            filesystem
+                .standard_close_on_exec
+                .iter()
+                .enumerate()
+                .filter_map(|(index, enabled)| enabled.then_some(index as i32)),
+        );
+        file_descriptors.extend(
+            filesystem
+                .descriptors
+                .iter()
+                .enumerate()
+                .filter_map(|(index, descriptor)| {
+                    descriptor
+                        .is_some_and(|descriptor| descriptor.close_on_exec)
+                        .then_some(FIRST_DESCRIPTOR + index as i32)
+                }),
+        );
+        file_descriptors
+    };
+    for file_descriptor in file_descriptors {
+        let _ = close_descriptor(file_descriptor);
+    }
+    crate::kernel::runtime::runtime_libc::network::close_on_exec_descriptors()
+        .map_err(|error| -(error as i32))?;
+    crate::kernel::runtime::runtime_libc::pty::close_on_exec_descriptors()
+        .map_err(|error| -(error as i32))?;
+    Ok(())
 }
 
 fn standard_descriptor_is_open(file_descriptor: i32) -> Result<bool, i32> {

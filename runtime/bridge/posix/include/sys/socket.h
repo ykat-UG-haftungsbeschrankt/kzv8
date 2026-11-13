@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #ifndef KZ_POSIX_SYS_SOCKET_H_
 #define KZ_POSIX_SYS_SOCKET_H_
 
@@ -66,6 +73,7 @@ struct linger {
 #define SO_RCVBUF 8
 #define SO_KEEPALIVE 9
 #define SO_OOBINLINE 10
+#define SO_PASSCRED 16
 #define SO_LINGER 13
 #define SO_RCVLOWAT 18
 #define SO_SNDLOWAT 19
@@ -77,6 +85,13 @@ struct linger {
 #define SOMAXCONN 128
 
 #define SCM_RIGHTS 1
+#define SCM_CREDENTIALS 2
+
+struct ucred {
+    pid_t pid;
+    uid_t uid;
+    gid_t gid;
+};
 
 #define MSG_OOB 0x0001
 #define MSG_PEEK 0x0002

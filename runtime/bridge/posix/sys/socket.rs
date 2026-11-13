@@ -23,10 +23,27 @@ const AF_UNIX: c_int = 1;
 const SOCK_NONBLOCK: c_int = 0x0000_0800;
 const SOCK_CLOEXEC: c_int = 0x0008_0000;
 const SOCK_CLOFORK: c_int = 0x0010_0000;
+const SOL_SOCKET: c_int = 1;
+const SCM_RIGHTS: c_int = 1;
+const SCM_CREDENTIALS: c_int = 2;
+const SO_PASSCRED: c_int = 16;
+const MSG_OOB: c_int = 0x0001;
+const MSG_PEEK: c_int = 0x0002;
+const MSG_CTRUNC: c_int = 0x0008;
 const MSG_NOSIGNAL: c_int = 0x4000;
-const MSG_SUPPORTED: c_int = MSG_NOSIGNAL;
+const MSG_CMSG_CLOEXEC: c_int = 0x4000_0000;
+const MSG_SUPPORTED: c_int = MSG_NOSIGNAL | MSG_OOB | MSG_PEEK | MSG_CMSG_CLOEXEC;
 const MAX_IOV_COUNT: usize = 1024;
 const MAX_MESSAGE_LENGTH: usize = 65_535;
+const MAX_CONTROL_LENGTH: usize = 65_536;
+const F_SETFD: c_int = 2;
+const FD_CLOEXEC: usize = 1;
+
+unsafe extern "C" {
+    fn dup(file_descriptor: c_int) -> c_int;
+    fn close(file_descriptor: c_int) -> c_int;
+    fn fcntl(file_descriptor: c_int, command: c_int, argument: usize) -> c_int;
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -53,6 +70,22 @@ struct Msghdr {
     control: *mut c_void,
     control_length: u32,
     flags: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CmsgHdr {
+    length: u32,
+    level: c_int,
+    kind: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ucred {
+    process_id: i32,
+    user_id: u32,
+    group_id: u32,
 }
 
 fn set_errno(error: Error) {
@@ -139,6 +172,277 @@ unsafe fn read_local_sockaddr(
     path.try_reserve_exact(path_length).map_err(|_| Error::NoMem)?;
     path.extend_from_slice(&path_bytes[..path_length]);
     Ok(path)
+}
+
+fn cmsg_aligned_length(length: usize) -> Result<usize, Error> {
+    let alignment = size_of::<usize>();
+    length
+        .checked_add(alignment - 1)
+        .map(|length| length & !(alignment - 1))
+        .ok_or(Error::Overflow)
+}
+
+fn close_control_rights(rights: Vec<c_int>) {
+    for descriptor in rights {
+        let _ = unsafe { close(descriptor) };
+    }
+}
+
+fn close_control_messages(messages: Vec<network::LocalControlMessage>) {
+    for message in messages {
+        close_control_rights(message.rights);
+    }
+}
+
+fn duplicate_control_right(file_descriptor: c_int) -> Result<c_int, Error> {
+    let duplicate = unsafe { dup(file_descriptor) };
+    if duplicate < 0 {
+        Err(Error::BadFd)
+    } else {
+        Ok(duplicate)
+    }
+}
+
+fn validate_passed_credentials(credentials: Ucred) -> Result<(), Error> {
+    let process = ThreadManager::current_process()?;
+    if process.effective_user_is_root() {
+        return Ok(());
+    }
+    let user_ids = process.user_ids();
+    let group_ids = process.group_ids();
+    if credentials.process_id != process.pid()
+        || !user_ids.contains(&credentials.user_id)
+        || !group_ids.contains(&credentials.group_id)
+    {
+        return Err(Error::Perm);
+    }
+    Ok(())
+}
+
+unsafe fn parse_control_messages(
+    control: *const c_void,
+    control_length: u32,
+) -> Result<Option<network::LocalControlMessage>, Error> {
+    let length = usize::try_from(control_length).map_err(|_| Error::TooBig)?;
+    if length == 0 {
+        return Ok(None);
+    }
+    if control.is_null() {
+        return Err(Error::Fault);
+    }
+    if length > MAX_CONTROL_LENGTH {
+        return Err(Error::TooBig);
+    }
+    let base = control.cast::<u8>();
+    let data_offset = cmsg_aligned_length(size_of::<CmsgHdr>())?;
+    let mut offset = 0usize;
+    let mut rights = Vec::new();
+    let mut credentials = None;
+    while offset < length {
+        let remaining = length - offset;
+        if remaining < size_of::<CmsgHdr>() {
+            break;
+        }
+        let header = unsafe { ptr::read_unaligned(base.add(offset).cast::<CmsgHdr>()) };
+        let header_length = usize::try_from(header.length).map_err(|_| Error::Inval)?;
+        if header_length < data_offset || header_length > remaining {
+            close_control_rights(rights);
+            return Err(Error::Inval);
+        }
+        let payload_length = header_length - data_offset;
+        let payload = unsafe { base.add(offset + data_offset) };
+        if header.level != SOL_SOCKET {
+            close_control_rights(rights);
+            return Err(Error::NoProtoOpt);
+        }
+        match header.kind {
+            SCM_RIGHTS => {
+                if payload_length == 0 || payload_length % size_of::<c_int>() != 0 {
+                    close_control_rights(rights);
+                    return Err(Error::Inval);
+                }
+                let descriptor_count = payload_length / size_of::<c_int>();
+                if rights.try_reserve(descriptor_count).is_err() {
+                    close_control_rights(rights);
+                    return Err(Error::NoMem);
+                }
+                for index in 0..descriptor_count {
+                    let source = unsafe {
+                        ptr::read_unaligned(payload.add(index * size_of::<c_int>()).cast::<c_int>())
+                    };
+                    match duplicate_control_right(source) {
+                        Ok(duplicate) => rights.push(duplicate),
+                        Err(error) => {
+                            close_control_rights(rights);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            SCM_CREDENTIALS => {
+                if payload_length != size_of::<Ucred>() || credentials.is_some() {
+                    close_control_rights(rights);
+                    return Err(Error::Inval);
+                }
+                let passed = unsafe { ptr::read_unaligned(payload.cast::<Ucred>()) };
+                if let Err(error) = validate_passed_credentials(passed) {
+                    close_control_rights(rights);
+                    return Err(error);
+                }
+                credentials = Some(network::LocalCredentials {
+                    process_id: passed.process_id,
+                    user_id: passed.user_id,
+                    group_id: passed.group_id,
+                });
+            }
+            _ => {
+                close_control_rights(rights);
+                return Err(Error::NoProtoOpt);
+            }
+        }
+        let aligned_length = cmsg_aligned_length(header_length)?;
+        if aligned_length > remaining {
+            if header_length != remaining {
+                close_control_rights(rights);
+                return Err(Error::Inval);
+            }
+            offset = length;
+        } else {
+            offset = offset.checked_add(aligned_length).ok_or(Error::Overflow)?;
+        }
+    }
+    if rights.is_empty() && credentials.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(network::LocalControlMessage { rights, credentials }))
+}
+
+fn write_control_messages(
+    header: &mut Msghdr,
+    mut messages: Vec<network::LocalControlMessage>,
+    peek: bool,
+    close_on_exec: bool,
+) -> Result<bool, Error> {
+    let has_control = messages
+        .iter()
+        .any(|message| !message.rights.is_empty() || message.credentials.is_some());
+    if !has_control {
+        header.control_length = 0;
+        return Ok(false);
+    }
+    let total_rights = messages.iter().map(|message| message.rights.len()).sum::<usize>();
+    let mut rights = Vec::new();
+    if rights.try_reserve_exact(total_rights).is_err() {
+        if !peek {
+            close_control_messages(messages);
+        }
+        return Err(Error::NoMem);
+    }
+    let credentials = messages.iter().find_map(|message| message.credentials);
+    for message in &mut messages {
+        rights.extend(message.rights.drain(..));
+    }
+    if peek {
+        let mut duplicates = Vec::new();
+        if duplicates.try_reserve_exact(rights.len()).is_err() {
+            return Err(Error::NoMem);
+        }
+        for descriptor in rights {
+            match duplicate_control_right(descriptor) {
+                Ok(duplicate) => duplicates.push(duplicate),
+                Err(error) => {
+                    close_control_rights(duplicates);
+                    return Err(error);
+                }
+            }
+        }
+        rights = duplicates;
+    }
+
+    let available = usize::try_from(header.control_length).map_err(|_| Error::Inval)?;
+    let Some(control) = (!header.control.is_null() && available != 0).then_some(header.control.cast::<u8>()) else {
+        close_control_rights(rights);
+        header.control_length = 0;
+        return Ok(true);
+    };
+    let mut offset = 0usize;
+    let mut truncated = false;
+    if !rights.is_empty() {
+        let data_offset = cmsg_aligned_length(size_of::<CmsgHdr>())?;
+        let remaining = available.saturating_sub(offset);
+        let delivered_count = if remaining < data_offset + size_of::<c_int>() {
+            0
+        } else {
+            rights.len().min((remaining - data_offset) / size_of::<c_int>())
+        };
+        if delivered_count == 0 {
+            truncated = true;
+            close_control_rights(rights);
+        } else {
+            let payload_length = delivered_count * size_of::<c_int>();
+            let cmsg_length = data_offset + payload_length;
+            let header_value = CmsgHdr {
+                length: u32::try_from(cmsg_length).map_err(|_| Error::Overflow)?,
+                level: SOL_SOCKET,
+                kind: SCM_RIGHTS,
+            };
+            unsafe {
+                ptr::write_unaligned(control.add(offset).cast::<CmsgHdr>(), header_value);
+                for (index, descriptor) in rights.iter().take(delivered_count).enumerate() {
+                    ptr::write_unaligned(
+                        control
+                            .add(offset + data_offset + index * size_of::<c_int>())
+                            .cast::<c_int>(),
+                        *descriptor,
+                    );
+                }
+            }
+            offset += cmsg_aligned_length(cmsg_length)?;
+            if delivered_count < rights.len() {
+                truncated = true;
+                close_control_rights(rights.drain(delivered_count..).collect());
+                rights.truncate(delivered_count);
+            }
+            if close_on_exec {
+                for descriptor in &rights {
+                    if unsafe { fcntl(*descriptor, F_SETFD, FD_CLOEXEC) } < 0 {
+                        close_control_rights(rights);
+                        header.control_length = 0;
+                        return Err(Error::BadFd);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(credentials) = credentials {
+        let data_offset = cmsg_aligned_length(size_of::<CmsgHdr>())?;
+        let cmsg_length = data_offset + size_of::<Ucred>();
+        let aligned_length = cmsg_aligned_length(cmsg_length)?;
+        if offset.checked_add(aligned_length).is_some_and(|end| end <= available) {
+            let header_value = CmsgHdr {
+                length: u32::try_from(cmsg_length).map_err(|_| Error::Overflow)?,
+                level: SOL_SOCKET,
+                kind: SCM_CREDENTIALS,
+            };
+            let credentials = Ucred {
+                process_id: credentials.process_id,
+                user_id: credentials.user_id,
+                group_id: credentials.group_id,
+            };
+            unsafe {
+                ptr::write_unaligned(control.add(offset).cast::<CmsgHdr>(), header_value);
+                ptr::write_unaligned(
+                    control.add(offset + data_offset).cast::<Ucred>(),
+                    credentials,
+                );
+            }
+            offset += aligned_length;
+        } else {
+            truncated = true;
+        }
+    }
+    header.control_length = u32::try_from(offset.min(available)).map_err(|_| Error::Overflow)?;
+    Ok(truncated)
 }
 
 unsafe fn write_sockaddr(
@@ -256,6 +560,12 @@ pub unsafe extern "C" fn accept4(
     };
     if flags & SOCK_NONBLOCK != 0 {
         if let Err(error) = network::set_nonblocking(accepted, true) {
+            let _ = network::close(accepted);
+            return fail(error);
+        }
+    }
+    if flags & SOCK_CLOEXEC != 0 {
+        if let Err(error) = network::set_descriptor_flags(accepted, 1) {
             let _ = network::close(accepted);
             return fail(error);
         }
@@ -443,16 +753,31 @@ pub unsafe extern "C" fn recv(
     flags: c_int,
 ) -> isize {
     if length > isize::MAX as usize
-        || flags & !MSG_SUPPORTED != 0
+        || flags & !(MSG_NOSIGNAL | MSG_OOB | MSG_PEEK) != 0
         || (buffer.is_null() && length != 0)
     {
         return fail_io(Error::Inval);
+    }
+    if !network::is_local_socket_fd(socket) && flags & (MSG_OOB | MSG_PEEK) != 0 {
+        return fail_io(Error::OpNotSupp);
     }
     let output = if length == 0 {
         &mut [][..]
     } else {
         unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) }
     };
+    if network::is_local_socket_fd(socket) {
+        return match network::receive_from_local_socket_with_control(
+            socket,
+            output,
+            flags & MSG_PEEK != 0,
+            flags & MSG_OOB != 0,
+            false,
+        ) {
+            Ok(result) => result.length as isize,
+            Err(error) => fail_io(error),
+        };
+    }
     match network::receive(socket, output) {
         Ok(amount) => match isize::try_from(amount) {
             Ok(amount) => amount,
@@ -477,19 +802,35 @@ pub unsafe extern "C" fn recvfrom(
         return fail_io(Error::Fault);
     }
     if length > isize::MAX as usize
-        || flags & !MSG_SUPPORTED != 0
+        || flags & !(MSG_NOSIGNAL | MSG_OOB | MSG_PEEK) != 0
         || (buffer.is_null() && length != 0)
     {
         return fail_io(Error::Inval);
+    }
+    if !network::is_local_socket_fd(socket) && flags & (MSG_OOB | MSG_PEEK) != 0 {
+        return fail_io(Error::OpNotSupp);
     }
     let output = if length == 0 {
         &mut [][..]
     } else {
         unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) }
     };
-    let (received, source) = match network::receive_from(socket, output) {
-        Ok(result) => result,
-        Err(error) => return fail_io(error),
+    let (received, source) = if network::is_local_socket_fd(socket) {
+        match network::receive_from_local_socket_with_control(
+            socket,
+            output,
+            flags & MSG_PEEK != 0,
+            flags & MSG_OOB != 0,
+            false,
+        ) {
+            Ok(result) => (result.length, None),
+            Err(error) => return fail_io(error),
+        }
+    } else {
+        match network::receive_from(socket, output) {
+            Ok(result) => result,
+            Err(error) => return fail_io(error),
+        }
     };
     if !address.is_null() {
         if network::is_local_socket_fd(socket) {
@@ -531,8 +872,19 @@ pub unsafe extern "C" fn recvmsg(
         return fail_io(if message.is_null() { Error::Fault } else { Error::Inval });
     }
     let mut header = unsafe { ptr::read_unaligned(message.cast::<Msghdr>()) };
-    if header.control_length != 0 {
-        return fail_io(Error::NoSys);
+    if header.control_length as usize > MAX_CONTROL_LENGTH
+        || (header.control_length != 0 && header.control.is_null())
+    {
+        return fail_io(if header.control.is_null() {
+            Error::Fault
+        } else {
+            Error::TooBig
+        });
+    }
+    if !network::is_local_socket_fd(socket)
+        && (header.control_length != 0 || flags & (MSG_OOB | MSG_PEEK | MSG_CMSG_CLOEXEC) != 0)
+    {
+        return fail_io(Error::OpNotSupp);
     }
     let vectors = match unsafe { message_vectors(&header) } {
         Ok(vectors) => vectors,
@@ -547,9 +899,22 @@ pub unsafe extern "C" fn recvmsg(
         return fail_io(Error::NoMem);
     }
     payload.resize(total_length, 0);
-    let (received, source) = match network::receive_from(socket, &mut payload) {
-        Ok(result) => result,
-        Err(error) => return fail_io(error),
+    let (received, source, mut control_messages) = if network::is_local_socket_fd(socket) {
+        match network::receive_from_local_socket_with_control(
+            socket,
+            &mut payload,
+            flags & MSG_PEEK != 0,
+            flags & MSG_OOB != 0,
+            true,
+        ) {
+            Ok(result) => (result.length, None, result.control_messages),
+            Err(error) => return fail_io(error),
+        }
+    } else {
+        match network::receive_from(socket, &mut payload) {
+            Ok((length, source)) => (length, source, Vec::new()),
+            Err(error) => return fail_io(error),
+        }
     };
     let mut copied = 0;
     for vector in vectors {
@@ -571,6 +936,9 @@ pub unsafe extern "C" fn recvmsg(
             let peer_path = match network::local_socket_names(socket, true) {
                 Ok(path) => path,
                 Err(error) => {
+                    if flags & MSG_PEEK == 0 {
+                        close_control_messages(control_messages);
+                    }
                     unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
                     return fail_io(error);
                 }
@@ -578,21 +946,40 @@ pub unsafe extern "C" fn recvmsg(
             if let Err(error) = unsafe {
                 write_local_sockaddr(header.name, &mut header.name_length, &peer_path)
             } {
+                if flags & MSG_PEEK == 0 {
+                    close_control_messages(control_messages);
+                }
                 unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
                 return fail_io(error);
             }
         } else {
             let peer = source.or_else(|| network::endpoint(socket, true).ok());
             let Some((address, port)) = peer else {
+                if flags & MSG_PEEK == 0 {
+                    close_control_messages(control_messages);
+                }
                 return fail_io(Error::NotConn);
             };
             if let Err(error) = unsafe {
                 write_sockaddr(header.name, &mut header.name_length, address, port)
             } {
+                if flags & MSG_PEEK == 0 {
+                    close_control_messages(control_messages);
+                }
                 unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
                 return fail_io(error);
             }
         }
+    }
+    match write_control_messages(
+        &mut header,
+        core::mem::take(&mut control_messages),
+        flags & MSG_PEEK != 0,
+        flags & MSG_CMSG_CLOEXEC != 0,
+    ) {
+        Ok(true) => header.flags |= MSG_CTRUNC,
+        Ok(false) => {}
+        Err(error) => return fail_io(error),
     }
     unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
     received as isize
@@ -605,15 +992,29 @@ pub unsafe extern "C" fn send(
     length: usize,
     flags: c_int,
 ) -> isize {
-    if flags & !MSG_SUPPORTED != 0 || (buffer.is_null() && length != 0) {
+    if flags & !(MSG_NOSIGNAL | MSG_OOB) != 0 || (buffer.is_null() && length != 0) {
         return fail_io(Error::Inval);
+    }
+    if flags & MSG_OOB != 0 && !network::is_local_socket_fd(socket) {
+        return fail_io(Error::OpNotSupp);
     }
     let input = if length == 0 {
         &[][..]
     } else {
         unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), length) }
     };
-    match network::send(socket, input) {
+    let result = if network::is_local_socket_fd(socket) {
+        network::send_to_local_socket_with_control(
+            socket,
+            None,
+            input,
+            None,
+            flags & MSG_OOB != 0,
+        )
+    } else {
+        network::send(socket, input)
+    };
+    match result {
         Ok(amount) => amount as isize,
         Err(error) => fail_io(error),
     }
@@ -625,12 +1026,24 @@ pub unsafe extern "C" fn sendmsg(
     message: *const c_void,
     flags: c_int,
 ) -> isize {
-    if message.is_null() || flags & !MSG_SUPPORTED != 0 {
+    if message.is_null() || flags & !(MSG_NOSIGNAL | MSG_OOB) != 0 {
         return fail_io(if message.is_null() { Error::Fault } else { Error::Inval });
     }
     let header = unsafe { ptr::read_unaligned(message.cast::<Msghdr>()) };
-    if header.control_length != 0 {
-        return fail_io(Error::NoSys);
+    if header.control_length as usize > MAX_CONTROL_LENGTH
+        || (header.control_length != 0 && header.control.is_null())
+    {
+        return fail_io(if header.control.is_null() {
+            Error::Fault
+        } else {
+            Error::TooBig
+        });
+    }
+    if !network::is_local_socket_fd(socket) && header.control_length != 0 {
+        return fail_io(Error::OpNotSupp);
+    }
+    if flags & MSG_OOB != 0 && !network::is_local_socket_fd(socket) {
+        return fail_io(Error::OpNotSupp);
     }
     let vectors = match unsafe { message_vectors(&header) } {
         Ok(vectors) => vectors,
@@ -652,25 +1065,63 @@ pub unsafe extern "C" fn sendmsg(
             payload.extend_from_slice(bytes);
         }
     }
+    let mut control_message = if network::is_local_socket_fd(socket) {
+        match unsafe { parse_control_messages(header.control, header.control_length) } {
+            Ok(control) => control,
+            Err(error) => return fail_io(error),
+        }
+    } else {
+        None
+    };
     if network::is_local_socket_fd(socket) {
         let destination = if header.name.is_null() {
             None
         } else {
             let path = match unsafe { read_local_sockaddr(header.name, header.name_length) } {
                 Ok(path) => path,
-                Err(error) => return fail_io(error),
+                Err(error) => {
+                    if let Some(control) = control_message {
+                        close_control_rights(control.rights);
+                    }
+                    return fail_io(error);
+                }
             };
             match crate::kernel::runtime::runtime_libc::filesystem::normalize_local_socket_path(&path) {
                 Ok(path) => Some(path),
                 Err(error) => {
+                    if let Some(control) = control_message {
+                        close_control_rights(control.rights);
+                    }
                     unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
                     return -1;
                 }
             }
         };
-        return match network::send_to_local_socket(socket, destination.as_deref(), &payload) {
+        let mut control_rights = Vec::new();
+        let rights_count = control_message
+            .as_ref()
+            .map_or(0, |control| control.rights.len());
+        if control_rights.try_reserve_exact(rights_count).is_err() {
+            if let Some(control) = control_message.take() {
+                close_control_rights(control.rights);
+            }
+            return fail_io(Error::NoMem);
+        }
+        if let Some(control) = control_message.as_ref() {
+            control_rights.extend_from_slice(&control.rights);
+        }
+        return match network::send_to_local_socket_with_control(
+            socket,
+            destination.as_deref(),
+            &payload,
+            control_message,
+            flags & MSG_OOB != 0,
+        ) {
             Ok(amount) => amount as isize,
-            Err(error) => fail_io(error),
+            Err(error) => {
+                close_control_rights(control_rights);
+                fail_io(error)
+            }
         };
     }
     let destination = if header.name.is_null() {
@@ -724,8 +1175,11 @@ pub unsafe extern "C" fn sendto(
     address: *const c_void,
     address_length: u32,
 ) -> isize {
-    if flags & !MSG_SUPPORTED != 0 || (buffer.is_null() && length != 0) {
+    if flags & !(MSG_NOSIGNAL | MSG_OOB) != 0 || (buffer.is_null() && length != 0) {
         return fail_io(Error::Inval);
+    }
+    if flags & MSG_OOB != 0 && !network::is_local_socket_fd(socket) {
+        return fail_io(Error::OpNotSupp);
     }
     if network::is_local_socket_fd(socket) {
         let destination = if address.is_null() {
@@ -748,7 +1202,13 @@ pub unsafe extern "C" fn sendto(
         } else {
             unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), length) }
         };
-        return match network::send_to_local_socket(socket, destination.as_deref(), input) {
+        return match network::send_to_local_socket_with_control(
+            socket,
+            destination.as_deref(),
+            input,
+            None,
+            flags & MSG_OOB != 0,
+        ) {
             Ok(amount) => amount as isize,
             Err(error) => fail_io(error),
         };
@@ -803,8 +1263,11 @@ pub unsafe extern "C" fn shutdown(socket: c_int, how: c_int) -> c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sockatmark(_socket: c_int) -> c_int {
-    unavailable()
+pub unsafe extern "C" fn sockatmark(socket: c_int) -> c_int {
+    match network::socket_at_mark(socket) {
+        Ok(at_mark) => i32::from(at_mark),
+        Err(error) => fail(error),
+    }
 }
 
 #[no_mangle]

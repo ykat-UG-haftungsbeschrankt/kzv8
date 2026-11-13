@@ -53,6 +53,25 @@ impl Context {
 		self.kernel_stack_pointer
 	}
 
+	pub(crate) fn replace_image(
+		&mut self,
+		address_space: UserAddressSpace,
+		entry: usize,
+		stack_pointer: usize,
+	) -> Result<(), Error> {
+		let stack_address = stack_pointer.checked_sub(1).ok_or(Error::Fault)?;
+		if !address_space.user_range_executable(entry, 1) {
+			return Err(Error::NoExec);
+		}
+		if !address_space.user_range_accessible(stack_address, 1, true) {
+			return Err(Error::Fault);
+		}
+		self.address_space = address_space;
+		self.entry = entry;
+		self.stack_pointer = stack_pointer;
+		Ok(())
+	}
+
 	pub(super) fn kernel(&self) -> &KernelContext {
 		&self.kernel
 	}

@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 pub(crate) mod aio;
 pub(crate) mod arpa;
 pub(crate) mod r#assert;
@@ -7,6 +14,7 @@ pub(crate) mod devctl;
 pub(crate) mod dirent;
 pub(crate) mod dlfcn;
 pub(crate) mod endian;
+pub(crate) mod exec;
 pub(crate) mod errno;
 pub(crate) mod fcntl;
 pub(crate) mod fenv;

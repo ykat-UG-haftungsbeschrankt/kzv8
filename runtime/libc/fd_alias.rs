@@ -43,6 +43,21 @@ pub(crate) fn contains_target(target: i32) -> bool {
         .any(|alias| alias.target == target)
 }
 
+pub(crate) fn close_on_exec_targets() -> Result<Vec<i32>, Error> {
+    let aliases = ALIASES.lock();
+    let mut targets = Vec::new();
+    targets
+        .try_reserve(aliases.iter().filter(|alias| alias.close_on_exec).count())
+        .map_err(|_| Error::NoMem)?;
+    targets.extend(
+        aliases
+            .iter()
+            .filter(|alias| alias.close_on_exec)
+            .map(|alias| alias.target),
+    );
+    Ok(targets)
+}
+
 pub(crate) fn resolve_any(target: i32) -> i32 {
     get(target).map_or(target, |alias| alias.backing)
 }

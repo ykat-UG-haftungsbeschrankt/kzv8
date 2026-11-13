@@ -219,6 +219,7 @@ impl SignalQueue {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SignalState {
     actions: [SignalAction; MAX_SIGNAL_NUMBER as usize + 1],
     pub(crate) pending: SignalQueue,
@@ -235,6 +236,28 @@ impl SignalState {
             alarm_deadline_ns: None,
             terminated_by_signal: None,
             stopped_by_signal: None,
+        }
+    }
+
+    pub(crate) fn for_spawn(&self, default_signals: SignalSet) -> Self {
+        let mut state = *self;
+        state.pending = SignalQueue::new();
+        state.alarm_deadline_ns = None;
+        state.terminated_by_signal = None;
+        state.stopped_by_signal = None;
+        for signal_number in 1..=MAX_SIGNAL_NUMBER {
+            if default_signals.contains(signal_number) {
+                state.actions[signal_number as usize] = SignalAction::DEFAULT;
+            }
+        }
+        state
+    }
+
+    pub(crate) fn reset_caught_actions_for_exec(&mut self) {
+        for action in self.actions.iter_mut().skip(1) {
+            if !action.is_ignored() {
+                *action = SignalAction::DEFAULT;
+            }
         }
     }
 

@@ -205,6 +205,27 @@ impl MqState {
 
 static MQUEUE_STATE: IrqSpinLock<MqState> = IrqSpinLock::new(MqState::new());
 
+pub(crate) fn close_on_exec_for_process(process_id: i32) {
+    let mut state = MQUEUE_STATE.lock();
+    for descriptor_index in 0..state.descriptors.len() {
+        let descriptor = state.descriptors[descriptor_index];
+        if !descriptor.active || descriptor.owner_pid != process_id || !descriptor.close_on_exec {
+            continue;
+        }
+        state.descriptors[descriptor_index].active = false;
+        if let Some(queue) = state
+            .queues
+            .get_mut(descriptor.queue_index)
+            .and_then(Option::as_mut)
+        {
+            queue.references = queue.references.saturating_sub(1);
+            if queue.references == 0 && queue.unlinked {
+                state.queues[descriptor.queue_index] = None;
+            }
+        }
+    }
+}
+
 unsafe extern "C" {
     fn clock_gettime(clock_id: c_int, output: *mut Timespec) -> c_int;
     fn pthread_yield() -> c_int;

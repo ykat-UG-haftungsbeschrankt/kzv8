@@ -6,6 +6,7 @@
  */
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::kernel::error::Error;
 use crate::kernel::scheduler::sync::{IrqSpinGuard, IrqSpinLock};
@@ -468,6 +469,26 @@ pub(crate) fn close(file_descriptor: i32) -> Result<(), Error> {
     let index = descriptor_index(file_descriptor)?;
     let descriptor = DESCRIPTORS.lock()[index].take().ok_or(Error::Badf)?;
     close_entry(descriptor);
+    Ok(())
+}
+
+pub(crate) fn close_on_exec_descriptors() -> Result<(), Error> {
+    let descriptors = {
+        let descriptors = DESCRIPTORS.lock();
+        let mut close_descriptors = Vec::new();
+        close_descriptors
+            .try_reserve(descriptors.iter().flatten().filter(|fd| fd.close_on_exec).count())
+            .map_err(|_| Error::NoMem)?;
+        close_descriptors.extend(descriptors.iter().enumerate().filter_map(|(index, fd)| {
+            fd.as_ref()
+                .is_some_and(|fd| fd.close_on_exec)
+                .then_some(PTY_FD_BASE + index as i32)
+        }));
+        close_descriptors
+    };
+    for file_descriptor in descriptors {
+        let _ = close(file_descriptor);
+    }
     Ok(())
 }
 
