@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #ifndef KZ_POSIX_SCHED_H_
 #define KZ_POSIX_SCHED_H_
 
@@ -6,6 +13,10 @@
 
 struct sched_param {
     int sched_priority;
+    int sched_ss_low_priority;
+    struct timespec sched_ss_repl_period;
+    struct timespec sched_ss_init_budget;
+    int sched_ss_max_repl;
 };
 
 #define SCHED_OTHER 0

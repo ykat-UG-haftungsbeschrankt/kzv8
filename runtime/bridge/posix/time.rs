@@ -682,6 +682,10 @@ fn dispatch_timer_notification(pid: i32, notification: TimerNotification) {
                 inherit_schedule: 0,
                 scheduler_policy: 0,
                 scheduler_priority: 0,
+                sporadic_low_priority: 0,
+                sporadic_period_ns: 0,
+                sporadic_budget_ns: 0,
+                sporadic_max_replenishments: 0,
             };
             let mut thread = 0;
             let result = unsafe {

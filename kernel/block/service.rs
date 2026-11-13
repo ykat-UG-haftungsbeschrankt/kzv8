@@ -15,7 +15,9 @@ use crate::kernel::block::device::BlockDevice;
 use crate::kernel::block::request::Request;
 use crate::kernel::error::Error;
 use crate::kernel::ipc::{
-    CallTicket, Capability, CapabilityRights, Endpoint, MessageBody, SharedMemory,
+    CallTicket, CallTicketApi as _, Capability, CapabilityRights, CapabilityRightsApi as _,
+    Endpoint, EndpointApi as _, MessageBody, MessageBodyApi as _, SharedMemory, SharedMemoryApi as _,
+    SharedMemoryGrantApi as _, SharedMemoryMappingApi as _,
 };
 use crate::kernel::process::{CapabilityHandle, Process};
 use crate::kernel::scheduler::sync::IrqSpinLock;

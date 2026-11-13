@@ -11,8 +11,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use crate::kernel::error::Error;
 use crate::kernel::ipc::{
-    CallFuture, CallTicket, Capability, CapabilityRights, Endpoint, MessageBody, ReceivedMessage,
-    ReplyCapability, SendFuture, SharedMemoryMapping,
+    CallFuture, CallTicket, Capability, CapabilityApi as _, CapabilityRights, Endpoint,
+    EndpointApi as _, MessageBody, MessageBodyApi as _, ReceivedMessage,
+    ReceivedMessageApi as _, ReplyCapability, ReplyCapabilityApi as _, SendFuture,
+    SharedMemoryGrantApi as _, SharedMemoryMapping,
 };
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::namespace::NamespaceSet;
@@ -233,13 +235,35 @@ impl ProcessResourceUsage {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct SporadicParameters {
+    pub(crate) low_priority: i32,
+    pub(crate) replenishment_period_ns: u64,
+    pub(crate) initial_budget_ns: u64,
+    pub(crate) max_replenishments: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SchedulingParameters {
+    pub(crate) policy: i32,
+    pub(crate) priority: i32,
+    pub(crate) sporadic: Option<SporadicParameters>,
+}
+
+impl SchedulingParameters {
+    pub(crate) const OTHER: Self = Self {
+        policy: 0,
+        priority: 0,
+        sporadic: None,
+    };
+}
+
+#[derive(Clone, Copy)]
 struct ProcessControlState {
     parent_pid: Option<i32>,
     process_group_id: i32,
     session_id: i32,
     controlling_terminal: bool,
-    scheduler_policy: i32,
-    scheduler_priority: i32,
+    scheduling: SchedulingParameters,
     nice_priority: i32,
     resource_limits: ResourceLimits,
 }
@@ -885,8 +909,7 @@ impl Process {
             process_group_id: pid,
             session_id: pid,
             controlling_terminal: false,
-            scheduler_policy: 0,
-            scheduler_priority: 0,
+            scheduling: SchedulingParameters::OTHER,
             nice_priority: 0,
             resource_limits: DEFAULT_RESOURCE_LIMITS,
         });
@@ -932,8 +955,7 @@ impl Process {
                 process_group_id: pid,
                 session_id: pid,
                 controlling_terminal: false,
-                scheduler_policy: 0,
-                scheduler_priority: 0,
+                scheduling: SchedulingParameters::OTHER,
                 nice_priority: 0,
                 resource_limits: DEFAULT_RESOURCE_LIMITS,
             },
@@ -1177,13 +1199,24 @@ impl Process {
 
     pub(crate) fn scheduler_parameters(&self) -> (i32, i32) {
         let control = self.control.lock();
-        (control.scheduler_policy, control.scheduler_priority)
+        (control.scheduling.policy, control.scheduling.priority)
     }
 
     pub(crate) fn set_scheduler_parameters(&self, policy: i32, priority: i32) {
         let mut control = self.control.lock();
-        control.scheduler_policy = policy;
-        control.scheduler_priority = priority;
+        control.scheduling = SchedulingParameters {
+            policy,
+            priority,
+            sporadic: None,
+        };
+    }
+
+    pub(crate) fn scheduling_configuration(&self) -> SchedulingParameters {
+        self.control.lock().scheduling
+    }
+
+    pub(crate) fn set_scheduling_configuration(&self, scheduling: SchedulingParameters) {
+        self.control.lock().scheduling = scheduling;
     }
 
     pub(crate) fn nice_priority(&self) -> i32 {
@@ -2329,9 +2362,10 @@ mod tests {
     use super::{
         Capability, CapabilityTable, Credentials, DEFAULT_RESOURCE_LIMITS, FileDescriptorTable,
         FilesystemContext, GroupId, KernelObjectRef, KernelObjectTable, NamespaceSet, Process,
-        ProcessControlState, ProcessResourceUsage, SignalState, UserAddressSpace, UserId,
+        ProcessControlState, ProcessResourceUsage, SchedulingParameters, SignalState,
+        UserAddressSpace, UserId,
     };
-    use crate::kernel::ipc::Endpoint;
+    use crate::kernel::ipc::{Endpoint, EndpointApi as _};
     use crate::kernel::scheduler::sync::IrqSpinLock;
     use crate::kernel::signal::{
         SignalInfo, SignalSet, CLD_CONTINUED, CLD_KILLED, CLD_STOPPED, SIGCHLD, SIGCONT, SIGKILL,
@@ -2379,8 +2413,7 @@ mod tests {
                 process_group_id: 1,
                 session_id: 1,
                 controlling_terminal: false,
-                scheduler_policy: 0,
-                scheduler_priority: 0,
+                scheduling: SchedulingParameters::OTHER,
                 nice_priority: 0,
                 resource_limits: DEFAULT_RESOURCE_LIMITS,
             }),

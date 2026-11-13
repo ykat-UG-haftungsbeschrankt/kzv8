@@ -19,7 +19,9 @@ use crate::kernel::arch::traits::{
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
-use crate::kernel::process::{Process, ResourceUsageSnapshot};
+use crate::kernel::process::{
+    Process, ResourceUsageSnapshot, SchedulingParameters, SporadicParameters,
+};
 use crate::kernel::namespace::NamespaceSet;
 use crate::kernel::signal::{SignalInfo, SignalQueue, SignalSet};
 
@@ -27,6 +29,9 @@ use super::sync::IrqSpinLock;
 
 const SCHED_FIFO_POLICY: i32 = 1;
 const SCHED_RR_POLICY: i32 = 2;
+const SCHED_SPORADIC_POLICY: i32 = 3;
+const SCHEDULER_TICK_NS: u64 = 10_000_000;
+pub(crate) const MAX_SPORADIC_REPLENISHMENTS: u32 = 64;
 
 #[path = "thread/kernel.rs"]
 pub(crate) mod kernel;
@@ -49,6 +54,10 @@ pub(crate) struct ThreadAttributes {
     pub(crate) inherit_schedule: i32,
     pub(crate) scheduler_policy: i32,
     pub(crate) scheduler_priority: i32,
+    pub(crate) sporadic_low_priority: i32,
+    pub(crate) sporadic_period_ns: u64,
+    pub(crate) sporadic_budget_ns: u64,
+    pub(crate) sporadic_max_replenishments: u32,
 }
 
 #[repr(C)]
@@ -96,10 +105,162 @@ struct ThreadResourceUsage {
     system_cpu_time_ns: u64,
 }
 
+#[derive(Clone, Copy, Default)]
+struct Replenishment {
+    deadline_ns: u64,
+    budget_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SporadicServer {
+    parameters: Option<SporadicParameters>,
+    remaining_budget_ns: u64,
+    replenishments: [Replenishment; MAX_SPORADIC_REPLENISHMENTS as usize],
+    replenishment_count: usize,
+}
+
+impl Default for SporadicServer {
+    fn default() -> Self {
+        Self {
+            parameters: None,
+            remaining_budget_ns: 0,
+            replenishments: [Replenishment::default(); MAX_SPORADIC_REPLENISHMENTS as usize],
+            replenishment_count: 0,
+        }
+    }
+}
+
+impl SporadicServer {
+    fn configured(scheduling: SchedulingParameters) -> Self {
+        let mut server = Self::default();
+        server.configure(scheduling);
+        server
+    }
+
+    fn configure(&mut self, scheduling: SchedulingParameters) {
+        *self = Self::default();
+        if scheduling.policy == SCHED_SPORADIC_POLICY {
+            if let Some(parameters) = scheduling.sporadic {
+                self.remaining_budget_ns = parameters.initial_budget_ns;
+                self.parameters = Some(parameters);
+            }
+        }
+    }
+
+    fn replenish_due(&mut self, now_ns: u64) {
+        let Some(parameters) = self.parameters else {
+            return;
+        };
+        let mut index = 0;
+        while index < self.replenishment_count {
+            let replenishment = self.replenishments[index];
+            if replenishment.deadline_ns <= now_ns {
+                self.remaining_budget_ns = self
+                    .remaining_budget_ns
+                    .saturating_add(replenishment.budget_ns)
+                    .min(parameters.initial_budget_ns);
+                self.replenishment_count -= 1;
+                self.replenishments[index] = self.replenishments[self.replenishment_count];
+                self.replenishments[self.replenishment_count] = Replenishment::default();
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn charge(&mut self, elapsed_ns: u64, now_ns: u64) {
+        let Some(parameters) = self.parameters else {
+            return;
+        };
+        self.replenish_due(now_ns);
+        let charged_ns = elapsed_ns.min(self.remaining_budget_ns);
+        if charged_ns == 0 {
+            return;
+        }
+        self.remaining_budget_ns -= charged_ns;
+        let unrounded_deadline = now_ns.saturating_add(parameters.replenishment_period_ns);
+        let rounded_deadline = unrounded_deadline
+            .checked_add(SCHEDULER_TICK_NS - 1)
+            .map(|deadline| deadline / SCHEDULER_TICK_NS * SCHEDULER_TICK_NS)
+            .unwrap_or(u64::MAX);
+        if let Some(replenishment) = self.replenishments[..self.replenishment_count]
+            .iter_mut()
+            .find(|replenishment| replenishment.deadline_ns == rounded_deadline)
+        {
+            replenishment.budget_ns = replenishment.budget_ns.saturating_add(charged_ns);
+            return;
+        }
+        let maximum = (parameters.max_replenishments as usize)
+            .min(MAX_SPORADIC_REPLENISHMENTS as usize);
+        if self.replenishment_count < maximum {
+            self.replenishments[self.replenishment_count] = Replenishment {
+                deadline_ns: rounded_deadline,
+                budget_ns: charged_ns,
+            };
+            self.replenishment_count += 1;
+        } else if maximum != 0 {
+            let latest = self.replenishments[..self.replenishment_count]
+                .iter_mut()
+                .max_by_key(|replenishment| replenishment.deadline_ns)
+                .expect("nonzero sporadic replenishment count");
+            latest.budget_ns = latest.budget_ns.saturating_add(charged_ns);
+            latest.deadline_ns = latest.deadline_ns.max(rounded_deadline);
+        }
+    }
+}
+
 impl ThreadResourceUsage {
     fn total_cpu_time_ns(&self) -> u64 {
         self.user_cpu_time_ns
             .saturating_add(self.system_cpu_time_ns)
+    }
+}
+
+#[cfg(test)]
+mod sporadic_tests {
+    use super::{SchedulingParameters, SporadicParameters, SporadicServer, SCHED_SPORADIC_POLICY};
+
+    fn configuration(max_replenishments: u32) -> SchedulingParameters {
+        SchedulingParameters {
+            policy: SCHED_SPORADIC_POLICY,
+            priority: 80,
+            sporadic: Some(SporadicParameters {
+                low_priority: 20,
+                replenishment_period_ns: 100_000_000,
+                initial_budget_ns: 10_000_000,
+                max_replenishments,
+            }),
+        }
+    }
+
+    #[test]
+    fn replenishment_is_rounded_up_to_scheduler_tick() {
+        let mut server = SporadicServer::configured(configuration(4));
+        server.charge(10_000_000, 10_000_001);
+
+        assert_eq!(server.remaining_budget_ns, 0);
+        assert_eq!(server.replenishment_count, 1);
+        assert_eq!(server.replenishments[0].deadline_ns, 120_000_000);
+
+        server.replenish_due(119_999_999);
+        assert_eq!(server.remaining_budget_ns, 0);
+        server.replenish_due(120_000_000);
+        assert_eq!(server.remaining_budget_ns, 10_000_000);
+    }
+
+    #[test]
+    fn replenishments_coalesce_at_configured_maximum() {
+        let mut server = SporadicServer::configured(configuration(1));
+        server.charge(1_000_000, 10_000_000);
+        server.charge(1_000_000, 20_000_000);
+
+        assert_eq!(server.replenishment_count, 1);
+        assert_eq!(server.replenishments[0].deadline_ns, 120_000_000);
+        assert_eq!(server.replenishments[0].budget_ns, 2_000_000);
+        server.replenish_due(119_999_999);
+        assert_eq!(server.remaining_budget_ns, 8_000_000);
+        server.replenish_due(120_000_000);
+        assert_eq!(server.remaining_budget_ns, 10_000_000);
     }
 }
 
@@ -136,7 +297,8 @@ pub(crate) struct Thread {
     // Thread IDs intentionally use the stable address of the Thread inside its Box.
     pub(crate) id: usize,
     process: Arc<Process>,
-    scheduler_override: Option<(i32, i32)>,
+    scheduler_override: Option<SchedulingParameters>,
+    sporadic_server: SporadicServer,
     pub(crate) context: ExecutionContext,
     pub(crate) state: ThreadState,
     pub(crate) start_routine: Option<StartRoutine>,
@@ -171,25 +333,47 @@ pub(crate) struct CleanupHandler {
 }
 
 impl Thread {
-    fn scheduler_parameters(&self) -> (i32, i32) {
+    fn scheduling_configuration(&self) -> SchedulingParameters {
         self.scheduler_override
-            .unwrap_or_else(|| self.process.scheduler_parameters())
+            .unwrap_or_else(|| self.process.scheduling_configuration())
+    }
+
+    fn scheduler_parameters(&self) -> (i32, i32) {
+        let scheduling = self.scheduling_configuration();
+        (scheduling.policy, scheduling.priority)
+    }
+
+    fn effective_priority(&self, scheduling: SchedulingParameters) -> i32 {
+        if scheduling.policy == SCHED_SPORADIC_POLICY
+            && self.sporadic_server.remaining_budget_ns == 0
+        {
+            scheduling
+                .sporadic
+                .map_or(scheduling.priority, |parameters| parameters.low_priority)
+        } else {
+            scheduling.priority
+        }
     }
 
     fn scheduling_rank(&self) -> i32 {
-        let (policy, priority) = self.scheduler_parameters();
-        if matches!(policy, SCHED_FIFO_POLICY | SCHED_RR_POLICY) {
-            100 + priority
+        let scheduling = self.scheduling_configuration();
+        if matches!(
+            scheduling.policy,
+            SCHED_FIFO_POLICY | SCHED_RR_POLICY | SCHED_SPORADIC_POLICY
+        ) {
+            100 + self.effective_priority(scheduling)
         } else {
             20 - self.process.nice_priority()
         }
     }
 
     fn main(stack_address: usize, stack_size: usize, process: Arc<Process>) -> Self {
+        let sporadic_server = SporadicServer::configured(process.scheduling_configuration());
         Self {
             id: 0,
             process,
             scheduler_override: None,
+            sporadic_server,
             context: ExecutionContext::Kernel(kernel::Context::main()),
             state: ThreadState::Running,
             start_routine: None,
@@ -226,10 +410,12 @@ impl Thread {
         argument: *mut c_void,
         detached: bool,
     ) -> Self {
+        let sporadic_server = SporadicServer::configured(process.scheduling_configuration());
         Self {
             id: 0,
             process,
             scheduler_override: None,
+            sporadic_server,
             context: ExecutionContext::Kernel(context),
             state: ThreadState::Ready,
             start_routine: Some(start_routine),
@@ -264,10 +450,12 @@ impl Thread {
         process: Arc<Process>,
         detached: bool,
     ) -> Self {
+        let sporadic_server = SporadicServer::configured(process.scheduling_configuration());
         Self {
             id: 0,
             process,
             scheduler_override: None,
+            sporadic_server,
             context: ExecutionContext::Userspace(context),
             state: ThreadState::Ready,
             start_routine: None,
@@ -303,10 +491,12 @@ impl Thread {
         process: Arc<Process>,
         detached: bool,
     ) -> Self {
+        let sporadic_server = SporadicServer::configured(process.scheduling_configuration());
         Self {
             id: 0,
             process,
             scheduler_override: None,
+            sporadic_server,
             context: ExecutionContext::Vm(context),
             state: ThreadState::Ready,
             start_routine: None,
@@ -491,6 +681,7 @@ impl ThreadManager {
         if let Some(thread) = self.busy.front_mut() {
             if let Some(started_ns) = thread.running_since_ns.take() {
                 let elapsed_ns = now_ns.saturating_sub(started_ns);
+                thread.sporadic_server.charge(elapsed_ns, now_ns);
                 if thread.in_kernel {
                     thread.resource_usage.system_cpu_time_ns = thread
                         .resource_usage
@@ -505,6 +696,15 @@ impl ThreadManager {
                     thread.process.add_cpu_time_ns(elapsed_ns);
                 }
             }
+        }
+    }
+
+    fn refresh_sporadic_servers(&mut self, now_ns: u64) {
+        for thread in self.ready.iter_mut() {
+            thread.sporadic_server.replenish_due(now_ns);
+        }
+        for thread in self.busy.iter_mut() {
+            thread.sporadic_server.replenish_due(now_ns);
         }
     }
 
@@ -638,9 +838,45 @@ impl ThreadManager {
         argument: *mut c_void,
         detached: bool,
     ) -> Result<usize, Error> {
+        Self::create_thread_in_process_with_scheduling(
+            process,
+            stack_size,
+            start_routine,
+            argument,
+            detached,
+            None,
+        )
+    }
+
+    pub(crate) fn create_thread_with_scheduling(
+        stack_size: usize,
+        start_routine: StartRoutine,
+        argument: *mut c_void,
+        detached: bool,
+        scheduling: SchedulingParameters,
+    ) -> Result<usize, Error> {
+        let process = Self::current_process()?;
+        Self::create_thread_in_process_with_scheduling(
+            process,
+            stack_size,
+            start_routine,
+            argument,
+            detached,
+            Some(scheduling),
+        )
+    }
+
+    fn create_thread_in_process_with_scheduling(
+        process: Arc<Process>,
+        stack_size: usize,
+        start_routine: StartRoutine,
+        argument: *mut c_void,
+        detached: bool,
+        scheduling: Option<SchedulingParameters>,
+    ) -> Result<usize, Error> {
         let mut stack = ThreadStack::try_new(stack_size)?;
         let context = kernel::Context::load(stack.as_mut_slice(), Self::thread_trampoline);
-        let thread = Box::new(ListNode::new(Thread::new(
+        let mut thread = Box::new(ListNode::new(Thread::new(
             stack,
             context,
             process,
@@ -648,6 +884,10 @@ impl ThreadManager {
             argument,
             detached,
         )));
+        if let Some(scheduling) = scheduling {
+            thread.scheduler_override = Some(scheduling);
+            thread.sporadic_server.configure(scheduling);
+        }
         Self::enqueue_thread(thread)
     }
 
@@ -840,6 +1080,7 @@ impl ThreadManager {
             } else {
                 let now_ns = scheduler_time_ns();
                 manager.account_current_cpu_time(now_ns);
+                manager.refresh_sporadic_servers(now_ns);
                 if let Some(mut current) = manager.busy.pop_front() {
                     current.process.record_context_switch(voluntary);
                 let old_context = current.context.kernel_mut() as *mut kernel::Context;
@@ -907,6 +1148,14 @@ impl ThreadManager {
     pub(crate) fn timer_tick() {
         let now_ns = crate::kernel::arch::TimerArchitecture::now_ns()
             .unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns);
+        {
+            let mut manager = THREAD_MANAGER.lock();
+            manager.account_current_cpu_time(now_ns);
+            manager.refresh_sporadic_servers(now_ns);
+            if let Some(thread) = manager.busy.front_mut() {
+                thread.running_since_ns = Some(now_ns);
+            }
+        }
         Process::tick_alarms(now_ns);
         Self::wake_expired_sleepers(now_ns);
         if let Ok(process) = Self::current_process() {
@@ -916,8 +1165,8 @@ impl ThreadManager {
         let should_preempt = {
             let manager = THREAD_MANAGER.lock();
             manager.busy.front().is_some_and(|current| {
-                let (policy, _) = current.process.scheduler_parameters();
-                policy != SCHED_FIFO_POLICY
+                let policy = current.scheduling_configuration().policy;
+                !matches!(policy, SCHED_FIFO_POLICY | SCHED_SPORADIC_POLICY)
                     || manager
                         .ready
                         .iter()
@@ -1476,13 +1725,20 @@ impl ThreadManager {
     pub(crate) fn scheduling_parameters_for_thread(
         thread_id: usize,
     ) -> Result<(i32, i32), Error> {
+        let scheduling = Self::scheduling_configuration_for_thread(thread_id)?;
+        Ok((scheduling.policy, scheduling.priority))
+    }
+
+    pub(crate) fn scheduling_configuration_for_thread(
+        thread_id: usize,
+    ) -> Result<SchedulingParameters, Error> {
         let manager = THREAD_MANAGER.lock();
         let node = manager.thread_node_by_id(thread_id).ok_or(Error::Srch)?;
         let thread = manager.thread_ref(node);
         if thread.state == ThreadState::Exited {
             return Err(Error::Srch);
         }
-        Ok(thread.scheduler_parameters())
+        Ok(thread.scheduling_configuration())
     }
 
     pub(crate) fn set_scheduling_parameters_for_thread(
@@ -1490,14 +1746,58 @@ impl ThreadManager {
         policy: i32,
         priority: i32,
     ) -> Result<(), Error> {
+        Self::set_scheduling_configuration_for_thread(
+            thread_id,
+            SchedulingParameters {
+                policy,
+                priority,
+                sporadic: None,
+            },
+        )
+    }
+
+    pub(crate) fn set_scheduling_configuration_for_thread(
+        thread_id: usize,
+        scheduling: SchedulingParameters,
+    ) -> Result<(), Error> {
+        let now_ns = scheduler_time_ns();
         let mut manager = THREAD_MANAGER.lock();
+        manager.account_current_cpu_time(now_ns);
+        if let Some(current) = manager.busy.front_mut() {
+            current.running_since_ns = Some(now_ns);
+        }
         let node = manager.thread_node_by_id(thread_id).ok_or(Error::Srch)?;
         let thread = manager.thread_mut(node);
         if thread.state == ThreadState::Exited {
             return Err(Error::Srch);
         }
-        thread.scheduler_override = Some((policy, priority));
+        thread.scheduler_override = Some(scheduling);
+        thread.sporadic_server.configure(scheduling);
         Ok(())
+    }
+
+    pub(crate) fn set_process_scheduling_configuration(
+        process: &Process,
+        scheduling: SchedulingParameters,
+    ) {
+        let process_id = process.pid();
+        let now_ns = scheduler_time_ns();
+        let mut manager = THREAD_MANAGER.lock();
+        manager.account_current_cpu_time(now_ns);
+        if let Some(current) = manager.busy.front_mut() {
+            current.running_since_ns = Some(now_ns);
+        }
+        process.set_scheduling_configuration(scheduling);
+        for thread in manager.busy.iter_mut() {
+            if thread.process.pid() == process_id && thread.scheduler_override.is_none() {
+                thread.sporadic_server.configure(scheduling);
+            }
+        }
+        for thread in manager.ready.iter_mut() {
+            if thread.process.pid() == process_id && thread.scheduler_override.is_none() {
+                thread.sporadic_server.configure(scheduling);
+            }
+        }
     }
 
     fn thread_attributes(&self, thread: NonNull<Thread>) -> (*mut c_void, usize, bool) {

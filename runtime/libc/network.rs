@@ -5,14 +5,13 @@
  * free of charge, without warranty of any kind.
  */
 
-use alloc::collections::VecDeque;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU16, Ordering};
 
-use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
+use crate::kernel::arch::traits::TimerArchitecture as _;
 use crate::kernel::error::Error;
 use crate::kernel::net::tcp::connection::{TcpSocketHandle, TcpState};
 use crate::kernel::net::udp::UdpSocketHandle;
@@ -20,16 +19,12 @@ use crate::kernel::net::wire::Ipv4Address;
 use crate::kernel::runtime::runtime_ffi::{
     with_active_tcp_context, TcpContext,
 };
-use crate::kernel::scheduler::sync::{IrqSpinGuard, IrqSpinLock};
-use crate::kernel::scheduler::thread::{ThreadManager, ThreadState};
+use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::vfs::plugin::tun::{TunDevice, TunTapMode};
 
 pub(crate) const SOCKET_FD_BASE: i32 = 128;
 const SOCKET_COUNT: usize = 32;
-pub(crate) const LOCAL_SOCKET_FD_BASE: i32 = 320;
-const LOCAL_SOCKET_COUNT: usize = 32;
-const LOCAL_SOCKET_BUFFER_SIZE: usize = 65_536;
-const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
@@ -86,33 +81,10 @@ const CONNECT_TIMEOUT_NS: u64 = 30_000_000_000;
 const IO_POLL_LIMIT: usize = 100_000;
 
 static NEXT_EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(0);
-static SOCKETS: IrqSpinLock<[Option<SocketFd>; SOCKET_COUNT]> =
-    IrqSpinLock::new([const { None }; SOCKET_COUNT]);
-static LOCAL_SOCKETS: IrqSpinLock<[Option<LocalSocketFd>; LOCAL_SOCKET_COUNT]> =
-    IrqSpinLock::new([const { None }; LOCAL_SOCKET_COUNT]);
-static LOCAL_SOCKET_PATHS: IrqSpinLock<Vec<(Vec<u8>, Weak<IrqSpinLock<LocalListener>>)>> =
-    IrqSpinLock::new(Vec::new());
+static SOCKETS: IrqSpinLock<[Option<SocketDescriptor>; SOCKET_COUNT]> =
+    IrqSpinLock::new([None; SOCKET_COUNT]);
 static PACKET_DEVICES: IrqSpinLock<[Option<PacketDescriptor>; PACKET_DEVICE_COUNT]> =
     IrqSpinLock::new([const { None }; PACKET_DEVICE_COUNT]);
-
-fn available_descriptor_index<T, const N: usize>(
-    descriptors: &IrqSpinGuard<'_, [Option<T>; N]>,
-    base: i32,
-    minimum: usize,
-) -> Option<usize> {
-    descriptors
-        .iter()
-        .enumerate()
-        .skip(minimum)
-        .find_map(|(index, descriptor)| {
-            let file_descriptor = base + index as i32;
-            (descriptor.is_none()
-                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
-                    file_descriptor,
-                ))
-            .then_some(index)
-        })
-}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SocketState {
@@ -132,7 +104,6 @@ enum SocketType {
 
 #[derive(Clone, Copy)]
 struct SocketDescriptor {
-    descriptor_references: usize,
     socket_type: SocketType,
     state: SocketState,
     local_address: Ipv4Address,
@@ -149,59 +120,11 @@ struct SocketDescriptor {
 }
 
 #[derive(Clone)]
-struct SocketFd {
-    description: Arc<IrqSpinLock<SocketDescriptor>>,
-    close_on_exec: bool,
-}
-
-struct LocalPair {
-    queues: [VecDeque<u8>; 2],
-    readers: [usize; 2],
-    writers: [usize; 2],
-    read_shutdown: [bool; 2],
-    write_shutdown: [bool; 2],
-}
-
-struct LocalListener {
-    path: Vec<u8>,
-    listening: bool,
-    closed: bool,
-    backlog: usize,
-    pending: VecDeque<PendingLocalConnection>,
-}
-
-struct PendingLocalConnection {
-    pair: Arc<IrqSpinLock<LocalPair>>,
-    peer_path: Option<Vec<u8>>,
-}
-
-#[derive(Clone)]
-struct LocalOpenDescription {
-    pair: Arc<IrqSpinLock<LocalPair>>,
-    side: usize,
-    descriptor_references: usize,
-    nonblocking: bool,
-    connected: bool,
-    connecting: bool,
-    closed: bool,
-    listener: Option<Arc<IrqSpinLock<LocalListener>>>,
-    local_path: Option<Vec<u8>>,
-    peer_path: Option<Vec<u8>>,
-}
-
-#[derive(Clone)]
-struct LocalSocketFd {
-    description: Arc<IrqSpinLock<LocalOpenDescription>>,
-    close_on_exec: bool,
-}
-
-#[derive(Clone)]
 struct PacketDescriptor {
     device: Arc<TunDevice>,
     mode: Option<TunTapMode>,
     no_packet_info: bool,
-    nonblocking: Arc<AtomicBool>,
-    close_on_exec: bool,
+    nonblocking: bool,
     name: [u8; 16],
 }
 
@@ -221,496 +144,21 @@ struct SockaddrIn {
 }
 
 pub(crate) fn is_socket_fd(file_descriptor: i32) -> bool {
-    socket_index(file_descriptor).is_ok() || local_socket_index(file_descriptor).is_ok()
-}
-
-pub(crate) fn is_local_socket_fd(file_descriptor: i32) -> bool {
-    local_socket_index(file_descriptor).is_ok()
-}
-
-pub(crate) fn same_socket_table(source: i32, target: i32) -> bool {
-    if local_socket_index(source).is_ok() {
-        local_socket_index(target).is_ok()
-    } else {
-        socket_index(source).is_ok() && socket_index(target).is_ok()
-    }
-}
-
-pub(crate) fn validate_local_socket(file_descriptor: i32) -> Result<(), Error> {
-    local_socket_description(file_descriptor).map(|_| ())
-}
-
-pub(crate) fn local_socket_names(
-    file_descriptor: i32,
-    peer: bool,
-) -> Result<Vec<u8>, Error> {
-    let description = local_socket_description(file_descriptor)?;
-    let description = description.lock();
-    if description.closed {
-        return Err(Error::Badf);
-    }
-    if peer && !description.connected {
-        return Err(Error::NotConn);
-    }
-    let path = if peer {
-        description.peer_path.as_deref()
-    } else {
-        description.local_path.as_deref()
-    };
-    let mut copy = Vec::new();
-    if let Some(path) = path {
-        copy.try_reserve_exact(path.len()).map_err(|_| Error::NoMem)?;
-        copy.extend_from_slice(path);
-    }
-    Ok(copy)
+    socket_index(file_descriptor).is_ok()
 }
 
 pub(crate) fn has_socket_fd(file_descriptor: i32) -> bool {
-    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
-        if alias.kind != crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket {
-            return false;
-        }
-        if let Ok(index) = socket_index(alias.backing) {
-            return SOCKETS.lock()[index].is_some();
-        }
-        return local_socket_index(alias.backing)
-            .ok()
-            .is_some_and(|index| LOCAL_SOCKETS.lock()[index].is_some());
-    }
-    if let Ok(index) = socket_index(file_descriptor) {
-        return SOCKETS.lock()[index].is_some();
-    }
-    local_socket_index(file_descriptor)
+    socket_index(file_descriptor)
         .ok()
-        .is_some_and(|index| LOCAL_SOCKETS.lock()[index].is_some())
-}
-
-fn local_socket_index(file_descriptor: i32) -> Result<usize, Error> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
-        file_descriptor,
-        crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket,
-    )?;
-    let index = file_descriptor
-        .checked_sub(LOCAL_SOCKET_FD_BASE)
-        .and_then(|value| usize::try_from(value).ok())
-        .ok_or(Error::BadFd)?;
-    (index < LOCAL_SOCKET_COUNT).then_some(index).ok_or(Error::BadFd)
-}
-
-fn local_socket_description(file_descriptor: i32) -> Result<Arc<IrqSpinLock<LocalOpenDescription>>, Error> {
-    let index = local_socket_index(file_descriptor)?;
-    LOCAL_SOCKETS.lock()[index]
-        .as_ref()
-        .map(|socket| Arc::clone(&socket.description))
-        .ok_or(Error::BadFd)
-}
-
-fn local_socket_state(
-    file_descriptor: i32,
-) -> Result<(Arc<IrqSpinLock<LocalPair>>, usize, bool), Error> {
-    let description = local_socket_description(file_descriptor)?;
-    let description = description.lock();
-    if description.closed {
-        return Err(Error::Badf);
-    }
-    if description.closed {
-        return Err(Error::Badf);
-    }
-    if !description.connected {
-        return Err(Error::NotConn);
-    }
-    Ok((
-        Arc::clone(&description.pair),
-        description.side,
-        description.nonblocking,
-    ))
-}
-
-fn new_local_pair() -> Result<Arc<IrqSpinLock<LocalPair>>, Error> {
-    let mut queues = [VecDeque::new(), VecDeque::new()];
-    for queue in &mut queues {
-        queue
-            .try_reserve_exact(LOCAL_SOCKET_BUFFER_SIZE)
-            .map_err(|_| Error::NoMem)?;
-    }
-    Ok(Arc::new(IrqSpinLock::new(LocalPair {
-        queues,
-        readers: [1, 1],
-        writers: [1, 1],
-        read_shutdown: [false, false],
-        write_shutdown: [false, false],
-    })))
-}
-
-fn empty_local_pair() -> Arc<IrqSpinLock<LocalPair>> {
-    Arc::new(IrqSpinLock::new(LocalPair {
-        queues: [VecDeque::new(), VecDeque::new()],
-        readers: [0, 0],
-        writers: [0, 0],
-        read_shutdown: [false, false],
-        write_shutdown: [false, false],
-    }))
-}
-
-pub(crate) fn create_local_socket(
-    domain: i32,
-    socket_type: i32,
-    protocol: i32,
-) -> Result<i32, Error> {
-    if domain != AF_UNIX {
-        return Err(Error::AfNoSupport);
-    }
-    let nonblocking = socket_type & SOCK_NONBLOCK != 0;
-    let close_on_exec = socket_type & SOCK_CLOEXEC != 0;
-    let socket_type = socket_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC | SOCK_CLOFORK);
-    if protocol != 0 || socket_type != SOCK_STREAM {
-        return Err(Error::SockTypeNoSupport);
-    }
-    let mut sockets = LOCAL_SOCKETS.lock();
-    let index = available_descriptor_index(&sockets, LOCAL_SOCKET_FD_BASE, 0)
-        .ok_or(Error::Mfile)?;
-    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-        LOCAL_SOCKET_FD_BASE + index as i32,
-    )?;
-    sockets[index] = Some(LocalSocketFd {
-        description: Arc::new(IrqSpinLock::new(LocalOpenDescription {
-            pair: empty_local_pair(),
-            side: 0,
-            descriptor_references: 1,
-            nonblocking,
-            connected: false,
-            connecting: false,
-            closed: false,
-            listener: None,
-            local_path: None,
-            peer_path: None,
-        })),
-        close_on_exec,
-    });
-    Ok(LOCAL_SOCKET_FD_BASE + index as i32)
-}
-
-pub(crate) fn bind_local_socket(file_descriptor: i32, path: &[u8]) -> Result<(), Error> {
-    if path.is_empty() || path[0] == 0 {
-        return Err(Error::Inval);
-    }
-    if path.len() > 107 {
-        return Err(Error::NameTooLong);
-    }
-    let description = local_socket_description(file_descriptor)?;
-    let mut path_copy = Vec::new();
-    path_copy.try_reserve_exact(path.len()).map_err(|_| Error::NoMem)?;
-    path_copy.extend_from_slice(path);
-    let listener = Arc::new(IrqSpinLock::new(LocalListener {
-        path: path_copy.clone(),
-        listening: false,
-        closed: false,
-        backlog: 0,
-        pending: VecDeque::new(),
-    }));
-    let mut paths = LOCAL_SOCKET_PATHS.lock();
-    paths.retain(|(_, existing)| existing.strong_count() != 0);
-    if paths.iter().any(|(registered_path, _)| registered_path.as_slice() == path) {
-        return Err(Error::AddrInUse);
-    }
-    paths.try_reserve(1).map_err(|_| Error::NoMem)?;
-    let mut description = description.lock();
-    if description.closed {
-        return Err(Error::Badf);
-    }
-    if description.connected || description.connecting || description.listener.is_some() || description.local_path.is_some() {
-        return Err(Error::Inval);
-    }
-    description.local_path = Some(path_copy.clone());
-    description.listener = Some(Arc::clone(&listener));
-    paths.push((path_copy, Arc::downgrade(&listener)));
-    Ok(())
-}
-
-pub(crate) fn listen_local_socket(file_descriptor: i32, backlog: i32) -> Result<(), Error> {
-    let description = local_socket_description(file_descriptor)?;
-    let description = description.lock();
-    if description.closed {
-        return Err(Error::Badf);
-    }
-    if description.connected {
-        return Err(Error::Inval);
-    }
-    let listener = description.listener.as_ref().ok_or(Error::Inval)?;
-    let mut listener = listener.lock();
-    if listener.closed {
-        return Err(Error::Badf);
-    }
-    listener.listening = true;
-    listener.backlog = usize::try_from(backlog.max(1)).unwrap_or(1).min(128);
-    Ok(())
-}
-
-pub(crate) fn connect_local_socket(file_descriptor: i32, path: &[u8]) -> Result<(), Error> {
-    let description = local_socket_description(file_descriptor)?;
-    let local_path = {
-        let mut description = description.lock();
-        if description.closed {
-            return Err(Error::Badf);
-        }
-        if description.connected || description.connecting {
-            return Err(Error::IsConn);
-        }
-        let mut local_path = Vec::new();
-        if let Some(path) = description.local_path.as_deref() {
-            local_path.try_reserve_exact(path.len()).map_err(|_| Error::NoMem)?;
-            local_path.extend_from_slice(path);
-        }
-        description.connecting = true;
-        (!local_path.is_empty()).then_some(local_path)
-    };
-    let result = connect_local_socket_pending(&description, path, local_path);
-    if result.is_err() {
-        description.lock().connecting = false;
-    }
-    result
-}
-
-fn connect_local_socket_pending(
-    description: &Arc<IrqSpinLock<LocalOpenDescription>>,
-    path: &[u8],
-    local_path: Option<Vec<u8>>,
-) -> Result<(), Error> {
-    let listener = {
-        let mut paths = LOCAL_SOCKET_PATHS.lock();
-        paths.retain(|(_, existing)| existing.strong_count() != 0);
-        paths
-            .iter()
-            .find_map(|(registered_path, listener)| {
-                (registered_path.as_slice() == path).then(|| listener.upgrade()).flatten()
-            })
-            .ok_or(Error::NoEnt)?
-    };
-    let pair = new_local_pair()?;
-    let mut peer_path = Vec::new();
-    peer_path.try_reserve_exact(path.len()).map_err(|_| Error::NoMem)?;
-    peer_path.extend_from_slice(path);
-    {
-        let mut listener_state = listener.lock();
-        if listener_state.closed || !listener_state.listening {
-            return Err(Error::ConnRefused);
-        }
-        if listener_state.pending.len() >= listener_state.backlog {
-            return Err(Error::Again);
-        }
-        listener_state.pending.try_reserve(1).map_err(|_| Error::NoMem)?;
-        listener_state.pending.push_back(PendingLocalConnection {
-            pair: Arc::clone(&pair),
-            peer_path: local_path,
-        });
-    }
-    let committed = {
-        let mut description = description.lock();
-        if description.closed {
-            Err(Error::Badf)
-        } else if description.connected || !description.connecting {
-            Err(Error::IsConn)
-        } else {
-            description.pair = Arc::clone(&pair);
-            description.side = 0;
-            description.connected = true;
-            description.connecting = false;
-            description.peer_path = Some(peer_path);
-            Ok(())
-        }
-    };
-    if let Err(error) = committed {
-        let mut listener_state = listener.lock();
-        if let Some(index) = listener_state
-            .pending
-            .iter()
-            .position(|connection| Arc::ptr_eq(&connection.pair, &pair))
-        {
-            listener_state.pending.remove(index);
-        }
-        let mut pair = pair.lock();
-        pair.readers[0] = 0;
-        pair.writers[0] = 0;
-        pair.read_shutdown[0] = true;
-        pair.write_shutdown[0] = true;
-        return Err(error);
-    }
-    wake_local_socket_waiters();
-    Ok(())
-}
-
-pub(crate) fn accept_local_socket(file_descriptor: i32) -> Result<i32, Error> {
-    let local_description = local_socket_description(file_descriptor)?;
-    let listener_description = local_description.lock();
-    if listener_description.closed {
-        return Err(Error::Badf);
-    }
-    let nonblocking = listener_description.nonblocking;
-    if listener_description.connected {
-        return Err(Error::Inval);
-    }
-    let listener = Arc::clone(listener_description.listener.as_ref().ok_or(Error::Inval)?);
-    drop(listener_description);
-    loop {
-        ThreadManager::cancel_current_if_requested();
-        let (connection, path) = {
-            let mut listener = listener.lock();
-            if listener.closed {
-                return Err(Error::Badf);
-            }
-            if let Some(connection) = listener.pending.pop_front() {
-                (connection, listener.path.clone())
-            } else if nonblocking {
-                return Err(Error::Again);
-            } else {
-                drop(listener);
-                wait_for_local_socket_change()?;
-                continue;
-            }
-        };
-        let mut sockets = LOCAL_SOCKETS.lock();
-        let index = available_descriptor_index(&sockets, LOCAL_SOCKET_FD_BASE, 0)
-            .ok_or(Error::Mfile)?;
-        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-            LOCAL_SOCKET_FD_BASE + index as i32,
-        )?;
-        sockets[index] = Some(LocalSocketFd {
-            description: Arc::new(IrqSpinLock::new(LocalOpenDescription {
-                pair: connection.pair,
-                side: 1,
-                descriptor_references: 1,
-                nonblocking,
-                connected: true,
-                connecting: false,
-                closed: false,
-                listener: None,
-                local_path: Some(path),
-                peer_path: connection.peer_path,
-            })),
-            close_on_exec: false,
-        });
-        return Ok(LOCAL_SOCKET_FD_BASE + index as i32);
-    }
-}
-
-pub(crate) fn unlink_local_socket_path(path: &[u8]) {
-    LOCAL_SOCKET_PATHS
-        .lock()
-        .retain(|(registered_path, listener)| {
-            listener.strong_count() != 0 && registered_path.as_slice() != path
-        });
-}
-
-fn wake_local_socket_waiters() {
-    ThreadManager::wake_all_blocked_threads();
-}
-
-fn wait_for_local_socket_change() -> Result<(), Error> {
-    if ThreadManager::current_signal_wake_pending() {
-        return if restart_interrupted_io() {
-            Ok(())
-        } else {
-            Err(Error::Intr)
-        };
-    }
-    if !ThreadManager::switch_current(ThreadState::Blocked) {
-        crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
-    }
-    Ok(())
-}
-
-fn local_send(file_descriptor: i32, bytes: &[u8]) -> Result<usize, Error> {
-    if bytes.is_empty() {
-        return Ok(0);
-    }
-    let (pair, side, nonblocking) = local_socket_state(file_descriptor)?;
-    loop {
-        ThreadManager::cancel_current_if_requested();
-        let result = {
-            let mut pair = pair.lock();
-            let peer = 1 - side;
-            if pair.writers[side] == 0
-                || pair.write_shutdown[side]
-                || pair.readers[peer] == 0
-                || pair.read_shutdown[peer]
-            {
-                Err(Error::Pipe)
-            } else {
-                let available = LOCAL_SOCKET_BUFFER_SIZE.saturating_sub(pair.queues[peer].len());
-                if available == 0 {
-                    Err(Error::Again)
-                } else {
-                    let amount = available.min(bytes.len());
-                    pair.queues[peer].extend(bytes[..amount].iter().copied());
-                    Ok(amount)
-                }
-            }
-        };
-        match result {
-            Ok(amount) => {
-                wake_local_socket_waiters();
-                return Ok(amount);
-            }
-            Err(Error::Again) if !nonblocking => wait_for_local_socket_change()?,
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn local_receive(file_descriptor: i32, output: &mut [u8]) -> Result<usize, Error> {
-    if output.is_empty() {
-        return Ok(0);
-    }
-    let (pair, side, nonblocking) = local_socket_state(file_descriptor)?;
-    loop {
-        ThreadManager::cancel_current_if_requested();
-        let result = {
-            let mut pair = pair.lock();
-            let peer = 1 - side;
-            if pair.readers[side] == 0 || pair.read_shutdown[side] {
-                Ok(0)
-            } else if !pair.queues[side].is_empty() {
-                let amount = output.len().min(pair.queues[side].len());
-                for (destination, byte) in output[..amount]
-                    .iter_mut()
-                    .zip(pair.queues[side].drain(..amount))
-                {
-                    *destination = byte;
-                }
-                Ok(amount)
-            } else if pair.writers[peer] == 0 || pair.write_shutdown[peer] {
-                Ok(0)
-            } else {
-                Err(Error::Again)
-            }
-        };
-        match result {
-            Ok(amount) => {
-                if amount != 0 {
-                    wake_local_socket_waiters();
-                }
-                return Ok(amount);
-            }
-            Err(Error::Again) if !nonblocking => wait_for_local_socket_change()?,
-            Err(error) => return Err(error),
-        }
-    }
+        .and_then(|index| SOCKETS.lock()[index])
+        .is_some()
 }
 
 pub(crate) fn is_packet_fd(file_descriptor: i32) -> bool {
-    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
-        return alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet;
-    }
     packet_index(file_descriptor).is_ok()
 }
 
 pub(crate) fn has_packet_fd(file_descriptor: i32) -> bool {
-    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
-        return alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet
-            && packet_index(alias.backing)
-                .ok()
-                .is_some_and(|index| PACKET_DEVICES.lock()[index].is_some());
-    }
     packet_index(file_descriptor)
         .ok()
         .and_then(|index| PACKET_DEVICES.lock()[index].as_ref().map(|_| ()))
@@ -761,19 +209,18 @@ pub(crate) fn tun_device_by_name(name: &[u8]) -> Result<Arc<TunDevice>, Error> {
         .ok_or(Error::NoDev)
 }
 
-pub(crate) fn open_tun_device(nonblocking: bool, close_on_exec: bool) -> Result<i32, Error> {
+pub(crate) fn open_tun_device(nonblocking: bool) -> Result<i32, Error> {
     let device = TunDevice::new()?;
     let mut devices = PACKET_DEVICES.lock();
-    let index = available_descriptor_index(&devices, PACKET_FD_BASE, 0).ok_or(Error::Mfile)?;
-    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-        PACKET_FD_BASE + index as i32,
-    )?;
+    let index = devices
+        .iter()
+        .position(Option::is_none)
+        .ok_or(Error::Mfile)?;
     devices[index] = Some(PacketDescriptor {
         device,
         mode: None,
         no_packet_info: false,
-        nonblocking: Arc::new(AtomicBool::new(nonblocking)),
-        close_on_exec,
+        nonblocking,
         name: [0; 16],
     });
     Ok(PACKET_FD_BASE + index as i32)
@@ -1177,104 +624,8 @@ pub(crate) fn pump_packet_network() {
 
 pub(crate) fn close_packet_fd(file_descriptor: i32) -> Result<(), Error> {
     let index = packet_index(file_descriptor)?;
-    let (descriptor, still_open) = {
-        let mut devices = PACKET_DEVICES.lock();
-        let descriptor = devices[index].take().ok_or(Error::BadFd)?;
-        let still_open = devices
-            .iter()
-            .flatten()
-            .any(|other| Arc::ptr_eq(&other.device, &descriptor.device));
-        (descriptor, still_open)
-    };
-    if !still_open {
-        descriptor.device.set_up(false);
-    }
-    Ok(())
-}
-
-pub(crate) fn duplicate_packet_fd(
-    file_descriptor: i32,
-    minimum: i32,
-    close_on_exec: bool,
-) -> Result<i32, Error> {
-    duplicate_packet_fd_internal(file_descriptor, minimum, close_on_exec, true)
-}
-
-pub(crate) fn duplicate_packet_fd_backing(file_descriptor: i32) -> Result<i32, Error> {
-    duplicate_packet_fd_internal(file_descriptor, PACKET_FD_BASE, false, false)
-}
-
-fn duplicate_packet_fd_internal(
-    file_descriptor: i32,
-    minimum: i32,
-    close_on_exec: bool,
-    enforce_limit: bool,
-) -> Result<i32, Error> {
-    if minimum < 0 {
-        return Err(Error::Inval);
-    }
-    let source_index = packet_index(file_descriptor)?;
-    let mut devices = PACKET_DEVICES.lock();
-    let mut descriptor = devices[source_index].as_ref().cloned().ok_or(Error::BadFd)?;
-    let first = usize::try_from(minimum.saturating_sub(PACKET_FD_BASE))
-        .unwrap_or(0)
-        .min(PACKET_DEVICE_COUNT);
-    let target_index = available_descriptor_index(&devices, PACKET_FD_BASE, first)
-        .ok_or(Error::Mfile)?;
-    if enforce_limit {
-        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-            PACKET_FD_BASE + target_index as i32,
-        )?;
-    }
-    descriptor.close_on_exec = close_on_exec;
-    devices[target_index] = Some(descriptor);
-    Ok(PACKET_FD_BASE + target_index as i32)
-}
-
-pub(crate) fn duplicate_packet_fd_to(
-    file_descriptor: i32,
-    new_descriptor: i32,
-    close_on_exec: bool,
-) -> Result<i32, Error> {
-    let source_index = packet_index(file_descriptor)?;
-    let target_index = packet_index(new_descriptor)?;
-    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(new_descriptor)?;
-    if file_descriptor == new_descriptor {
-        return if close_on_exec {
-            Err(Error::Inval)
-        } else {
-            Ok(new_descriptor)
-        };
-    }
-    let mut devices = PACKET_DEVICES.lock();
-    let mut descriptor = devices[source_index].as_ref().cloned().ok_or(Error::BadFd)?;
-    if let Some(replaced) = devices[target_index].take() {
-        let still_open = devices
-            .iter()
-            .flatten()
-            .any(|other| Arc::ptr_eq(&other.device, &replaced.device));
-        if !still_open {
-            replaced.device.set_up(false);
-        }
-    }
-    descriptor.close_on_exec = close_on_exec;
-    devices[target_index] = Some(descriptor);
-    Ok(new_descriptor)
-}
-
-pub(crate) fn packet_descriptor_flags(file_descriptor: i32) -> Result<i32, Error> {
-    Ok(i32::from(packet_descriptor(file_descriptor)?.close_on_exec))
-}
-
-pub(crate) fn set_packet_descriptor_flags(file_descriptor: i32, flags: i32) -> Result<(), Error> {
-    if flags & !1 != 0 {
-        return Err(Error::Inval);
-    }
-    let index = packet_index(file_descriptor)?;
-    PACKET_DEVICES.lock()[index]
-        .as_mut()
-        .ok_or(Error::BadFd)?
-        .close_on_exec = flags & 1 != 0;
+    let descriptor = PACKET_DEVICES.lock()[index].take().ok_or(Error::BadFd)?;
+    descriptor.device.set_up(false);
     Ok(())
 }
 
@@ -1295,16 +646,17 @@ pub(crate) fn packet_readiness(file_descriptor: i32, events: i16) -> Result<i16,
 }
 
 pub(crate) fn packet_nonblocking(file_descriptor: i32) -> Result<bool, Error> {
-    let descriptor = packet_descriptor(file_descriptor)?;
-    Ok(descriptor.nonblocking.load(Ordering::Acquire))
+    Ok(packet_descriptor(file_descriptor)?.nonblocking)
 }
 
 pub(crate) fn set_packet_nonblocking(
     file_descriptor: i32,
     nonblocking: bool,
 ) -> Result<(), Error> {
-    let description = packet_descriptor(file_descriptor)?.nonblocking;
-    description.store(nonblocking, Ordering::Release);
+    let index = packet_index(file_descriptor)?;
+    let mut devices = PACKET_DEVICES.lock();
+    let descriptor = devices[index].as_mut().ok_or(Error::BadFd)?;
+    descriptor.nonblocking = nonblocking;
     Ok(())
 }
 
@@ -1313,14 +665,10 @@ pub(crate) fn create_socket(
     socket_type: i32,
     protocol: i32,
 ) -> Result<i32, Error> {
-    if domain == AF_UNIX {
-        return create_local_socket(domain, socket_type, protocol);
-    }
     if domain != AF_INET {
         return Err(Error::AfNoSupport);
     }
     let nonblocking = socket_type & SOCK_NONBLOCK != 0;
-    let close_on_exec = socket_type & SOCK_CLOEXEC != 0;
     let socket_type = socket_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC | SOCK_CLOFORK);
     if socket_type == SOCK_RAW {
         return Err(Error::SockTypeNoSupport);
@@ -1340,7 +688,6 @@ pub(crate) fn create_socket(
         None
     };
     let descriptor = SocketDescriptor {
-        descriptor_references: 1,
         socket_type,
         state: SocketState::Created,
         local_address: Ipv4Address([0; 4]),
@@ -1356,96 +703,12 @@ pub(crate) fn create_socket(
         broadcast: false,
     };
     let mut sockets = SOCKETS.lock();
-    let Some(index) = available_descriptor_index(&sockets, SOCKET_FD_BASE, 0) else {
-        drop(sockets);
-        if let Some(handle) = udp_handle {
-            let _ = active_context(|context| context.udp_close(handle));
-        }
-        return Err(Error::Mfile);
-    };
-    if let Err(error) = crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-        SOCKET_FD_BASE + index as i32,
-    ) {
-        drop(sockets);
-        if let Some(handle) = udp_handle {
-            let _ = active_context(|context| context.udp_close(handle));
-        }
-        return Err(error);
-    }
-    sockets[index] = Some(SocketFd {
-        description: Arc::new(IrqSpinLock::new(descriptor)),
-        close_on_exec,
-    });
-    Ok(SOCKET_FD_BASE + index as i32)
-}
-
-pub(crate) fn create_local_socket_pair(
-    domain: i32,
-    socket_type: i32,
-    protocol: i32,
-) -> Result<(i32, i32), Error> {
-    if domain != AF_UNIX {
-        return Err(Error::AfNoSupport);
-    }
-    let nonblocking = socket_type & SOCK_NONBLOCK != 0;
-    let close_on_exec = socket_type & SOCK_CLOEXEC != 0;
-    let socket_type = socket_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC | SOCK_CLOFORK);
-    if protocol != 0 || socket_type != SOCK_STREAM {
-        return Err(Error::SockTypeNoSupport);
-    }
-    let mut queues = [VecDeque::new(), VecDeque::new()];
-    for queue in &mut queues {
-        queue
-            .try_reserve_exact(LOCAL_SOCKET_BUFFER_SIZE)
-            .map_err(|_| Error::NoMem)?;
-    }
-    let mut sockets = LOCAL_SOCKETS.lock();
-    let mut available = sockets
+    let index = sockets
         .iter()
-        .enumerate()
-        .filter_map(|(index, socket)| {
-            let file_descriptor = LOCAL_SOCKET_FD_BASE + index as i32;
-            (socket.is_none()
-                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
-                    file_descriptor,
-                ))
-            .then_some(index)
-        });
-    let first = available.next().ok_or(Error::Mfile)?;
-    let second = available.next().ok_or(Error::Mfile)?;
-    for index in [first, second] {
-        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-            LOCAL_SOCKET_FD_BASE + index as i32,
-        )?;
-    }
-    let pair = Arc::new(IrqSpinLock::new(LocalPair {
-        queues,
-        readers: [1, 1],
-        writers: [1, 1],
-        read_shutdown: [false, false],
-        write_shutdown: [false, false],
-    }));
-    for (index, side) in [(first, 0), (second, 1)] {
-        sockets[index] = Some(LocalSocketFd {
-            description: Arc::new(IrqSpinLock::new(LocalOpenDescription {
-                pair: Arc::clone(&pair),
-                side,
-                descriptor_references: 1,
-                nonblocking,
-                connected: true,
-                connecting: false,
-                closed: false,
-                listener: None,
-                local_path: None,
-                peer_path: None,
-            })),
-            close_on_exec,
-        });
-    }
-    Ok((
-        LOCAL_SOCKET_FD_BASE + first as i32,
-        LOCAL_SOCKET_FD_BASE + second as i32,
-    ))
+        .position(Option::is_none)
+        .ok_or(Error::Mfile)?;
+    sockets[index] = Some(descriptor);
+    Ok(SOCKET_FD_BASE + index as i32)
 }
 
 pub(crate) fn bind(
@@ -1467,7 +730,6 @@ pub(crate) fn bind(
     }
     let port = if port == 0 { allocate_ephemeral_port()? } else { port };
     if SOCKETS.lock().iter().flatten().any(|other| {
-        let other = *other.description.lock();
         other.local_port == port
             && other.state != SocketState::Created
             && other.socket_type == descriptor.socket_type
@@ -1495,9 +757,6 @@ pub(crate) fn bind(
 }
 
 pub(crate) fn listen(file_descriptor: i32, backlog: i32) -> Result<(), Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        return listen_local_socket(file_descriptor, backlog);
-    }
     let index = socket_index(file_descriptor)?;
     let mut descriptor = socket_descriptor(index)?;
     if descriptor.socket_type != SocketType::Stream {
@@ -1520,10 +779,6 @@ pub(crate) fn listen(file_descriptor: i32, backlog: i32) -> Result<(), Error> {
 }
 
 pub(crate) fn accept(file_descriptor: i32) -> Result<(i32, Ipv4Address, u16), Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        return accept_local_socket(file_descriptor)
-            .map(|accepted| (accepted, Ipv4Address([0; 4]), 0));
-    }
     let listener_index = socket_index(file_descriptor)?;
     let listener = socket_descriptor(listener_index)?;
     if listener.socket_type != SocketType::Stream || listener.state != SocketState::Listening {
@@ -1532,7 +787,6 @@ pub(crate) fn accept(file_descriptor: i32) -> Result<(i32, Ipv4Address, u16), Er
     let handle = listener.handle.ok_or(Error::BadFd)?;
     let started = now_ns();
     for _ in 0..IO_POLL_LIMIT {
-        ThreadManager::cancel_current_if_requested();
         let accepted = active_context(|context| {
             context.poll_network();
             context.tcp_accept(handle)
@@ -1547,7 +801,6 @@ pub(crate) fn accept(file_descriptor: i32) -> Result<(i32, Ipv4Address, u16), Er
             })?
             .ok_or(Error::Proto)?;
             let descriptor = SocketDescriptor {
-                descriptor_references: 1,
                 socket_type: SocketType::Stream,
                 state: SocketState::Connected,
                 local_address,
@@ -1563,22 +816,12 @@ pub(crate) fn accept(file_descriptor: i32) -> Result<(i32, Ipv4Address, u16), Er
                 broadcast: false,
             };
             let mut sockets = SOCKETS.lock();
-            let Some(index) = available_descriptor_index(&sockets, SOCKET_FD_BASE, 0) else {
+            let Some(index) = sockets.iter().position(Option::is_none) else {
                 drop(sockets);
                 let _removed = active_context(|context| context.tcp_remove(accepted));
                 return Err(Error::Mfile);
             };
-            if let Err(error) = crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-                SOCKET_FD_BASE + index as i32,
-            ) {
-                drop(sockets);
-                let _removed = active_context(|context| context.tcp_remove(accepted));
-                return Err(error);
-            }
-            sockets[index] = Some(SocketFd {
-                description: Arc::new(IrqSpinLock::new(descriptor)),
-                close_on_exec: false,
-            });
+            sockets[index] = Some(descriptor);
             return Ok((SOCKET_FD_BASE + index as i32, remote_address, remote_port));
         }
         if listener.nonblocking {
@@ -1658,7 +901,6 @@ pub(crate) fn connect(
     let handle = descriptor.handle.ok_or(Error::BadFd)?;
     let started = now_ns();
     for _ in 0..IO_POLL_LIMIT {
-        ThreadManager::cancel_current_if_requested();
         let state = active_context(|context| {
             context.poll_network();
             context.tcp_state(handle)
@@ -1693,9 +935,6 @@ pub(crate) fn connect(
 }
 
 pub(crate) fn send(file_descriptor: i32, bytes: &[u8]) -> Result<usize, Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        return local_send(file_descriptor, bytes);
-    }
     let index = socket_index(file_descriptor)?;
     let descriptor = refresh_connection(index, socket_descriptor(index)?)?;
     if descriptor.write_shutdown {
@@ -1729,13 +968,6 @@ pub(crate) fn send_to(
     destination: Option<(Ipv4Address, u16)>,
     bytes: &[u8],
 ) -> Result<usize, Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        return if destination.is_some() {
-            Err(Error::Inval)
-        } else {
-            local_send(file_descriptor, bytes)
-        };
-    }
     let index = socket_index(file_descriptor)?;
     let mut descriptor = socket_descriptor(index)?;
     if descriptor.socket_type == SocketType::Stream {
@@ -1765,23 +997,6 @@ pub(crate) fn send_to(
     active_context(|context| context.udp_send(handle, address, port, bytes))?
 }
 
-pub(crate) fn send_to_local_socket(
-    file_descriptor: i32,
-    destination: Option<&[u8]>,
-    bytes: &[u8],
-) -> Result<usize, Error> {
-    if let Some(destination) = destination {
-        let description = local_socket_description(file_descriptor)?;
-        let description = description.lock();
-        if !description.connected
-            || description.peer_path.as_deref() != Some(destination)
-        {
-            return Err(Error::Inval);
-        }
-    }
-    local_send(file_descriptor, bytes)
-}
-
 pub(crate) fn receive(file_descriptor: i32, output: &mut [u8]) -> Result<usize, Error> {
     receive_from(file_descriptor, output).map(|result| result.0)
 }
@@ -1790,9 +1005,6 @@ pub(crate) fn receive_from(
     file_descriptor: i32,
     output: &mut [u8],
 ) -> Result<(usize, Option<(Ipv4Address, u16)>), Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        return local_receive(file_descriptor, output).map(|length| (length, None));
-    }
     let index = socket_index(file_descriptor)?;
     let descriptor = socket_descriptor(index)?;
     if output.is_empty() {
@@ -1807,7 +1019,6 @@ pub(crate) fn receive_from(
         let handle = descriptor.udp_handle.ok_or(Error::BadFd)?;
         let started = now_ns();
         for _ in 0..IO_POLL_LIMIT {
-            ThreadManager::cancel_current_if_requested();
             let datagram = active_context(|context| {
                 context.poll_network();
                 context.udp_receive(handle, output)
@@ -1837,7 +1048,6 @@ pub(crate) fn receive_from(
     let handle = descriptor.handle.ok_or(Error::BadFd)?;
     let started = now_ns();
     for _ in 0..IO_POLL_LIMIT {
-        ThreadManager::cancel_current_if_requested();
         let result = active_context(|context| {
             let count = context.tcp_receive(handle, output)?;
             if count != 0 {
@@ -1894,19 +1104,8 @@ fn ensure_udp_binding(
 }
 
 pub(crate) fn close(file_descriptor: i32) -> Result<(), Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        return close_local_socket(file_descriptor);
-    }
     let index = socket_index(file_descriptor)?;
-    let socket_fd = SOCKETS.lock()[index].take().ok_or(Error::BadFd)?;
-    let descriptor = {
-        let mut descriptor = socket_fd.description.lock();
-        descriptor.descriptor_references = descriptor.descriptor_references.saturating_sub(1);
-        if descriptor.descriptor_references != 0 {
-            return Ok(());
-        }
-        *descriptor
-    };
+    let descriptor = socket_descriptor(index)?;
     match descriptor.socket_type {
         SocketType::Stream => {
             if let Some(handle) = descriptor.handle {
@@ -1922,81 +1121,11 @@ pub(crate) fn close(file_descriptor: i32) -> Result<(), Error> {
             }
         }
     }
-    Ok(())
-}
-
-fn release_local_socket(socket: LocalSocketFd) {
-    let (pair, listener, local_path, connected) = {
-        let mut description = socket.description.lock();
-        description.descriptor_references = description.descriptor_references.saturating_sub(1);
-        if description.descriptor_references != 0 {
-            return;
-        }
-        description.closed = true;
-        (
-            Arc::clone(&description.pair),
-            description.listener.as_ref().map(Arc::clone),
-            description.local_path.clone(),
-            description.connected,
-        )
-    };
-    if connected {
-        let side = socket.description.lock().side;
-        let mut pair = pair.lock();
-        pair.readers[side] = 0;
-        pair.writers[side] = 0;
-        pair.read_shutdown[side] = true;
-        pair.write_shutdown[side] = true;
-    }
-    if let Some(listener) = listener {
-        let pending = {
-            let mut listener = listener.lock();
-            listener.closed = true;
-            core::mem::take(&mut listener.pending)
-        };
-        for connection in pending {
-            let mut pair = connection.pair.lock();
-            pair.readers[1] = 0;
-            pair.writers[1] = 0;
-            pair.read_shutdown[1] = true;
-            pair.write_shutdown[1] = true;
-        }
-    }
-    if let Some(path) = local_path {
-        unlink_local_socket_path(&path);
-    }
-    wake_local_socket_waiters();
-}
-
-fn close_local_socket(file_descriptor: i32) -> Result<(), Error> {
-    let index = local_socket_index(file_descriptor)?;
-    let socket = LOCAL_SOCKETS.lock()[index].take().ok_or(Error::BadFd)?;
-    release_local_socket(socket);
+    SOCKETS.lock()[index] = None;
     Ok(())
 }
 
 pub(crate) fn shutdown(file_descriptor: i32, how: c_int) -> Result<(), Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        let (pair, side, _) = local_socket_state(file_descriptor)?;
-        {
-            let mut pair = pair.lock();
-            match how {
-                0 => {
-                    pair.read_shutdown[side] = true;
-                    pair.queues[side].clear();
-                }
-                1 => pair.write_shutdown[side] = true,
-                2 => {
-                    pair.read_shutdown[side] = true;
-                    pair.write_shutdown[side] = true;
-                    pair.queues[side].clear();
-                }
-                _ => return Err(Error::Inval),
-            }
-        }
-        wake_local_socket_waiters();
-        return Ok(());
-    }
     let index = socket_index(file_descriptor)?;
     let mut descriptor = socket_descriptor(index)?;
     if descriptor.state != SocketState::Connected {
@@ -2024,18 +1153,10 @@ pub(crate) fn shutdown(file_descriptor: i32, how: c_int) -> Result<(), Error> {
 }
 
 pub(crate) fn nonblocking(file_descriptor: i32) -> Result<bool, Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        return Ok(local_socket_state(file_descriptor)?.2);
-    }
     Ok(socket_descriptor(socket_index(file_descriptor)?)?.nonblocking)
 }
 
 pub(crate) fn set_nonblocking(file_descriptor: i32, nonblocking: bool) -> Result<(), Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        let description = local_socket_description(file_descriptor)?;
-        description.lock().nonblocking = nonblocking;
-        return Ok(());
-    }
     let index = socket_index(file_descriptor)?;
     let mut descriptor = socket_descriptor(index)?;
     descriptor.nonblocking = nonblocking;
@@ -2060,197 +1181,12 @@ pub(crate) fn set_status_flags(file_descriptor: i32, flags: i32) -> Result<(), E
     }
 }
 
-pub(crate) fn descriptor_flags(file_descriptor: i32) -> Result<i32, Error> {
-    if let Ok(index) = local_socket_index(file_descriptor) {
-        return LOCAL_SOCKETS.lock()[index]
-            .as_ref()
-            .map(|socket| i32::from(socket.close_on_exec))
-            .ok_or(Error::BadFd);
-    }
-    let index = socket_index(file_descriptor)?;
-    SOCKETS.lock()[index]
-        .as_ref()
-        .map(|socket| i32::from(socket.close_on_exec))
-        .ok_or(Error::BadFd)
-}
-
-pub(crate) fn set_descriptor_flags(file_descriptor: i32, flags: i32) -> Result<(), Error> {
-    if flags & !1 != 0 {
-        return Err(Error::Inval);
-    }
-    if let Ok(index) = local_socket_index(file_descriptor) {
-        let mut sockets = LOCAL_SOCKETS.lock();
-        let socket = sockets[index].as_mut().ok_or(Error::BadFd)?;
-        socket.close_on_exec = flags & 1 != 0;
-        return Ok(());
-    }
-    let index = socket_index(file_descriptor)?;
-    let mut sockets = SOCKETS.lock();
-    let socket = sockets[index].as_mut().ok_or(Error::BadFd)?;
-    socket.close_on_exec = flags & 1 != 0;
-    Ok(())
-}
-
-pub(crate) fn duplicate_socket(
-    file_descriptor: i32,
-    minimum: i32,
-    close_on_exec: bool,
-) -> Result<i32, Error> {
-    duplicate_socket_internal(file_descriptor, minimum, close_on_exec, true)
-}
-
-pub(crate) fn duplicate_socket_backing(file_descriptor: i32) -> Result<i32, Error> {
-    duplicate_socket_internal(file_descriptor, 0, false, false)
-}
-
-fn duplicate_socket_internal(
-    file_descriptor: i32,
-    minimum: i32,
-    close_on_exec: bool,
-    enforce_limit: bool,
-) -> Result<i32, Error> {
-    if minimum < 0 {
-        return Err(Error::Inval);
-    }
-    if local_socket_index(file_descriptor).is_ok() {
-        let source_index = local_socket_index(file_descriptor)?;
-        let mut sockets = LOCAL_SOCKETS.lock();
-        let source = sockets[source_index].as_ref().cloned().ok_or(Error::BadFd)?;
-        let first = usize::try_from(minimum.saturating_sub(LOCAL_SOCKET_FD_BASE))
-            .unwrap_or(0)
-            .min(LOCAL_SOCKET_COUNT);
-        let target_index = available_descriptor_index(&sockets, LOCAL_SOCKET_FD_BASE, first)
-            .ok_or(Error::Mfile)?;
-        if enforce_limit {
-            crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-                LOCAL_SOCKET_FD_BASE + target_index as i32,
-            )?;
-        }
-        {
-            let mut description = source.description.lock();
-            description.descriptor_references = description
-                .descriptor_references
-                .checked_add(1)
-                .ok_or(Error::Mfile)?;
-        }
-        sockets[target_index] = Some(LocalSocketFd {
-            description: source.description,
-            close_on_exec,
-        });
-        return Ok(LOCAL_SOCKET_FD_BASE + target_index as i32);
-    }
-    let source_index = socket_index(file_descriptor)?;
-    let mut sockets = SOCKETS.lock();
-    let source = sockets[source_index].as_ref().cloned().ok_or(Error::BadFd)?;
-    let minimum_index = usize::try_from(minimum.saturating_sub(SOCKET_FD_BASE))
-        .unwrap_or(0)
-        .min(SOCKET_COUNT);
-    let target_index = available_descriptor_index(&sockets, SOCKET_FD_BASE, minimum_index)
-        .ok_or(Error::Mfile)?;
-    if enforce_limit {
-        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-            SOCKET_FD_BASE + target_index as i32,
-        )?;
-    }
-    {
-        let mut description = source.description.lock();
-        description.descriptor_references = description
-            .descriptor_references
-            .checked_add(1)
-            .ok_or(Error::Mfile)?;
-    }
-    sockets[target_index] = Some(SocketFd {
-        description: source.description,
-        close_on_exec,
-    });
-    Ok(SOCKET_FD_BASE + target_index as i32)
-}
-
-pub(crate) fn duplicate_socket_to(
-    file_descriptor: i32,
-    new_descriptor: i32,
-    close_on_exec: bool,
-) -> Result<i32, Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        return duplicate_local_socket_to(file_descriptor, new_descriptor, close_on_exec);
-    }
-    let source_index = socket_index(file_descriptor)?;
-    if file_descriptor == new_descriptor {
-        return if close_on_exec {
-            Err(Error::Inval)
-        } else {
-            Ok(new_descriptor)
-        };
-    }
-    let target_index = socket_index(new_descriptor)?;
-    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(new_descriptor)?;
-    let source = SOCKETS.lock()[source_index]
-        .as_ref()
-        .cloned()
-        .ok_or(Error::BadFd)?;
-    if SOCKETS.lock()[target_index].is_some() {
-        close(new_descriptor)?;
-    }
-    {
-        let mut description = source.description.lock();
-        description.descriptor_references = description
-            .descriptor_references
-            .checked_add(1)
-            .ok_or(Error::Mfile)?;
-    }
-    SOCKETS.lock()[target_index] = Some(SocketFd {
-        description: source.description,
-        close_on_exec,
-    });
-    Ok(new_descriptor)
-}
-
-fn duplicate_local_socket_to(
-    file_descriptor: i32,
-    new_descriptor: i32,
-    close_on_exec: bool,
-) -> Result<i32, Error> {
-    let source_index = local_socket_index(file_descriptor)?;
-    let target_index = local_socket_index(new_descriptor)?;
-    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(new_descriptor)?;
-    let replaced = {
-        let mut sockets = LOCAL_SOCKETS.lock();
-        let source = sockets[source_index].as_ref().cloned().ok_or(Error::BadFd)?;
-        if file_descriptor == new_descriptor {
-            return if close_on_exec {
-                Err(Error::Inval)
-            } else {
-                Ok(new_descriptor)
-            };
-        }
-        {
-            let mut description = source.description.lock();
-            description.descriptor_references = description
-                .descriptor_references
-                .checked_add(1)
-                .ok_or(Error::Mfile)?;
-        }
-        sockets[target_index].replace(LocalSocketFd {
-            description: source.description,
-            close_on_exec,
-        })
-    };
-    if let Some(replaced) = replaced {
-        release_local_socket(replaced);
-    }
-    Ok(new_descriptor)
-}
-
 pub(crate) fn set_socket_option(
     file_descriptor: i32,
     level: i32,
     option: i32,
     value: i32,
 ) -> Result<(), Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        validate_local_socket(file_descriptor)?;
-        return Err(Error::NoProtoOpt);
-    }
     if level != SOL_SOCKET {
         return Err(Error::NoProtoOpt);
     }
@@ -2273,26 +1209,6 @@ pub(crate) fn get_socket_option(
     level: i32,
     option: i32,
 ) -> Result<i32, Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        validate_local_socket(file_descriptor)?;
-        if level != SOL_SOCKET {
-            return Err(Error::NoProtoOpt);
-        }
-        return match option {
-            SO_TYPE => Ok(SOCK_STREAM),
-            SO_DOMAIN => Ok(AF_UNIX),
-            SO_PROTOCOL | SO_ERROR => Ok(0),
-            SO_ACCEPTCONN => {
-                let description = local_socket_description(file_descriptor)?;
-                let description = description.lock();
-                Ok(description.listener.as_ref().is_some_and(|listener| {
-                    listener.lock().listening
-                }) as i32)
-            }
-            SO_SNDBUF | SO_RCVBUF => Ok(LOCAL_SOCKET_BUFFER_SIZE as i32),
-            _ => Err(Error::NoProtoOpt),
-        };
-    }
     if level != SOL_SOCKET {
         return Err(Error::NoProtoOpt);
     }
@@ -2342,9 +1258,6 @@ pub(crate) fn endpoint(
 }
 
 pub(crate) fn readiness(file_descriptor: i32, events: i16) -> Result<i16, Error> {
-    if local_socket_index(file_descriptor).is_ok() {
-        return local_readiness(file_descriptor, events);
-    }
     let index = socket_index(file_descriptor)?;
     let descriptor = refresh_connection(index, socket_descriptor(index)?)?;
     if descriptor.socket_type == SocketType::Datagram {
@@ -2388,67 +1301,11 @@ pub(crate) fn readiness(file_descriptor: i32, events: i16) -> Result<i16, Error>
     Ok(flags)
 }
 
-fn local_readiness(file_descriptor: i32, events: i16) -> Result<i16, Error> {
-    let description = local_socket_description(file_descriptor)?;
-    let description = description.lock();
-    if description.closed {
-        return Err(Error::Badf);
-    }
-    if let Some(listener) = description.listener.as_ref() {
-        let listener_state = listener.lock();
-        if listener_state.listening {
-            let mut flags = 0;
-            if events & 0x001 != 0 && !listener_state.pending.is_empty() {
-                flags |= 0x001;
-            }
-            if listener_state.closed {
-                flags |= 0x010;
-            }
-            return Ok(flags);
-        }
-    }
-    if !description.connected {
-        return Ok(0);
-    }
-    let pair = Arc::clone(&description.pair);
-    let side = description.side;
-    drop(description);
-    let pair = pair.lock();
-    let peer = 1 - side;
-    let mut flags = 0;
-    let readable = pair.read_shutdown[side]
-        || !pair.queues[side].is_empty()
-        || pair.writers[peer] == 0
-        || pair.write_shutdown[peer];
-    let writable = pair.writers[side] != 0
-        && !pair.write_shutdown[side]
-        && pair.readers[peer] != 0
-        && !pair.read_shutdown[peer]
-        && pair.queues[peer].len() < LOCAL_SOCKET_BUFFER_SIZE;
-    if events & 0x001 != 0 && readable {
-        flags |= 0x001;
-    }
-    if events & 0x004 != 0 && writable {
-        flags |= 0x004;
-    }
-    if pair.readers[peer] == 0 || pair.read_shutdown[peer] {
-        flags |= 0x008;
-    }
-    if pair.readers[peer] == 0 && pair.writers[peer] == 0 {
-        flags |= 0x010;
-    }
-    Ok(flags)
-}
-
 fn active_context<R>(operation: impl FnOnce(&mut TcpContext) -> R) -> Result<R, Error> {
     with_active_tcp_context(operation).ok_or(Error::NoDev)
 }
 
 fn socket_index(file_descriptor: i32) -> Result<usize, Error> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
-        file_descriptor,
-        crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket,
-    )?;
     let index = file_descriptor
         .checked_sub(SOCKET_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())
@@ -2457,10 +1314,6 @@ fn socket_index(file_descriptor: i32) -> Result<usize, Error> {
 }
 
 fn packet_index(file_descriptor: i32) -> Result<usize, Error> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
-        file_descriptor,
-        crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet,
-    )?;
     let index = file_descriptor
         .checked_sub(PACKET_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())
@@ -2490,26 +1343,11 @@ fn default_interface_name(mode: TunTapMode, index: usize) -> [u8; 16] {
 }
 
 fn socket_descriptor(index: usize) -> Result<SocketDescriptor, Error> {
-    let shared = SOCKETS.lock()[index]
-        .as_ref()
-        .map(|socket| Arc::clone(&socket.description))
-        .ok_or(Error::BadFd)?;
-    let descriptor = *shared.lock();
-    Ok(descriptor)
+    SOCKETS.lock()[index].ok_or(Error::BadFd)
 }
 
 fn set_socket_descriptor(index: usize, descriptor: SocketDescriptor) {
-    let shared = SOCKETS.lock()[index]
-        .as_ref()
-        .map(|socket| Arc::clone(&socket.description));
-    if let Some(shared) = shared {
-        *shared.lock() = descriptor;
-    } else {
-        SOCKETS.lock()[index] = Some(SocketFd {
-            description: Arc::new(IrqSpinLock::new(descriptor)),
-            close_on_exec: false,
-        });
-    }
+    SOCKETS.lock()[index] = Some(descriptor);
 }
 
 fn refresh_connection(
@@ -2545,7 +1383,7 @@ fn allocate_ephemeral_port() -> Result<u16, Error> {
             .lock()
             .iter()
             .flatten()
-            .any(|socket| socket.description.lock().local_port == port);
+            .any(|descriptor| descriptor.local_port == port);
         if !occupied {
             return Ok(port);
         }
@@ -2568,35 +1406,4 @@ fn wait_for_interrupt() -> bool {
 
 fn restart_interrupted_io() -> bool {
     crate::kernel::runtime::runtime_posix::signal::dispatch_pending_signals().unwrap_or(true)
-}
-
-#[cfg(test)]
-mod local_socket_tests {
-    use super::*;
-
-    #[test]
-    fn pathname_stream_accepts_and_transfers_data() {
-        let path = b"/tmp/kzv8-local-stream-test";
-        let server = create_local_socket(AF_UNIX, SOCK_STREAM, 0).unwrap();
-        bind_local_socket(server, path).unwrap();
-        listen_local_socket(server, 4).unwrap();
-
-        let client = create_local_socket(AF_UNIX, SOCK_STREAM, 0).unwrap();
-        connect_local_socket(client, path).unwrap();
-        let accepted = accept_local_socket(server).unwrap();
-
-        assert_eq!(send(client, b"ping").unwrap(), 4);
-        let mut received = [0; 4];
-        assert_eq!(receive(accepted, &mut received).unwrap(), 4);
-        assert_eq!(&received, b"ping");
-
-        assert_eq!(send(accepted, b"pong").unwrap(), 4);
-        let mut response = [0; 4];
-        assert_eq!(receive(client, &mut response).unwrap(), 4);
-        assert_eq!(&response, b"pong");
-
-        close(client).unwrap();
-        close(accepted).unwrap();
-        close(server).unwrap();
-    }
 }

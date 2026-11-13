@@ -15,6 +15,7 @@ use crate::kernel::process::Process;
 use crate::kernel::scheduler::thread::{ThreadAttributes, ThreadManager};
 
 use super::errno::{as_errno, ENOSYS};
+use super::sched::{self, SchedParam};
 
 const PTHREAD_CANCEL_ENABLE: c_int = 0;
 const PTHREAD_CANCEL_DISABLE: c_int = 1;
@@ -25,6 +26,7 @@ const PTHREAD_EXPLICIT_SCHED: c_int = 1;
 const SCHED_OTHER: c_int = 0;
 const SCHED_FIFO: c_int = 1;
 const SCHED_RR: c_int = 2;
+const SCHED_SPORADIC: c_int = 3;
 const SCHED_PRIORITY_MIN: c_int = 1;
 const SCHED_PRIORITY_MAX: c_int = 99;
 
@@ -50,6 +52,10 @@ pub unsafe extern "C" fn pthread_attr_init(attributes: *mut c_void) -> c_int {
             inherit_schedule: PTHREAD_INHERIT_SCHED,
             scheduler_policy: SCHED_OTHER,
             scheduler_priority: 0,
+            sporadic_low_priority: 0,
+            sporadic_period_ns: 0,
+            sporadic_budget_ns: 0,
+            sporadic_max_replenishments: 0,
         });
     }
     0
@@ -68,6 +74,10 @@ pub unsafe extern "C" fn pthread_attr_destroy(attributes: *mut c_void) -> c_int 
             inherit_schedule: PTHREAD_INHERIT_SCHED,
             scheduler_policy: SCHED_OTHER,
             scheduler_priority: 0,
+            sporadic_low_priority: 0,
+            sporadic_period_ns: 0,
+            sporadic_budget_ns: 0,
+            sporadic_max_replenishments: 0,
         });
     }
     0
@@ -102,8 +112,24 @@ pub unsafe extern "C" fn pthread_attr_getschedparam(
     if attributes.is_null() || parameters.is_null() {
         return as_errno(Error::Inval);
     }
-    let priority = unsafe { (*attributes.cast::<ThreadAttributes>()).scheduler_priority };
-    unsafe { parameters.cast::<c_int>().write(priority) };
+    let attributes = unsafe { &*attributes.cast::<ThreadAttributes>() };
+    let scheduling = crate::kernel::process::SchedulingParameters {
+        policy: attributes.scheduler_policy,
+        priority: attributes.scheduler_priority,
+        sporadic: (attributes.scheduler_policy == SCHED_SPORADIC).then_some(
+            crate::kernel::process::SporadicParameters {
+                low_priority: attributes.sporadic_low_priority,
+                replenishment_period_ns: attributes.sporadic_period_ns,
+                initial_budget_ns: attributes.sporadic_budget_ns,
+                max_replenishments: attributes.sporadic_max_replenishments,
+            },
+        ),
+    };
+    unsafe {
+        parameters
+            .cast::<SchedParam>()
+            .write(sched::sched_param_for_configuration(scheduling))
+    };
     0
 }
 
@@ -140,17 +166,22 @@ pub unsafe extern "C" fn pthread_attr_setschedparam(
     if attributes.is_null() || parameters.is_null() {
         return as_errno(Error::Inval);
     }
-    let priority = unsafe { read_unaligned(parameters.cast::<c_int>()) };
+    let parameter = unsafe { read_unaligned(parameters.cast::<SchedParam>()) };
     let attributes = unsafe { &mut *attributes.cast::<ThreadAttributes>() };
-    let valid = match attributes.scheduler_policy {
-        SCHED_OTHER => priority == 0,
-        SCHED_FIFO | SCHED_RR => (SCHED_PRIORITY_MIN..=SCHED_PRIORITY_MAX).contains(&priority),
-        _ => false,
+    let scheduling = match sched::scheduling_configuration_from_param(
+        attributes.scheduler_policy,
+        parameter,
+    ) {
+        Ok(scheduling) => scheduling,
+        Err(error) => return as_errno(error),
     };
-    if !valid {
-        return as_errno(Error::Inval);
+    attributes.scheduler_priority = scheduling.priority;
+    if let Some(sporadic) = scheduling.sporadic {
+        attributes.sporadic_low_priority = sporadic.low_priority;
+        attributes.sporadic_period_ns = sporadic.replenishment_period_ns;
+        attributes.sporadic_budget_ns = sporadic.initial_budget_ns;
+        attributes.sporadic_max_replenishments = sporadic.max_replenishments;
     }
-    attributes.scheduler_priority = priority;
     0
 }
 
@@ -159,7 +190,9 @@ pub unsafe extern "C" fn pthread_attr_setschedpolicy(
     attributes: *mut c_void,
     policy: c_int,
 ) -> c_int {
-    if attributes.is_null() || !matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR) {
+    if attributes.is_null()
+        || !matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_SPORADIC)
+    {
         return as_errno(Error::Inval);
     }
     unsafe { (*attributes.cast::<ThreadAttributes>()).scheduler_policy = policy };
@@ -291,12 +324,6 @@ unsupported_pthread!(pthread_getcpuclockid(_thread: usize, _clock_id: *mut c_int
 unsupported_pthread!(pthread_setconcurrency(_concurrency: c_int));
 unsupported_pthread!(pthread_getconcurrency());
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SchedParam {
-    priority: c_int,
-}
-
 fn scheduling_process(thread: usize) -> Result<alloc::sync::Arc<Process>, Error> {
     let process = ThreadManager::current_process()?;
     if ThreadManager::thread_belongs_to_process(thread, process.pid()) {
@@ -323,12 +350,12 @@ fn write_sched_outputs(
     policy: *mut c_int,
     parameters: *mut c_void,
     policy_value: c_int,
-    priority: c_int,
+    scheduling: crate::kernel::process::SchedulingParameters,
 ) -> Result<(), Error> {
     if policy.is_null() || parameters.is_null() {
         return Err(Error::Fault);
     }
-    let parameter_value = SchedParam { priority };
+    let parameter_value = super::sched::sched_param_for_configuration(scheduling);
     let policy_bytes = unsafe {
         core::slice::from_raw_parts(
             (&policy_value as *const c_int).cast::<u8>(),
@@ -356,12 +383,12 @@ pub unsafe extern "C" fn pthread_getschedparam(
         Ok(process) => process,
         Err(error) => return as_errno(error),
     };
-    let (policy_value, priority) =
-        match ThreadManager::scheduling_parameters_for_thread(thread) {
+    let scheduling =
+        match ThreadManager::scheduling_configuration_for_thread(thread) {
             Ok(parameters) => parameters,
             Err(error) => return as_errno(error),
         };
-    match write_sched_outputs(&process, policy, parameters, policy_value, priority) {
+    match write_sched_outputs(&process, policy, parameters, scheduling.policy, scheduling) {
         Ok(()) => 0,
         Err(error) => as_errno(error),
     }
@@ -381,18 +408,14 @@ pub unsafe extern "C" fn pthread_setschedparam(
         Ok(parameters) => parameters,
         Err(error) => return as_errno(error),
     };
-    if let Err(error) = super::sched::validate_scheduling_parameters(
-        &process,
-        policy,
-        parameters.priority,
-    ) {
+    let scheduling = match super::sched::scheduling_configuration_from_param(policy, parameters) {
+        Ok(scheduling) => scheduling,
+        Err(error) => return as_errno(error),
+    };
+    if let Err(error) = super::sched::validate_scheduling_configuration(&process, scheduling) {
         return as_errno(error);
     }
-    match ThreadManager::set_scheduling_parameters_for_thread(
-        thread,
-        policy,
-        parameters.priority,
-    ) {
+    match ThreadManager::set_scheduling_configuration_for_thread(thread, scheduling) {
         Ok(()) => 0,
         Err(error) => as_errno(error),
     }
@@ -404,14 +427,15 @@ pub unsafe extern "C" fn pthread_setschedprio(thread: usize, priority: c_int) ->
         Ok(process) => process,
         Err(error) => return as_errno(error),
     };
-    let (policy, _) = match ThreadManager::scheduling_parameters_for_thread(thread) {
+    let mut scheduling = match ThreadManager::scheduling_configuration_for_thread(thread) {
         Ok(parameters) => parameters,
         Err(error) => return as_errno(error),
     };
-    if let Err(error) = super::sched::validate_scheduling_parameters(&process, policy, priority) {
+    scheduling.priority = priority;
+    if let Err(error) = super::sched::validate_scheduling_configuration(&process, scheduling) {
         return as_errno(error);
     }
-    match ThreadManager::set_scheduling_parameters_for_thread(thread, policy, priority) {
+    match ThreadManager::set_scheduling_configuration_for_thread(thread, scheduling) {
         Ok(()) => 0,
         Err(error) => as_errno(error),
     }
