@@ -10,7 +10,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::error::Error;
@@ -20,7 +20,7 @@ use crate::kernel::net::wire::Ipv4Address;
 use crate::kernel::runtime::runtime_ffi::{
     with_active_tcp_context, TcpContext,
 };
-use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::scheduler::sync::{IrqSpinGuard, IrqSpinLock};
 use crate::kernel::scheduler::thread::{ThreadManager, ThreadState};
 use crate::kernel::vfs::plugin::tun::{TunDevice, TunTapMode};
 
@@ -94,6 +94,25 @@ static LOCAL_SOCKET_PATHS: IrqSpinLock<Vec<(Vec<u8>, Weak<IrqSpinLock<LocalListe
     IrqSpinLock::new(Vec::new());
 static PACKET_DEVICES: IrqSpinLock<[Option<PacketDescriptor>; PACKET_DEVICE_COUNT]> =
     IrqSpinLock::new([const { None }; PACKET_DEVICE_COUNT]);
+
+fn available_descriptor_index<T, const N: usize>(
+    descriptors: &IrqSpinGuard<'_, [Option<T>; N]>,
+    base: i32,
+    minimum: usize,
+) -> Option<usize> {
+    descriptors
+        .iter()
+        .enumerate()
+        .skip(minimum)
+        .find_map(|(index, descriptor)| {
+            let file_descriptor = base + index as i32;
+            (descriptor.is_none()
+                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
+                    file_descriptor,
+                ))
+            .then_some(index)
+        })
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SocketState {
@@ -181,7 +200,7 @@ struct PacketDescriptor {
     device: Arc<TunDevice>,
     mode: Option<TunTapMode>,
     no_packet_info: bool,
-    nonblocking: bool,
+    nonblocking: Arc<AtomicBool>,
     close_on_exec: bool,
     name: [u8; 16],
 }
@@ -207,6 +226,14 @@ pub(crate) fn is_socket_fd(file_descriptor: i32) -> bool {
 
 pub(crate) fn is_local_socket_fd(file_descriptor: i32) -> bool {
     local_socket_index(file_descriptor).is_ok()
+}
+
+pub(crate) fn same_socket_table(source: i32, target: i32) -> bool {
+    if local_socket_index(source).is_ok() {
+        local_socket_index(target).is_ok()
+    } else {
+        socket_index(source).is_ok() && socket_index(target).is_ok()
+    }
 }
 
 pub(crate) fn validate_local_socket(file_descriptor: i32) -> Result<(), Error> {
@@ -239,6 +266,17 @@ pub(crate) fn local_socket_names(
 }
 
 pub(crate) fn has_socket_fd(file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind != crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket {
+            return false;
+        }
+        if let Ok(index) = socket_index(alias.backing) {
+            return SOCKETS.lock()[index].is_some();
+        }
+        return local_socket_index(alias.backing)
+            .ok()
+            .is_some_and(|index| LOCAL_SOCKETS.lock()[index].is_some());
+    }
     if let Ok(index) = socket_index(file_descriptor) {
         return SOCKETS.lock()[index].is_some();
     }
@@ -248,6 +286,10 @@ pub(crate) fn has_socket_fd(file_descriptor: i32) -> bool {
 }
 
 fn local_socket_index(file_descriptor: i32) -> Result<usize, Error> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+        file_descriptor,
+        crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket,
+    )?;
     let index = file_descriptor
         .checked_sub(LOCAL_SOCKET_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())
@@ -325,7 +367,8 @@ pub(crate) fn create_local_socket(
         return Err(Error::SockTypeNoSupport);
     }
     let mut sockets = LOCAL_SOCKETS.lock();
-    let index = sockets.iter().position(Option::is_none).ok_or(Error::Mfile)?;
+    let index = available_descriptor_index(&sockets, LOCAL_SOCKET_FD_BASE, 0)
+        .ok_or(Error::Mfile)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
         LOCAL_SOCKET_FD_BASE + index as i32,
     )?;
@@ -526,7 +569,8 @@ pub(crate) fn accept_local_socket(file_descriptor: i32) -> Result<i32, Error> {
             }
         };
         let mut sockets = LOCAL_SOCKETS.lock();
-        let index = sockets.iter().position(Option::is_none).ok_or(Error::Mfile)?;
+        let index = available_descriptor_index(&sockets, LOCAL_SOCKET_FD_BASE, 0)
+            .ok_or(Error::Mfile)?;
         crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
             LOCAL_SOCKET_FD_BASE + index as i32,
         )?;
@@ -654,10 +698,19 @@ fn local_receive(file_descriptor: i32, output: &mut [u8]) -> Result<usize, Error
 }
 
 pub(crate) fn is_packet_fd(file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        return alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet;
+    }
     packet_index(file_descriptor).is_ok()
 }
 
 pub(crate) fn has_packet_fd(file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        return alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet
+            && packet_index(alias.backing)
+                .ok()
+                .is_some_and(|index| PACKET_DEVICES.lock()[index].is_some());
+    }
     packet_index(file_descriptor)
         .ok()
         .and_then(|index| PACKET_DEVICES.lock()[index].as_ref().map(|_| ()))
@@ -711,10 +764,7 @@ pub(crate) fn tun_device_by_name(name: &[u8]) -> Result<Arc<TunDevice>, Error> {
 pub(crate) fn open_tun_device(nonblocking: bool, close_on_exec: bool) -> Result<i32, Error> {
     let device = TunDevice::new()?;
     let mut devices = PACKET_DEVICES.lock();
-    let index = devices
-        .iter()
-        .position(Option::is_none)
-        .ok_or(Error::Mfile)?;
+    let index = available_descriptor_index(&devices, PACKET_FD_BASE, 0).ok_or(Error::Mfile)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
         PACKET_FD_BASE + index as i32,
     )?;
@@ -722,7 +772,7 @@ pub(crate) fn open_tun_device(nonblocking: bool, close_on_exec: bool) -> Result<
         device,
         mode: None,
         no_packet_info: false,
-        nonblocking,
+        nonblocking: Arc::new(AtomicBool::new(nonblocking)),
         close_on_exec,
         name: [0; 16],
     });
@@ -1147,6 +1197,19 @@ pub(crate) fn duplicate_packet_fd(
     minimum: i32,
     close_on_exec: bool,
 ) -> Result<i32, Error> {
+    duplicate_packet_fd_internal(file_descriptor, minimum, close_on_exec, true)
+}
+
+pub(crate) fn duplicate_packet_fd_backing(file_descriptor: i32) -> Result<i32, Error> {
+    duplicate_packet_fd_internal(file_descriptor, PACKET_FD_BASE, false, false)
+}
+
+fn duplicate_packet_fd_internal(
+    file_descriptor: i32,
+    minimum: i32,
+    close_on_exec: bool,
+    enforce_limit: bool,
+) -> Result<i32, Error> {
     if minimum < 0 {
         return Err(Error::Inval);
     }
@@ -1156,15 +1219,13 @@ pub(crate) fn duplicate_packet_fd(
     let first = usize::try_from(minimum.saturating_sub(PACKET_FD_BASE))
         .unwrap_or(0)
         .min(PACKET_DEVICE_COUNT);
-    let target_index = devices
-        .iter()
-        .enumerate()
-        .skip(first)
-        .find_map(|(index, entry)| entry.is_none().then_some(index))
+    let target_index = available_descriptor_index(&devices, PACKET_FD_BASE, first)
         .ok_or(Error::Mfile)?;
-    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-        PACKET_FD_BASE + target_index as i32,
-    )?;
+    if enforce_limit {
+        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+            PACKET_FD_BASE + target_index as i32,
+        )?;
+    }
     descriptor.close_on_exec = close_on_exec;
     devices[target_index] = Some(descriptor);
     Ok(PACKET_FD_BASE + target_index as i32)
@@ -1234,17 +1295,16 @@ pub(crate) fn packet_readiness(file_descriptor: i32, events: i16) -> Result<i16,
 }
 
 pub(crate) fn packet_nonblocking(file_descriptor: i32) -> Result<bool, Error> {
-    Ok(packet_descriptor(file_descriptor)?.nonblocking)
+    let descriptor = packet_descriptor(file_descriptor)?;
+    Ok(descriptor.nonblocking.load(Ordering::Acquire))
 }
 
 pub(crate) fn set_packet_nonblocking(
     file_descriptor: i32,
     nonblocking: bool,
 ) -> Result<(), Error> {
-    let index = packet_index(file_descriptor)?;
-    let mut devices = PACKET_DEVICES.lock();
-    let descriptor = devices[index].as_mut().ok_or(Error::BadFd)?;
-    descriptor.nonblocking = nonblocking;
+    let description = packet_descriptor(file_descriptor)?.nonblocking;
+    description.store(nonblocking, Ordering::Release);
     Ok(())
 }
 
@@ -1296,10 +1356,7 @@ pub(crate) fn create_socket(
         broadcast: false,
     };
     let mut sockets = SOCKETS.lock();
-    let Some(index) = sockets
-        .iter()
-        .position(Option::is_none)
-    else {
+    let Some(index) = available_descriptor_index(&sockets, SOCKET_FD_BASE, 0) else {
         drop(sockets);
         if let Some(handle) = udp_handle {
             let _ = active_context(|context| context.udp_close(handle));
@@ -1346,7 +1403,14 @@ pub(crate) fn create_local_socket_pair(
     let mut available = sockets
         .iter()
         .enumerate()
-        .filter_map(|(index, socket)| socket.is_none().then_some(index));
+        .filter_map(|(index, socket)| {
+            let file_descriptor = LOCAL_SOCKET_FD_BASE + index as i32;
+            (socket.is_none()
+                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
+                    file_descriptor,
+                ))
+            .then_some(index)
+        });
     let first = available.next().ok_or(Error::Mfile)?;
     let second = available.next().ok_or(Error::Mfile)?;
     for index in [first, second] {
@@ -1499,7 +1563,7 @@ pub(crate) fn accept(file_descriptor: i32) -> Result<(i32, Ipv4Address, u16), Er
                 broadcast: false,
             };
             let mut sockets = SOCKETS.lock();
-            let Some(index) = sockets.iter().position(Option::is_none) else {
+            let Some(index) = available_descriptor_index(&sockets, SOCKET_FD_BASE, 0) else {
                 drop(sockets);
                 let _removed = active_context(|context| context.tcp_remove(accepted));
                 return Err(Error::Mfile);
@@ -2027,7 +2091,24 @@ pub(crate) fn set_descriptor_flags(file_descriptor: i32, flags: i32) -> Result<(
     Ok(())
 }
 
-pub(crate) fn duplicate_socket(file_descriptor: i32, minimum: i32, close_on_exec: bool) -> Result<i32, Error> {
+pub(crate) fn duplicate_socket(
+    file_descriptor: i32,
+    minimum: i32,
+    close_on_exec: bool,
+) -> Result<i32, Error> {
+    duplicate_socket_internal(file_descriptor, minimum, close_on_exec, true)
+}
+
+pub(crate) fn duplicate_socket_backing(file_descriptor: i32) -> Result<i32, Error> {
+    duplicate_socket_internal(file_descriptor, 0, false, false)
+}
+
+fn duplicate_socket_internal(
+    file_descriptor: i32,
+    minimum: i32,
+    close_on_exec: bool,
+    enforce_limit: bool,
+) -> Result<i32, Error> {
     if minimum < 0 {
         return Err(Error::Inval);
     }
@@ -2038,15 +2119,13 @@ pub(crate) fn duplicate_socket(file_descriptor: i32, minimum: i32, close_on_exec
         let first = usize::try_from(minimum.saturating_sub(LOCAL_SOCKET_FD_BASE))
             .unwrap_or(0)
             .min(LOCAL_SOCKET_COUNT);
-        let target_index = sockets
-            .iter()
-            .enumerate()
-            .skip(first)
-            .find_map(|(index, socket)| socket.is_none().then_some(index))
+        let target_index = available_descriptor_index(&sockets, LOCAL_SOCKET_FD_BASE, first)
             .ok_or(Error::Mfile)?;
-        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-            LOCAL_SOCKET_FD_BASE + target_index as i32,
-        )?;
+        if enforce_limit {
+            crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+                LOCAL_SOCKET_FD_BASE + target_index as i32,
+            )?;
+        }
         {
             let mut description = source.description.lock();
             description.descriptor_references = description
@@ -2066,15 +2145,13 @@ pub(crate) fn duplicate_socket(file_descriptor: i32, minimum: i32, close_on_exec
     let minimum_index = usize::try_from(minimum.saturating_sub(SOCKET_FD_BASE))
         .unwrap_or(0)
         .min(SOCKET_COUNT);
-    let target_index = sockets
-        .iter()
-        .enumerate()
-        .skip(minimum_index)
-        .find_map(|(index, socket)| socket.is_none().then_some(index))
+    let target_index = available_descriptor_index(&sockets, SOCKET_FD_BASE, minimum_index)
         .ok_or(Error::Mfile)?;
-    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-        SOCKET_FD_BASE + target_index as i32,
-    )?;
+    if enforce_limit {
+        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+            SOCKET_FD_BASE + target_index as i32,
+        )?;
+    }
     {
         let mut description = source.description.lock();
         description.descriptor_references = description
@@ -2368,6 +2445,10 @@ fn active_context<R>(operation: impl FnOnce(&mut TcpContext) -> R) -> Result<R, 
 }
 
 fn socket_index(file_descriptor: i32) -> Result<usize, Error> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+        file_descriptor,
+        crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket,
+    )?;
     let index = file_descriptor
         .checked_sub(SOCKET_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())
@@ -2376,6 +2457,10 @@ fn socket_index(file_descriptor: i32) -> Result<usize, Error> {
 }
 
 fn packet_index(file_descriptor: i32) -> Result<usize, Error> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+        file_descriptor,
+        crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet,
+    )?;
     let index = file_descriptor
         .checked_sub(PACKET_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())

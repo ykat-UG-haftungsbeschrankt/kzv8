@@ -8,6 +8,7 @@
 pub(crate) mod compat;
 pub(crate) mod cxxabi;
 pub(crate) mod errno;
+pub(crate) mod fd_alias;
 pub(crate) mod filesystem;
 pub(crate) mod format;
 pub(crate) mod math;

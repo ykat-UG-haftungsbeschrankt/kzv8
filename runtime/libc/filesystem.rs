@@ -484,6 +484,11 @@ impl FileSystem {
     }
 
     fn descriptor_slot(&self, file_descriptor: i32) -> Result<usize, i32> {
+        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+            file_descriptor,
+            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::File,
+        )
+        .map_err(|_| EBADF)?;
         if file_descriptor < FIRST_DESCRIPTOR {
             return Err(EBADF);
         }
@@ -492,6 +497,21 @@ impl FileSystem {
             return Err(EBADF);
         }
         Ok(slot)
+    }
+
+    fn available_descriptor_slot(&self, minimum: i32) -> Option<usize> {
+        self.descriptors
+            .iter()
+            .enumerate()
+            .skip(minimum.saturating_sub(FIRST_DESCRIPTOR).max(0) as usize)
+            .find_map(|(slot, descriptor)| {
+                let file_descriptor = FIRST_DESCRIPTOR + slot as i32;
+                (descriptor.is_none()
+                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
+                        file_descriptor,
+                    ))
+                .then_some(slot)
+            })
     }
 
     fn descriptor_offset(&self, slot: usize, descriptor: Descriptor) -> i64 {
@@ -750,11 +770,7 @@ impl FileSystem {
             return Err(EINVAL);
         }
         self.check_search_permissions(&path, credentials)?;
-        let slot = self
-            .descriptors
-            .iter()
-            .position(Option::is_none)
-            .ok_or(EMFILE)?;
+        let slot = self.available_descriptor_slot(FIRST_DESCRIPTOR).ok_or(EMFILE)?;
         crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
             slot as i32 + FIRST_DESCRIPTOR,
         )
@@ -896,11 +912,7 @@ impl FileSystem {
         {
             return Err(EINVAL);
         }
-        let slot = self
-            .descriptors
-            .iter()
-            .position(Option::is_none)
-            .ok_or(EMFILE)?;
+        let slot = self.available_descriptor_slot(FIRST_DESCRIPTOR).ok_or(EMFILE)?;
         crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
             slot as i32 + FIRST_DESCRIPTOR,
         )
@@ -930,7 +942,14 @@ impl FileSystem {
             .descriptors
             .iter()
             .enumerate()
-            .filter_map(|(index, descriptor)| descriptor.is_none().then_some(index));
+            .filter_map(|(index, descriptor)| {
+                let file_descriptor = FIRST_DESCRIPTOR + index as i32;
+                (descriptor.is_none()
+                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
+                        file_descriptor,
+                    ))
+                .then_some(index)
+            });
         let read_slot = free_slots.next().ok_or(EMFILE)?;
         let write_slot = free_slots.next().ok_or(EMFILE)?;
         for slot in [read_slot, write_slot] {
@@ -1627,6 +1646,7 @@ impl FileSystem {
     }
 
     fn descriptor_for_duplication(&self, file_descriptor: i32) -> Result<Descriptor, i32> {
+        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
         if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
             if !self.standard_descriptor_is_open(file_descriptor)? {
                 return Err(EBADF);
@@ -1652,9 +1672,24 @@ impl FileSystem {
         minimum: i32,
         close_on_exec: bool,
     ) -> Result<i32, i32> {
+        self.duplicate_internal(file_descriptor, minimum, close_on_exec, true)
+    }
+
+    fn duplicate_backing(&mut self, file_descriptor: i32) -> Result<i32, i32> {
+        self.duplicate_internal(file_descriptor, FIRST_DESCRIPTOR, false, false)
+    }
+
+    fn duplicate_internal(
+        &mut self,
+        file_descriptor: i32,
+        minimum: i32,
+        close_on_exec: bool,
+        enforce_limit: bool,
+    ) -> Result<i32, i32> {
         if minimum < 0 {
             return Err(EINVAL);
         }
+        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
         let source = self.descriptor_for_duplication(file_descriptor)?;
         let source_offset = if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
             None
@@ -1668,17 +1703,13 @@ impl FileSystem {
             let source_slot = self.descriptor_slot(file_descriptor)?;
             self.shared_flags[source_slot].as_ref().map(Arc::clone)
         };
-        let target_slot = self
-            .descriptors
-            .iter()
-            .enumerate()
-            .skip(minimum.saturating_sub(FIRST_DESCRIPTOR) as usize)
-            .find_map(|(slot, descriptor)| descriptor.is_none().then_some(slot))
-            .ok_or(EMFILE)?;
-        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-            target_slot as i32 + FIRST_DESCRIPTOR,
-        )
-        .map_err(|error| -(error as i32))?;
+        let target_slot = self.available_descriptor_slot(minimum).ok_or(EMFILE)?;
+        if enforce_limit {
+            crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+                target_slot as i32 + FIRST_DESCRIPTOR,
+            )
+            .map_err(|error| -(error as i32))?;
+        }
         self.add_descriptor_reference(source)?;
         self.descriptors[target_slot] = Some(Descriptor {
             close_on_exec,
@@ -1696,6 +1727,7 @@ impl FileSystem {
         close_on_exec: bool,
         process_id: i32,
     ) -> Result<i32, i32> {
+        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
         let source = self.descriptor_for_duplication(file_descriptor)?;
         if file_descriptor == new_descriptor {
             if close_on_exec {
@@ -2445,6 +2477,10 @@ pub(crate) fn duplicate(
         .duplicate(file_descriptor, minimum, close_on_exec)
 }
 
+pub(crate) fn duplicate_backing(file_descriptor: i32) -> Result<i32, i32> {
+    FILESYSTEM.lock().duplicate_backing(file_descriptor)
+}
+
 pub(crate) fn duplicate_to(
     file_descriptor: i32,
     new_descriptor: i32,
@@ -2623,6 +2659,7 @@ pub(crate) fn capacity_for_descriptor(
 }
 
 pub(crate) fn sync_descriptor(file_descriptor: i32, data_only: bool) -> Result<(), i32> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if pty::is_fd(file_descriptor) {
         return if pty::has_fd(file_descriptor) {
             Err(EINVAL)
@@ -2843,6 +2880,7 @@ pub(crate) fn poll_readiness(file_descriptor: i32, events: i16) -> i16 {
     const POLLOUT: i16 = 0x004;
     const POLLNVAL: i16 = 0x020;
 
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if pty::is_fd(file_descriptor) {
         return match pty::readiness(file_descriptor, events) {
             Ok(readiness) => readiness,
@@ -3672,10 +3710,61 @@ pub extern "C" fn kz_rust_fchdir(file_descriptor: i32) -> i32 {
 }
 
 pub(crate) fn is_terminal_descriptor(file_descriptor: i32) -> Result<bool, i32> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if pty::has_fd(file_descriptor) {
         return Ok(true);
     }
     FILESYSTEM.lock().is_terminal_descriptor(file_descriptor)
+}
+
+pub(crate) fn descriptor_is_open(file_descriptor: i32) -> Result<bool, i32> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
+    if (0..3).contains(&file_descriptor) {
+        FILESYSTEM.lock().standard_descriptor_is_open(file_descriptor)
+    } else {
+        FILESYSTEM.lock().descriptor_slot(file_descriptor).map(|_| true)
+    }
+}
+
+pub(crate) fn is_direct_fd_number(file_descriptor: i32) -> bool {
+    (FIRST_DESCRIPTOR..FIRST_DESCRIPTOR + DESCRIPTOR_COUNT as i32).contains(&file_descriptor)
+}
+
+pub(crate) fn close_descriptor(file_descriptor: i32) -> Result<(), i32> {
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
+    let pipe = is_pipe_descriptor(file_descriptor);
+    let result = if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::remove(file_descriptor) {
+        match alias.kind {
+            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::File => {
+                FILESYSTEM.lock().close(alias.backing, process_id)
+            }
+            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket => {
+                network::close(alias.backing).map_err(|error| -(error as i32))
+            }
+            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet => {
+                network::close_packet_fd(alias.backing).map_err(|error| -(error as i32))
+            }
+            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty => {
+                pty::close(alias.backing).map_err(|error| -(error as i32))
+            }
+        }
+    } else if (0..=2).contains(&file_descriptor) {
+        FILESYSTEM.lock().close(file_descriptor, process_id)
+    } else if pty::is_fd(file_descriptor) {
+        pty::close(file_descriptor).map_err(|error| -(error as i32))
+    } else if network::is_socket_fd(file_descriptor) {
+        network::close(file_descriptor).map_err(|error| -(error as i32))
+    } else if network::is_packet_fd(file_descriptor) {
+        network::close_packet_fd(file_descriptor).map_err(|error| -(error as i32))
+    } else {
+        FILESYSTEM.lock().close(file_descriptor, process_id)
+    };
+    if result.is_ok() && pipe {
+        wake_pipe_waiters();
+    }
+    result
 }
 
 fn standard_descriptor_is_open(file_descriptor: i32) -> Result<bool, i32> {
@@ -3712,6 +3801,7 @@ fn wait_for_blocking_pipe(file_descriptor: i32) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length: usize) -> isize {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor)
         && (file_descriptor != 0 || !standard_descriptor_is_open(file_descriptor).unwrap_or(false))
     {
@@ -3907,6 +3997,7 @@ pub unsafe extern "C" fn write(
     buffer: *const c_void,
     length: usize,
 ) -> isize {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor)
         && (file_descriptor == 0 || !standard_descriptor_is_open(file_descriptor).unwrap_or(false))
     {
@@ -4069,46 +4160,8 @@ fn write_console(buffer: *const u8, length: usize, nonblocking: bool) -> isize {
 
 #[no_mangle]
 pub extern "C" fn close(file_descriptor: i32) -> i32 {
-    let process_id = match ThreadManager::current_process() {
-        Ok(process) => process.pid(),
-        Err(error) => return fail(-(error as i32)),
-    };
-    if (0..=2).contains(&file_descriptor) {
-        return match FILESYSTEM.lock().close(file_descriptor, process_id) {
-            Ok(()) => 0,
-            Err(error) => fail(error),
-        };
-    }
-    if pty::is_fd(file_descriptor) {
-        return match pty::close(file_descriptor) {
-            Ok(()) => 0,
-            Err(error) => fail(-(error as i32)),
-        };
-    }
-    if network::is_socket_fd(file_descriptor) {
-        return match network::close(file_descriptor) {
-            Ok(()) => 0,
-            Err(error) => {
-                set_errno(-(error as i32));
-                -1
-            }
-        };
-    }
-    if network::is_packet_fd(file_descriptor) {
-        return match network::close_packet_fd(file_descriptor) {
-            Ok(()) => 0,
-            Err(error) => {
-                set_errno(-(error as i32));
-                -1
-            }
-        };
-    }
-    let pipe = is_pipe_descriptor(file_descriptor);
-    match FILESYSTEM.lock().close(file_descriptor, process_id) {
+    match close_descriptor(file_descriptor) {
         Ok(()) => {
-            if pipe {
-                wake_pipe_waiters();
-            }
             0
         }
         Err(error) => fail(error),
@@ -4209,6 +4262,7 @@ pub unsafe extern "C" fn fstat(file_descriptor: i32, output: *mut c_void) -> i32
     if output.is_null() {
         return fail(EFAULT);
     }
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     let status = if network::has_socket_fd(file_descriptor) {
         Ok(CStat {
             device: 1,
@@ -4378,9 +4432,7 @@ pub(super) fn tmpfile_descriptor() -> Result<i32, i32> {
     let credentials = current_credentials()?;
     let mut filesystem = FILESYSTEM.lock();
     let slot = filesystem
-        .descriptors
-        .iter()
-        .position(Option::is_none)
+        .available_descriptor_slot(FIRST_DESCRIPTOR)
         .ok_or(EMFILE)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
         slot as i32 + FIRST_DESCRIPTOR,
@@ -4423,6 +4475,7 @@ pub(super) fn fd_access(
 }
 
 pub(super) fn status_for_fd(file_descriptor: i32) -> Result<CStat, i32> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if pty::has_fd(file_descriptor) {
         return pty_status(file_descriptor);
     }
@@ -4792,6 +4845,7 @@ pub unsafe extern "C" fn kz_rust_ioctl(
     request: usize,
     argument: *mut c_void,
 ) -> i32 {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if network::ioctl_requires_admin(request) {
         match current_credentials() {
             Ok(credentials) if credentials.is_root() => {}

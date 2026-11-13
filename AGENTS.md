@@ -1,5 +1,7 @@
-When working on files under `runtime/`, do not modify files under `kernel/`. If a runtime task appears to require a kernel change, explain why and ask for approval before editing `kernel/`.
-For POSIX interfaces under `runtime/bridge/posix`, do not remove or change existing functions or constants, including function names and signatures or constant names and values. Change an existing POSIX function only by updating its body, and only when required to accommodate a kernel change; preserve its POSIX-facing semantics.
+## Read-Only Files
+- Never modify a file containing the `//@READONLY` comment. This includes editing, reformatting, regeneration, and automated transformations. If a task requires changing such a file, leave it untouched and explain the constraint.
+- When working on files under `runtime/`, do not modify files under `kernel/`. If a runtime task appears to require a kernel change, explain why and ask for approval before editing `kernel/`.
+- For POSIX interfaces under `runtime/bridge/posix`, do not remove or change existing functions or constants, including function names and signatures or constant names and values. Change an existing POSIX function only by updating its body, and only when required to accommodate a kernel change; preserve its POSIX-facing semantics.
 
 ## Copyright Headers
 - Add the following notice to every new or modified first-party text source file. Preserve its wording and use the file's native comment syntax.

@@ -84,6 +84,29 @@ pub unsafe extern "C" fn fcntl(
     command: c_int,
     argument: usize,
 ) -> c_int {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        match command {
+            F_GETFD => return c_int::from(alias.close_on_exec),
+            F_SETFD => {
+                let flags = argument as c_int;
+                if flags & !1 != 0 {
+                    set_errno(EINVAL);
+                    return -1;
+                }
+                return match crate::kernel::runtime::runtime_libc::fd_alias::set_close_on_exec(
+                    file_descriptor,
+                    flags & 1 != 0,
+                ) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        set_errno(-(error as c_int));
+                        -1
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
     if pty::is_fd(file_descriptor) {
         return match command {
             F_DUPFD | F_DUPFD_CLOEXEC => {

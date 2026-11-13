@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 
 use crate::kernel::error::Error;
-use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::scheduler::sync::{IrqSpinGuard, IrqSpinLock};
 use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::tty::{Pty, TerminalAttributes, WindowSize};
 
@@ -50,6 +50,10 @@ static DESCRIPTORS: IrqSpinLock<[Option<PtyDescriptor>; PTY_DESCRIPTOR_COUNT]> =
     IrqSpinLock::new([const { None }; PTY_DESCRIPTOR_COUNT]);
 
 fn descriptor_index(file_descriptor: i32) -> Result<usize, Error> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+        file_descriptor,
+        crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty,
+    )?;
     let index = file_descriptor
         .checked_sub(PTY_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())
@@ -60,13 +64,40 @@ fn descriptor_index(file_descriptor: i32) -> Result<usize, Error> {
 }
 
 pub(crate) fn is_fd(file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        return alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty;
+    }
     descriptor_index(file_descriptor).is_ok()
 }
 
 pub(crate) fn has_fd(file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        return alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty
+            && descriptor_index(alias.backing)
+                .ok()
+                .is_some_and(|index| DESCRIPTORS.lock()[index].is_some());
+    }
     descriptor_index(file_descriptor)
         .ok()
         .is_some_and(|index| DESCRIPTORS.lock()[index].is_some())
+}
+
+fn available_descriptor_index(
+    descriptors: &IrqSpinGuard<'_, [Option<PtyDescriptor>; PTY_DESCRIPTOR_COUNT]>,
+    minimum: usize,
+) -> Option<usize> {
+    descriptors
+        .iter()
+        .enumerate()
+        .skip(minimum)
+        .find_map(|(index, descriptor)| {
+            let file_descriptor = PTY_FD_BASE + index as i32;
+            (descriptor.is_none()
+                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
+                    file_descriptor,
+                ))
+            .then_some(index)
+        })
 }
 
 fn descriptor(file_descriptor: i32) -> Result<PtyDescriptor, Error> {
@@ -92,10 +123,7 @@ pub(crate) fn open_master(flags: i32) -> Result<i32, Error> {
     let mut pairs = PTYS.lock();
     let pty_index = pairs.iter().position(Option::is_none).ok_or(Error::Mfile)?;
     let mut descriptors = DESCRIPTORS.lock();
-    let descriptor_index = descriptors
-        .iter()
-        .position(Option::is_none)
-        .ok_or(Error::Mfile)?;
+    let descriptor_index = available_descriptor_index(&descriptors, 0).ok_or(Error::Mfile)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
         PTY_FD_BASE + descriptor_index as i32,
     )?;
@@ -155,10 +183,7 @@ fn open_slave(pty_index: usize, flags: i32) -> Result<i32, Error> {
         .map(Arc::clone)
         .ok_or(Error::NoEnt)?;
     let mut descriptors = DESCRIPTORS.lock();
-    let descriptor_index = descriptors
-        .iter()
-        .position(Option::is_none)
-        .ok_or(Error::Mfile)?;
+    let descriptor_index = available_descriptor_index(&descriptors, 0).ok_or(Error::Mfile)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
         PTY_FD_BASE + descriptor_index as i32,
     )?;
@@ -358,6 +383,19 @@ pub(crate) fn duplicate(
     minimum: i32,
     close_on_exec: bool,
 ) -> Result<i32, Error> {
+    duplicate_internal(file_descriptor, minimum, close_on_exec, true)
+}
+
+pub(crate) fn duplicate_backing(file_descriptor: i32) -> Result<i32, Error> {
+    duplicate_internal(file_descriptor, PTY_FD_BASE, false, false)
+}
+
+fn duplicate_internal(
+    file_descriptor: i32,
+    minimum: i32,
+    close_on_exec: bool,
+    enforce_limit: bool,
+) -> Result<i32, Error> {
     if minimum < 0 {
         return Err(Error::Inval);
     }
@@ -367,15 +405,12 @@ pub(crate) fn duplicate(
     let minimum_index = usize::try_from(minimum.saturating_sub(PTY_FD_BASE))
         .unwrap_or(0)
         .min(PTY_DESCRIPTOR_COUNT);
-    let target_index = descriptors
-        .iter()
-        .enumerate()
-        .skip(minimum_index)
-        .find_map(|(index, descriptor)| descriptor.is_none().then_some(index))
-        .ok_or(Error::Mfile)?;
-    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
-        PTY_FD_BASE + target_index as i32,
-    )?;
+    let target_index = available_descriptor_index(&descriptors, minimum_index).ok_or(Error::Mfile)?;
+    if enforce_limit {
+        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+            PTY_FD_BASE + target_index as i32,
+        )?;
+    }
     let description = Arc::clone(&source.description);
     let mut open_description = description.lock();
     open_description.descriptor_references = open_description
