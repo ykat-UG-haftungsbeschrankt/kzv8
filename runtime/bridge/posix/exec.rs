@@ -39,7 +39,6 @@ const POSIX_SPAWN_SETSIGMASK: i16 = 0x08;
 const POSIX_SPAWN_SETSCHEDPARAM: i16 = 0x10;
 const POSIX_SPAWN_SETSCHEDULER: i16 = 0x20;
 const POSIX_SPAWN_SETSID: i16 = 0x40;
-const O_CLOEXEC: i32 = 0o2000000;
 
 struct EmptySymbolResolver;
 
@@ -363,22 +362,8 @@ pub(crate) unsafe fn posix_spawn(
         Ok(actions) => actions,
         Err(error) => return error,
     };
-    let mut reserved_targets = Vec::new();
-    if reserved_targets.try_reserve_exact(file_actions.len()).is_err() {
-        return ENOMEM;
-    }
-    for action in &file_actions {
-        match action {
-            super::spawn::SpawnFileAction::Close(file_descriptor)
-            | super::spawn::SpawnFileAction::Open {
-                file_descriptor, ..
-            } => reserved_targets.push(*file_descriptor),
-            super::spawn::SpawnFileAction::Dup2 { destination, .. } => {
-                reserved_targets.push(*destination)
-            }
-            super::spawn::SpawnFileAction::Chdir(_)
-            | super::spawn::SpawnFileAction::Fchdir(_) => {}
-        }
+    if !file_actions.is_empty() {
+        return as_errno(Error::OpNotSupp);
     }
     let attributes = match super::spawn::spawn_attributes(attributes) {
         Ok(attributes) => attributes,
@@ -432,7 +417,7 @@ pub(crate) unsafe fn posix_spawn(
     if let Err(error) = crate::kernel::runtime::runtime_libc::filesystem::inherit_descriptors_for_process(
         parent.pid(),
         child_id,
-        &reserved_targets,
+        &[],
     ) {
         crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
             child_id,
@@ -480,13 +465,6 @@ pub(crate) unsafe fn posix_spawn(
             parent.discard_unstarted_child(child_id);
             return as_errno(error);
         }
-    }
-    if let Err(error) = apply_spawn_file_actions(child_id, &file_actions) {
-        crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
-            child_id,
-        );
-        parent.discard_unstarted_child(child_id);
-        return error;
     }
     let candidate = match find_executable(&child, &requested, &environment, search_path) {
         Ok(path) => path,
@@ -557,68 +535,6 @@ pub(crate) unsafe fn posix_spawn(
         return as_errno(error);
     }
     0
-}
-
-fn apply_spawn_file_actions(
-    process_id: i32,
-    actions: &[super::spawn::SpawnFileAction],
-) -> Result<(), c_int> {
-    for action in actions {
-        match action {
-            super::spawn::SpawnFileAction::Close(file_descriptor) => {
-                crate::kernel::runtime::runtime_libc::filesystem::close_descriptor_for_process(
-                    process_id,
-                    *file_descriptor,
-                )?;
-            }
-            super::spawn::SpawnFileAction::Dup2 { source, destination } => {
-                crate::kernel::runtime::runtime_libc::filesystem::duplicate_descriptor_to_process(
-                    process_id,
-                    *source,
-                    process_id,
-                    *destination,
-                    false,
-                )?;
-            }
-            super::spawn::SpawnFileAction::Open {
-                file_descriptor,
-                path,
-                flags,
-                mode,
-            } => {
-                let _ = crate::kernel::runtime::runtime_libc::filesystem::close_descriptor_for_process(
-                    process_id,
-                    *file_descriptor,
-                );
-                let (backing, kind) = crate::kernel::runtime::runtime_libc::filesystem::open_for_process(
-                    path,
-                    *flags,
-                    *mode,
-                    process_id,
-                )?;
-                crate::kernel::runtime::runtime_libc::filesystem::install_open_descriptor_for_process(
-                    process_id,
-                    *file_descriptor,
-                    backing,
-                    kind,
-                    flags & O_CLOEXEC != 0,
-                )?;
-            }
-            super::spawn::SpawnFileAction::Chdir(path) => {
-                crate::kernel::runtime::runtime_libc::filesystem::chdir_for_process(
-                    process_id,
-                    path,
-                )?;
-            }
-            super::spawn::SpawnFileAction::Fchdir(file_descriptor) => {
-                crate::kernel::runtime::runtime_libc::filesystem::fchdir_for_process(
-                    process_id,
-                    *file_descriptor,
-                )?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn find_executable(
