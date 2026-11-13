@@ -521,20 +521,39 @@ impl UserAddressSpace {
 		self.release_range(address, length, false)
 	}
 
+	pub(crate) fn release_user_mapping_accounted(
+		&self,
+		address: usize,
+		length: usize,
+	) -> Option<(u64, u64)> {
+		self.release_range_accounted(address, length, false)
+			.map(|(released_bytes, resident_bytes, _)| (released_bytes, resident_bytes))
+	}
+
 	fn release_range(&self, address: usize, length: usize, exact: bool) -> bool {
+		self.release_range_accounted(address, length, exact)
+			.is_some_and(|(_, _, released)| released)
+	}
+
+	fn release_range_accounted(
+		&self,
+		address: usize,
+		length: usize,
+		exact: bool,
+	) -> Option<(u64, u64, bool)> {
 		let Some(range) = self.reservation_range(address, length) else {
-			return false;
+			return None;
 		};
 		self.activate(|| {
 			let mut areas = self.inner.areas.lock();
 			let Some(area_index) = areas.area_index(range.start) else {
-				return false;
+			return None;
 			};
 			let (area_range, first_page, end_page, prefix_pages, suffix_pages) = {
 				let area = &areas.areas[area_index];
 				let area_range = area.range.clone();
 				if range.end > area_range.end || (exact && range != area_range) {
-					return false;
+					return None;
 				}
 				let first_page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
 				let end_page = (range.end - area_range.start) / USER_VM_PAGE_SIZE;
@@ -542,7 +561,7 @@ impl UserAddressSpace {
 					area.page_states[page].load(Ordering::Acquire) & (VM_RESERVED | VM_USER)
 						!= (VM_RESERVED | VM_USER)
 				}) {
-					return false;
+					return None;
 				}
 				(
 					area_range,
@@ -556,11 +575,16 @@ impl UserAddressSpace {
 				&& suffix_pages != 0
 				&& areas.areas.try_reserve(1).is_err()
 			{
-				return false;
+				return None;
 			}
 			let mut area = areas.areas.remove(area_index);
 			let suffix_states = area.page_states.split_off(end_page);
 			let released_states = area.page_states.split_off(first_page);
+			let resident_bytes = released_states
+				.iter()
+				.filter(|state| state.load(Ordering::Acquire) & VM_OWNED != 0)
+				.count()
+				.saturating_mul(USER_VM_PAGE_SIZE) as u64;
 			let mut released = true;
 			for (offset, state) in released_states.iter().enumerate() {
 				let virtual_address = range.start + offset * USER_VM_PAGE_SIZE;
@@ -605,9 +629,9 @@ impl UserAddressSpace {
 				}
 				(false, false) => {}
 			}
-			released
+			Some((range.end.saturating_sub(range.start) as u64, resident_bytes, released))
 		})
-		.unwrap_or(false)
+		.flatten()
 	}
 
 	fn set_permissions(&self, address: usize, length: usize, permissions: i32) -> bool {
@@ -720,14 +744,22 @@ impl UserAddressSpace {
 		address: usize,
 		access: crate::kernel::memory::r#virtual::FaultAccess,
 	) -> bool {
+		self.resolve_page_fault_accounted(address, access).0
+	}
+
+	pub(crate) fn resolve_page_fault_accounted(
+		&self,
+		address: usize,
+		access: crate::kernel::memory::r#virtual::FaultAccess,
+	) -> (bool, bool) {
 		let page_address = address & !(USER_VM_PAGE_SIZE - 1);
 		let Some(range) = self.reservation_range(page_address, USER_VM_PAGE_SIZE) else {
-			return false;
+			return (false, false);
 		};
 		self.activate(|| {
 			let areas = self.inner.areas.lock();
 			let Some(area_index) = areas.area_index(range.start) else {
-				return false;
+				return (false, false);
 			};
 			let area = &areas.areas[area_index];
 			let page = (range.start - area.range.start) / USER_VM_PAGE_SIZE;
@@ -736,10 +768,10 @@ impl UserAddressSpace {
 				.get(page)
 				.map(|state| state.load(Ordering::Acquire))
 			else {
-				return false;
+				return (false, false);
 			};
 			if state & (VM_RESERVED | VM_USER) != (VM_RESERVED | VM_USER) {
-				return false;
+				return (false, false);
 			}
 			let permissions = (state & VM_PERMISSION_MASK) as i32;
 			let allowed = match access {
@@ -748,13 +780,13 @@ impl UserAddressSpace {
 				crate::kernel::memory::r#virtual::FaultAccess::Execute => matches!(permissions, 3 | 4),
 			};
 			if !allowed {
-				return false;
+				return (false, false);
 			}
 			if crate::kernel::arch::MemoryArchitecture::page_is_mapped(page_address) {
-				return true;
+				return (true, false);
 			}
 			let Some(frame) = PhysicalAllocator::allocate() else {
-				return false;
+				return (false, false);
 			};
 			if !crate::kernel::arch::MemoryArchitecture::map_user_page(
 				page_address,
@@ -762,7 +794,7 @@ impl UserAddressSpace {
 				2,
 			) {
 				let _released = PhysicalAllocator::deallocate(frame);
-				return false;
+				return (false, false);
 			}
 			unsafe { core::ptr::write_bytes(page_address as *mut u8, 0, USER_VM_PAGE_SIZE) };
 			if permissions == 2
@@ -773,13 +805,13 @@ impl UserAddressSpace {
 				)
 			{
 				area.page_states[page].fetch_or(VM_OWNED, Ordering::Release);
-				return true;
+				return (true, true);
 			}
 			let _unmapped = crate::kernel::arch::MemoryArchitecture::unmap_page(page_address);
 			let _released = PhysicalAllocator::deallocate(frame);
-			false
+			(false, false)
 		})
-		.unwrap_or(false)
+		.unwrap_or((false, false))
 	}
 
 	/// Transfer control to a sealed executable in this user VM arena.

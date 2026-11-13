@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 
 use super::{Completion, Event, EventFlags, EventLoop, EventSourceId};
 use crate::kernel::error::Error;
+use crate::kernel::event::{EventFlagsApi, EventLoopApi as _};
 
     #[test]
     fn readiness_is_filtered_and_level_triggered() {

@@ -5,12 +5,15 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::vec::Vec;
 use core::ffi::c_void;
 
 use crate::kernel::arch::traits::MemoryArchitecture as _;
 use crate::kernel::arch::MemoryArchitecture;
+use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::scheduler::thread::ThreadManager;
 
-use super::errno::{EINVAL, ENOMEM};
+use super::errno::{as_errno, EINVAL, ENOMEM};
 
 const PAGE_SIZE: usize = 4096;
 
@@ -31,6 +34,50 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
 const MAP_FIXED: i32 = 0x10;
+
+#[derive(Clone, Copy)]
+struct MappingRange {
+    start: usize,
+    length: usize,
+}
+
+#[derive(Default)]
+struct MemoryUsage {
+    mappings: Vec<MappingRange>,
+}
+
+struct ProcessMemoryUsage {
+    process_id: i32,
+    usage: MemoryUsage,
+}
+
+#[derive(Default)]
+struct MemoryAccounting {
+    processes: Vec<ProcessMemoryUsage>,
+}
+
+impl MemoryAccounting {
+    fn process_usage_mut(&mut self, process_id: i32) -> Result<&mut ProcessMemoryUsage, i32> {
+        let index = if let Some(index) = self
+            .processes
+            .iter()
+            .position(|process| process.process_id == process_id)
+        {
+            index
+        } else {
+            self.processes.try_reserve(1).map_err(|_| ENOMEM)?;
+            self.processes.push(ProcessMemoryUsage {
+                process_id,
+                usage: MemoryUsage::default(),
+            });
+            self.processes.len() - 1
+        };
+        self.processes.get_mut(index).ok_or(ENOMEM)
+    }
+}
+
+static MEMORY_ACCOUNTING: IrqSpinLock<MemoryAccounting> =
+    IrqSpinLock::new(MemoryAccounting { processes: Vec::new() });
 
 fn set_errno(error: i32) {
     unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
@@ -89,16 +136,76 @@ pub unsafe extern "C" fn mmap(
         if address_hint.is_null() || permissions != 0 {
             return fail(EINVAL);
         }
-        if !crate::kernel::memory::r#virtual::decommit(address_hint as usize, length) {
+        let process = ThreadManager::current_process().ok();
+        let mapping_start = address_hint as usize;
+        let mapping_end = mapping_start.checked_add(length);
+        let tracked_mapping = process.as_ref().is_some_and(|process| {
+            let Some(mapping_end) = mapping_end else {
+                return false;
+            };
+            MEMORY_ACCOUNTING
+                .lock()
+                .processes
+                .iter()
+                .find(|usage| usage.process_id == process.pid())
+                .is_some_and(|usage| {
+                    usage.usage.mappings.iter().any(|mapping| {
+                        mapping.start <= mapping_start
+                            && mapping
+                                .start
+                                .checked_add(mapping.length)
+                                .is_some_and(|end| end >= mapping_end)
+                    })
+                })
+        });
+        let Some((resident_bytes, decommitted)) =
+            crate::kernel::memory::r#virtual::decommit_accounted(mapping_start, length)
+        else {
+            return fail(ENOMEM);
+        };
+        if tracked_mapping {
+            if let Some(process) = process {
+                process.release_memory(0, 0, resident_bytes);
+            }
+        }
+        if !decommitted {
             return fail(ENOMEM);
         }
         return address_hint;
     }
+    let process = ThreadManager::current_process().ok();
+    let Some(process) = process else {
+        let Some(address) =
+            crate::kernel::memory::r#virtual::reserve(length, PAGE_SIZE, permissions)
+        else {
+            return fail(ENOMEM);
+        };
+        return address as *mut c_void;
+    };
+    let Ok(length_bytes) = u64::try_from(length) else {
+        return fail(ENOMEM);
+    };
+    let mut accounting = MEMORY_ACCOUNTING.lock();
+    let usage = match accounting.process_usage_mut(process.pid()) {
+        Ok(process_usage) => &mut process_usage.usage,
+        Err(error) => return fail(error),
+    };
+    if usage.mappings.try_reserve(1).is_err() {
+        return fail(ENOMEM);
+    }
+    if let Err(error) = process.try_reserve_memory(length_bytes) {
+        return fail(as_errno(error));
+    }
     let Some(address) =
         crate::kernel::memory::r#virtual::reserve(length, PAGE_SIZE, permissions)
     else {
+        process.release_memory(length_bytes, length_bytes, 0);
         return fail(ENOMEM);
     };
+    usage.mappings.push(MappingRange {
+        start: address,
+        length,
+    });
     address as *mut c_void
 }
 
@@ -169,9 +276,83 @@ pub unsafe extern "C" fn munmap(address: *mut c_void, length: usize) -> i32 {
         set_errno(EINVAL);
         return -1;
     };
-    if !crate::kernel::memory::r#virtual::release_range(address, length) {
+    let Some(end) = address.checked_add(length) else {
         set_errno(EINVAL);
         return -1;
+    };
+    let process = ThreadManager::current_process().ok();
+    let Some(process) = process else {
+        if crate::kernel::memory::r#virtual::release_range(address, length) {
+            return 0;
+        }
+        set_errno(EINVAL);
+        return -1;
+    };
+    let mut accounting = MEMORY_ACCOUNTING.lock();
+    let Some(process_index) = accounting
+        .processes
+        .iter()
+        .position(|usage| usage.process_id == process.pid())
+    else {
+        drop(accounting);
+        if crate::kernel::memory::r#virtual::release_range(address, length) {
+            return 0;
+        }
+        set_errno(EINVAL);
+        return -1;
+    };
+    let usage = &mut accounting.processes[process_index].usage;
+    let Some(mapping_index) = usage.mappings.iter().position(|mapping| {
+        mapping.start <= address
+            && mapping
+                .start
+                .checked_add(mapping.length)
+                .is_some_and(|mapping_end| mapping_end >= end)
+    }) else {
+        drop(accounting);
+        if crate::kernel::memory::r#virtual::release_range(address, length) {
+            return 0;
+        }
+        set_errno(EINVAL);
+        return -1;
+    };
+    let mapping = usage.mappings[mapping_index];
+    let mapping_end = mapping.start + mapping.length;
+    let prefix_length = address - mapping.start;
+    let suffix_length = mapping_end - end;
+    if prefix_length != 0 && suffix_length != 0 && usage.mappings.try_reserve(1).is_err() {
+        set_errno(ENOMEM);
+        return -1;
     }
+    let Some((released_bytes, resident_bytes)) =
+        crate::kernel::memory::r#virtual::release_range_accounted(address, length)
+    else {
+        set_errno(EINVAL);
+        return -1;
+    };
+    {
+        if prefix_length == 0 && suffix_length == 0 {
+            usage.mappings.swap_remove(mapping_index);
+        } else if prefix_length == 0 {
+            usage.mappings[mapping_index] = MappingRange {
+                start: end,
+                length: suffix_length,
+            };
+        } else if suffix_length == 0 {
+            usage.mappings[mapping_index].length = prefix_length;
+        } else {
+            usage.mappings[mapping_index].length = prefix_length;
+            usage.mappings.push(MappingRange {
+                start: end,
+                length: suffix_length,
+            });
+        }
+    }
+    let process_usage_is_empty = accounting.processes[process_index].usage.mappings.is_empty();
+    if process_usage_is_empty {
+        accounting.processes.swap_remove(process_index);
+    }
+    drop(accounting);
+    process.release_memory(released_bytes, released_bytes, resident_bytes);
     0
 }

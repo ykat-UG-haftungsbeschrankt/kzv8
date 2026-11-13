@@ -22,6 +22,7 @@ use crate::arch::traits::{
     BootArchitecture as _, CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _,
     TimerArchitecture as _,
 };
+use crate::kernel::event::{EventFlagsApi, EventLoopApi as _};
 #[cfg(feature = "virtualization")]
 use crate::arch::traits::VirtualizationArchitecture as _;
 
@@ -70,10 +71,10 @@ pub(crate) mod kernel {
 }
 
 pub(crate) struct KernelContext<'a> {
-    pub(crate) events: &'a mut event::r#loop::EventLoop<16>,
+    pub(crate) events: &'a mut event::EventLoop<16>,
     pub(crate) block_device: Option<&'a mut block::service::BlockClient>,
     pub(crate) network_stack: Option<&'a mut net::stack::NetStack>,
-    pub(crate) network_registration: Option<event::r#loop::EventSourceToken>,
+    pub(crate) network_registration: Option<event::EventSourceToken>,
 }
 
 struct Kernel;
@@ -81,7 +82,7 @@ struct Kernel;
 impl Kernel {
     fn interrupt() {
         let pending = driver::virtio::transport::dispatch_interrupts();
-        event::r#loop::EventLoop::<16>::record_device_interrupts(pending);
+        event::EventLoop::<16>::record_device_interrupts(pending);
         driver::virtio::console::Console::handle_interrupt(pending);
     }
 
@@ -141,11 +142,11 @@ impl Kernel {
 
         let console_ready = driver::virtio::console::Console::initialize();
         let mut virtio_services = driver::virtio::service::KernelVirtioServices::initialize();
-        let mut events = event::r#loop::EventLoop::<16>::new();
+        let mut events = event::EventLoop::<16>::new();
         let network_registration = events
             .register(
                 net::stack::NETWORK_EVENT_SOURCE,
-                event::r#loop::EventFlags::READABLE,
+                event::EventFlags::READABLE,
                 0,
             )
             .ok();

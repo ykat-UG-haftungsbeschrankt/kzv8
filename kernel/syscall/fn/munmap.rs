@@ -29,14 +29,15 @@ impl Munmap {
         if address == 0 || address % PAGE_SIZE != 0 || length == 0 {
             return Err(Error::Inval);
         }
-        if crate::kernel::scheduler::thread::ThreadManager::current_process()?
+        let process = crate::kernel::scheduler::thread::ThreadManager::current_process()?;
+        let Some((released_bytes, resident_bytes)) = process
             .address_space()
-            .release_user_mapping(address, length)
-        {
-            Ok(0)
-        } else {
-            Err(Error::Inval)
-        }
+            .release_user_mapping_accounted(address, length)
+        else {
+            return Err(Error::Inval);
+        };
+        process.release_memory(released_bytes, released_bytes, resident_bytes);
+        Ok(0)
     }
 
     pub(crate) fn handle(frame: SyscallFrame) -> Result<i64, Error> {

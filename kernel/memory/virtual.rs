@@ -239,16 +239,25 @@ impl VirtualAreas {
     }
 
     fn release_range(&mut self, address: usize, length: usize) -> bool {
+        self.release_range_inner(address, length)
+            .is_some_and(|(_, _, released)| released)
+    }
+
+    fn release_range_inner(
+        &mut self,
+        address: usize,
+        length: usize,
+    ) -> Option<(u64, u64, bool)> {
         let Ok(range) = Self::checked_page_range(address, length) else {
-            return false;
+            return None;
         };
         let Some(area) = self.containing_area(range) else {
-            return false;
+            return None;
         };
         if (range.start_page..range.end_page)
             .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
-            return false;
+            return None;
         }
 
         let area_address_range = Self::address_range(area).expect("valid VM area range");
@@ -256,11 +265,11 @@ impl VirtualAreas {
         let area_end = area.end_page;
         let suffix_page_count = area_end - range.end_page;
         if prefix_page_count != 0 && suffix_page_count != 0 && self.area_index.is_full() {
-            return false;
+            return None;
         }
 
         if self.area_index.remove(&area_address_range).is_none() {
-            return false;
+            return None;
         }
         match (prefix_page_count, suffix_page_count) {
             (0, 0) => {}
@@ -302,7 +311,17 @@ impl VirtualAreas {
                 debug_assert!(matches!(suffix_inserted, Ok(None)));
             }
         }
-        self.release_pages(range.start_page, range.end_page)
+        let resident_pages = (range.start_page..range.end_page)
+            .filter(|page| {
+                self.page_state[*page].load(Ordering::Acquire) & Self::VM_OWNED != 0
+            })
+            .count();
+        let released = self.release_pages(range.start_page, range.end_page);
+        Some((
+            (range.end_page - range.start_page) as u64 * Self::PAGE_SIZE as u64,
+            resident_pages as u64 * Self::PAGE_SIZE as u64,
+            released,
+        ))
     }
 
     fn decommit_debug(code: u8) {
@@ -310,38 +329,48 @@ impl VirtualAreas {
     }
 
     fn decommit(&self, address: usize, length: usize) -> bool {
+        self.decommit_accounted(address, length)
+            .is_some_and(|(_, decommitted)| decommitted)
+    }
+
+    fn decommit_accounted(&self, address: usize, length: usize) -> Option<(u64, bool)> {
         let range = match Self::checked_page_range(address, length) {
             Ok(range) => range,
             Err(PageRangeError::InvalidRange) => {
                 Self::decommit_debug(b'a');
-                return false;
+                return None;
             }
             Err(PageRangeError::LengthOverflow) => {
                 Self::decommit_debug(b'b');
-                return false;
+                return None;
             }
             Err(PageRangeError::OffsetUnderflow) => {
                 Self::decommit_debug(b'c');
-                return false;
+                return None;
             }
-            Err(PageRangeError::RangeOverflow) => return false,
+            Err(PageRangeError::RangeOverflow) => return None,
             Err(PageRangeError::OutOfBounds) => {
                 Self::decommit_debug(b'd');
-                return false;
+                return None;
             }
         };
 
         if self.containing_area(range).is_none() {
             Self::decommit_debug(b'e');
-            return false;
+            return None;
         }
         if (range.start_page..range.end_page)
             .any(|page| self.page_state[page].load(Ordering::Acquire) & Self::VM_RESERVED == 0)
         {
             Self::decommit_debug(b'f');
-            return false;
+            return None;
         }
 
+        let resident_pages = (range.start_page..range.end_page)
+            .filter(|page| {
+                self.page_state[*page].load(Ordering::Acquire) & Self::VM_OWNED != 0
+            })
+            .count();
         let mut decommitted = true;
         for page in range.start_page..range.end_page {
             let virtual_address = Self::VM_BASE + page * Self::PAGE_SIZE;
@@ -359,7 +388,7 @@ impl VirtualAreas {
         if decommitted {
             Self::decommit_debug(b'.');
         }
-        decommitted
+        Some((resident_pages as u64 * Self::PAGE_SIZE as u64, decommitted))
     }
 
     fn release_suffix(&mut self, address: usize, length: usize, new_length: usize) -> bool {
@@ -472,18 +501,26 @@ impl VirtualAreas {
     }
 
     fn resolve_page_fault(&self, address: usize, access: FaultAccess) -> bool {
+        self.resolve_page_fault_accounted(address, access).0
+    }
+
+    fn resolve_page_fault_accounted(
+        &self,
+        address: usize,
+        access: FaultAccess,
+    ) -> (bool, bool) {
         let page_address = address & !(Self::PAGE_SIZE - 1);
         let Some(offset) = page_address.checked_sub(Self::VM_BASE) else {
-            return false;
+            return (false, false);
         };
         if offset >= Self::VM_ARENA_SIZE {
-            return false;
+            return (false, false);
         }
         let page = offset / Self::PAGE_SIZE;
 
         let state = self.page_state[page].load(Ordering::Acquire);
         if state & Self::VM_RESERVED == 0 {
-            return false;
+            return (false, false);
         }
         let permissions = (state & Self::VM_PERMISSION_MASK) as i32;
         let access_allowed = match access {
@@ -492,30 +529,30 @@ impl VirtualAreas {
             FaultAccess::Execute => matches!(permissions, 3 | 4),
         };
         if !access_allowed {
-            return false;
+            return (false, false);
         }
         if MemoryArchitecture::page_is_mapped(page_address) {
-            return true;
+            return (true, false);
         }
 
         let Some(frame) = PhysicalAllocator::allocate() else {
-            return false;
+            return (false, false);
         };
         let physical_address = frame.address();
         if !MemoryArchitecture::map_page(page_address, physical_address, 2) {
             let _released = PhysicalAllocator::deallocate(frame);
-            return false;
+            return (false, false);
         }
         unsafe { core::ptr::write_bytes(page_address as *mut u8, 0, Self::PAGE_SIZE) };
         if permissions == 2
             || MemoryArchitecture::set_page_permissions(page_address, Self::PAGE_SIZE, permissions)
         {
             self.page_state[page].fetch_or(Self::VM_OWNED, Ordering::Release);
-            return true;
+            return (true, true);
         }
         let _unmapped = MemoryArchitecture::unmap_page(page_address);
         let _released = PhysicalAllocator::deallocate(frame);
-        false
+        (false, false)
     }
 }
 
@@ -558,8 +595,26 @@ impl VirtualAreasLock {
         Self::get_instance().lock().release_range(address, length)
     }
 
+    pub(crate) fn release_range_accounted(
+        address: usize,
+        length: usize,
+    ) -> Option<(u64, u64)> {
+        Self::get_instance()
+            .lock()
+            .release_range_inner(address, length)
+            .map(|(address_space_bytes, resident_bytes, _)| {
+                (address_space_bytes, resident_bytes)
+            })
+    }
+
     pub(crate) fn decommit(address: usize, length: usize) -> bool {
         Self::get_instance().lock().decommit(address, length)
+    }
+
+    pub(crate) fn decommit_accounted(address: usize, length: usize) -> Option<(u64, bool)> {
+        Self::get_instance()
+            .lock()
+            .decommit_accounted(address, length)
     }
 
     pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -> bool {
@@ -574,6 +629,15 @@ impl VirtualAreasLock {
 
     pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
         Self::get_instance().lock().resolve_page_fault(address, access)
+    }
+
+    pub(crate) fn resolve_page_fault_accounted(
+        address: usize,
+        access: FaultAccess,
+    ) -> (bool, bool) {
+        Self::get_instance()
+            .lock()
+            .resolve_page_fault_accounted(address, access)
     }
 
     #[allow(dead_code)]
@@ -626,8 +690,16 @@ pub(crate) fn release_range(address: usize, length: usize) -> bool {
     VirtualAreasLock::release_range(address, length)
 }
 
+pub(crate) fn release_range_accounted(address: usize, length: usize) -> Option<(u64, u64)> {
+    VirtualAreasLock::release_range_accounted(address, length)
+}
+
 pub(crate) fn decommit(address: usize, length: usize) -> bool {
     VirtualAreasLock::decommit(address, length)
+}
+
+pub(crate) fn decommit_accounted(address: usize, length: usize) -> Option<(u64, bool)> {
+    VirtualAreasLock::decommit_accounted(address, length)
 }
 
 pub(crate) fn release_suffix(address: usize, length: usize, new_length: usize) -> bool {
@@ -639,16 +711,23 @@ pub(crate) fn set_permissions(address: usize, length: usize, permissions: i32) -
 }
 
 pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
-    let Some(offset) = address.checked_sub(VirtualAreas::allocator_base()) else {
-        return crate::kernel::scheduler::thread::ThreadManager::current_process()
-            .is_ok_and(|process| process.address_space().resolve_page_fault(address, access));
+    let process = crate::kernel::scheduler::thread::ThreadManager::current_process().ok();
+    let (resolved, newly_resident) = match address.checked_sub(VirtualAreas::allocator_base()) {
+        Some(offset) if offset < VirtualAreas::VM_ARENA_SIZE => {
+            VirtualAreasLock::resolve_page_fault_accounted(address, access)
+        }
+        _ => process.as_ref().map_or((false, false), |process| {
+            process
+                .address_space()
+                .resolve_page_fault_accounted(address, access)
+        }),
     };
-    if offset < VirtualAreas::VM_ARENA_SIZE {
-        VirtualAreasLock::resolve_page_fault(address, access)
-    } else {
-        crate::kernel::scheduler::thread::ThreadManager::current_process()
-            .is_ok_and(|process| process.address_space().resolve_page_fault(address, access))
+    if resolved && newly_resident {
+        if let Some(process) = process {
+            process.record_page_fault(false);
+        }
     }
+    resolved
 }
 
 #[allow(dead_code)]

@@ -43,15 +43,194 @@ struct ResourceLimit {
     hard: u64,
 }
 
-const DEFAULT_RESOURCE_LIMITS: [ResourceLimit; 7] = [
-    ResourceLimit { soft: u64::MAX, hard: u64::MAX },
-    ResourceLimit { soft: u64::MAX, hard: u64::MAX },
-    ResourceLimit { soft: u64::MAX, hard: u64::MAX },
-    ResourceLimit { soft: 8 * 1024 * 1024, hard: 8 * 1024 * 1024 },
-    ResourceLimit { soft: 0, hard: 0 },
-    ResourceLimit { soft: 1024, hard: 1024 },
-    ResourceLimit { soft: u64::MAX, hard: u64::MAX },
-];
+#[derive(Clone, Copy)]
+struct ResourceLimits {
+    cpu: ResourceLimit,
+    file_size: ResourceLimit,
+    data: ResourceLimit,
+    stack: ResourceLimit,
+    core: ResourceLimit,
+    open_files: ResourceLimit,
+    address_space: ResourceLimit,
+}
+
+impl ResourceLimits {
+    fn get(&self, resource: i32) -> Option<ResourceLimit> {
+        match resource {
+            0 => Some(self.cpu),
+            1 => Some(self.file_size),
+            2 => Some(self.data),
+            3 => Some(self.stack),
+            4 => Some(self.core),
+            5 => Some(self.open_files),
+            9 => Some(self.address_space),
+            _ => None,
+        }
+    }
+
+    fn get_mut(&mut self, resource: i32) -> Option<&mut ResourceLimit> {
+        match resource {
+            0 => Some(&mut self.cpu),
+            1 => Some(&mut self.file_size),
+            2 => Some(&mut self.data),
+            3 => Some(&mut self.stack),
+            4 => Some(&mut self.core),
+            5 => Some(&mut self.open_files),
+            9 => Some(&mut self.address_space),
+            _ => None,
+        }
+    }
+}
+
+const UNLIMITED_RESOURCE: ResourceLimit = ResourceLimit {
+    soft: u64::MAX,
+    hard: u64::MAX,
+};
+const DEFAULT_RESOURCE_LIMITS: ResourceLimits = ResourceLimits {
+    cpu: UNLIMITED_RESOURCE,
+    file_size: UNLIMITED_RESOURCE,
+    data: UNLIMITED_RESOURCE,
+    stack: ResourceLimit {
+        soft: 8 * 1024 * 1024,
+        hard: 8 * 1024 * 1024,
+    },
+    core: ResourceLimit { soft: 0, hard: 0 },
+    open_files: ResourceLimit {
+        soft: 1024,
+        hard: 1024,
+    },
+    address_space: UNLIMITED_RESOURCE,
+};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ResourceUsageSnapshot {
+    pub(crate) user_cpu_time_ns: u64,
+    pub(crate) system_cpu_time_ns: u64,
+    pub(crate) max_rss_bytes: u64,
+    pub(crate) minor_page_faults: u64,
+    pub(crate) major_page_faults: u64,
+    pub(crate) swaps: u64,
+    pub(crate) input_blocks: u64,
+    pub(crate) output_blocks: u64,
+    pub(crate) messages_sent: u64,
+    pub(crate) messages_received: u64,
+    pub(crate) signals_received: u64,
+    pub(crate) voluntary_context_switches: u64,
+    pub(crate) involuntary_context_switches: u64,
+}
+
+impl ResourceUsageSnapshot {
+    pub(crate) fn total_cpu_time_ns(self) -> u64 {
+        self.user_cpu_time_ns
+            .saturating_add(self.system_cpu_time_ns)
+    }
+
+    fn accumulate(&mut self, other: Self) {
+        self.user_cpu_time_ns = self.user_cpu_time_ns.saturating_add(other.user_cpu_time_ns);
+        self.system_cpu_time_ns = self.system_cpu_time_ns.saturating_add(other.system_cpu_time_ns);
+        self.max_rss_bytes = self.max_rss_bytes.max(other.max_rss_bytes);
+        self.minor_page_faults = self.minor_page_faults.saturating_add(other.minor_page_faults);
+        self.major_page_faults = self.major_page_faults.saturating_add(other.major_page_faults);
+        self.swaps = self.swaps.saturating_add(other.swaps);
+        self.input_blocks = self.input_blocks.saturating_add(other.input_blocks);
+        self.output_blocks = self.output_blocks.saturating_add(other.output_blocks);
+        self.messages_sent = self.messages_sent.saturating_add(other.messages_sent);
+        self.messages_received = self.messages_received.saturating_add(other.messages_received);
+        self.signals_received = self.signals_received.saturating_add(other.signals_received);
+        self.voluntary_context_switches = self
+            .voluntary_context_switches
+            .saturating_add(other.voluntary_context_switches);
+        self.involuntary_context_switches = self
+            .involuntary_context_switches
+            .saturating_add(other.involuntary_context_switches);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct MemoryResourceUsage {
+    address_space_bytes: u64,
+    data_bytes: u64,
+    resident_bytes: u64,
+    max_rss_bytes: u64,
+    minor_page_faults: u64,
+    major_page_faults: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct IoResourceUsage {
+    input_blocks: u64,
+    output_blocks: u64,
+    messages_sent: u64,
+    messages_received: u64,
+    swaps: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SchedulerResourceUsage {
+    voluntary_context_switches: u64,
+    involuntary_context_switches: u64,
+}
+
+struct ProcessResourceUsage {
+    user_cpu_time_ns: AtomicU64,
+    system_cpu_time_ns: AtomicU64,
+    cpu_limit_signals: AtomicU64,
+    memory: IrqSpinLock<MemoryResourceUsage>,
+    io: IrqSpinLock<IoResourceUsage>,
+    scheduler: IrqSpinLock<SchedulerResourceUsage>,
+    signals_received: AtomicU64,
+    child_usage: IrqSpinLock<ResourceUsageSnapshot>,
+}
+
+impl ProcessResourceUsage {
+    fn new() -> Self {
+        Self {
+            user_cpu_time_ns: AtomicU64::new(0),
+            system_cpu_time_ns: AtomicU64::new(0),
+            cpu_limit_signals: AtomicU64::new(0),
+            memory: IrqSpinLock::new(MemoryResourceUsage::default()),
+            io: IrqSpinLock::new(IoResourceUsage::default()),
+            scheduler: IrqSpinLock::new(SchedulerResourceUsage::default()),
+            signals_received: AtomicU64::new(0),
+            child_usage: IrqSpinLock::new(ResourceUsageSnapshot::default()),
+        }
+    }
+
+    fn total_cpu_time_ns(&self) -> u64 {
+        self.user_cpu_time_ns
+            .load(Ordering::Relaxed)
+            .saturating_add(self.system_cpu_time_ns.load(Ordering::Relaxed))
+    }
+
+    fn snapshot(&self) -> ResourceUsageSnapshot {
+        let memory = *self.memory.lock();
+        let io = *self.io.lock();
+        let scheduler = *self.scheduler.lock();
+        ResourceUsageSnapshot {
+            user_cpu_time_ns: self.user_cpu_time_ns.load(Ordering::Relaxed),
+            system_cpu_time_ns: self.system_cpu_time_ns.load(Ordering::Relaxed),
+            max_rss_bytes: memory.max_rss_bytes,
+            minor_page_faults: memory.minor_page_faults,
+            major_page_faults: memory.major_page_faults,
+            swaps: io.swaps,
+            input_blocks: io.input_blocks,
+            output_blocks: io.output_blocks,
+            messages_sent: io.messages_sent,
+            messages_received: io.messages_received,
+            signals_received: self.signals_received.load(Ordering::Relaxed),
+            voluntary_context_switches: scheduler.voluntary_context_switches,
+            involuntary_context_switches: scheduler.involuntary_context_switches,
+        }
+    }
+
+    fn child_snapshot(&self) -> ResourceUsageSnapshot {
+        *self.child_usage.lock()
+    }
+
+    fn add_child_usage(&self, usage: ResourceUsageSnapshot) {
+        self.child_usage.lock().accumulate(usage);
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ProcessControlState {
@@ -62,20 +241,7 @@ struct ProcessControlState {
     scheduler_policy: i32,
     scheduler_priority: i32,
     nice_priority: i32,
-    resource_limits: [ResourceLimit; 7],
-}
-
-fn resource_limit_index(resource: i32) -> Option<usize> {
-    match resource {
-        0 => Some(0),
-        1 => Some(1),
-        2 => Some(2),
-        3 => Some(3),
-        4 => Some(4),
-        5 => Some(5),
-        9 => Some(6),
-        _ => None,
-    }
+    resource_limits: ResourceLimits,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,7 +250,7 @@ pub(crate) struct ChildExitStatus {
     pub(crate) process_group_id: i32,
     pub(crate) code: i32,
     pub(crate) status: i32,
-    cpu_time_ns: u64,
+    resource_usage: ResourceUsageSnapshot,
 }
 
 struct ChildProcessRecord {
@@ -653,9 +819,7 @@ impl FileDescriptorTable {
 pub(crate) struct Process {
     pid: i32,
     active_threads: AtomicUsize,
-    cpu_time_ns: AtomicU64,
-    child_cpu_time_ns: AtomicU64,
-    cpu_limit_signals: AtomicU64,
+    resource_usage: ProcessResourceUsage,
     exit_notified: AtomicBool,
     control: IrqSpinLock<ProcessControlState>,
     pty_terminal: IrqSpinLock<Option<Arc<crate::kernel::tty::Pty>>>,
@@ -735,9 +899,7 @@ impl Process {
         let process = Arc::new(Self {
             pid,
             active_threads: AtomicUsize::new(0),
-            cpu_time_ns: AtomicU64::new(0),
-            child_cpu_time_ns: AtomicU64::new(0),
-            cpu_limit_signals: AtomicU64::new(0),
+            resource_usage: ProcessResourceUsage::new(),
             exit_notified: AtomicBool::new(false),
             control: IrqSpinLock::new(control),
             pty_terminal: IrqSpinLock::new(inherited_pty_terminal),
@@ -787,9 +949,7 @@ impl Process {
         let process = Arc::new(Self {
             pid,
             active_threads: AtomicUsize::new(0),
-            cpu_time_ns: AtomicU64::new(0),
-            child_cpu_time_ns: AtomicU64::new(0),
-            cpu_limit_signals: AtomicU64::new(0),
+            resource_usage: ProcessResourceUsage::new(),
             exit_notified: AtomicBool::new(false),
             control: IrqSpinLock::new(control),
             pty_terminal: IrqSpinLock::new(None),
@@ -904,15 +1064,103 @@ impl Process {
     }
 
     pub(crate) fn add_cpu_time_ns(&self, elapsed_ns: u64) {
-        self.cpu_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.resource_usage
+            .user_cpu_time_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_system_cpu_time_ns(&self, elapsed_ns: u64) {
+        self.resource_usage
+            .system_cpu_time_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
     }
 
     pub(crate) fn cpu_time_ns(&self) -> u64 {
-        self.cpu_time_ns.load(Ordering::Relaxed)
+        self.resource_usage.total_cpu_time_ns()
     }
 
     pub(crate) fn child_cpu_time_ns(&self) -> u64 {
-        self.child_cpu_time_ns.load(Ordering::Relaxed)
+        self.resource_usage.child_snapshot().total_cpu_time_ns()
+    }
+
+    pub(crate) fn resource_usage_snapshot(&self) -> ResourceUsageSnapshot {
+        self.resource_usage.snapshot()
+    }
+
+    pub(crate) fn child_resource_usage_snapshot(&self) -> ResourceUsageSnapshot {
+        self.resource_usage.child_snapshot()
+    }
+
+    pub(crate) fn try_reserve_memory(&self, bytes: u64) -> Result<(), Error> {
+        let control = self.control.lock();
+        let mut usage = self.resource_usage.memory.lock();
+        let address_space_bytes = usage
+            .address_space_bytes
+            .checked_add(bytes)
+            .ok_or(Error::NoMem)?;
+        let data_bytes = usage.data_bytes.checked_add(bytes).ok_or(Error::NoMem)?;
+        if address_space_bytes > control.resource_limits.address_space.soft
+            || data_bytes > control.resource_limits.data.soft
+        {
+            return Err(Error::NoMem);
+        }
+        usage.address_space_bytes = address_space_bytes;
+        usage.data_bytes = data_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn release_memory(&self, address_space_bytes: u64, data_bytes: u64, resident_bytes: u64) {
+        let mut usage = self.resource_usage.memory.lock();
+        usage.address_space_bytes = usage.address_space_bytes.saturating_sub(address_space_bytes);
+        usage.data_bytes = usage.data_bytes.saturating_sub(data_bytes);
+        usage.resident_bytes = usage.resident_bytes.saturating_sub(resident_bytes);
+    }
+
+    pub(crate) fn record_page_fault(&self, major: bool) {
+        const PAGE_SIZE: u64 = 4096;
+        let mut usage = self.resource_usage.memory.lock();
+        if major {
+            usage.major_page_faults = usage.major_page_faults.saturating_add(1);
+        } else {
+            usage.minor_page_faults = usage.minor_page_faults.saturating_add(1);
+        }
+        usage.resident_bytes = usage.resident_bytes.saturating_add(PAGE_SIZE);
+        usage.max_rss_bytes = usage.max_rss_bytes.max(usage.resident_bytes);
+    }
+
+    pub(crate) fn record_input_blocks(&self, blocks: u64) {
+        let mut usage = self.resource_usage.io.lock();
+        usage.input_blocks = usage.input_blocks.saturating_add(blocks);
+    }
+
+    pub(crate) fn record_output_blocks(&self, blocks: u64) {
+        let mut usage = self.resource_usage.io.lock();
+        usage.output_blocks = usage.output_blocks.saturating_add(blocks);
+    }
+
+    pub(crate) fn record_message_sent(&self) {
+        let mut usage = self.resource_usage.io.lock();
+        usage.messages_sent = usage.messages_sent.saturating_add(1);
+    }
+
+    pub(crate) fn record_message_received(&self) {
+        let mut usage = self.resource_usage.io.lock();
+        usage.messages_received = usage.messages_received.saturating_add(1);
+    }
+
+    pub(crate) fn record_signal_received(&self) {
+        self.resource_usage
+            .signals_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_context_switch(&self, voluntary: bool) {
+        let mut usage = self.resource_usage.scheduler.lock();
+        if voluntary {
+            usage.voluntary_context_switches = usage.voluntary_context_switches.saturating_add(1);
+        } else {
+            usage.involuntary_context_switches = usage.involuntary_context_switches.saturating_add(1);
+        }
     }
 
     pub(crate) fn parent_pid(&self) -> i32 {
@@ -963,8 +1211,12 @@ impl Process {
     }
 
     pub(crate) fn resource_limit(&self, resource: i32) -> Result<(u64, u64), Error> {
-        let index = resource_limit_index(resource).ok_or(Error::Inval)?;
-        let limit = self.control.lock().resource_limits[index];
+        let limit = self
+            .control
+            .lock()
+            .resource_limits
+            .get(resource)
+            .ok_or(Error::Inval)?;
         Ok((limit.soft, limit.hard))
     }
 
@@ -978,14 +1230,19 @@ impl Process {
             return Err(Error::Inval);
         }
         let is_root = self.effective_user_is_root();
-        let index = resource_limit_index(resource).ok_or(Error::Inval)?;
         let mut control = self.control.lock();
-        if hard > control.resource_limits[index].hard && !is_root {
+        let current = control.resource_limits.get(resource).ok_or(Error::Inval)?;
+        if hard > current.hard && !is_root {
             return Err(Error::Perm);
         }
-        control.resource_limits[index] = ResourceLimit { soft, hard };
+        *control
+            .resource_limits
+            .get_mut(resource)
+            .ok_or(Error::Inval)? = ResourceLimit { soft, hard };
         if resource == 0 {
-            self.cpu_limit_signals.store(0, Ordering::Relaxed);
+            self.resource_usage
+                .cpu_limit_signals
+                .store(0, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -1002,12 +1259,16 @@ impl Process {
             let _ = self.queue_signal(SignalInfo::new(SIGKILL, 0, 0, 0, 0, 0));
             return;
         }
-        let signal_count = self.cpu_limit_signals.load(Ordering::Relaxed);
+        let signal_count = self
+            .resource_usage
+            .cpu_limit_signals
+            .load(Ordering::Relaxed);
         let next_threshold = soft_limit.saturating_add(signal_count);
         if elapsed_seconds < next_threshold {
             return;
         }
         if self
+            .resource_usage
             .cpu_limit_signals
             .compare_exchange(
                 signal_count,
@@ -1046,6 +1307,7 @@ impl Process {
         if information.signal_number == 0 || information.signal_number > MAX_SIGNAL_NUMBER {
             return Err(Error::Inval);
         }
+        self.record_signal_received();
         if information.signal_number == SIGKILL {
             self.terminate_by_signal(SIGKILL);
             return Ok(());
@@ -1225,8 +1487,7 @@ impl Process {
         let status = children[index].events[event_index];
         if !no_wait {
             if matches!(status.code, CLD_EXITED | CLD_KILLED) {
-                self.child_cpu_time_ns
-                    .fetch_add(status.cpu_time_ns, Ordering::Relaxed);
+                self.resource_usage.add_child_usage(status.resource_usage);
                 children.remove(index);
             } else {
                 children[index].events.remove(event_index);
@@ -1250,7 +1511,7 @@ impl Process {
                 process_group_id: self.process_group_id(),
                 code,
                 status,
-                cpu_time_ns: self.cpu_time_ns(),
+                resource_usage: self.resource_usage.snapshot(),
             });
             if code == CLD_STOPPED
                 && parent
@@ -2063,12 +2324,12 @@ impl ProcessMessage {
 mod tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+    use core::sync::atomic::{AtomicBool, AtomicUsize};
 
     use super::{
         Capability, CapabilityTable, Credentials, DEFAULT_RESOURCE_LIMITS, FileDescriptorTable,
         FilesystemContext, GroupId, KernelObjectRef, KernelObjectTable, NamespaceSet, Process,
-        ProcessControlState, SignalState, UserAddressSpace, UserId,
+        ProcessControlState, ProcessResourceUsage, SignalState, UserAddressSpace, UserId,
     };
     use crate::kernel::ipc::Endpoint;
     use crate::kernel::scheduler::sync::IrqSpinLock;
@@ -2111,9 +2372,7 @@ mod tests {
         let process = Arc::new(Process {
             pid: 1,
             active_threads: AtomicUsize::new(0),
-            cpu_time_ns: AtomicU64::new(0),
-            child_cpu_time_ns: AtomicU64::new(0),
-            cpu_limit_signals: AtomicU64::new(0),
+            resource_usage: ProcessResourceUsage::new(),
             exit_notified: AtomicBool::new(false),
             control: IrqSpinLock::new(ProcessControlState {
                 parent_pid: None,

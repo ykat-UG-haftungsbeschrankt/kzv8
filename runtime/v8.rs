@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 unsafe extern "C" {
     fn kz_v8_run_smoke(
         event_loop: *mut core::ffi::c_void,
@@ -90,7 +97,7 @@ pub extern "C" fn kz_host_v8_set_page_permissions(
 }
 
 pub(crate) fn run_smoke(
-    event_loop: &mut crate::kernel::event::r#loop::EventLoop<16>,
+    event_loop: &mut crate::kernel::event::EventLoop<16>,
     block_device: *mut core::ffi::c_void,
     tcp_context: *mut core::ffi::c_void,
 ) -> Option<i32> {

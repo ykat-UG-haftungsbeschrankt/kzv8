@@ -16,12 +16,26 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use crate::kernel::error::Error;
-use crate::kernel::event::r#loop::{
-    EventFlags, EventLoop, EventSignal, EventSourceToken,
+use crate::kernel::event::{
+    EventFlags, EventFlagsApi, EventLoop, EventLoopApi as _, EventSignal, EventSignalApi as _,
+    EventSourceToken,
 };
 use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::scheduler::thread::vm::UserAddressSpace;
+
+fn record_message_sent() {
+    if let Ok(process) = ThreadManager::current_process() {
+        process.record_message_sent();
+    }
+}
+
+fn record_message_received() {
+    if let Ok(process) = ThreadManager::current_process() {
+        process.record_message_received();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CapabilityRights(u8);
@@ -367,7 +381,9 @@ impl Endpoint {
         }
         self.core
             .enqueue(Message::one_way(body), None)
-            .map_err(|(error, _message)| error)
+            .map_err(|(error, _message)| error)?;
+        record_message_sent();
+        Ok(())
     }
 
     pub(crate) fn send(&self, body: MessageBody) -> SendFuture {
@@ -382,7 +398,9 @@ impl Endpoint {
         if !self.rights.contains(CapabilityRights::RECEIVE) {
             return Err(Error::Acces);
         }
-        self.core.dequeue(None).map(|message| ReceivedMessage {
+        let message = self.core.dequeue(None)?;
+        record_message_received();
+        Ok(ReceivedMessage {
             body: message.body,
             reply: message.reply,
         })
@@ -432,6 +450,7 @@ impl Endpoint {
         self.core
             .enqueue(message, None)
             .map_err(|(error, _message)| error)?;
+        record_message_sent();
         Ok(CallTicket { reply })
     }
 
@@ -465,7 +484,10 @@ impl Future for SendFuture {
             return Poll::Ready(Err(Error::Inval));
         };
         match this.endpoint.core.enqueue(message, Some(context.waker())) {
-            Ok(()) => Poll::Ready(Ok(())),
+            Ok(()) => {
+                record_message_sent();
+                Poll::Ready(Ok(()))
+            }
             Err((Error::Again, message)) => {
                 this.message = Some(message);
                 this.waiter = Some(context.waker().clone());
@@ -501,10 +523,13 @@ impl Future for ReceiveFuture {
             this.endpoint.core.remove_receive_waiter(&waiter);
         }
         match this.endpoint.core.dequeue(Some(context.waker())) {
-            Ok(message) => Poll::Ready(Ok(ReceivedMessage {
-                body: message.body,
-                reply: message.reply,
-            })),
+            Ok(message) => {
+                record_message_received();
+                Poll::Ready(Ok(ReceivedMessage {
+                    body: message.body,
+                    reply: message.reply,
+                }))
+            }
             Err(Error::Again) => {
                 this.waiter = Some(context.waker().clone());
                 Poll::Pending
@@ -1103,7 +1128,9 @@ pub(crate) fn shared_mapping_smoke() -> Result<(), Error> {
 }
 
 pub(crate) fn smoke() -> Result<(), Error> {
-    use crate::kernel::event::r#loop::{Event, EventFlags, EventLoop};
+    use crate::kernel::event::{
+        Event, EventFlags, EventFlagsApi, EventLoop, EventLoopApi as _,
+    };
 
     let waker = Waker::from(Arc::new(IpcSmokeWake));
     let mut context = Context::from_waker(&waker);

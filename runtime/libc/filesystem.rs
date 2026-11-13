@@ -2690,9 +2690,15 @@ pub(crate) fn positioned_read(
     length: usize,
     offset: i64,
 ) -> Result<usize, i32> {
-    FILESYSTEM
+    let result = FILESYSTEM
         .lock()
-        .pread(file_descriptor, buffer, length, offset)
+        .pread(file_descriptor, buffer, length, offset);
+    if let Ok(amount) = result {
+        record_file_blocks(amount, true);
+        Ok(amount)
+    } else {
+        result
+    }
 }
 
 pub(crate) fn positioned_write(
@@ -2701,9 +2707,15 @@ pub(crate) fn positioned_write(
     length: usize,
     offset: i64,
 ) -> Result<usize, i32> {
-    FILESYSTEM
+    let result = FILESYSTEM
         .lock()
-        .pwrite(file_descriptor, buffer, length, offset)
+        .pwrite(file_descriptor, buffer, length, offset);
+    if let Ok(amount) = result {
+        record_file_blocks(amount, false);
+        Ok(amount)
+    } else {
+        result
+    }
 }
 
 pub(crate) fn truncate_descriptor(file_descriptor: i32, length: i64) -> Result<(), i32> {
@@ -3795,6 +3807,23 @@ fn wake_pipe_waiters() {
     }
 }
 
+fn record_file_blocks(bytes: usize, input: bool) {
+    if bytes == 0 {
+        return;
+    }
+    let blocks = bytes.saturating_add(511) / 512;
+    let Ok(blocks) = u64::try_from(blocks) else {
+        return;
+    };
+    if let Ok(process) = ThreadManager::current_process() {
+        if input {
+            process.record_input_blocks(blocks);
+        } else {
+            process.record_output_blocks(blocks);
+        }
+    }
+}
+
 fn wait_for_blocking_pipe(file_descriptor: i32) -> bool {
     matches!(pipe_nonblocking(file_descriptor), Ok(Some(false)))
 }
@@ -3970,6 +3999,8 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
             Ok(amount) => {
                 if is_pipe_descriptor(file_descriptor) {
                     wake_pipe_waiters();
+                } else {
+                    record_file_blocks(amount, true);
                 }
                 dispatch_signals_before_io_return();
                 return amount as isize;
@@ -4114,6 +4145,8 @@ pub unsafe extern "C" fn write(
             Ok(amount) => {
                 if is_pipe_descriptor(file_descriptor) {
                     wake_pipe_waiters();
+                } else {
+                    record_file_blocks(amount, false);
                 }
                 return amount as isize;
             }

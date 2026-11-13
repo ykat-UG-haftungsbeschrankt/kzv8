@@ -19,7 +19,7 @@ use crate::kernel::arch::traits::{
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
-use crate::kernel::process::Process;
+use crate::kernel::process::{Process, ResourceUsageSnapshot};
 use crate::kernel::namespace::NamespaceSet;
 use crate::kernel::signal::{SignalInfo, SignalQueue, SignalSet};
 
@@ -90,6 +90,19 @@ pub(crate) enum ExecutionContext {
     Vm(vm::VcpuContext),
 }
 
+#[derive(Default)]
+struct ThreadResourceUsage {
+    user_cpu_time_ns: u64,
+    system_cpu_time_ns: u64,
+}
+
+impl ThreadResourceUsage {
+    fn total_cpu_time_ns(&self) -> u64 {
+        self.user_cpu_time_ns
+            .saturating_add(self.system_cpu_time_ns)
+    }
+}
+
 impl ExecutionContext {
     fn user_kernel_stack_pointer(&self) -> Option<usize> {
         match self {
@@ -132,7 +145,8 @@ pub(crate) struct Thread {
     pub(crate) joiner: usize,
     pub(crate) detached: bool,
     pub(crate) errno: i32,
-    cpu_time_ns: u64,
+    resource_usage: ThreadResourceUsage,
+    in_kernel: bool,
     running_since_ns: Option<u64>,
     cleanup_handlers: Vec<CleanupHandler>,
     pub(crate) tls: [usize; ThreadManager::MAX_TLS_KEYS],
@@ -184,7 +198,8 @@ impl Thread {
             joiner: 0,
             detached: false,
             errno: 0,
-            cpu_time_ns: 0,
+            resource_usage: ThreadResourceUsage::default(),
+            in_kernel: false,
             running_since_ns: None,
             cleanup_handlers: Vec::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
@@ -223,7 +238,8 @@ impl Thread {
             joiner: 0,
             detached,
             errno: 0,
-            cpu_time_ns: 0,
+            resource_usage: ThreadResourceUsage::default(),
+            in_kernel: false,
             running_since_ns: None,
             cleanup_handlers: Vec::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
@@ -260,7 +276,8 @@ impl Thread {
             joiner: 0,
             detached,
             errno: 0,
-            cpu_time_ns: 0,
+            resource_usage: ThreadResourceUsage::default(),
+            in_kernel: false,
             running_since_ns: None,
             cleanup_handlers: Vec::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
@@ -298,7 +315,8 @@ impl Thread {
             joiner: 0,
             detached,
             errno: 0,
-            cpu_time_ns: 0,
+            resource_usage: ThreadResourceUsage::default(),
+            in_kernel: false,
             running_since_ns: None,
             cleanup_handlers: Vec::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
@@ -473,8 +491,19 @@ impl ThreadManager {
         if let Some(thread) = self.busy.front_mut() {
             if let Some(started_ns) = thread.running_since_ns.take() {
                 let elapsed_ns = now_ns.saturating_sub(started_ns);
-                thread.cpu_time_ns = thread.cpu_time_ns.saturating_add(elapsed_ns);
-                thread.process.add_cpu_time_ns(elapsed_ns);
+                if thread.in_kernel {
+                    thread.resource_usage.system_cpu_time_ns = thread
+                        .resource_usage
+                        .system_cpu_time_ns
+                        .saturating_add(elapsed_ns);
+                    thread.process.add_system_cpu_time_ns(elapsed_ns);
+                } else {
+                    thread.resource_usage.user_cpu_time_ns = thread
+                        .resource_usage
+                        .user_cpu_time_ns
+                        .saturating_add(elapsed_ns);
+                    thread.process.add_cpu_time_ns(elapsed_ns);
+                }
             }
         }
     }
@@ -767,17 +796,27 @@ impl ThreadManager {
     }
 
     pub(crate) fn switch_current(next_state: ThreadState) -> bool {
-        Self::switch_current_inner(next_state, false, true)
+        Self::switch_current_inner(
+            next_state,
+            false,
+            true,
+            next_state == ThreadState::Blocked,
+        )
+    }
+
+    pub(crate) fn yield_current() -> bool {
+        Self::switch_current_inner(ThreadState::Ready, false, true, true)
     }
 
     pub(crate) fn switch_current_for_signal() -> bool {
-        Self::switch_current_inner(ThreadState::Blocked, true, true)
+        Self::switch_current_inner(ThreadState::Blocked, true, true, true)
     }
 
     fn switch_current_inner(
         next_state: ThreadState,
         check_signal_wake: bool,
         check_process_stopped: bool,
+        voluntary: bool,
     ) -> bool {
         let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
         if !matches!(next_state, ThreadState::Ready | ThreadState::Blocked) {
@@ -802,6 +841,7 @@ impl ThreadManager {
                 let now_ns = scheduler_time_ns();
                 manager.account_current_cpu_time(now_ns);
                 if let Some(mut current) = manager.busy.pop_front() {
+                    current.process.record_context_switch(voluntary);
                 let old_context = current.context.kernel_mut() as *mut kernel::Context;
                 current.state = next_state;
                 if next_state == ThreadState::Ready {
@@ -1139,7 +1179,7 @@ impl ThreadManager {
             if let Some(thread) = THREAD_MANAGER.lock().busy.front_mut() {
                 thread.process_stop_wait = true;
             }
-            if !Self::switch_current_inner(ThreadState::Blocked, true, false) {
+            if !Self::switch_current_inner(ThreadState::Blocked, true, false, true) {
                 if Self::take_current_process_stop_wake() || Self::take_current_signal_wake() {
                     continue;
                 }
@@ -1213,7 +1253,7 @@ impl ThreadManager {
         let manager = THREAD_MANAGER.lock();
         let now_ns = scheduler_time_ns();
         manager.busy.front().map_or(0, |thread| {
-            thread.cpu_time_ns.saturating_add(
+            thread.resource_usage.total_cpu_time_ns().saturating_add(
                 thread
                     .running_since_ns
                     .map_or(0, |started_ns| now_ns.saturating_sub(started_ns)),
@@ -1232,6 +1272,47 @@ impl ThreadManager {
                 .running_since_ns
                 .map_or(0, |started_ns| now_ns.saturating_sub(started_ns)),
         )
+    }
+
+    pub(crate) fn current_process_resource_usage_snapshot() -> Option<ResourceUsageSnapshot> {
+        let manager = THREAD_MANAGER.lock();
+        let thread = manager.busy.front()?;
+        let mut usage = thread.process.resource_usage_snapshot();
+        if let Some(started_ns) = thread.running_since_ns {
+            let elapsed_ns = scheduler_time_ns().saturating_sub(started_ns);
+            if thread.in_kernel {
+                usage.system_cpu_time_ns = usage.system_cpu_time_ns.saturating_add(elapsed_ns);
+            } else {
+                usage.user_cpu_time_ns = usage.user_cpu_time_ns.saturating_add(elapsed_ns);
+            }
+        }
+        Some(usage)
+    }
+
+    pub(crate) fn begin_syscall_accounting() {
+        let mut manager = THREAD_MANAGER.lock();
+        if !manager.initialized {
+            return;
+        }
+        let now_ns = scheduler_time_ns();
+        manager.account_current_cpu_time(now_ns);
+        if let Some(thread) = manager.busy.front_mut() {
+            thread.in_kernel = true;
+            thread.running_since_ns = Some(now_ns);
+        }
+    }
+
+    pub(crate) fn end_syscall_accounting() {
+        let mut manager = THREAD_MANAGER.lock();
+        if !manager.initialized {
+            return;
+        }
+        let now_ns = scheduler_time_ns();
+        manager.account_current_cpu_time(now_ns);
+        if let Some(thread) = manager.busy.front_mut() {
+            thread.in_kernel = false;
+            thread.running_since_ns = Some(now_ns);
+        }
     }
 
     pub(crate) fn process_cpu_time_ns(process: &Process) -> u64 {

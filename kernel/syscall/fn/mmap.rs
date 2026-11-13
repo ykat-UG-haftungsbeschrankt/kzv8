@@ -5,7 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use super::{protection_to_vm, PROT_EXEC, PROT_READ, PROT_WRITE};
+use super::{protection_to_vm, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE};
 use super::super::SyscallFrame;
 use crate::kernel::error::Error;
 
@@ -53,12 +53,28 @@ impl Mmap {
         };
         let process = crate::kernel::scheduler::thread::ThreadManager::current_process()?;
         let (address_space_limit, _) = process.resource_limit(9)?;
+        let Some(rounded_length) = length
+            .checked_add(PAGE_SIZE - 1)
+            .map(|length| length & !(PAGE_SIZE - 1))
+        else {
+            return Err(Error::NoMem);
+        };
+        let mapped_bytes = u64::try_from(rounded_length).map_err(|_| Error::NoMem)?;
+        process.try_reserve_memory(mapped_bytes)?;
         let address_space = process.address_space();
         let hint = (arguments.address_hint != 0).then_some(arguments.address_hint as usize);
-        address_space
-            .reserve_user_mapping_limited(hint, length, permissions, address_space_limit)
-            .map(|address| address as i64)
-            .ok_or(Error::NoMem)
+        match address_space.reserve_user_mapping_limited(
+            hint,
+            length,
+            permissions,
+            address_space_limit,
+        ) {
+            Some(address) => Ok(address as i64),
+            None => {
+                process.release_memory(mapped_bytes, mapped_bytes, 0);
+                Err(Error::NoMem)
+            }
+        }
     }
 
     pub(crate) fn handle(frame: SyscallFrame) -> Result<i64, Error> {

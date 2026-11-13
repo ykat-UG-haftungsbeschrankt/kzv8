@@ -20,7 +20,7 @@ use crate::kernel::arch::MemoryArchitecture;
 #[allow(unused_imports)]
 use crate::kernel::driver::virtio::console::Console;
 #[allow(unused_imports)]
-use crate::kernel::event::r#loop::{EventLoop, EventSourceToken};
+use crate::kernel::event::{EventLoop, EventSourceToken};
 use crate::kernel::memory::physical::PhysicalAllocator;
 #[allow(unused_imports)]
 use crate::kernel::net::stack::NetStack;

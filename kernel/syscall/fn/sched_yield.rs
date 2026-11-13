@@ -7,7 +7,7 @@
 
 use super::super::SyscallFrame;
 use crate::kernel::error::Error;
-use crate::kernel::scheduler::thread::{ThreadManager, ThreadState};
+use crate::kernel::scheduler::thread::ThreadManager;
 
 pub(crate) struct SchedYield;
 
@@ -17,7 +17,7 @@ impl SchedYield {
     pub(crate) const ID: u64 = crate::kernel::arch::syscall::SchedYield;
 
     pub(crate) fn callback(_arguments: SchedYieldArguments) -> Result<i64, Error> {
-        let _switched = ThreadManager::switch_current(ThreadState::Ready);
+        let _switched = ThreadManager::yield_current();
         Ok(0)
     }
 

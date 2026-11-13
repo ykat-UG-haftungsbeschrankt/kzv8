@@ -13,7 +13,7 @@ use core::ptr::read_volatile;
 use crate::kernel::arch::traits::TimerArchitecture as _;
 use crate::kernel::dl::AddressSpace;
 use crate::kernel::error::Error;
-use crate::kernel::event::r#loop::EventLoop;
+use crate::kernel::event::{EventLoop, EventLoopApi as _};
 use crate::kernel::process::KernelObjectRef;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::scheduler::thread::{vm::UserAddressSpace, ThreadAttributes, ThreadManager};

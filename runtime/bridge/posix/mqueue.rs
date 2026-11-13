@@ -307,6 +307,7 @@ fn send_message(
                 if let Some(notification) = notification {
                     dispatch_notification(notification);
                 }
+                process.record_message_sent();
                 return Ok(());
             }
             Err(EAGAIN) => {
@@ -407,6 +408,7 @@ fn receive_message(
                 if !priority.is_null() {
                     write_user_value(&process, priority, &received.priority)?;
                 }
+                process.record_message_received();
                 return isize::try_from(received.bytes.len()).map_err(|_| EINVAL);
             }
             Err(EAGAIN) => {

@@ -9,6 +9,7 @@
 mod r#fn;
 
 use crate::kernel::error::Error;
+use crate::kernel::scheduler::thread::ThreadManager;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,6 +20,7 @@ pub(crate) struct SyscallFrame {
 }
 
 pub(crate) fn dispatch(frame: &mut SyscallFrame) {
+    ThreadManager::begin_syscall_accounting();
     let result = match frame.number {
         r#fn::exit::Exit::ID => r#fn::exit::Exit::handle(*frame),
         r#fn::exit_group::ExitGroup::ID => r#fn::exit_group::ExitGroup::handle(*frame),
@@ -38,4 +40,5 @@ pub(crate) fn dispatch(frame: &mut SyscallFrame) {
         _ => Err(Error::NoSys),
     };
     frame.result = result.unwrap_or_else(|error| error as i64);
+    ThreadManager::end_syscall_accounting();
 }

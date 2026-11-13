@@ -24,7 +24,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::kernel::error::Error;
-use crate::kernel::event::r#loop::{EventFlags, EventLoop, EventSourceId, EventSourceToken};
+use crate::kernel::event::{
+    EventFlags, EventFlagsApi, EventLoop, EventLoopApi as _, EventSourceId, EventSourceToken,
+};
 use crate::kernel::net::arp::{ArpOperation, ArpPacket, ARP_PACKET_LENGTH};
 use crate::kernel::net::device::EthernetDevice;
 use crate::kernel::net::icmp::{

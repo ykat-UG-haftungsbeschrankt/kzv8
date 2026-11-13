@@ -46,11 +46,14 @@ pub unsafe extern "C" fn times(buffer: *mut c_void) -> i64 {
             return -1;
         }
     };
+    let process_usage = ThreadManager::current_process_resource_usage_snapshot()
+        .unwrap_or_else(|| process.resource_usage_snapshot());
+    let child_usage = process.child_resource_usage_snapshot();
     let value = Tms {
-        user_time: cpu_ticks(ThreadManager::current_process_cpu_time_ns()),
-        system_time: 0,
-        child_user_time: cpu_ticks(process.child_cpu_time_ns()),
-        child_system_time: 0,
+        user_time: cpu_ticks(process_usage.user_cpu_time_ns),
+        system_time: cpu_ticks(process_usage.system_cpu_time_ns),
+        child_user_time: cpu_ticks(child_usage.user_cpu_time_ns),
+        child_system_time: cpu_ticks(child_usage.system_cpu_time_ns),
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(

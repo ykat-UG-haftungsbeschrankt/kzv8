@@ -14,8 +14,9 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::block::service::BlockClient;
 use crate::kernel::error::Error;
-use crate::kernel::event::r#loop::{
-    Completion, Event, EventFlags, EventLoop, EventSourceId, EventSourceToken,
+use crate::kernel::event::{
+    Completion, Event, EventFlags, EventFlagsApi, EventLoop, EventLoopApi as _, EventSourceId,
+    EventSourceIdApi, EventSourceToken, EventSourceTokenApi,
 };
 use crate::kernel::process::KernelObjectRef;
 use crate::kernel::net::tcp::connection::{TcpSocketHandle, TcpState};
@@ -690,7 +691,11 @@ pub unsafe extern "C" fn kz_host_event_loop_register(
         return 0;
     };
     let events = unsafe { &mut *context.cast::<EventLoop<16>>() };
-    let Ok(source_token) = events.register(EventSourceId::new(source_id), interest, data) else {
+    let Ok(source_token) = events.register(
+        <EventSourceId as EventSourceIdApi>::new(source_id),
+        interest,
+        data,
+    ) else {
         return 0;
     };
     unsafe { token.write(source_token.raw()) };

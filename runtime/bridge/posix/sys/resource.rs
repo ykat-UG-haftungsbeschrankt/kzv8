@@ -33,7 +33,20 @@ struct Timeval {
 struct RUsage {
     user_time: Timeval,
     system_time: Timeval,
-    counters: [c_long; 14],
+    max_resident_set: c_long,
+    integral_shared_memory: c_long,
+    integral_unshared_data: c_long,
+    integral_unshared_stack: c_long,
+    minor_page_faults: c_long,
+    major_page_faults: c_long,
+    swaps: c_long,
+    input_blocks: c_long,
+    output_blocks: c_long,
+    messages_sent: c_long,
+    messages_received: c_long,
+    signals_received: c_long,
+    voluntary_context_switches: c_long,
+    involuntary_context_switches: c_long,
 }
 
 const PRIO_PROCESS: c_int = 0;
@@ -41,6 +54,19 @@ const PRIO_PGRP: c_int = 1;
 const PRIO_USER: c_int = 2;
 const RUSAGE_SELF: c_int = 0;
 const RUSAGE_CHILDREN: c_int = -1;
+
+fn timeval(cpu_time_ns: u64) -> Result<Timeval, Error> {
+    let seconds = c_long::try_from(cpu_time_ns / 1_000_000_000).map_err(|_| Error::Overflow)?;
+    let microseconds = ((cpu_time_ns % 1_000_000_000) / 1000) as c_long;
+    Ok(Timeval {
+        seconds,
+        microseconds,
+    })
+}
+
+fn counter(value: u64) -> c_long {
+    c_long::try_from(value).unwrap_or(c_long::MAX)
+}
 
 fn processes_for_priority(
     which: c_int,
@@ -142,26 +168,35 @@ pub unsafe extern "C" fn getrusage(_who: c_int, _usage: *mut core::ffi::c_void) 
         Ok(process) => process,
         Err(error) => return fail(error),
     };
-    let cpu_time_ns = match _who {
-        RUSAGE_SELF => ThreadManager::current_process_cpu_time_ns(),
-        RUSAGE_CHILDREN => process.child_cpu_time_ns(),
+    let usage = match _who {
+        RUSAGE_SELF => ThreadManager::current_process_resource_usage_snapshot()
+            .unwrap_or_else(|| process.resource_usage_snapshot()),
+        RUSAGE_CHILDREN => process.child_resource_usage_snapshot(),
         _ => return fail(Error::Inval),
     };
-    let seconds = match c_long::try_from(cpu_time_ns / 1_000_000_000) {
-        Ok(seconds) => seconds,
-        Err(_) => return fail(Error::Overflow),
-    };
-    let microseconds = ((cpu_time_ns % 1_000_000_000) / 1000) as c_long;
     let value = RUsage {
-        user_time: Timeval {
-            seconds,
-            microseconds,
+        user_time: match timeval(usage.user_cpu_time_ns) {
+            Ok(value) => value,
+            Err(error) => return fail(error),
         },
-        system_time: Timeval {
-            seconds: 0,
-            microseconds: 0,
+        system_time: match timeval(usage.system_cpu_time_ns) {
+            Ok(value) => value,
+            Err(error) => return fail(error),
         },
-        counters: [0; 14],
+        max_resident_set: counter(usage.max_rss_bytes / 1024),
+        integral_shared_memory: 0,
+        integral_unshared_data: 0,
+        integral_unshared_stack: 0,
+        minor_page_faults: counter(usage.minor_page_faults),
+        major_page_faults: counter(usage.major_page_faults),
+        swaps: counter(usage.swaps),
+        input_blocks: counter(usage.input_blocks),
+        output_blocks: counter(usage.output_blocks),
+        messages_sent: counter(usage.messages_sent),
+        messages_received: counter(usage.messages_received),
+        signals_received: counter(usage.signals_received),
+        voluntary_context_switches: counter(usage.voluntary_context_switches),
+        involuntary_context_switches: counter(usage.involuntary_context_switches),
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(
