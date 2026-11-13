@@ -5,8 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
-use alloc::vec::Vec;
-
+mod dl;
 mod elf;
 
 pub(crate) use elf::{ElfKind, LoadedObject};
@@ -23,47 +22,24 @@ pub(crate) trait FileSource {
 }
 
 pub(crate) struct SliceFile<'a> {
-    bytes: &'a [u8],
+    state: dl::SliceFileState<'a>,
 }
 
-impl<'a> SliceFile<'a> {
-    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-}
-
-impl FileSource for SliceFile<'_> {
-    fn len(&self) -> u64 {
-        self.bytes.len() as u64
-    }
-
-    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize, Error> {
-        let offset = usize::try_from(offset).map_err(|_| Error::Overflow)?;
-        if offset >= self.bytes.len() {
-            return Ok(0);
-        }
-        let count = buffer.len().min(self.bytes.len() - offset);
-        buffer[..count].copy_from_slice(&self.bytes[offset..offset + count]);
-        Ok(count)
-    }
+pub(crate) trait SliceFileApi<'a>: Sized {
+    fn new(bytes: &'a [u8]) -> Self;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Permissions(u8);
 
-impl Permissions {
-    pub(crate) const NONE: Self = Self(0);
-    pub(crate) const READ: Self = Self(1);
-    pub(crate) const WRITE: Self = Self(2);
-    pub(crate) const EXECUTE: Self = Self(4);
+pub(crate) trait PermissionsApi: Sized {
+    const NONE: Self;
+    const READ: Self;
+    const WRITE: Self;
+    const EXECUTE: Self;
 
-    pub(crate) const fn from_bits(bits: u8) -> Self {
-        Self(bits & 0x07)
-    }
-
-    pub(crate) const fn bits(self) -> u8 {
-        self.0
-    }
+    fn from_bits(bits: u8) -> Self;
+    fn bits(self) -> u8;
 }
 
 pub(crate) trait AddressSpace {
@@ -108,51 +84,9 @@ struct ScopedSymbol<'a> {
 }
 
 pub(crate) struct SymbolScope<'a> {
-    symbols: Vec<ScopedSymbol<'a>>,
+    state: dl::SymbolScopeState<'a>,
 }
 
-impl<'a> SymbolScope<'a> {
-    pub(crate) fn new(objects: &[&'a LoadedObject]) -> Result<Self, Error> {
-        const MAX_SCOPE_SYMBOLS: usize = 1 << 20;
-
-        let symbol_count = objects.iter().try_fold(0usize, |count, object| {
-            count
-                .checked_add(object.exported_symbols().count())
-                .ok_or(Error::Overflow)
-        })?;
-        if symbol_count > MAX_SCOPE_SYMBOLS {
-            return Err(Error::Fbig);
-        }
-        let mut symbols = Vec::new();
-        symbols
-            .try_reserve_exact(symbol_count)
-            .map_err(|_| Error::NoMem)?;
-        let mut order = 0usize;
-        for object in objects {
-            for (name, address, _weak) in object.exported_symbols() {
-                symbols.push(ScopedSymbol {
-                    name,
-                    address,
-                    order,
-                });
-                order += 1;
-            }
-        }
-        symbols.sort_unstable_by(|left, right| {
-            left.name.cmp(right.name).then(left.order.cmp(&right.order))
-        });
-        Ok(Self { symbols })
-    }
-}
-
-impl SymbolResolver for SymbolScope<'_> {
-    fn resolve(&mut self, name: &[u8]) -> Option<ResolvedSymbol> {
-        let index = self.symbols.partition_point(|symbol| symbol.name < name);
-        self.symbols
-            .get(index)
-            .filter(|symbol| symbol.name == name)
-            .map(|symbol| ResolvedSymbol {
-                address: symbol.address,
-            })
-    }
+pub(crate) trait SymbolScopeApi<'a>: Sized {
+    fn new(objects: &[&'a LoadedObject]) -> Result<Self, Error>;
 }

@@ -9,7 +9,7 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::kernel::arch::traits::InterruptArchitecture as _;
-use crate::kernel::dl::{AddressSpace, Error, Permissions};
+use crate::kernel::dl::{AddressSpace, Error, Permissions, PermissionsApi as _};
 use super::vm::UserAddressSpace;
 use super::{ThreadManager, ThreadStack, ThreadState};
 

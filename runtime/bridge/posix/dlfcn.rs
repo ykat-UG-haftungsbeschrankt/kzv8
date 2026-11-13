@@ -10,7 +10,10 @@ use core::ffi::{c_char, c_int, c_void};
 use core::mem::{size_of, MaybeUninit};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::kernel::dl::{AddressSpace, ElfKind, LoadedObject, SliceFile, SymbolScope};
+use crate::kernel::dl::{
+    AddressSpace, ElfKind, LoadedObject, SliceFile, SliceFileApi as _, SymbolScope,
+    SymbolScopeApi as _,
+};
 use crate::kernel::error::Error;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::scheduler::thread::{vm::UserAddressSpace, ThreadManager};

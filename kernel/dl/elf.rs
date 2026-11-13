@@ -8,7 +8,9 @@
 use alloc::vec::Vec;
 use crate::kernel::lib::alignment::align_up;
 use crate::kernel::lib::endian;
-use super::{AddressSpace, FileSource, Error, Permissions, SymbolResolver};
+use super::{
+    AddressSpace, Error, FileSource, Permissions, PermissionsApi as _, SymbolResolver,
+};
 
 const ELF_HEADER_SIZE: usize = 64;
 const PROGRAM_HEADER_SIZE: usize = 56;

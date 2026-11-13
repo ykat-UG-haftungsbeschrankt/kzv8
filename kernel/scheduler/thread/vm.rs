@@ -10,7 +10,9 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use crate::kernel::dl::{AddressSpace, ElfKind, Error, LoadedObject, Permissions};
+use crate::kernel::dl::{
+	AddressSpace, ElfKind, Error, LoadedObject, Permissions, PermissionsApi as _,
+};
 use crate::kernel::arch::traits::{
 	CpuArchitecture as _, InterruptArchitecture as _, MemoryArchitecture as _,
 	ThreadArchitecture as _,

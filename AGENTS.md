@@ -30,6 +30,11 @@
 - Prefer safe Rust and avoid `unsafe` whenever a safe API can express the operation.
 - When `unsafe` is necessary, keep the block minimal and document its safety invariants.
 
+## API and Implementation Separation
+- Keep module root files such as `mod.rs` focused on the module's API: type and trait declarations, constants, and re-exports.
+- Put concrete implementations, private state, and implementation-only helpers in child modules. Implement API traits outside the module root.
+- When splitting an existing module, preserve established import paths with re-exports. Use this separation where it clarifies a meaningful API boundary; avoid extra modules for trivial code.
+
 ## Object Identity
 - For identity of a live in-memory object, use its address (for `Arc<T>`, `Arc::as_ptr`) rather than assigning a separate integer ID and maintaining an integer-to-object mapping.
 - A trusted userspace API may expose that address as an opaque identity or correlation token for a live object. Do not dereference it, and do not use a raw kernel address as a descriptor, authorization token, or handle accepted back from userspace.
