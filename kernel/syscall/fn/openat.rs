@@ -13,7 +13,7 @@ use crate::kernel::dl::AddressSpace;
 use crate::kernel::error::Error;
 use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::scheduler::thread::vm::UserAddressSpace;
-use crate::kernel::vfs::OpenMode;
+use crate::kernel::vfs::{OpenMode, VfsApi as _};
 
 const AT_FDCWD: i64 = -100;
 const OPEN_ACCESS_MODE_MASK: u64 = 0x3;

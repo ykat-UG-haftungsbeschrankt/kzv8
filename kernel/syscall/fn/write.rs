@@ -8,6 +8,7 @@
 use crate::kernel::error::Error;
 use crate::kernel::dl::AddressSpace;
 use super::super::SyscallFrame;
+use crate::kernel::vfs::FileHandleApi as _;
 
 const MAX_WRITE_LENGTH: usize = 1 << 20;
 

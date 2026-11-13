@@ -194,12 +194,17 @@ pub(crate) fn validate_scheduling_parameters(
     policy: c_int,
     priority: c_int,
 ) -> Result<(), Error> {
+    let sporadic = if policy == SCHED_SPORADIC {
+        process.scheduling_configuration().sporadic
+    } else {
+        None
+    };
     validate_scheduling_configuration(
         process,
         SchedulingParameters {
             policy,
             priority,
-            sporadic: None,
+            sporadic,
         },
     )
 }
@@ -365,4 +370,44 @@ pub unsafe extern "C" fn sched_setscheduler(
 fn fail(error: Error) -> c_int {
     set_errno(as_errno(error));
     -1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scheduling_configuration_from_param, SchedParam, Timespec, SCHED_SPORADIC};
+
+    fn valid_parameters() -> SchedParam {
+        SchedParam {
+            priority: 80,
+            low_priority: 20,
+            replenishment_period: Timespec {
+                seconds: 0,
+                nanoseconds: 100_000_000,
+            },
+            initial_budget: Timespec {
+                seconds: 0,
+                nanoseconds: 10_000_000,
+            },
+            max_replenishments: 4,
+        }
+    }
+
+    #[test]
+    fn sporadic_sched_param_validates_budget_and_priority_fields() {
+        let scheduling = scheduling_configuration_from_param(SCHED_SPORADIC, valid_parameters())
+            .expect("valid sporadic parameters");
+        let server = scheduling.sporadic.expect("sporadic server parameters");
+        assert_eq!(server.low_priority, 20);
+        assert_eq!(server.replenishment_period_ns, 100_000_000);
+        assert_eq!(server.initial_budget_ns, 10_000_000);
+        assert_eq!(server.max_replenishments, 4);
+
+        let mut invalid = valid_parameters();
+        invalid.initial_budget.nanoseconds = 200_000_000;
+        assert!(scheduling_configuration_from_param(SCHED_SPORADIC, invalid).is_err());
+
+        let mut invalid = valid_parameters();
+        invalid.low_priority = invalid.priority;
+        assert!(scheduling_configuration_from_param(SCHED_SPORADIC, invalid).is_err());
+    }
 }

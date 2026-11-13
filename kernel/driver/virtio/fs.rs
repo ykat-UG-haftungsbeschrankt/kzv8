@@ -20,8 +20,8 @@ use crate::kernel::memory::dma::{DmaArena, DmaBuffer};
 use crate::kernel::process::{GroupId, UserId};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::vfs::{
-    AppendResult, DirectoryEntry, DirectoryPlugin, FilePlugin, Node, NodeMetadata, VfsFuture,
-    VfsResult,
+    AppendResult, DirectoryEntry, DirectoryPlugin, FilePlugin, Node, NodeApi as _, NodeMetadata,
+    NodeMetadataApi as _, VfsFuture, VfsResult,
 };
 
 struct FuseDirectory {

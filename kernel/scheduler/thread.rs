@@ -153,15 +153,26 @@ impl SporadicServer {
         };
         let mut index = 0;
         while index < self.replenishment_count {
-            let replenishment = self.replenishments[index];
+            let Some(replenishment) = self.replenishments.get(index).copied() else {
+                break;
+            };
             if replenishment.deadline_ns <= now_ns {
                 self.remaining_budget_ns = self
                     .remaining_budget_ns
                     .saturating_add(replenishment.budget_ns)
                     .min(parameters.initial_budget_ns);
                 self.replenishment_count -= 1;
-                self.replenishments[index] = self.replenishments[self.replenishment_count];
-                self.replenishments[self.replenishment_count] = Replenishment::default();
+                let last = self
+                    .replenishments
+                    .get(self.replenishment_count)
+                    .copied()
+                    .unwrap_or_default();
+                if let Some(slot) = self.replenishments.get_mut(index) {
+                    *slot = last;
+                }
+                if let Some(slot) = self.replenishments.get_mut(self.replenishment_count) {
+                    *slot = Replenishment::default();
+                }
             } else {
                 index += 1;
             }
@@ -172,9 +183,9 @@ impl SporadicServer {
         let Some(parameters) = self.parameters else {
             return;
         };
-        self.replenish_due(now_ns);
         let charged_ns = elapsed_ns.min(self.remaining_budget_ns);
         if charged_ns == 0 {
+            self.replenish_due(now_ns);
             return;
         }
         self.remaining_budget_ns -= charged_ns;
@@ -183,29 +194,39 @@ impl SporadicServer {
             .checked_add(SCHEDULER_TICK_NS - 1)
             .map(|deadline| deadline / SCHEDULER_TICK_NS * SCHEDULER_TICK_NS)
             .unwrap_or(u64::MAX);
-        if let Some(replenishment) = self.replenishments[..self.replenishment_count]
+        if let Some(replenishment) = self
+            .replenishments
             .iter_mut()
+            .take(self.replenishment_count)
             .find(|replenishment| replenishment.deadline_ns == rounded_deadline)
         {
             replenishment.budget_ns = replenishment.budget_ns.saturating_add(charged_ns);
+            self.replenish_due(now_ns);
             return;
         }
         let maximum = (parameters.max_replenishments as usize)
             .min(MAX_SPORADIC_REPLENISHMENTS as usize);
         if self.replenishment_count < maximum {
-            self.replenishments[self.replenishment_count] = Replenishment {
-                deadline_ns: rounded_deadline,
-                budget_ns: charged_ns,
-            };
-            self.replenishment_count += 1;
+            if let Some(slot) = self.replenishments.get_mut(self.replenishment_count) {
+                *slot = Replenishment {
+                    deadline_ns: rounded_deadline,
+                    budget_ns: charged_ns,
+                };
+                self.replenishment_count += 1;
+            }
         } else if maximum != 0 {
-            let latest = self.replenishments[..self.replenishment_count]
+            let Some(latest) = self
+                .replenishments
                 .iter_mut()
+                .take(self.replenishment_count)
                 .max_by_key(|replenishment| replenishment.deadline_ns)
-                .expect("nonzero sporadic replenishment count");
+            else {
+                return;
+            };
             latest.budget_ns = latest.budget_ns.saturating_add(charged_ns);
             latest.deadline_ns = latest.deadline_ns.max(rounded_deadline);
         }
+        self.replenish_due(now_ns);
     }
 }
 
@@ -240,7 +261,10 @@ mod sporadic_tests {
 
         assert_eq!(server.remaining_budget_ns, 0);
         assert_eq!(server.replenishment_count, 1);
-        assert_eq!(server.replenishments[0].deadline_ns, 120_000_000);
+        assert_eq!(
+            server.replenishments.first().unwrap().deadline_ns,
+            120_000_000
+        );
 
         server.replenish_due(119_999_999);
         assert_eq!(server.remaining_budget_ns, 0);
@@ -255,8 +279,9 @@ mod sporadic_tests {
         server.charge(1_000_000, 20_000_000);
 
         assert_eq!(server.replenishment_count, 1);
-        assert_eq!(server.replenishments[0].deadline_ns, 120_000_000);
-        assert_eq!(server.replenishments[0].budget_ns, 2_000_000);
+        let replenishment = server.replenishments.first().unwrap();
+        assert_eq!(replenishment.deadline_ns, 120_000_000);
+        assert_eq!(replenishment.budget_ns, 2_000_000);
         server.replenish_due(119_999_999);
         assert_eq!(server.remaining_budget_ns, 8_000_000);
         server.replenish_due(120_000_000);
@@ -318,6 +343,7 @@ pub(crate) struct Thread {
     signal_wake_pending: bool,
     cancellation_requested: bool,
     cancellation_enabled: bool,
+    cancellation_asynchronous: bool,
     sleep_deadline_ns: Option<u64>,
     process_stop_wait: bool,
     process_stop_wake: bool,
@@ -356,6 +382,12 @@ impl Thread {
     }
 
     fn scheduling_rank(&self) -> i32 {
+        if self.cancellation_enabled
+            && self.cancellation_asynchronous
+            && self.cancellation_requested
+        {
+            return i32::MAX;
+        }
         let scheduling = self.scheduling_configuration();
         if matches!(
             scheduling.policy,
@@ -393,6 +425,7 @@ impl Thread {
             signal_wake_pending: false,
             cancellation_requested: false,
             cancellation_enabled: true,
+            cancellation_asynchronous: false,
             sleep_deadline_ns: None,
             process_stop_wait: false,
             process_stop_wake: false,
@@ -435,6 +468,7 @@ impl Thread {
             signal_wake_pending: false,
             cancellation_requested: false,
             cancellation_enabled: true,
+            cancellation_asynchronous: false,
             sleep_deadline_ns: None,
             process_stop_wait: false,
             process_stop_wake: false,
@@ -475,6 +509,7 @@ impl Thread {
             signal_wake_pending: false,
             cancellation_requested: false,
             cancellation_enabled: true,
+            cancellation_asynchronous: false,
             sleep_deadline_ns: None,
             process_stop_wait: false,
             process_stop_wake: false,
@@ -516,6 +551,7 @@ impl Thread {
             signal_wake_pending: false,
             cancellation_requested: false,
             cancellation_enabled: true,
+            cancellation_asynchronous: false,
             sleep_deadline_ns: None,
             process_stop_wait: false,
             process_stop_wake: false,
@@ -1132,6 +1168,7 @@ impl ThreadManager {
         unsafe { Self::switch_threads(context) };
         Self::reap_pending();
         crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
+        Self::cancel_current_if_async_requested();
         Self::exit_if_process_terminated();
         if check_process_stopped {
             Self::wait_if_process_stopped();
@@ -1156,6 +1193,7 @@ impl ThreadManager {
                 thread.running_since_ns = Some(now_ns);
             }
         }
+        Self::cancel_current_if_async_requested();
         Process::tick_alarms(now_ns);
         Self::wake_expired_sleepers(now_ns);
         if let Ok(process) = Self::current_process() {
@@ -1630,6 +1668,16 @@ impl ThreadManager {
         Ok(previous)
     }
 
+    pub(crate) fn set_current_cancellation_asynchronous(
+        asynchronous: bool,
+    ) -> Result<bool, Error> {
+        let mut manager = THREAD_MANAGER.lock();
+        let thread = manager.busy.front_mut().ok_or(Error::Srch)?;
+        let previous = thread.cancellation_asynchronous;
+        thread.cancellation_asynchronous = asynchronous;
+        Ok(previous)
+    }
+
     pub(crate) fn cancellation_requested_current() -> bool {
         THREAD_MANAGER.lock().busy.front().is_some_and(|thread| {
             thread.cancellation_enabled && thread.cancellation_requested
@@ -1710,15 +1758,43 @@ impl ThreadManager {
             };
             if thread.cancellation_enabled && thread.cancellation_requested {
                 thread.cancellation_requested = false;
+                thread.cancellation_enabled = false;
                 true
             } else {
                 false
             }
         };
         if should_cancel {
-            Self::run_cleanup_handlers_current();
-            Self::run_tls_destructors_current();
-            Self::exit_current(usize::MAX as *mut c_void);
+            Self::finish_current_cancellation();
+        }
+    }
+
+    fn finish_current_cancellation() -> ! {
+        Self::run_cleanup_handlers_current();
+        Self::run_tls_destructors_current();
+        Self::exit_current(usize::MAX as *mut c_void)
+    }
+
+    pub(crate) fn cancel_current_if_async_requested() {
+        let should_cancel = {
+            let mut manager = THREAD_MANAGER.lock();
+            let Some(thread) = manager.busy.front_mut() else {
+                return;
+            };
+            if thread.cancellation_enabled
+                && thread.cancellation_asynchronous
+                && thread.cancellation_requested
+            {
+                thread.cancellation_requested = false;
+                thread.cancellation_enabled = false;
+                true
+            } else {
+                false
+            }
+        };
+        if should_cancel {
+            crate::kernel::arch::InterruptArchitecture::enable_interrupts();
+            Self::finish_current_cancellation();
         }
     }
 

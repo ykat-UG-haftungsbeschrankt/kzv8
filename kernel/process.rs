@@ -1204,10 +1204,13 @@ impl Process {
 
     pub(crate) fn set_scheduler_parameters(&self, policy: i32, priority: i32) {
         let mut control = self.control.lock();
+        let sporadic = (control.scheduling.policy == policy)
+            .then_some(control.scheduling.sporadic)
+            .flatten();
         control.scheduling = SchedulingParameters {
             policy,
             priority,
-            sporadic: None,
+            sporadic,
         };
     }
 
@@ -2371,7 +2374,7 @@ mod tests {
         SignalInfo, SignalSet, CLD_CONTINUED, CLD_KILLED, CLD_STOPPED, SIGCHLD, SIGCONT, SIGKILL,
         SIGSTOP,
     };
-    use crate::kernel::vfs::NodeMetadata;
+    use crate::kernel::vfs::{NodeMetadata, NodeMetadataApi as _};
 
     static PROCESS_CONTROL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

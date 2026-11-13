@@ -11,6 +11,7 @@ use super::super::SyscallFrame;
 use crate::kernel::dl::AddressSpace;
 use crate::kernel::error::Error;
 use crate::kernel::scheduler::thread::ThreadManager;
+use crate::kernel::vfs::FileHandleApi as _;
 
 const MAX_READ_LENGTH: usize = 1 << 20;
 

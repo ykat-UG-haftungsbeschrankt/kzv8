@@ -17,7 +17,9 @@ use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::error::Error as KernelError;
 use crate::kernel::process::{Credentials, GroupId, UserId};
 use crate::kernel::scheduler::thread::ThreadManager;
-use crate::kernel::vfs::{NodeMetadata, INODE_FLAG_APPEND, INODE_FLAG_IMMUTABLE};
+use crate::kernel::vfs::{
+    NodeMetadata, NodeMetadataApi as _, INODE_FLAG_APPEND, INODE_FLAG_IMMUTABLE,
+};
 
 use super::errno::{
     E2BIG, EAGAIN, EBADF, EBUSY, EEXIST, EFAULT, EFBIG, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT,

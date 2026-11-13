@@ -272,20 +272,31 @@ pub unsafe extern "C" fn pthread_setcanceltype(
     cancel_type: c_int,
     old_type: *mut c_int,
 ) -> c_int {
-    if cancel_type == PTHREAD_CANCEL_ASYNCHRONOUS {
-        return ENOSYS;
-    }
-    if cancel_type != PTHREAD_CANCEL_DEFERRED {
+    if !matches!(cancel_type, PTHREAD_CANCEL_DEFERRED | PTHREAD_CANCEL_ASYNCHRONOUS) {
         return as_errno(Error::Inval);
     }
     let process = match ThreadManager::current_process() {
         Ok(process) => process,
         Err(error) => return as_errno(error),
     };
-    match write_optional_int(&process, old_type, PTHREAD_CANCEL_DEFERRED) {
-        Ok(()) => 0,
-        Err(error) => as_errno(error),
+    let asynchronous = cancel_type == PTHREAD_CANCEL_ASYNCHRONOUS;
+    let previous = match ThreadManager::set_current_cancellation_asynchronous(asynchronous) {
+        Ok(previous) => previous,
+        Err(error) => return as_errno(error),
+    };
+    let previous_type = if previous {
+        PTHREAD_CANCEL_ASYNCHRONOUS
+    } else {
+        PTHREAD_CANCEL_DEFERRED
+    };
+    if let Err(error) = write_optional_int(&process, old_type, previous_type) {
+        let _ = ThreadManager::set_current_cancellation_asynchronous(previous);
+        return as_errno(error);
     }
+    if asynchronous {
+        ThreadManager::cancel_current_if_requested();
+    }
+    0
 }
 #[no_mangle]
 pub unsafe extern "C" fn pthread_cond_clockwait(
