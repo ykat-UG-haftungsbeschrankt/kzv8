@@ -28,6 +28,7 @@ const NAME_MAX: usize = 255;
 const DTYPE_UNKNOWN: u8 = 0;
 const DTYPE_DIR: u8 = 3;
 const DTYPE_REG: u8 = 5;
+const DTYPE_LNK: u8 = 6;
 const HANDLE_SLOT_BITS: usize = 8;
 const HANDLE_SLOT_MASK: usize = (1 << HANDLE_SLOT_BITS) - 1;
 const HANDLE_GENERATION_MASK: usize = usize::MAX >> HANDLE_SLOT_BITS;
@@ -239,6 +240,7 @@ fn entry_type(mode: u32) -> u8 {
     match mode & 0o170000 {
         0o040000 => DTYPE_DIR,
         0o100000 => DTYPE_REG,
+        0o120000 => DTYPE_LNK,
         _ => DTYPE_UNKNOWN,
     }
 }

@@ -11,14 +11,18 @@ use core::mem::size_of;
 use core::ptr;
 
 use crate::kernel::error::Error;
+use crate::kernel::dl::AddressSpace;
 use crate::kernel::net::wire::Ipv4Address;
 use crate::kernel::runtime::runtime_libc::network;
+use crate::kernel::scheduler::thread::ThreadManager;
 
 use super::super::errno::ENOSYS;
 
 const AF_INET: c_int = 2;
+const AF_UNIX: c_int = 1;
 const SOCK_NONBLOCK: c_int = 0x0000_0800;
 const SOCK_CLOEXEC: c_int = 0x0008_0000;
+const SOCK_CLOFORK: c_int = 0x0010_0000;
 const MSG_NOSIGNAL: c_int = 0x4000;
 const MSG_SUPPORTED: c_int = MSG_NOSIGNAL;
 const MAX_IOV_COUNT: usize = 1024;
@@ -115,6 +119,29 @@ unsafe fn write_sockaddr(
     Ok(())
 }
 
+unsafe fn write_local_sockaddr(
+    output: *mut c_void,
+    output_length: *mut u32,
+) -> Result<(), Error> {
+    if output.is_null() && output_length.is_null() {
+        return Ok(());
+    }
+    if output.is_null() || output_length.is_null() {
+        return Err(Error::Fault);
+    }
+    let address_length = size_of::<u16>();
+    let available = unsafe { ptr::read_unaligned(output_length) } as usize;
+    if available < address_length {
+        unsafe { ptr::write_unaligned(output_length, address_length as u32) };
+        return Err(Error::MsgSize);
+    }
+    unsafe {
+        ptr::write_unaligned(output.cast::<u16>(), AF_UNIX as u16);
+        ptr::write_unaligned(output_length, address_length as u32);
+    }
+    Ok(())
+}
+
 fn unavailable() -> c_int {
     unsafe {
         crate::kernel::scheduler::thread::__errno_location().write(ENOSYS);
@@ -207,6 +234,15 @@ pub unsafe extern "C" fn getpeername(
     address: *mut c_void,
     address_length: *mut u32,
 ) -> c_int {
+    if network::is_local_socket_fd(socket) {
+        if let Err(error) = network::validate_local_socket(socket) {
+            return fail(error);
+        }
+        return match unsafe { write_local_sockaddr(address, address_length) } {
+            Ok(()) => 0,
+            Err(error) => fail(error),
+        };
+    }
     let (address_value, port) = match network::endpoint(socket, true) {
         Ok(endpoint) => endpoint,
         Err(error) => return fail(error),
@@ -223,6 +259,15 @@ pub unsafe extern "C" fn getsockname(
     address: *mut c_void,
     address_length: *mut u32,
 ) -> c_int {
+    if network::is_local_socket_fd(socket) {
+        if let Err(error) = network::validate_local_socket(socket) {
+            return fail(error);
+        }
+        return match unsafe { write_local_sockaddr(address, address_length) } {
+            Ok(()) => 0,
+            Err(error) => fail(error),
+        };
+    }
     let (address_value, port) = match network::endpoint(socket, false) {
         Ok(endpoint) => endpoint,
         Err(error) => return fail(error),
@@ -325,14 +370,24 @@ pub unsafe extern "C" fn recvfrom(
         Err(error) => return fail_io(error),
     };
     if !address.is_null() {
-        let (peer_address, peer_port) = match source.or_else(|| network::endpoint(socket, true).ok()) {
-            Some(endpoint) => endpoint,
-            None => return fail_io(Error::NotConn),
-        };
-        if let Err(error) = unsafe {
-            write_sockaddr(address, address_length, peer_address, peer_port)
-        } {
-            return fail_io(error);
+        if network::is_local_socket_fd(socket) {
+            if let Err(error) = network::validate_local_socket(socket) {
+                return fail_io(error);
+            }
+            if let Err(error) = unsafe { write_local_sockaddr(address, address_length) } {
+                return fail_io(error);
+            }
+        } else {
+            let (peer_address, peer_port) =
+                match source.or_else(|| network::endpoint(socket, true).ok()) {
+                    Some(endpoint) => endpoint,
+                    None => return fail_io(Error::NotConn),
+                };
+            if let Err(error) = unsafe {
+                write_sockaddr(address, address_length, peer_address, peer_port)
+            } {
+                return fail_io(error);
+            }
         }
     }
     match isize::try_from(received) {
@@ -387,15 +442,28 @@ pub unsafe extern "C" fn recvmsg(
     }
     header.flags = 0;
     if !header.name.is_null() {
-        let peer = source.or_else(|| network::endpoint(socket, true).ok());
-        let Some((address, port)) = peer else {
-            return fail_io(Error::NotConn);
-        };
-        if let Err(error) = unsafe {
-            write_sockaddr(header.name, &mut header.name_length, address, port)
-        } {
-            unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
-            return fail_io(error);
+        if network::is_local_socket_fd(socket) {
+            if let Err(error) = network::validate_local_socket(socket) {
+                unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
+                return fail_io(error);
+            }
+            if let Err(error) = unsafe {
+                write_local_sockaddr(header.name, &mut header.name_length)
+            } {
+                unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
+                return fail_io(error);
+            }
+        } else {
+            let peer = source.or_else(|| network::endpoint(socket, true).ok());
+            let Some((address, port)) = peer else {
+                return fail_io(Error::NotConn);
+            };
+            if let Err(error) = unsafe {
+                write_sockaddr(header.name, &mut header.name_length, address, port)
+            } {
+                unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
+                return fail_io(error);
+            }
         }
     }
     unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
@@ -574,10 +642,40 @@ pub unsafe extern "C" fn socket(domain: c_int, socket_type: c_int, protocol: c_i
 
 #[no_mangle]
 pub unsafe extern "C" fn socketpair(
-    _domain: c_int,
-    _type: c_int,
-    _protocol: c_int,
-    _sockets: *mut c_int,
+    domain: c_int,
+    socket_type: c_int,
+    protocol: c_int,
+    sockets: *mut c_int,
 ) -> c_int {
-    unavailable()
+    if sockets.is_null() {
+        return fail(Error::Fault);
+    }
+    if domain != AF_UNIX {
+        return fail(Error::AfNoSupport);
+    }
+    if socket_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC | SOCK_CLOFORK | 0x0f) != 0 {
+        return fail(Error::Inval);
+    }
+    let (first, second) = match network::create_local_socket_pair(domain, socket_type, protocol) {
+        Ok(descriptors) => descriptors,
+        Err(error) => return fail(error),
+    };
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => {
+            let _ = network::close(first);
+            let _ = network::close(second);
+            return fail(error);
+        }
+    };
+    let descriptors = [first, second];
+    let output = unsafe {
+        core::slice::from_raw_parts(descriptors.as_ptr().cast::<u8>(), 2 * size_of::<c_int>())
+    };
+    if let Err(error) = process.address_space().write(sockets as usize, output) {
+        let _ = network::close(first);
+        let _ = network::close(second);
+        return fail(error);
+    }
+    0
 }

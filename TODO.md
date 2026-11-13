@@ -23,17 +23,13 @@ This list records kernel or runtime-kernel facilities indicated by `ENOSYS` stub
 ## VFS and Descriptors
 
 - [x] Add per-process filesystem context (current directory and umask) plus directory-descriptor-relative path resolution. `openat`, `fstatat`, `mkdirat`, and `unlinkat` resolve relative paths from a validated directory descriptor; `chdir`, `fchdir`, and `getcwd` use the process context.
-- [ ] Add file locking and complete descriptor duplication across sockets and standard descriptors. Runtime pipes now support blocking/nonblocking `pipe`/`pipe2`, duplicated endpoints, `POLLIN`/`POLLOUT`/hangup readiness, and EOF/`EPIPE`; regular-file `dup*`, `F_DUPFD*`, descriptor flags, `fcntl` status flags, `pread`/`pwrite`, `truncate`/`ftruncate`, and `posix_fallocate` use the runtime file table.
-- [ ] Complete VFS mutation and backing-filesystem hooks for hard links, symbolic links, timestamps, FIFOs, and device nodes. `chmod`/`chown` path and descriptor forms now use the existing metadata setters; persistent sync hooks remain backend-dependent.
-- [ ] Expose filesystem capacity information for `statvfs`/`fstatvfs`; `posix_fallocate` now reserves and extends in-memory regular-file data through the runtime filesystem.
+- [ ] Complete cross-table `dup2`/`dup3` targets between socket, packet, standard, and regular descriptors. Socket descriptors and regular files share open descriptions across `dup*`/`F_DUPFD*`; close-on-exec is per descriptor. Runtime pipes/FIFOs support blocking/nonblocking I/O, poll readiness, EOF, and `EPIPE`. Regular-file locks, `pread`/`pwrite`, `truncate`/`ftruncate`, `fcntl` flags, and `posix_fallocate` are implemented.
+- [x] Add device-node creation and sync semantics for the volatile runtime VFS. `mknod`/`mknodat` create regular, FIFO, character, and block special nodes; the standard null/zero character-device numbers are serviced, while unsupported devices fail with `ENODEV`. `fsync`/`fdatasync` validate syncable filesystem descriptors and succeed because this VFS has no persistent backend; `sync` is a no-op. Hard links, bounded symbolic-link traversal, timestamps, FIFOs, and chmod/chown path and descriptor forms also use the runtime filesystem.
+- [x] Expose filesystem allocation and capacity information for `posix_fallocate` and `statvfs`/`fstatvfs`. The runtime filesystem enforces 64 MiB logical data and 1024 inode limits and reports current free blocks/inodes.
 - [x] Provide stable device/inode identifiers for `ftok` and keyed IPC lookup. The runtime filesystem has stable device/inode metadata, and `ftok` now composes keys from it.
 
 ## Memory and IPC
 
-- [ ] Add page pinning and unpinning for `mlock`/`munlock`, including process-wide variants, and define backing-object synchronization semantics for `msync`.
-- [ ] Add POSIX shared-memory object creation, naming, unlink, and mapping lifecycle for `shm_open`/`shm_unlink`.
-- [ ] Add a namespaced IPC object registry with keys and validated identifiers, then implement System V message queues, semaphore sets, and shared-memory attach/detach/control operations. Existing endpoint and shared-memory capabilities do not provide these POSIX object semantics.
-- [ ] Add POSIX message queues with blocking/timed send and receive, notification, and attribute operations. Named POSIX semaphore storage, close/unlink lifetime, and timed waits now use the runtime registry and clock hooks.
 
 ## Scheduling and Accounting
 
@@ -42,13 +38,14 @@ This list records kernel or runtime-kernel facilities indicated by `ENOSYS` stub
 - [ ] Add resource-limit state and accounting for CPU time, child usage, priorities, and process/thread clocks. Wire `getrlimit`/`setrlimit`, `getrusage`, `times`, `getpriority`, and CPU-clock queries.
 - [ ] Add cancellation-point support; timed pthread condition and mutex waits now convert absolute clock deadlines to the existing monotonic scheduler clock and reacquire the mutex before returning. Keep barriers, rwlocks, spinlocks, and attribute bookkeeping in the userspace synchronization layer where possible.
 - [x] Add POSIX timer object lifecycle and notification semantics on top of the existing event timer queue; implement create/delete/get/set/overrun operations.
-- [ ] Add asynchronous I/O request tracking, completion results, cancellation, and suspend/wait operations for the POSIX AIO APIs.
+- [x] Add asynchronous I/O request tracking, completion results, queued cancellation, and suspend/list-wait operations for the POSIX AIO APIs.
 
 ## Devices and Networking
 
 - [ ] Add pseudoterminals (PTYs) with independent master/slave device state and session integration.
-- [ ] Add generic descriptor-based device-control dispatch for `ioctl`/`posix_devctl` and the terminal operations that depend on it.
-- [ ] Add local-domain sockets and `socketpair`, plus ancillary-message and out-of-band socket support needed by the remaining socket stubs.
+- [x] Add generic descriptor-based device-control dispatch for `ioctl`/`posix_devctl` and terminal window-size operations. Terminal attributes and line discipline use the existing TTY bridge.
+- [x] Implement unnamed `AF_UNIX` `SOCK_STREAM` `socketpair` endpoints with bounded in-memory duplex queues, nonblocking mode, shutdown/EOF, descriptor duplication, and poll readiness.
+- [ ] Add pathname-based local sockets, ancillary-message passing, and out-of-band socket support needed by the remaining socket stubs.
 - [x] Add a kernel cryptographically secure random-byte service and expose it to `getentropy` using the architecture-gated RDRAND/RNDR source.
 
 ## Existing Facilities to Wire

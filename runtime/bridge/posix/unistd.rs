@@ -56,7 +56,30 @@ unsafe extern "C" {
         path: *const c_char,
         owner: u32,
         group: u32,
+        flags: c_int,
     ) -> c_int;
+    fn kz_rust_lchown(path: *const c_char, owner: u32, group: u32) -> c_int;
+    fn kz_rust_link(source_path: *const c_char, destination_path: *const c_char) -> c_int;
+    fn kz_rust_linkat(
+        source_directory: c_int,
+        source_path: *const c_char,
+        destination_directory: c_int,
+        destination_path: *const c_char,
+        flags: c_int,
+    ) -> c_int;
+    fn kz_rust_symlink(target: *const c_char, link_path: *const c_char) -> c_int;
+    fn kz_rust_symlinkat(
+        target: *const c_char,
+        directory_descriptor: c_int,
+        link_path: *const c_char,
+    ) -> c_int;
+    fn kz_rust_readlink(path: *const c_char, buffer: *mut c_void, size: usize) -> isize;
+    fn kz_rust_readlinkat(
+        directory_descriptor: c_int,
+        path: *const c_char,
+        buffer: *mut c_void,
+        size: usize,
+    ) -> isize;
     fn nanosleep(request: *const Timespec, remaining: *mut Timespec) -> c_int;
     fn uname(output: *mut c_void) -> c_int;
 }
@@ -281,21 +304,26 @@ pub unsafe extern "C" fn fchownat(
         set_errno(EINVAL);
         return -1;
     }
-    unsafe { kz_rust_chownat(directory_descriptor, path, owner, group) }
+    unsafe { kz_rust_chownat(directory_descriptor, path, owner, group, flags) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn lchown(path: *const c_char, owner: u32, group: u32) -> c_int {
-    unsafe { kz_rust_chown(path, owner, group) }
+    unsafe { kz_rust_lchown(path, owner, group) }
 }
 
 #[no_mangle]
 pub extern "C" fn dup(file_descriptor: c_int) -> c_int {
-    match crate::kernel::runtime::runtime_libc::filesystem::duplicate(
-        file_descriptor,
-        3,
-        false,
-    ) {
+    let result = if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
+        crate::kernel::runtime::runtime_libc::network::duplicate_socket(file_descriptor, 0, false)
+            .map_err(|error| -(error as i32))
+    } else if crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor) {
+        crate::kernel::runtime::runtime_libc::network::duplicate_packet_fd(file_descriptor, 0, false)
+            .map_err(|error| -(error as i32))
+    } else {
+        crate::kernel::runtime::runtime_libc::filesystem::duplicate(file_descriptor, 3, false)
+    };
+    match result {
         Ok(descriptor) => descriptor,
         Err(error) => {
             set_errno(error);
@@ -306,11 +334,28 @@ pub extern "C" fn dup(file_descriptor: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn dup2(file_descriptor: c_int, new_descriptor: c_int) -> c_int {
-    match crate::kernel::runtime::runtime_libc::filesystem::duplicate_to(
-        file_descriptor,
-        new_descriptor,
-        false,
-    ) {
+    let result = if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
+        crate::kernel::runtime::runtime_libc::network::duplicate_socket_to(
+            file_descriptor,
+            new_descriptor,
+            false,
+        )
+        .map_err(|error| -(error as i32))
+    } else if crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor) {
+        crate::kernel::runtime::runtime_libc::network::duplicate_packet_fd_to(
+            file_descriptor,
+            new_descriptor,
+            false,
+        )
+        .map_err(|error| -(error as i32))
+    } else {
+        crate::kernel::runtime::runtime_libc::filesystem::duplicate_to(
+            file_descriptor,
+            new_descriptor,
+            false,
+        )
+    };
+    match result {
         Ok(descriptor) => descriptor,
         Err(error) => {
             set_errno(error);
@@ -329,11 +374,28 @@ pub extern "C" fn dup3(
         set_errno(EINVAL);
         return -1;
     }
-    match crate::kernel::runtime::runtime_libc::filesystem::duplicate_to(
-        file_descriptor,
-        new_descriptor,
-        flags & O_CLOEXEC != 0,
-    ) {
+    let result = if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
+        crate::kernel::runtime::runtime_libc::network::duplicate_socket_to(
+            file_descriptor,
+            new_descriptor,
+            flags & O_CLOEXEC != 0,
+        )
+        .map_err(|error| -(error as i32))
+    } else if crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor) {
+        crate::kernel::runtime::runtime_libc::network::duplicate_packet_fd_to(
+            file_descriptor,
+            new_descriptor,
+            flags & O_CLOEXEC != 0,
+        )
+        .map_err(|error| -(error as i32))
+    } else {
+        crate::kernel::runtime::runtime_libc::filesystem::duplicate_to(
+            file_descriptor,
+            new_descriptor,
+            flags & O_CLOEXEC != 0,
+        )
+    };
+    match result {
         Ok(descriptor) => descriptor,
         Err(error) => {
             set_errno(error);
@@ -447,15 +509,26 @@ pub unsafe extern "C" fn fexecve(
     fail_int()
 }
 
-// FIXME: The runtime VFS has no synchronization with persistent storage.
 #[no_mangle]
-pub extern "C" fn fdatasync(_file_descriptor: c_int) -> c_int {
-    fail_int()
+pub extern "C" fn fdatasync(file_descriptor: c_int) -> c_int {
+    match crate::kernel::runtime::runtime_libc::filesystem::sync_descriptor(file_descriptor, true) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn fsync(_file_descriptor: c_int) -> c_int {
-    fail_int()
+pub extern "C" fn fsync(file_descriptor: c_int) -> c_int {
+    match crate::kernel::runtime::runtime_libc::filesystem::sync_descriptor(file_descriptor, false) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
@@ -727,17 +800,6 @@ pub unsafe extern "C" fn getpgid(process: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn getpgrp() -> i32 {
     process_query(|process| Ok(process.process_group_id()))
-}
-
-#[no_mangle]
-pub extern "C" fn umask(mask: u32) -> u32 {
-    match ThreadManager::current_process() {
-        Ok(process) => process.set_umask(mask),
-        Err(error) => {
-            set_kernel_errno(error);
-            u32::MAX
-        }
-    }
 }
 
 #[no_mangle]
@@ -1103,56 +1165,61 @@ pub unsafe extern "C" fn swab(source: *const c_void, destination: *mut c_void, s
     }
 }
 
-// FIXME: The runtime VFS has no hard-link or symbolic-link operations.
 #[no_mangle]
-pub unsafe extern "C" fn link(_existing_path: *const c_char, _new_path: *const c_char) -> c_int {
-    fail_int()
+pub unsafe extern "C" fn link(existing_path: *const c_char, new_path: *const c_char) -> c_int {
+    unsafe { kz_rust_link(existing_path, new_path) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn linkat(
-    _old_directory_descriptor: c_int,
-    _old_path: *const c_char,
-    _new_directory_descriptor: c_int,
-    _new_path: *const c_char,
-    _flags: c_int,
+    old_directory_descriptor: c_int,
+    old_path: *const c_char,
+    new_directory_descriptor: c_int,
+    new_path: *const c_char,
+    flags: c_int,
 ) -> c_int {
-    fail_int()
+    unsafe {
+        kz_rust_linkat(
+            old_directory_descriptor,
+            old_path,
+            new_directory_descriptor,
+            new_path,
+            flags,
+        )
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn symlink(_target: *const c_char, _link_path: *const c_char) -> c_int {
-    fail_int()
+    unsafe { kz_rust_symlink(_target, _link_path) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn symlinkat(
-    _target: *const c_char,
-    _directory_descriptor: c_int,
-    _link_path: *const c_char,
+    target: *const c_char,
+    directory_descriptor: c_int,
+    link_path: *const c_char,
 ) -> c_int {
-    fail_int()
+    unsafe { kz_rust_symlinkat(target, directory_descriptor, link_path) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn readlink(
-    _path: *const c_char,
-    _buffer: *mut c_char,
-    _size: usize,
+    path: *const c_char,
+    buffer: *mut c_char,
+    size: usize,
 ) -> isize {
-    set_errno(ENOSYS);
-    -1
+    unsafe { kz_rust_readlink(path, buffer.cast(), size) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn readlinkat(
-    _directory_descriptor: c_int,
-    _path: *const c_char,
-    _buffer: *mut c_char,
-    _size: usize,
+    directory_descriptor: c_int,
+    path: *const c_char,
+    buffer: *mut c_char,
+    size: usize,
 ) -> isize {
-    set_errno(ENOSYS);
-    -1
+    unsafe { kz_rust_readlinkat(directory_descriptor, path, buffer.cast(), size) }
 }
 
 #[no_mangle]
@@ -1176,8 +1243,57 @@ pub extern "C" fn fpathconf(_file_descriptor: c_int, _name: c_int) -> c_long {
 }
 
 #[no_mangle]
-pub extern "C" fn lockf(_file_descriptor: c_int, _command: c_int, _length: i64) -> c_int {
-    fail_int()
+pub extern "C" fn lockf(file_descriptor: c_int, command: c_int, length: i64) -> c_int {
+    const F_ULOCK: c_int = 0;
+    const F_LOCK: c_int = 1;
+    const F_TLOCK: c_int = 2;
+    const F_TEST: c_int = 3;
+    let mut lock = crate::kernel::runtime::runtime_libc::filesystem::FileLockRecord {
+        lock_type: 1,
+        whence: 1,
+        start: 0,
+        length,
+        process_id: 0,
+    };
+    let result = match command {
+        F_ULOCK => {
+            lock.lock_type = 2;
+            crate::kernel::runtime::runtime_libc::filesystem::set_record_lock(
+                file_descriptor,
+                &lock,
+                false,
+            )
+        }
+        F_LOCK => crate::kernel::runtime::runtime_libc::filesystem::set_record_lock(
+            file_descriptor,
+            &lock,
+            true,
+        ),
+        F_TLOCK => crate::kernel::runtime::runtime_libc::filesystem::set_record_lock(
+            file_descriptor,
+            &lock,
+            false,
+        ),
+        F_TEST => crate::kernel::runtime::runtime_libc::filesystem::query_record_lock(
+            file_descriptor,
+            &mut lock,
+        )
+        .and_then(|()| {
+            if lock.lock_type == 2 {
+                Ok(())
+            } else {
+                Err(as_errno(KernelError::Acces))
+            }
+        }),
+        _ => return fail_int(),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
 }
 
 #[no_mangle]
@@ -1261,8 +1377,6 @@ pub unsafe extern "C" fn encrypt(_block: *mut c_char, _flag: c_int) {
     set_errno(ENOSYS);
 }
 
-// FIXME: The kernel has no persistent filesystem to synchronize.
 #[no_mangle]
 pub extern "C" fn sync() {
-    set_errno(ENOSYS);
 }

@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::ffi::{c_char, c_void, CStr};
 use core::ptr::{read_volatile, write_volatile};
 
+use crate::kernel::dl::AddressSpace;
 use crate::kernel::arch::traits::CpuArchitecture as _;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::error::Error as KernelError;
@@ -19,7 +20,7 @@ use crate::kernel::vfs::{NodeMetadata, INODE_FLAG_APPEND, INODE_FLAG_IMMUTABLE};
 
 use super::errno::{
     E2BIG, EAGAIN, EBADF, EBUSY, EEXIST, EFAULT, EFBIG, EINVAL, EISDIR, EMFILE, ENAMETOOLONG, ENOENT,
-    ENOMEM, ENOTDIR, ENOTEMPTY, ENOTTY, EPERM, ERANGE,
+    ENOMEM, ENOTDIR, ENOTEMPTY, ENOTTY, EOVERFLOW, EPERM, ERANGE,
 };
 use super::network;
 
@@ -38,6 +39,8 @@ const O_LARGEFILE: i32 = 0o100000;
 const O_DIRECTORY: i32 = 0o200000;
 const O_NOFOLLOW: i32 = 0o400000;
 const O_CLOEXEC: i32 = 0o2000000;
+const TIOCGWINSZ: usize = 0x5413;
+const TIOCSWINSZ: usize = 0x5414;
 const O_SUPPORTED: i32 = O_ACCMODE
     | O_CREAT
     | O_EXCL
@@ -54,17 +57,27 @@ const S_IFMT: u32 = 0o170000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFCHR: u32 = 0o020000;
+const S_IFBLK: u32 = 0o060000;
+const S_IFLNK: u32 = 0o120000;
 const S_IFREG: u32 = 0o100000;
 const S_IFSOCK: u32 = 0o140000;
+const DEVICE_NULL: u64 = 0x103;
+const DEVICE_ZERO: u64 = 0x105;
 const PATH_MAX: usize = 4096;
+const MAX_SYMLINKS: usize = 40;
 const DESCRIPTOR_COUNT: usize = 64;
 const FIRST_DESCRIPTOR: i32 = 3;
+const MAX_FILESYSTEM_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FILESYSTEM_INODES: usize = 1024;
+const FILESYSTEM_BLOCK_SIZE: usize = 4096;
 const AT_FDCWD: i32 = -100;
 const ROOT_NODE: usize = usize::MAX;
 const TERMINAL_NODE: usize = usize::MAX - 1;
 const PIPE_NODE: usize = usize::MAX - 2;
 const PIPE_CAPACITY: usize = 4096;
 const PIPE_BUF: usize = 512;
+const UTIME_NOW: i64 = (1 << 30) - 1;
+const UTIME_OMIT: i64 = (1 << 30) - 2;
 const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 64 * 1024;
 
@@ -95,15 +108,31 @@ pub(crate) struct CStat {
     reserved: [i64; 3],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CWindowSize {
+    rows: u16,
+    columns: u16,
+    x_pixels: u16,
+    y_pixels: u16,
+}
+
 #[derive(Clone)]
 struct Node {
     path: Option<Vec<u8>>,
+    aliases: Vec<Vec<u8>>,
+    symlink_target: Option<Vec<u8>>,
+    fifo_pipe_id: Option<usize>,
     data: Vec<u8>,
     open_count: usize,
     inode: u64,
+    special_device: u64,
     mode: u32,
     linked: bool,
     metadata: NodeMetadata,
+    accessed: Timespec,
+    modified: Timespec,
+    changed: Timespec,
 }
 
 #[derive(Clone, Copy)]
@@ -118,11 +147,31 @@ struct Descriptor {
     close_on_exec: bool,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct FileLockRecord {
+    pub(crate) lock_type: i16,
+    pub(crate) whence: i16,
+    pub(crate) start: i64,
+    pub(crate) length: i64,
+    pub(crate) process_id: i32,
+}
+
+#[derive(Clone, Copy)]
+struct RecordLock {
+    inode: u64,
+    process_id: i32,
+    start: i64,
+    end: Option<i64>,
+    lock_type: i16,
+}
+
 struct PipeBuffer {
     inode: u64,
     bytes: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    named_fifo: bool,
 }
 
 #[derive(Clone)]
@@ -132,13 +181,50 @@ pub(crate) struct DirectoryEntry {
     pub(crate) name: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct FileSystemCapacity {
+    pub(crate) block_size: u64,
+    pub(crate) fragment_size: u64,
+    pub(crate) blocks: u64,
+    pub(crate) free_blocks: u64,
+    pub(crate) available_blocks: u64,
+    pub(crate) files: u64,
+    pub(crate) free_files: u64,
+    pub(crate) available_files: u64,
+    pub(crate) filesystem_id: u64,
+    pub(crate) flags: u64,
+    pub(crate) name_max: u64,
+}
+
 struct FileSystem {
     nodes: Vec<Option<Node>>,
     descriptors: [Option<Descriptor>; DESCRIPTOR_COUNT],
     standard_descriptors: [bool; 3],
     pipes: Vec<Option<PipeBuffer>>,
+    record_locks: Vec<RecordLock>,
     root_metadata: Option<NodeMetadata>,
+    root_accessed: Timespec,
+    root_modified: Timespec,
+    root_changed: Timespec,
     next_inode: u64,
+}
+
+unsafe extern "C" {
+    fn clock_gettime(clock_id: i32, output: *mut Timespec) -> i32;
+}
+
+fn current_realtime() -> Timespec {
+    let mut now = Timespec {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    let _ = unsafe { clock_gettime(0, &mut now) };
+    now
+}
+
+fn ranges_overlap(left_start: i64, left_end: Option<i64>, right_start: i64, right_end: Option<i64>) -> bool {
+    left_end.is_none_or(|end| right_start < end)
+        && right_end.is_none_or(|end| left_start < end)
 }
 
 impl FileSystem {
@@ -148,7 +234,11 @@ impl FileSystem {
             descriptors: [None; DESCRIPTOR_COUNT],
             standard_descriptors: [true; 3],
             pipes: Vec::new(),
+            record_locks: Vec::new(),
             root_metadata: None,
+            root_accessed: Timespec { seconds: 0, nanoseconds: 0 },
+            root_modified: Timespec { seconds: 0, nanoseconds: 0 },
+            root_changed: Timespec { seconds: 0, nanoseconds: 0 },
             next_inode: 2,
         }
     }
@@ -162,7 +252,10 @@ impl FileSystem {
             .enumerate()
             .find_map(|(index, candidate)| {
                 let node = candidate.as_ref()?;
-                (node.linked && node.path.as_deref() == Some(path)).then_some(index)
+                (node.linked
+                    && (node.path.as_deref() == Some(path)
+                        || node.aliases.iter().any(|alias| alias.as_slice() == path)))
+                .then_some(index)
             })
     }
 
@@ -182,6 +275,21 @@ impl FileSystem {
         }
     }
 
+    fn symlink_target(&self, path: &[u8]) -> Result<Option<Vec<u8>>, i32> {
+        let Some(index) = self.find_node(path) else {
+            return Ok(None);
+        };
+        let node = self.nodes.get(index).and_then(Option::as_ref).ok_or(ENOENT)?;
+        if node.mode & S_IFMT != S_IFLNK {
+            return Ok(None);
+        }
+        let target = node.symlink_target.as_deref().ok_or(ENOENT)?;
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(target.len()).map_err(|_| ENOMEM)?;
+        copy.extend_from_slice(target);
+        Ok(Some(copy))
+    }
+
     fn node_length(&self, index: usize) -> Option<usize> {
         if index == ROOT_NODE {
             Some(0)
@@ -198,6 +306,37 @@ impl FileSystem {
         } else {
             self.nodes.get(index)?.as_ref().map(|node| node.inode)
         }
+    }
+
+    fn append_directory_entry(
+        &self,
+        directory_path: &[u8],
+        node: &Node,
+        path: &[u8],
+        entries: &mut Vec<DirectoryEntry>,
+    ) -> Result<(), i32> {
+        let child = if directory_path == b"/" {
+            path.strip_prefix(b"/")
+        } else {
+            path.strip_prefix(directory_path)
+                .and_then(|suffix| suffix.strip_prefix(b"/"))
+        };
+        let Some(name) = child.filter(|name| !name.is_empty() && !name.contains(&b'/')) else {
+            return Ok(());
+        };
+        if name.len() > 255 {
+            return Err(ENAMETOOLONG);
+        }
+        entries.try_reserve(1).map_err(|_| ENOMEM)?;
+        let mut name_copy = Vec::new();
+        name_copy.try_reserve_exact(name.len()).map_err(|_| ENOMEM)?;
+        name_copy.extend_from_slice(name);
+        entries.push(DirectoryEntry {
+            inode: node.inode,
+            mode: node.mode & S_IFMT,
+            name: name_copy,
+        });
+        Ok(())
     }
 
     fn read_directory(&self, file_descriptor: i32) -> Result<Vec<DirectoryEntry>, i32> {
@@ -243,29 +382,12 @@ impl FileSystem {
             if !node.linked {
                 continue;
             }
-            let Some(path) = node.path.as_deref() else {
-                continue;
-            };
-            let child = if directory_path == b"/" {
-                path.strip_prefix(b"/")
-            } else {
-                path.strip_prefix(directory_path)
-                    .and_then(|suffix| suffix.strip_prefix(b"/"))
-            };
-            let Some(name) = child.filter(|name| !name.is_empty() && !name.contains(&b'/')) else {
-                continue;
-            };
-            if name.len() > 255 {
-                return Err(ENAMETOOLONG);
+            if let Some(path) = node.path.as_deref() {
+                self.append_directory_entry(directory_path, node, path, &mut entries)?;
             }
-            let mut name_copy = Vec::new();
-            name_copy.try_reserve_exact(name.len()).map_err(|_| ENOMEM)?;
-            name_copy.extend_from_slice(name);
-            entries.push(DirectoryEntry {
-                inode: node.inode,
-                mode: node.mode & S_IFMT,
-                name: name_copy,
-            });
+            for path in &node.aliases {
+                self.append_directory_entry(directory_path, node, path, &mut entries)?;
+            }
         }
         Ok(entries)
     }
@@ -401,60 +523,6 @@ impl FileSystem {
             .map_err(metadata_errno)
     }
 
-    fn validate_path_components(
-        &mut self,
-        input: &[u8],
-        base: &[u8],
-        credentials: &Credentials,
-    ) -> Result<(), i32> {
-        if input == b"/dev/tty" || input == b"/dev/console" || input == b"/dev/net/tun" {
-            return Ok(());
-        }
-        let mut current = if input.first() == Some(&b'/') {
-            b"/".to_vec()
-        } else {
-            base.to_vec()
-        };
-        let mut components = input
-            .split(|byte| *byte == b'/')
-            .filter(|component| !component.is_empty())
-            .peekable();
-        self.check_directory_search(&current, credentials)?;
-        while let Some(component) = components.next() {
-            self.check_directory_search(&current, credentials)?;
-            match component {
-                b"." => {}
-                b".." => pop_path_component(&mut current),
-                component => {
-                    let separator = usize::from(current.len() > 1);
-                    if current.len() + separator + component.len() > PATH_MAX {
-                        return Err(ENAMETOOLONG);
-                    }
-                    if separator != 0 {
-                        current.push(b'/');
-                    }
-                    current.extend_from_slice(component);
-                    if components.peek().is_some() {
-                        let is_device_directory =
-                            (current.as_slice() == b"/dev"
-                                && components.peek().is_some_and(|next| {
-                                    *next == b"tty" || *next == b"console" || *next == b"net"
-                                }))
-                                || (current.as_slice() == b"/dev/net"
-                                    && components.peek().is_some_and(|next| *next == b"tun"));
-                        if !is_device_directory {
-                            let directory = self.find_node(&current).ok_or(ENOENT)?;
-                            if self.node_mode(directory).ok_or(ENOENT)? & S_IFMT != S_IFDIR {
-                                return Err(ENOTDIR);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn check_directory_search(
         &mut self,
         path: &[u8],
@@ -488,16 +556,27 @@ impl FileSystem {
         owner: UserId,
         group: GroupId,
     ) -> Result<usize, i32> {
+        if self.nodes.iter().flatten().count().saturating_add(1) >= MAX_FILESYSTEM_INODES {
+            return Err(-(KernelError::NoSpc as i32));
+        }
         let metadata = NodeMetadata::with_owner_and_mode(owner, group, (mode & 0o777) as u16)
             .map_err(metadata_errno)?;
+        let now = current_realtime();
         let node = Node {
             path,
+            aliases: Vec::new(),
+            symlink_target: None,
+            fifo_pipe_id: None,
             data: Vec::new(),
             open_count: 0,
             inode: self.next_inode,
+            special_device: 0,
             mode,
             linked,
             metadata,
+            accessed: now,
+            modified: now,
+            changed: now,
         };
         self.next_inode = self.next_inode.wrapping_add(1).max(2);
         if let Some(index) = self.nodes.iter().position(Option::is_none) {
@@ -508,6 +587,67 @@ impl FileSystem {
         let index = self.nodes.len();
         self.nodes.push(Some(node));
         Ok(index)
+    }
+
+    fn allocated_file_bytes(&self) -> usize {
+        self.nodes.iter().flatten().fold(0usize, |total, node| {
+            total
+                .saturating_add(node.data.len())
+                .saturating_add(node.symlink_target.as_ref().map_or(0, Vec::len))
+        })
+    }
+
+    fn check_file_capacity(&self, node_index: usize, new_length: usize) -> Result<(), i32> {
+        if new_length > MAX_FILESYSTEM_BYTES {
+            return Err(-(KernelError::NoSpc as i32));
+        }
+        let current_node = self
+            .nodes
+            .get(node_index)
+            .and_then(Option::as_ref)
+            .ok_or(EBADF)?;
+        let current_length = current_node
+            .data
+            .len()
+            .saturating_add(current_node.symlink_target.as_ref().map_or(0, Vec::len));
+        let projected = self
+            .allocated_file_bytes()
+            .saturating_sub(current_length)
+            .checked_add(new_length)
+            .and_then(|bytes| {
+                bytes.checked_add(current_node.symlink_target.as_ref().map_or(0, Vec::len))
+            })
+            .ok_or(-(KernelError::NoSpc as i32))?;
+        if projected > MAX_FILESYSTEM_BYTES {
+            return Err(-(KernelError::NoSpc as i32));
+        }
+        Ok(())
+    }
+
+    fn capacity(&self) -> FileSystemCapacity {
+        let allocated_bytes = self.nodes.iter().flatten().fold(0usize, |total, node| {
+            total
+                .saturating_add(node.data.len())
+                .saturating_add(node.symlink_target.as_ref().map_or(0, Vec::len))
+        });
+        let total_blocks = MAX_FILESYSTEM_BYTES.div_ceil(FILESYSTEM_BLOCK_SIZE) as u64;
+        let free_bytes = MAX_FILESYSTEM_BYTES.saturating_sub(allocated_bytes);
+        let free_blocks = (free_bytes / FILESYSTEM_BLOCK_SIZE) as u64;
+        let allocated_inodes = self.nodes.iter().flatten().count().saturating_add(1);
+        let free_inodes = MAX_FILESYSTEM_INODES.saturating_sub(allocated_inodes) as u64;
+        FileSystemCapacity {
+            block_size: FILESYSTEM_BLOCK_SIZE as u64,
+            fragment_size: FILESYSTEM_BLOCK_SIZE as u64,
+            blocks: total_blocks,
+            free_blocks,
+            available_blocks: free_blocks,
+            files: MAX_FILESYSTEM_INODES as u64,
+            free_files: free_inodes,
+            available_files: free_inodes,
+            filesystem_id: 1,
+            flags: 0,
+            name_max: 255,
+        }
     }
 
     fn open(
@@ -559,6 +699,26 @@ impl FileSystem {
         };
         let node_mode = self.node_mode(node_index).ok_or(ENOENT)?;
         let node_type = node_mode & S_IFMT;
+        if node_type == S_IFLNK {
+            return Err(-(KernelError::Loop as i32));
+        }
+        if node_type == S_IFBLK {
+            return Err(-(KernelError::NoDev as i32));
+        }
+        if node_type == S_IFCHR {
+            let device = self
+                .nodes
+                .get(node_index)
+                .and_then(Option::as_ref)
+                .map(|node| node.special_device)
+                .ok_or(ENOENT)?;
+            if !matches!(device, DEVICE_NULL | DEVICE_ZERO) {
+                return Err(-(KernelError::NoDev as i32));
+            }
+        }
+        if node_type == S_IFIFO && flags & O_TRUNC != 0 {
+            return Err(EINVAL);
+        }
         if flags & O_DIRECTORY != 0 && node_type != S_IFDIR {
             return Err(ENOTDIR);
         }
@@ -583,12 +743,36 @@ impl FileSystem {
         {
             return Err(EPERM);
         }
+        let fifo_pipe_id = if node_type == S_IFIFO {
+            let pipe_id = self
+                .nodes
+                .get(node_index)
+                .and_then(Option::as_ref)
+                .and_then(|node| node.fifo_pipe_id)
+                .ok_or(EBADF)?;
+            let pipe = self.pipes.get(pipe_id).and_then(Option::as_ref).ok_or(EBADF)?;
+            if access == O_WRONLY && flags & O_NONBLOCK != 0 && pipe.readers == 0 {
+                return Err(-(KernelError::Nxio as i32));
+            }
+            Some(pipe_id)
+        } else {
+            None
+        };
         if node_index != ROOT_NODE {
             let node = self.nodes[node_index].as_mut().ok_or(ENOENT)?;
             if flags & O_TRUNC != 0 {
                 node.data.clear();
             }
             node.open_count += 1;
+        }
+        if let Some(pipe_id) = fifo_pipe_id {
+            let pipe = self.pipes.get_mut(pipe_id).and_then(Option::as_mut).ok_or(EBADF)?;
+            if access != O_WRONLY {
+                pipe.readers = pipe.readers.checked_add(1).ok_or(EMFILE)?;
+            }
+            if access != O_RDONLY {
+                pipe.writers = pipe.writers.checked_add(1).ok_or(EMFILE)?;
+            }
         }
         let offset = if flags & O_APPEND != 0 {
             self.node_length(node_index).ok_or(ENOENT)? as i64
@@ -597,7 +781,7 @@ impl FileSystem {
         };
         self.descriptors[slot] = Some(Descriptor {
             node: node_index,
-            pipe_id: None,
+            pipe_id: fifo_pipe_id,
             offset,
             readable: access != O_WRONLY,
             writable: access != O_RDONLY,
@@ -658,6 +842,7 @@ impl FileSystem {
             bytes: VecDeque::new(),
             readers: 1,
             writers: 1,
+            named_fifo: false,
         });
         let nonblocking = flags & O_NONBLOCK != 0;
         let close_on_exec = flags & O_CLOEXEC != 0;
@@ -751,6 +936,21 @@ impl FileSystem {
             return Ok(0);
         }
         let node = self.nodes[descriptor.node].as_ref().ok_or(EBADF)?;
+        if node.mode & S_IFMT == S_IFCHR {
+            match node.special_device {
+                DEVICE_NULL => return Ok(0),
+                DEVICE_ZERO => {
+                    for index in 0..length {
+                        unsafe { write_volatile(buffer.add(index), 0) };
+                    }
+                    return Ok(length);
+                }
+                _ => return Err(-(KernelError::NoDev as i32)),
+            }
+        }
+        if node.mode & S_IFMT == S_IFBLK {
+            return Err(-(KernelError::NoDev as i32));
+        }
         if descriptor.offset < 0 || descriptor.offset as usize >= node.data.len() {
             return Ok(0);
         }
@@ -759,6 +959,10 @@ impl FileSystem {
         for index in 0..amount {
             unsafe { write_volatile(buffer.add(index), node.data[offset + index]) };
         }
+        self.nodes[descriptor.node]
+            .as_mut()
+            .ok_or(EBADF)?
+            .accessed = current_realtime();
         descriptor.offset += amount as i64;
         self.descriptors[slot] = Some(descriptor);
         Ok(amount)
@@ -840,6 +1044,23 @@ impl FileSystem {
         if length == 0 {
             return Ok(0);
         }
+        let node_type = self.node_mode(descriptor.node).ok_or(EBADF)? & S_IFMT;
+        if node_type == S_IFCHR {
+            let device = self
+                .nodes
+                .get(descriptor.node)
+                .and_then(Option::as_ref)
+                .map(|node| node.special_device)
+                .ok_or(EBADF)?;
+            return if matches!(device, DEVICE_NULL | DEVICE_ZERO) {
+                Ok(length)
+            } else {
+                Err(-(KernelError::NoDev as i32))
+            };
+        }
+        if node_type == S_IFBLK {
+            return Err(-(KernelError::NoDev as i32));
+        }
         if descriptor.node == ROOT_NODE {
             return Err(EISDIR);
         }
@@ -847,9 +1068,15 @@ impl FileSystem {
         if inode_flags & INODE_FLAG_IMMUTABLE != 0 {
             return Err(EPERM);
         }
-        let node = self.nodes[descriptor.node].as_mut().ok_or(EBADF)?;
         if descriptor.append || inode_flags & INODE_FLAG_APPEND != 0 {
-            descriptor.offset = node.data.len() as i64;
+            let current_length = self
+                .nodes
+                .get(descriptor.node)
+                .and_then(Option::as_ref)
+                .ok_or(EBADF)?
+                .data
+                .len();
+            descriptor.offset = current_length as i64;
         }
         if descriptor.offset < 0 || length > i64::MAX as usize {
             return Err(EFBIG);
@@ -859,6 +1086,8 @@ impl FileSystem {
         if end > i64::MAX as usize {
             return Err(EFBIG);
         }
+        self.check_file_capacity(descriptor.node, end)?;
+        let node = self.nodes[descriptor.node].as_mut().ok_or(EBADF)?;
         node.data
             .try_reserve(end.saturating_sub(node.data.len()))
             .map_err(|_| ENOMEM)?;
@@ -868,6 +1097,9 @@ impl FileSystem {
         for index in 0..length {
             node.data[offset + index] = unsafe { read_volatile(buffer.add(index)) };
         }
+        let now = current_realtime();
+        node.modified = now;
+        node.changed = now;
         descriptor.offset = end as i64;
         self.descriptors[slot] = Some(descriptor);
         Ok(length)
@@ -909,6 +1141,7 @@ impl FileSystem {
                 return Err(EPERM);
             }
         }
+        self.check_file_capacity(descriptor.node, end)?;
         let node = self.nodes.get_mut(descriptor.node).and_then(Option::as_mut).ok_or(EBADF)?;
         node.data
             .try_reserve(end.saturating_sub(node.data.len()))
@@ -919,6 +1152,9 @@ impl FileSystem {
         for index in 0..length {
             node.data[start + index] = unsafe { read_volatile(buffer.add(index)) };
         }
+        let now = current_realtime();
+        node.modified = now;
+        node.changed = now;
         Ok(length)
     }
 
@@ -936,6 +1172,7 @@ impl FileSystem {
         if length > i64::MAX as usize {
             return Err(EFBIG);
         }
+        self.check_file_capacity(node_index, length)?;
         let node = self.nodes.get_mut(node_index).and_then(Option::as_mut).ok_or(EBADF)?;
         if length > node.data.len() {
             node.data
@@ -945,6 +1182,9 @@ impl FileSystem {
         } else {
             node.data.truncate(length);
         }
+        let now = current_realtime();
+        node.modified = now;
+        node.changed = now;
         Ok(())
     }
 
@@ -1005,6 +1245,144 @@ impl FileSystem {
         Ok(())
     }
 
+    fn lock_range(
+        &self,
+        file_descriptor: i32,
+        lock: &FileLockRecord,
+    ) -> Result<(u64, i64, Option<i64>), i32> {
+        let slot = self.descriptor_slot(file_descriptor)?;
+        let descriptor = self.descriptors[slot].ok_or(EBADF)?;
+        if descriptor.pipe_id.is_some() || descriptor.node == TERMINAL_NODE {
+            return Err(-(KernelError::Spipe as i32));
+        }
+        let node = self.nodes.get(descriptor.node).and_then(Option::as_ref).ok_or(EBADF)?;
+        if node.mode & S_IFMT != S_IFREG {
+            return Err(EINVAL);
+        }
+        let base = match lock.whence {
+            0 => 0,
+            1 => descriptor.offset,
+            2 => i64::try_from(node.data.len()).map_err(|_| EOVERFLOW)?,
+            _ => return Err(EINVAL),
+        };
+        let position = base.checked_add(lock.start).ok_or(EOVERFLOW)?;
+        let (start, end) = if lock.length > 0 {
+            (position, Some(position.checked_add(lock.length).ok_or(EOVERFLOW)?))
+        } else if lock.length < 0 {
+            (position.checked_add(lock.length).ok_or(EOVERFLOW)?, Some(position))
+        } else {
+            (position, None)
+        };
+        if start < 0 || end.is_some_and(|end| end < start) {
+            return Err(EINVAL);
+        }
+        Ok((node.inode, start, end))
+    }
+
+    fn conflicting_lock(
+        &self,
+        inode: u64,
+        process_id: i32,
+        start: i64,
+        end: Option<i64>,
+        lock_type: i16,
+    ) -> Option<RecordLock> {
+        self.record_locks.iter().copied().find(|existing| {
+            existing.inode == inode
+                && existing.process_id != process_id
+                && !(existing.lock_type == 0 && lock_type == 0)
+                && ranges_overlap(existing.start, existing.end, start, end)
+        })
+    }
+
+    fn query_record_lock(
+        &self,
+        file_descriptor: i32,
+        process_id: i32,
+        request: &mut FileLockRecord,
+    ) -> Result<(), i32> {
+        if !matches!(request.lock_type, 0 | 1) {
+            return Err(EINVAL);
+        }
+        let (inode, start, end) = self.lock_range(file_descriptor, request)?;
+        if let Some(conflict) =
+            self.conflicting_lock(inode, process_id, start, end, request.lock_type)
+        {
+            request.lock_type = conflict.lock_type;
+            request.whence = 0;
+            request.start = conflict.start;
+            request.length = conflict.end.map_or(0, |end| end - conflict.start);
+            request.process_id = conflict.process_id;
+        } else {
+            request.lock_type = 2;
+            request.process_id = 0;
+        }
+        Ok(())
+    }
+
+    fn set_record_lock(
+        &mut self,
+        file_descriptor: i32,
+        process_id: i32,
+        request: &FileLockRecord,
+    ) -> Result<(), i32> {
+        if !matches!(request.lock_type, 0 | 1 | 2) {
+            return Err(EINVAL);
+        }
+        let (inode, start, end) = self.lock_range(file_descriptor, request)?;
+        if request.lock_type != 2
+            && self
+                .conflicting_lock(inode, process_id, start, end, request.lock_type)
+                .is_some()
+        {
+            return Err(EAGAIN);
+        }
+
+        let capacity = self
+            .record_locks
+            .len()
+            .checked_mul(2)
+            .and_then(|capacity| capacity.checked_add(1))
+            .ok_or(ENOMEM)?;
+        let mut updated = Vec::new();
+        updated.try_reserve_exact(capacity).map_err(|_| ENOMEM)?;
+        for existing in self.record_locks.iter().copied() {
+            if existing.inode != inode
+                || existing.process_id != process_id
+                || !ranges_overlap(existing.start, existing.end, start, end)
+            {
+                updated.push(existing);
+                continue;
+            }
+            if existing.start < start {
+                updated.push(RecordLock {
+                    end: Some(start),
+                    ..existing
+                });
+            }
+            if let Some(request_end) = end {
+                let has_right_remainder = existing.end.is_none_or(|existing_end| existing_end > request_end);
+                if has_right_remainder {
+                    updated.push(RecordLock {
+                        start: request_end,
+                        ..existing
+                    });
+                }
+            }
+        }
+        if request.lock_type != 2 {
+            updated.push(RecordLock {
+                inode,
+                process_id,
+                start,
+                end,
+                lock_type: request.lock_type,
+            });
+        }
+        self.record_locks = updated;
+        Ok(())
+    }
+
     fn seek(&mut self, file_descriptor: i32, offset: i64, origin: i32) -> Result<i64, i32> {
         let slot = self.descriptor_slot(file_descriptor)?;
         let descriptor = self.descriptors[slot].ok_or(EBADF)?;
@@ -1028,7 +1406,7 @@ impl FileSystem {
         Ok(position)
     }
 
-    fn close(&mut self, file_descriptor: i32) -> Result<(), i32> {
+    fn close(&mut self, file_descriptor: i32, process_id: i32) -> Result<(), i32> {
         if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
             let descriptor = &mut self.standard_descriptors[file_descriptor as usize];
             if !*descriptor {
@@ -1054,7 +1432,16 @@ impl FileSystem {
                 }
                 pipe.readers == 0 && pipe.writers == 0
             };
-            if empty {
+            if descriptor.node != PIPE_NODE {
+                let node = self.nodes.get_mut(descriptor.node).and_then(Option::as_mut).ok_or(EBADF)?;
+                node.open_count = node.open_count.saturating_sub(1);
+                if !node.linked && node.open_count == 0 {
+                    self.nodes[descriptor.node] = None;
+                    if empty {
+                        self.pipes[pipe_id] = None;
+                    }
+                }
+            } else if empty {
                 self.pipes[pipe_id] = None;
             }
             return Ok(());
@@ -1063,6 +1450,14 @@ impl FileSystem {
             return Ok(());
         }
         if descriptor.node != ROOT_NODE {
+            let inode = self
+                .nodes
+                .get(descriptor.node)
+                .and_then(Option::as_ref)
+                .ok_or(EBADF)?
+                .inode;
+            self.record_locks
+                .retain(|lock| lock.inode != inode || lock.process_id != process_id);
             let node = self.nodes[descriptor.node].as_mut().ok_or(EBADF)?;
             node.open_count -= 1;
             if !node.linked && node.open_count == 0 {
@@ -1080,6 +1475,23 @@ impl FileSystem {
             .get(file_descriptor as usize)
             .copied()
             .ok_or(EBADF)
+    }
+
+    fn sync_descriptor(&self, file_descriptor: i32, data_only: bool) -> Result<(), i32> {
+        if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
+            self.standard_descriptor_is_open(file_descriptor)?;
+            return Err(EINVAL);
+        }
+        let slot = self.descriptor_slot(file_descriptor)?;
+        let descriptor = self.descriptors[slot].ok_or(EBADF)?;
+        if descriptor.pipe_id.is_some() || descriptor.node == TERMINAL_NODE {
+            return Err(EINVAL);
+        }
+        match self.node_mode(descriptor.node).ok_or(EBADF)? & S_IFMT {
+            S_IFREG => Ok(()),
+            S_IFDIR if !data_only => Ok(()),
+            _ => Err(EINVAL),
+        }
     }
 
     fn descriptor_for_duplication(&self, file_descriptor: i32) -> Result<Descriptor, i32> {
@@ -1132,6 +1544,7 @@ impl FileSystem {
         file_descriptor: i32,
         new_descriptor: i32,
         close_on_exec: bool,
+        process_id: i32,
     ) -> Result<i32, i32> {
         let source = self.descriptor_for_duplication(file_descriptor)?;
         if file_descriptor == new_descriptor {
@@ -1148,7 +1561,7 @@ impl FileSystem {
             return Err(EMFILE);
         }
         if self.descriptors[target_slot].is_some() {
-            self.close(new_descriptor)?;
+            self.close(new_descriptor, process_id)?;
         }
         self.add_descriptor_reference(source)?;
         self.descriptors[target_slot] = Some(Descriptor {
@@ -1177,6 +1590,14 @@ impl FileSystem {
             };
             pipe.readers = readers;
             pipe.writers = writers;
+            if descriptor.node != PIPE_NODE {
+                let node = self
+                    .nodes
+                    .get_mut(descriptor.node)
+                    .and_then(Option::as_mut)
+                    .ok_or(EBADF)?;
+                node.open_count = node.open_count.checked_add(1).ok_or(EMFILE)?;
+            }
             return Ok(());
         }
         if matches!(descriptor.node, ROOT_NODE | TERMINAL_NODE) {
@@ -1249,11 +1670,192 @@ impl FileSystem {
         if self.node_metadata(index)?.flags() & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
             return Err(EPERM);
         }
-        let node = self.nodes[index].as_mut().ok_or(ENOENT)?;
-        node.linked = false;
-        if node.open_count == 0 {
+        let (linked, open_count, fifo_pipe_id) = {
+            let node = self.nodes[index].as_mut().ok_or(ENOENT)?;
+            if node.path.as_deref() == Some(path) {
+                if node.aliases.is_empty() {
+                    node.path = None;
+                    node.linked = false;
+                } else {
+                    node.path = Some(node.aliases.remove(0));
+                }
+            } else if let Some(alias_index) = node
+                .aliases
+                .iter()
+                .position(|alias| alias.as_slice() == path)
+            {
+                node.aliases.remove(alias_index);
+                node.linked = node.path.is_some() || !node.aliases.is_empty();
+            }
+            (node.linked, node.open_count, node.fifo_pipe_id)
+        };
+        if !linked && open_count == 0 {
             self.nodes[index] = None;
+            if let Some(pipe_id) = fifo_pipe_id {
+                self.pipes[pipe_id] = None;
+            }
         }
+        Ok(())
+    }
+
+    fn link(
+        &mut self,
+        source_path: &[u8],
+        destination_path: Vec<u8>,
+        credentials: &Credentials,
+    ) -> Result<(), i32> {
+        self.check_search_permissions(source_path, credentials)?;
+        self.check_search_permissions(&destination_path, credentials)?;
+        let source = self.find_node(source_path).ok_or(ENOENT)?;
+        if self.node_mode(source).ok_or(ENOENT)? & S_IFMT == S_IFDIR {
+            return Err(EPERM);
+        }
+        if self.find_node(&destination_path).is_some() {
+            return Err(EEXIST);
+        }
+        self.parent_allows_mutation(&destination_path)?;
+        let parent = self.parent_node(&destination_path)?;
+        self.node_metadata(parent)?
+            .check_access(credentials, 0o3, true)
+            .map_err(metadata_errno)?;
+        if self.node_metadata(source)?.flags() & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
+            return Err(EPERM);
+        }
+        let node = self.nodes.get_mut(source).and_then(Option::as_mut).ok_or(ENOENT)?;
+        node.aliases.try_reserve(1).map_err(|_| ENOMEM)?;
+        node.aliases.push(destination_path);
+        node.linked = true;
+        Ok(())
+    }
+
+    fn symlink(
+        &mut self,
+        target: &[u8],
+        link_path: Vec<u8>,
+        credentials: &Credentials,
+    ) -> Result<(), i32> {
+        if target.is_empty() || target.len() > PATH_MAX || target.contains(&0) {
+            return Err(EINVAL);
+        }
+        if self
+            .allocated_file_bytes()
+            .checked_add(target.len())
+            .is_none_or(|bytes| bytes > MAX_FILESYSTEM_BYTES)
+        {
+            return Err(-(KernelError::NoSpc as i32));
+        }
+        self.check_search_permissions(&link_path, credentials)?;
+        if self.find_node(&link_path).is_some() {
+            return Err(EEXIST);
+        }
+        self.parent_allows_mutation(&link_path)?;
+        let parent = self.parent_node(&link_path)?;
+        self.node_metadata(parent)?
+            .check_access(credentials, 0o3, true)
+            .map_err(metadata_errno)?;
+        let index = self.allocate_node(
+            Some(link_path),
+            S_IFLNK | 0o777,
+            true,
+            credentials.effective_user(),
+            credentials.effective_group(),
+        )?;
+        let mut stored_target = Vec::new();
+        stored_target
+            .try_reserve_exact(target.len())
+            .map_err(|_| ENOMEM)?;
+        stored_target.extend_from_slice(target);
+        self.nodes[index].as_mut().ok_or(ENOENT)?.symlink_target = Some(stored_target);
+        Ok(())
+    }
+
+    fn mkfifo(
+        &mut self,
+        path: Vec<u8>,
+        mode: u32,
+        credentials: &Credentials,
+    ) -> Result<(), i32> {
+        self.check_search_permissions(&path, credentials)?;
+        if self.find_node(&path).is_some() {
+            return Err(EEXIST);
+        }
+        self.parent_allows_mutation(&path)?;
+        let parent = self.parent_node(&path)?;
+        self.node_metadata(parent)?
+            .check_access(credentials, 0o3, true)
+            .map_err(metadata_errno)?;
+        let pipe_id = if let Some(index) = self.pipes.iter().position(Option::is_none) {
+            index
+        } else {
+            self.pipes.try_reserve(1).map_err(|_| ENOMEM)?;
+            self.pipes.push(None);
+            self.pipes.len() - 1
+        };
+        let inode = self.next_inode;
+        let node_index = self.allocate_node(
+            Some(path),
+            S_IFIFO | (mode & 0o777),
+            true,
+            credentials.effective_user(),
+            credentials.effective_group(),
+        )?;
+        let node = self.nodes[node_index].as_mut().ok_or(ENOENT)?;
+        node.inode = inode;
+        node.fifo_pipe_id = Some(pipe_id);
+        self.pipes[pipe_id] = Some(PipeBuffer {
+            inode,
+            bytes: VecDeque::new(),
+            readers: 0,
+            writers: 0,
+            named_fifo: true,
+        });
+        Ok(())
+    }
+
+    fn mknod(
+        &mut self,
+        path: Vec<u8>,
+        mode: u32,
+        device: u64,
+        credentials: &Credentials,
+    ) -> Result<(), i32> {
+        let node_type = match mode & S_IFMT {
+            0 => S_IFREG,
+            node_type => node_type,
+        };
+        if node_type == S_IFIFO {
+            return self.mkfifo(path, mode, credentials);
+        }
+        if !matches!(node_type, S_IFREG | S_IFCHR | S_IFBLK) {
+            return Err(EINVAL);
+        }
+        if matches!(node_type, S_IFCHR | S_IFBLK) && credentials.effective_user().raw() != 0 {
+            return Err(EPERM);
+        }
+        self.check_search_permissions(&path, credentials)?;
+        if self.find_node(&path).is_some() || path == b"/" {
+            return Err(EEXIST);
+        }
+        self.parent_allows_mutation(&path)?;
+        let parent = self.parent_node(&path)?;
+        self.node_metadata(parent)?
+            .check_access(credentials, 0o3, true)
+            .map_err(metadata_errno)?;
+        let index = self.allocate_node(
+            Some(path),
+            node_type | (mode & 0o777),
+            true,
+            credentials.effective_user(),
+            credentials.effective_group(),
+        )?;
+        self.nodes[index]
+            .as_mut()
+            .ok_or(ENOENT)?
+            .special_device = if matches!(node_type, S_IFCHR | S_IFBLK) {
+            device
+        } else {
+            0
+        };
         Ok(())
     }
 
@@ -1391,6 +1993,84 @@ impl FileSystem {
             .map_err(metadata_errno)
     }
 
+    fn set_node_times(
+        &mut self,
+        index: usize,
+        times: Option<[Timespec; 2]>,
+        credentials: &Credentials,
+    ) -> Result<(), i32> {
+        let metadata = self.node_metadata(index)?;
+        if !credentials.is_root() && credentials.effective_user() != metadata.owner() {
+            return Err(EPERM);
+        }
+        let now = current_realtime();
+        let requested = times.unwrap_or([
+            Timespec {
+                seconds: 0,
+                nanoseconds: UTIME_NOW,
+            };
+            2
+        ]);
+        let mut values = [None, None];
+        for (index, requested) in requested.into_iter().enumerate() {
+            if requested.nanoseconds == UTIME_OMIT {
+                continue;
+            }
+            let value = if requested.nanoseconds == UTIME_NOW {
+                now
+            } else if (0..1_000_000_000).contains(&requested.nanoseconds) {
+                requested
+            } else {
+                return Err(EINVAL);
+            };
+            values[index] = Some(value);
+        }
+        if index == ROOT_NODE {
+            if let Some(accessed) = values[0] {
+                self.root_accessed = accessed;
+            }
+            if let Some(modified) = values[1] {
+                self.root_modified = modified;
+            }
+            self.root_changed = now;
+        } else {
+            let node = self.nodes.get_mut(index).and_then(Option::as_mut).ok_or(ENOENT)?;
+            if let Some(accessed) = values[0] {
+                node.accessed = accessed;
+            }
+            if let Some(modified) = values[1] {
+                node.modified = modified;
+            }
+            node.changed = now;
+        }
+        Ok(())
+    }
+
+    fn set_times_path(
+        &mut self,
+        path: &[u8],
+        times: Option<[Timespec; 2]>,
+        credentials: &Credentials,
+    ) -> Result<(), i32> {
+        self.check_search_permissions(path, credentials)?;
+        let index = self.find_node(path).ok_or(ENOENT)?;
+        self.set_node_times(index, times, credentials)
+    }
+
+    fn set_times_descriptor(
+        &mut self,
+        file_descriptor: i32,
+        times: Option<[Timespec; 2]>,
+        credentials: &Credentials,
+    ) -> Result<(), i32> {
+        let slot = self.descriptor_slot(file_descriptor)?;
+        let descriptor = self.descriptors[slot].ok_or(EBADF)?;
+        if descriptor.pipe_id.is_some() || descriptor.node == TERMINAL_NODE {
+            return Err(EBADF);
+        }
+        self.set_node_times(descriptor.node, times, credentials)
+    }
+
     fn rmdir(&mut self, path: &[u8], credentials: &Credentials) -> Result<(), i32> {
         self.check_search_permissions(path, credentials)?;
         if path == b"/" {
@@ -1460,7 +2140,7 @@ impl FileSystem {
                 reserved: [0; 3],
             });
         }
-        let (inode, mode, size, links, user, group) = if index == ROOT_NODE {
+        let (inode, mode, size, links, user, group, accessed, modified, changed) = if index == ROOT_NODE {
             (
                 1,
                 S_IFDIR
@@ -1472,6 +2152,9 @@ impl FileSystem {
                 1,
                 self.root_metadata.as_ref().map_or(0, |metadata| metadata.owner().raw()),
                 self.root_metadata.as_ref().map_or(0, |metadata| metadata.group().raw()),
+                self.root_accessed,
+                self.root_modified,
+                self.root_changed,
             )
         } else {
             let node = self
@@ -1482,11 +2165,25 @@ impl FileSystem {
             (
                 node.inode,
                 node.mode,
-                node.data.len(),
-                u64::from(node.linked),
+                node.symlink_target
+                    .as_ref()
+                    .map_or(node.data.len(), Vec::len),
+                u64::from(node.path.is_some()) + node.aliases.len() as u64,
                 node.metadata.owner().raw(),
                 node.metadata.group().raw(),
+                node.accessed,
+                node.modified,
+                node.changed,
             )
+        };
+        let special_device = if index == ROOT_NODE {
+            0
+        } else {
+            self.nodes
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|node| node.special_device)
+                .ok_or(ENOENT)?
         };
         Ok(CStat {
             device: 1,
@@ -1496,22 +2193,13 @@ impl FileSystem {
             user,
             group,
             pad: 0,
-            special_device: 0,
+            special_device,
             size: size as i64,
             block_size: 4096,
             blocks: (size / 512 + if size % 512 != 0 { 1 } else { 0 }) as i64,
-            accessed: Timespec {
-                seconds: 0,
-                nanoseconds: 0,
-            },
-            modified: Timespec {
-                seconds: 0,
-                nanoseconds: 0,
-            },
-            changed: Timespec {
-                seconds: 0,
-                nanoseconds: 0,
-            },
+            accessed,
+            modified,
+            changed,
             reserved: [0; 3],
         })
     }
@@ -1525,6 +2213,9 @@ impl FileSystem {
                 .get(pipe_id)
                 .and_then(Option::as_ref)
                 .ok_or(EBADF)?;
+            if descriptor.node != PIPE_NODE {
+                return self.stat_node(descriptor.node);
+            }
             return Ok(CStat {
                 device: 1,
                 inode: pipe.inode,
@@ -1578,9 +2269,12 @@ pub(crate) fn duplicate_to(
     new_descriptor: i32,
     close_on_exec: bool,
 ) -> Result<i32, i32> {
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
     FILESYSTEM
         .lock()
-        .duplicate_to(file_descriptor, new_descriptor, close_on_exec)
+        .duplicate_to(file_descriptor, new_descriptor, close_on_exec, process_id)
 }
 
 pub(crate) fn descriptor_flags(file_descriptor: i32) -> Result<i32, i32> {
@@ -1599,6 +2293,46 @@ pub(crate) fn status_flags(file_descriptor: i32) -> Result<i32, i32> {
 
 pub(crate) fn set_status_flags(file_descriptor: i32, flags: i32) -> Result<(), i32> {
     FILESYSTEM.lock().set_status_flags(file_descriptor, flags)
+}
+
+pub(crate) fn query_record_lock(
+    file_descriptor: i32,
+    request: &mut FileLockRecord,
+) -> Result<(), i32> {
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
+    FILESYSTEM
+        .lock()
+        .query_record_lock(file_descriptor, process_id, request)
+}
+
+pub(crate) fn set_record_lock(
+    file_descriptor: i32,
+    request: &FileLockRecord,
+    wait: bool,
+) -> Result<(), i32> {
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
+    loop {
+        let result = FILESYSTEM
+            .lock()
+            .set_record_lock(file_descriptor, process_id, request);
+        match result {
+            Err(EAGAIN) if wait => {
+                if crate::kernel::runtime::runtime_posix::signal::dispatch_pending_signals()
+                    .is_some_and(|restart| !restart)
+                {
+                    return Err(-(KernelError::Intr as i32));
+                }
+                if !ThreadManager::switch_current(crate::kernel::scheduler::thread::ThreadState::Ready) {
+                    crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+                }
+            }
+            result => return result,
+        }
+    }
 }
 
 pub(crate) fn create_pipe(flags: i32) -> Result<(i32, i32), i32> {
@@ -1624,6 +2358,45 @@ pub(crate) fn file_identity(path: *const c_char) -> Result<(u64, u64), i32> {
     let node = filesystem.find_node(&path).ok_or(ENOENT)?;
     let status = filesystem.stat_node(node)?;
     Ok((status.device, status.inode))
+}
+
+pub(crate) fn capacity_for_path(path: *const c_char) -> Result<FileSystemCapacity, i32> {
+    let path = unsafe { normalize_path(path) }?;
+    let credentials = current_credentials()?;
+    let mut filesystem = FILESYSTEM.lock();
+    filesystem.check_search_permissions(&path, &credentials)?;
+    filesystem.find_node(&path).ok_or(ENOENT)?;
+    Ok(filesystem.capacity())
+}
+
+pub(crate) fn capacity_for_descriptor(
+    file_descriptor: i32,
+) -> Result<FileSystemCapacity, i32> {
+    let filesystem = FILESYSTEM.lock();
+    if (0..3).contains(&file_descriptor) {
+        filesystem.standard_descriptor_is_open(file_descriptor)?;
+    } else {
+        filesystem.descriptor_slot(file_descriptor)?;
+    }
+    Ok(filesystem.capacity())
+}
+
+pub(crate) fn sync_descriptor(file_descriptor: i32, data_only: bool) -> Result<(), i32> {
+    if network::is_socket_fd(file_descriptor) {
+        return if network::has_socket_fd(file_descriptor) {
+            Err(EINVAL)
+        } else {
+            Err(EBADF)
+        };
+    }
+    if network::is_packet_fd(file_descriptor) {
+        return if network::has_packet_fd(file_descriptor) {
+            Err(EINVAL)
+        } else {
+            Err(EBADF)
+        };
+    }
+    FILESYSTEM.lock().sync_descriptor(file_descriptor, data_only)
 }
 
 pub(crate) fn positioned_read(
@@ -1684,30 +2457,40 @@ fn normalize_path_from(
     base: &[u8],
     credentials: &Credentials,
 ) -> Result<Vec<u8>, i32> {
+    normalize_path_from_depth(input, base, credentials, true, 0)
+}
+
+fn normalize_path_from_depth(
+    input: &[u8],
+    base: &[u8],
+    credentials: &Credentials,
+    follow_final: bool,
+    depth: usize,
+) -> Result<Vec<u8>, i32> {
     if input.is_empty() {
         return Err(ENOENT);
     }
     if input.len() > PATH_MAX || base.first() != Some(&b'/') {
         return Err(ENAMETOOLONG);
     }
-    if input != b"/dev/tty" && input != b"/dev/console" && input != b"/dev/net/tun" {
-        FILESYSTEM
-            .lock()
-            .validate_path_components(input, base, credentials)?;
+    if depth > MAX_SYMLINKS {
+        return Err(-(KernelError::Loop as i32));
     }
-    let reserve = base
-        .len()
-        .checked_add(input.len())
-        .and_then(|length| length.checked_add(1))
-        .ok_or(ENAMETOOLONG)?;
+    let follow_final = follow_final || input.last() == Some(&b'/');
     let mut output = Vec::new();
-    output.try_reserve(reserve).map_err(|_| ENOMEM)?;
     if input.first() == Some(&b'/') {
+        output.try_reserve(input.len().saturating_add(1)).map_err(|_| ENOMEM)?;
         output.push(b'/');
     } else {
+        output.try_reserve(base.len().saturating_add(input.len()).saturating_add(1))
+            .map_err(|_| ENOMEM)?;
         output.extend_from_slice(base);
     }
-    for segment in input.split(|byte| *byte == b'/') {
+    let mut components = input
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .peekable();
+    while let Some(segment) = components.next() {
         if segment.is_empty() || segment == b"." {
             continue;
         }
@@ -1722,6 +2505,10 @@ fn normalize_path_from(
             }
             continue;
         }
+        FILESYSTEM
+            .lock()
+            .check_directory_search(&output, credentials)?;
+        let parent = output.clone();
         let separator = usize::from(output.len() > 1);
         if output.len() + separator + segment.len() > PATH_MAX {
             return Err(ENAMETOOLONG);
@@ -1730,6 +2517,40 @@ fn normalize_path_from(
             output.push(b'/');
         }
         output.extend_from_slice(segment);
+        let is_final = components.peek().is_none();
+        if !is_final || follow_final {
+            let target = FILESYSTEM.lock().symlink_target(&output)?;
+            if let Some(target) = target {
+                let mut replacement = Vec::new();
+                replacement
+                    .try_reserve(target.len().saturating_add(input.len()).saturating_add(1))
+                    .map_err(|_| ENOMEM)?;
+                replacement.extend_from_slice(&target);
+                for component in components {
+                    if replacement.last() != Some(&b'/') {
+                        replacement.push(b'/');
+                    }
+                    replacement.extend_from_slice(component);
+                }
+                let replacement_base = if target.first() == Some(&b'/') {
+                    b"/".as_slice()
+                } else {
+                    parent.as_slice()
+                };
+                return normalize_path_from_depth(
+                    &replacement,
+                    replacement_base,
+                    credentials,
+                    follow_final,
+                    depth + 1,
+                );
+            }
+        }
+        if !is_final {
+            FILESYSTEM
+                .lock()
+                .check_directory_search(&output, credentials)?;
+        }
     }
     Ok(output)
 }
@@ -1748,6 +2569,7 @@ fn pop_path_component(path: &mut Vec<u8>) {
 unsafe fn normalize_path_at(
     directory_descriptor: i32,
     path: *const c_char,
+    follow_final: bool,
 ) -> Result<Vec<u8>, i32> {
     if path.is_null() {
         return Err(EFAULT);
@@ -1765,7 +2587,7 @@ unsafe fn normalize_path_at(
     } else {
         FILESYSTEM.lock().directory_path(directory_descriptor)?
     };
-    normalize_path_from(input, &base, &credentials)
+    normalize_path_from_depth(input, &base, &credentials, follow_final, 0)
 }
 
 pub(crate) fn poll_readiness(file_descriptor: i32, events: i16) -> i16 {
@@ -1867,6 +2689,13 @@ fn fail(error: i32) -> i32 {
 }
 
 unsafe fn normalize_path(path: *const c_char) -> Result<Vec<u8>, i32> {
+    unsafe { normalize_path_follow(path, true) }
+}
+
+unsafe fn normalize_path_follow(
+    path: *const c_char,
+    follow_final: bool,
+) -> Result<Vec<u8>, i32> {
     if path.is_null() {
         return Err(EFAULT);
     }
@@ -1877,15 +2706,21 @@ unsafe fn normalize_path(path: *const c_char) -> Result<Vec<u8>, i32> {
     } else {
         Some(current_directory_path()?)
     };
-    normalize_path_from(
+    normalize_path_from_depth(
         input,
         current_directory.as_deref().unwrap_or(b"/"),
         &credentials,
+        follow_final,
+        0,
     )
 }
 
-fn with_path(path: *const c_char, operation: impl FnOnce(Vec<u8>) -> Result<i32, i32>) -> i32 {
-    let normalized = match unsafe { normalize_path(path) } {
+fn with_path_follow(
+    path: *const c_char,
+    follow_final: bool,
+    operation: impl FnOnce(Vec<u8>) -> Result<i32, i32>,
+) -> i32 {
+    let normalized = match unsafe { normalize_path_follow(path, follow_final) } {
         Ok(path) => path,
         Err(error) => return fail(error),
     };
@@ -1895,12 +2730,25 @@ fn with_path(path: *const c_char, operation: impl FnOnce(Vec<u8>) -> Result<i32,
     }
 }
 
+fn with_path(path: *const c_char, operation: impl FnOnce(Vec<u8>) -> Result<i32, i32>) -> i32 {
+    with_path_follow(path, true, operation)
+}
+
 fn with_path_at(
     directory_descriptor: i32,
     path: *const c_char,
     operation: impl FnOnce(Vec<u8>) -> Result<i32, i32>,
 ) -> i32 {
-    let normalized = match unsafe { normalize_path_at(directory_descriptor, path) } {
+    with_path_at_follow(directory_descriptor, path, true, operation)
+}
+
+fn with_path_at_follow(
+    directory_descriptor: i32,
+    path: *const c_char,
+    follow_final: bool,
+    operation: impl FnOnce(Vec<u8>) -> Result<i32, i32>,
+) -> i32 {
+    let normalized = match unsafe { normalize_path_at(directory_descriptor, path, follow_final) } {
         Ok(path) => path,
         Err(error) => return fail(error),
     };
@@ -1921,7 +2769,7 @@ fn path_c_string(path: &[u8]) -> Result<Vec<u8>, i32> {
 
 #[no_mangle]
 pub unsafe extern "C" fn kz_rust_open(path: *const c_char, flags: i32, mode: u32) -> i32 {
-    with_path(path, |path| {
+    with_path_follow(path, flags & O_NOFOLLOW == 0, |path| {
         if path.as_slice() == b"/dev/tty" || path.as_slice() == b"/dev/console" {
             let access = flags & O_ACCMODE;
             if flags & !(O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY) != 0
@@ -1961,7 +2809,10 @@ pub unsafe extern "C" fn kz_rust_open(path: *const c_char, flags: i32, mode: u32
             {
                 return Err(EINVAL);
             }
-            return network::open_tun_device(flags & O_NONBLOCK != 0)
+            return network::open_tun_device(
+                flags & O_NONBLOCK != 0,
+                flags & O_CLOEXEC != 0,
+            )
                 .map_err(|error| -(error as i32));
         }
         let credentials = current_credentials()?;
@@ -1980,7 +2831,7 @@ pub unsafe extern "C" fn kz_rust_openat(
     flags: i32,
     mode: u32,
 ) -> i32 {
-    with_path_at(directory_descriptor, path, |path| {
+    with_path_at_follow(directory_descriptor, path, flags & O_NOFOLLOW == 0, |path| {
         let path = path_c_string(&path)?;
         let descriptor = unsafe { kz_rust_open(path.as_ptr().cast(), flags, mode) };
         if descriptor < 0 {
@@ -1996,15 +2847,16 @@ pub unsafe extern "C" fn kz_rust_statat(
     directory_descriptor: i32,
     path: *const c_char,
     output: *mut c_void,
+    flags: i32,
 ) -> i32 {
-    with_path_at(directory_descriptor, path, |path| {
-        let path = path_c_string(&path)?;
-        if unsafe { stat(path.as_ptr().cast(), output) } == 0 {
-            Ok(0)
-        } else {
-            Err(unsafe { crate::kernel::scheduler::thread::__errno_location().read() })
-        }
-    })
+    if flags & !0x100 != 0 {
+        return fail(EINVAL);
+    }
+    let path = match unsafe { normalize_path_at(directory_descriptor, path, flags & 0x100 == 0) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    stat_normalized(&path, output)
 }
 
 #[no_mangle]
@@ -2013,7 +2865,7 @@ pub unsafe extern "C" fn kz_rust_mkdirat(
     path: *const c_char,
     mode: u32,
 ) -> i32 {
-    with_path_at(directory_descriptor, path, |path| {
+    with_path_at_follow(directory_descriptor, path, false, |path| {
         let path = path_c_string(&path)?;
         let result = unsafe { mkdir(path.as_ptr().cast(), mode) };
         if result == 0 {
@@ -2025,24 +2877,274 @@ pub unsafe extern "C" fn kz_rust_mkdirat(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn kz_rust_mkfifo(
+    path: *const c_char,
+    mode: u32,
+) -> i32 {
+    with_path_follow(path, false, |path| {
+        let process = ThreadManager::current_process().map_err(|error| -(error as i32))?;
+        let credentials = process.credentials().map_err(metadata_errno)?;
+        FILESYSTEM
+            .lock()
+            .mkfifo(path, mode & !process.umask(), &credentials)
+            .map(|()| 0)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_mkfifoat(
+    directory_descriptor: i32,
+    path: *const c_char,
+    mode: u32,
+) -> i32 {
+    with_path_at_follow(directory_descriptor, path, false, |path| {
+        let process = ThreadManager::current_process().map_err(|error| -(error as i32))?;
+        let credentials = process.credentials().map_err(metadata_errno)?;
+        FILESYSTEM
+            .lock()
+            .mkfifo(path, mode & !process.umask(), &credentials)
+            .map(|()| 0)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_mknod(
+    path: *const c_char,
+    mode: u32,
+    device: u64,
+) -> i32 {
+    with_path_follow(path, false, |path| {
+        let process = ThreadManager::current_process().map_err(|error| -(error as i32))?;
+        let credentials = process.credentials().map_err(metadata_errno)?;
+        FILESYSTEM
+            .lock()
+            .mknod(path, mode & !process.umask(), device, &credentials)
+            .map(|()| 0)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_mknodat(
+    directory_descriptor: i32,
+    path: *const c_char,
+    mode: u32,
+    device: u64,
+) -> i32 {
+    with_path_at_follow(directory_descriptor, path, false, |path| {
+        let process = ThreadManager::current_process().map_err(|error| -(error as i32))?;
+        let credentials = process.credentials().map_err(metadata_errno)?;
+        FILESYSTEM
+            .lock()
+            .mknod(path, mode & !process.umask(), device, &credentials)
+            .map(|()| 0)
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn kz_rust_unlinkat(
     directory_descriptor: i32,
     path: *const c_char,
     flags: i32,
 ) -> i32 {
-    with_path_at(directory_descriptor, path, |path| {
-        let path = path_c_string(&path)?;
-        let result = match flags {
-            0 => unsafe { unlink(path.as_ptr().cast()) },
-            0x200 => unsafe { rmdir(path.as_ptr().cast()) },
-            _ => return Err(EINVAL),
-        };
-        if result == 0 {
-            Ok(0)
-        } else {
-            Err(unsafe { crate::kernel::scheduler::thread::__errno_location().read() })
+    if !matches!(flags, 0 | 0x200) {
+        return fail(EINVAL);
+    }
+    let path = match unsafe { normalize_path_at(directory_descriptor, path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    let credentials = match current_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => return fail(error),
+    };
+    let result = if flags == 0x200 {
+        FILESYSTEM.lock().rmdir(&path, &credentials)
+    } else {
+        FILESYSTEM.lock().unlink(&path, &credentials)
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_link(
+    source_path: *const c_char,
+    destination_path: *const c_char,
+) -> i32 {
+    let source_path = match unsafe { normalize_path_follow(source_path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    let destination_path = match unsafe { normalize_path_follow(destination_path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    let credentials = match current_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => return fail(error),
+    };
+    match FILESYSTEM
+        .lock()
+        .link(&source_path, destination_path, &credentials)
+    {
+        Ok(()) => 0,
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_linkat(
+    source_directory: i32,
+    source_path: *const c_char,
+    destination_directory: i32,
+    destination_path: *const c_char,
+    flags: i32,
+) -> i32 {
+    if flags & !0x400 != 0 {
+        return fail(EINVAL);
+    }
+    let source_path = match unsafe {
+        normalize_path_at(source_directory, source_path, flags & 0x400 != 0)
+    } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    let destination_path = match unsafe { normalize_path_at(destination_directory, destination_path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    let credentials = match current_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => return fail(error),
+    };
+    match FILESYSTEM
+        .lock()
+        .link(&source_path, destination_path, &credentials)
+    {
+        Ok(()) => 0,
+        Err(error) => fail(error),
+    }
+}
+
+fn create_symlink(target: &[u8], path: Vec<u8>) -> i32 {
+    let credentials = match current_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => return fail(error),
+    };
+    match FILESYSTEM.lock().symlink(target, path, &credentials) {
+        Ok(()) => 0,
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_symlink(
+    target: *const c_char,
+    link_path: *const c_char,
+) -> i32 {
+    if target.is_null() || link_path.is_null() {
+        return fail(EFAULT);
+    }
+    let target = unsafe { CStr::from_ptr(target) }.to_bytes();
+    if target.is_empty() || target.len() > PATH_MAX {
+        return fail(EINVAL);
+    }
+    let path = match unsafe { normalize_path_follow(link_path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    create_symlink(target, path)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_symlinkat(
+    target: *const c_char,
+    directory_descriptor: i32,
+    link_path: *const c_char,
+) -> i32 {
+    if target.is_null() || link_path.is_null() {
+        return fail(EFAULT);
+    }
+    let target = unsafe { CStr::from_ptr(target) }.to_bytes();
+    if target.is_empty() || target.len() > PATH_MAX {
+        return fail(EINVAL);
+    }
+    let path = match unsafe { normalize_path_at(directory_descriptor, link_path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    create_symlink(target, path)
+}
+
+fn read_symlink(path: &[u8], buffer: *mut c_void, buffer_size: usize) -> isize {
+    if buffer.is_null() && buffer_size != 0 {
+        set_errno(EFAULT);
+        return -1;
+    }
+    let target = {
+        let filesystem = FILESYSTEM.lock();
+        match filesystem.symlink_target(path) {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                set_errno(EINVAL);
+                return -1;
+            }
+            Err(error) => {
+                set_errno(error);
+                return -1;
+            }
         }
-    })
+    };
+    let amount = target.len().min(buffer_size);
+    if amount == 0 {
+        return 0;
+    }
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => {
+            set_errno(-(error as i32));
+            return -1;
+        }
+    };
+    match process
+        .address_space()
+        .write(buffer as usize, &target[..amount])
+    {
+        Ok(()) => amount as isize,
+        Err(error) => {
+            set_errno(-(error as i32));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_readlink(
+    path: *const c_char,
+    buffer: *mut c_void,
+    buffer_size: usize,
+) -> isize {
+    let path = match unsafe { normalize_path_follow(path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error) as isize,
+    };
+    read_symlink(&path, buffer, buffer_size)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_readlinkat(
+    directory_descriptor: i32,
+    path: *const c_char,
+    buffer: *mut c_void,
+    buffer_size: usize,
+) -> isize {
+    let path = match unsafe { normalize_path_at(directory_descriptor, path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error) as isize,
+    };
+    read_symlink(&path, buffer, buffer_size)
 }
 
 #[no_mangle]
@@ -2058,11 +3160,33 @@ pub unsafe extern "C" fn kz_rust_chmodat(
     directory_descriptor: i32,
     path: *const c_char,
     mode: u32,
+    flags: i32,
 ) -> i32 {
-    with_path_at(directory_descriptor, path, |path| {
-        let credentials = current_credentials()?;
-        FILESYSTEM.lock().chmod(&path, mode, &credentials).map(|()| 0)
-    })
+    if flags & !0x100 != 0 {
+        return fail(EINVAL);
+    }
+    let path = match unsafe { normalize_path_at(directory_descriptor, path, flags & 0x100 == 0) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    let credentials = match current_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => return fail(error),
+    };
+    let is_symlink = {
+        let filesystem = FILESYSTEM.lock();
+        filesystem
+            .find_node(&path)
+            .and_then(|index| filesystem.node_mode(index))
+            .is_some_and(|mode| mode & S_IFMT == S_IFLNK)
+    };
+    if flags & 0x100 != 0 && is_symlink {
+        return fail(-(KernelError::OpNotSupp as i32));
+    }
+    match FILESYSTEM.lock().chmod(&path, mode, &credentials) {
+        Ok(()) => 0,
+        Err(error) => fail(error),
+    }
 }
 
 #[no_mangle]
@@ -2100,16 +3224,118 @@ pub unsafe extern "C" fn kz_rust_chownat(
     path: *const c_char,
     owner: u32,
     group: u32,
+    flags: i32,
 ) -> i32 {
-    with_path_at(directory_descriptor, path, |path| {
-        let credentials = current_credentials()?;
-        FILESYSTEM
-            .lock()
-            .chown(&path, owner, group, &credentials)
-            .map(|()| 0)
-    })
+    if flags & !0x100 != 0 {
+        return fail(EINVAL);
+    }
+    let path = match unsafe { normalize_path_at(directory_descriptor, path, flags & 0x100 == 0) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    let credentials = match current_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => return fail(error),
+    };
+    match FILESYSTEM.lock().chown(&path, owner, group, &credentials) {
+        Ok(()) => 0,
+        Err(error) => fail(error),
+    }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_lchown(path: *const c_char, owner: u32, group: u32) -> i32 {
+    let path = match unsafe { normalize_path_follow(path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    let credentials = match current_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => return fail(error),
+    };
+    match FILESYSTEM.lock().chown(&path, owner, group, &credentials) {
+        Ok(()) => 0,
+        Err(error) => fail(error),
+    }
+}
+
+
+fn read_times(times: *const c_void) -> Result<Option<[Timespec; 2]>, i32> {
+    if times.is_null() {
+        return Ok(None);
+    }
+    let process = ThreadManager::current_process().map_err(|error| -(error as i32))?;
+    let mut values = [
+        Timespec { seconds: 0, nanoseconds: 0 },
+        Timespec { seconds: 0, nanoseconds: 0 },
+    ];
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            values.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<[Timespec; 2]>(),
+        )
+    };
+    process
+        .address_space()
+        .read(times as usize, bytes)
+        .map_err(|error| -(error as i32))?;
+    Ok(Some(values))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_futimens(
+    file_descriptor: i32,
+    times: *const c_void,
+) -> i32 {
+    let times = match read_times(times) {
+        Ok(times) => times,
+        Err(error) => return fail(error),
+    };
+    let credentials = match current_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => return fail(error),
+    };
+    match FILESYSTEM
+        .lock()
+        .set_times_descriptor(file_descriptor, times, &credentials)
+    {
+        Ok(()) => 0,
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_utimensat(
+    directory_descriptor: i32,
+    path: *const c_char,
+    times: *const c_void,
+    flags: i32,
+) -> i32 {
+    if flags & !0x100 != 0 {
+        return fail(EINVAL);
+    }
+    let path = match unsafe {
+        normalize_path_at(directory_descriptor, path, flags & 0x100 == 0)
+    } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    let times = match read_times(times) {
+        Ok(times) => times,
+        Err(error) => return fail(error),
+    };
+    let credentials = match current_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => return fail(error),
+    };
+    match FILESYSTEM
+        .lock()
+        .set_times_path(&path, times, &credentials)
+    {
+        Ok(()) => 0,
+        Err(error) => fail(error),
+    }
+}
 #[no_mangle]
 pub extern "C" fn kz_rust_fchown(file_descriptor: i32, owner: u32, group: u32) -> i32 {
     let credentials = match current_credentials() {
@@ -2492,8 +3718,12 @@ fn write_console(buffer: *const u8, length: usize, nonblocking: bool) -> isize {
 
 #[no_mangle]
 pub extern "C" fn close(file_descriptor: i32) -> i32 {
+    let process_id = match ThreadManager::current_process() {
+        Ok(process) => process.pid(),
+        Err(error) => return fail(-(error as i32)),
+    };
     if (0..=2).contains(&file_descriptor) {
-        return match FILESYSTEM.lock().close(file_descriptor) {
+        return match FILESYSTEM.lock().close(file_descriptor, process_id) {
             Ok(()) => 0,
             Err(error) => fail(error),
         };
@@ -2517,7 +3747,7 @@ pub extern "C" fn close(file_descriptor: i32) -> i32 {
         };
     }
     let pipe = is_pipe_descriptor(file_descriptor);
-    match FILESYSTEM.lock().close(file_descriptor) {
+    match FILESYSTEM.lock().close(file_descriptor, process_id) {
         Ok(()) => {
             if pipe {
                 wake_pipe_waiters();
@@ -2549,7 +3779,7 @@ pub extern "C" fn lseek(file_descriptor: i32, offset: i64, origin: i32) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn unlink(path: *const c_char) -> i32 {
-    let normalized = match unsafe { normalize_path(path) } {
+    let normalized = match unsafe { normalize_path_follow(path, false) } {
         Ok(path) => path,
         Err(error) => return fail(error),
     };
@@ -2565,7 +3795,7 @@ pub unsafe extern "C" fn unlink(path: *const c_char) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn mkdir(path: *const c_char, mode: u32) -> i32 {
-    with_path(path, |path| {
+    with_path_follow(path, false, |path| {
         let credentials = current_credentials()?;
         let process = crate::kernel::scheduler::thread::ThreadManager::current_process()
             .map_err(|error| -(error as i32))?;
@@ -2578,7 +3808,7 @@ pub unsafe extern "C" fn mkdir(path: *const c_char, mode: u32) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn rmdir(path: *const c_char) -> i32 {
-    let normalized = match unsafe { normalize_path(path) } {
+    let normalized = match unsafe { normalize_path_follow(path, false) } {
         Ok(path) => path,
         Err(error) => return fail(error),
     };
@@ -2688,13 +3918,26 @@ pub unsafe extern "C" fn fstat64(file_descriptor: i32, output: *mut c_void) -> i
 
 #[no_mangle]
 pub unsafe extern "C" fn stat(path: *const c_char, output: *mut c_void) -> i32 {
-    if output.is_null() {
-        return fail(EFAULT);
-    }
     let normalized = match unsafe { normalize_path(path) } {
         Ok(path) => path,
         Err(error) => return fail(error),
     };
+    stat_normalized(&normalized, output)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kz_rust_lstat(path: *const c_char, output: *mut c_void) -> i32 {
+    let normalized = match unsafe { normalize_path_follow(path, false) } {
+        Ok(path) => path,
+        Err(error) => return fail(error),
+    };
+    stat_normalized(&normalized, output)
+}
+
+fn stat_normalized(normalized: &[u8], output: *mut c_void) -> i32 {
+    if output.is_null() {
+        return fail(EFAULT);
+    }
     if normalized == b"/dev/tty" {
         let process = match ThreadManager::current_process() {
             Ok(process) => process,
@@ -2732,7 +3975,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, output: *mut c_void) -> i32 {
             .check_search_permissions(&normalized, &credentials)
             .and_then(|()| {
                 filesystem
-                    .find_node(&normalized)
+                    .find_node(normalized)
                     .ok_or(ENOENT)
                     .and_then(|index| filesystem.stat_node(index))
             })
@@ -3179,6 +4422,61 @@ pub unsafe extern "C" fn kz_rust_ioctl(
             Ok(()) => 0,
             Err(error) => fail(-(error as i32)),
         };
+    }
+    if matches!(request, TIOCGWINSZ | TIOCSWINSZ) {
+        match is_terminal_descriptor(file_descriptor) {
+            Ok(true) => {}
+            Ok(false) => return fail(ENOTTY),
+            Err(error) => return fail(error),
+        }
+        let process = match ThreadManager::current_process() {
+            Ok(process) => process,
+            Err(error) => return fail(-(error as i32)),
+        };
+        if argument.is_null() {
+            return fail(EFAULT);
+        }
+        let mut address_space = process.address_space();
+        if request == TIOCGWINSZ {
+            let size = crate::kernel::tty::window_size();
+            let output = CWindowSize {
+                rows: size.rows,
+                columns: size.columns,
+                x_pixels: size.x_pixels,
+                y_pixels: size.y_pixels,
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&output as *const CWindowSize).cast::<u8>(),
+                    core::mem::size_of::<CWindowSize>(),
+                )
+            };
+            return address_space
+                .write(argument as usize, bytes)
+                .map_or_else(|error| fail(-(error as i32)), |_| 0);
+        }
+        let mut input = CWindowSize {
+            rows: 0,
+            columns: 0,
+            x_pixels: 0,
+            y_pixels: 0,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                (&mut input as *mut CWindowSize).cast::<u8>(),
+                core::mem::size_of::<CWindowSize>(),
+            )
+        };
+        if let Err(error) = address_space.read(argument as usize, bytes) {
+            return fail(-(error as i32));
+        }
+        crate::kernel::tty::set_window_size(crate::kernel::tty::WindowSize {
+            rows: input.rows,
+            columns: input.columns,
+            x_pixels: input.x_pixels,
+            y_pixels: input.y_pixels,
+        });
+        return 0;
     }
     if request != FS_IOC_GETFLAGS && request != FS_IOC_SETFLAGS {
         return fail(ENOTTY);

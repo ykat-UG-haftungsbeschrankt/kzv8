@@ -8,6 +8,9 @@
 #ifndef KZ_POSIX_SYS_IOCTL_H_
 #define KZ_POSIX_SYS_IOCTL_H_
 
+#define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
+
 #ifndef _IOC
 #define _IOC(direction, type, number, size) \
     (((direction) << 30) | ((size) << 16) | ((type) << 8) | (number))

@@ -306,7 +306,7 @@ fn join_path(directory: &[u8], name: &[u8]) -> Result<Vec<u8>, Error> {
         joined.push(b'/');
     }
     joined.extend_from_slice(name);
-    normalize_path(&joined)
+    normalize_path(&joined, b"/")
 }
 
 fn dependency_candidates(parent: &[u8], name: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
@@ -314,7 +314,7 @@ fn dependency_candidates(parent: &[u8], name: &[u8]) -> Result<Vec<Vec<u8>>, Err
     candidates.try_reserve(5).map_err(|_| Error::NoMem)?;
     if name.contains(&b'/') {
         if name.first() == Some(&b'/') {
-            candidates.push(normalize_path(name)?);
+            candidates.push(normalize_path(name, b"/")?);
         } else {
             let directory_end = parent.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
             let directory = if directory_end == 0 {
