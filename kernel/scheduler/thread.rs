@@ -46,6 +46,9 @@ pub(crate) struct ThreadAttributes {
     pub(crate) stack_size: usize,
     pub(crate) detach_state: i32,
     pub(crate) stack_address: *mut c_void,
+    pub(crate) inherit_schedule: i32,
+    pub(crate) scheduler_policy: i32,
+    pub(crate) scheduler_priority: i32,
 }
 
 #[repr(C)]
@@ -129,6 +132,9 @@ pub(crate) struct Thread {
     pub(crate) joiner: usize,
     pub(crate) detached: bool,
     pub(crate) errno: i32,
+    cpu_time_ns: u64,
+    running_since_ns: Option<u64>,
+    cleanup_handlers: Vec<CleanupHandler>,
     pub(crate) tls: [usize; ThreadManager::MAX_TLS_KEYS],
     signal_mask: SignalSet,
     pending_signals: SignalQueue,
@@ -142,6 +148,12 @@ pub(crate) struct Thread {
     stack: Option<ThreadStack>,
     external_stack_address: usize,
     external_stack_size: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CleanupHandler {
+    pub(crate) routine: unsafe extern "C" fn(*mut c_void),
+    pub(crate) argument: usize,
 }
 
 impl Thread {
@@ -172,6 +184,9 @@ impl Thread {
             joiner: 0,
             detached: false,
             errno: 0,
+            cpu_time_ns: 0,
+            running_since_ns: None,
+            cleanup_handlers: Vec::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
             signal_mask: SignalSet::EMPTY,
             pending_signals: SignalQueue::new(),
@@ -208,6 +223,9 @@ impl Thread {
             joiner: 0,
             detached,
             errno: 0,
+            cpu_time_ns: 0,
+            running_since_ns: None,
+            cleanup_handlers: Vec::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
             signal_mask: SignalSet::EMPTY,
             pending_signals: SignalQueue::new(),
@@ -242,6 +260,9 @@ impl Thread {
             joiner: 0,
             detached,
             errno: 0,
+            cpu_time_ns: 0,
+            running_since_ns: None,
+            cleanup_handlers: Vec::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
             signal_mask: SignalSet::EMPTY,
             pending_signals: SignalQueue::new(),
@@ -277,6 +298,9 @@ impl Thread {
             joiner: 0,
             detached,
             errno: 0,
+            cpu_time_ns: 0,
+            running_since_ns: None,
+            cleanup_handlers: Vec::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
             signal_mask: SignalSet::EMPTY,
             pending_signals: SignalQueue::new(),
@@ -350,6 +374,11 @@ pub(crate) struct ThreadManager {
 
 static THREAD_MANAGER: IrqSpinLock<ThreadManager> =
     IrqSpinLock::new(ThreadManager::new());
+
+fn scheduler_time_ns() -> u64 {
+    crate::kernel::arch::TimerArchitecture::now_ns()
+        .unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns)
+}
 
 impl ThreadManager {
     pub(crate) const MAX_TLS_KEYS: usize = 64;
@@ -440,6 +469,16 @@ impl ThreadManager {
         unsafe { ListNode::remove(&mut self.ready, node) }
     }
 
+    fn account_current_cpu_time(&mut self, now_ns: u64) {
+        if let Some(thread) = self.busy.front_mut() {
+            if let Some(started_ns) = thread.running_since_ns.take() {
+                let elapsed_ns = now_ns.saturating_sub(started_ns);
+                thread.cpu_time_ns = thread.cpu_time_ns.saturating_add(elapsed_ns);
+                thread.process.add_cpu_time_ns(elapsed_ns);
+            }
+        }
+    }
+
     pub(crate) fn initialize() -> bool {
         let Ok(process) = Process::new() else {
             return false;
@@ -455,6 +494,7 @@ impl ThreadManager {
             stack_size,
             process,
         )));
+        main_thread.running_since_ns = Some(scheduler_time_ns());
         let id = addr_of_mut!(**main_thread) as usize;
         main_thread.id = id;
         let node_address = main_thread.as_mut() as *mut ListNode<Thread> as usize;
@@ -758,7 +798,10 @@ impl ThreadManager {
                         }))
             {
                 None
-            } else if let Some(mut current) = manager.busy.pop_front() {
+            } else {
+                let now_ns = scheduler_time_ns();
+                manager.account_current_cpu_time(now_ns);
+                if let Some(mut current) = manager.busy.pop_front() {
                 let old_context = current.context.kernel_mut() as *mut kernel::Context;
                 current.state = next_state;
                 if next_state == ThreadState::Ready {
@@ -769,6 +812,7 @@ impl ThreadManager {
 
                 if let Some(mut next) = manager.pop_next_ready() {
                     next.state = ThreadState::Running;
+                    next.running_since_ns = Some(now_ns);
                     let context = SwitchContext {
                         old_context,
                         new_context: next.context.kernel() as *const kernel::Context,
@@ -780,8 +824,9 @@ impl ThreadManager {
                 } else {
                     None
                 }
-            } else {
-                None
+                } else {
+                    None
+                }
             }
         };
         let Some(context) = context else {
@@ -824,6 +869,10 @@ impl ThreadManager {
             .unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns);
         Process::tick_alarms(now_ns);
         Self::wake_expired_sleepers(now_ns);
+        if let Ok(process) = Self::current_process() {
+            let cpu_time_ns = Self::process_cpu_time_ns(&process);
+            process.check_cpu_limit(cpu_time_ns);
+        }
         let should_preempt = {
             let manager = THREAD_MANAGER.lock();
             manager.busy.front().is_some_and(|current| {
@@ -1048,6 +1097,23 @@ impl ThreadManager {
         }
     }
 
+    pub(crate) fn wake_all_blocked_threads() {
+        let mut manager = THREAD_MANAGER.lock();
+        loop {
+            let thread_id = manager
+                .busy
+                .iter()
+                .find_map(|thread| (thread.state == ThreadState::Blocked).then_some(thread.id));
+            let Some(thread_id) = thread_id else {
+                return;
+            };
+            let Some(node) = manager.thread_node_by_id(thread_id) else {
+                continue;
+            };
+            manager.wake_blocked(node);
+        }
+    }
+
     fn exit_if_process_terminated() {
         let Ok(process) = Self::current_process() else {
             return;
@@ -1143,6 +1209,44 @@ impl ThreadManager {
         }
     }
 
+    pub(crate) fn current_thread_cpu_time_ns() -> u64 {
+        let manager = THREAD_MANAGER.lock();
+        let now_ns = scheduler_time_ns();
+        manager.busy.front().map_or(0, |thread| {
+            thread.cpu_time_ns.saturating_add(
+                thread
+                    .running_since_ns
+                    .map_or(0, |started_ns| now_ns.saturating_sub(started_ns)),
+            )
+        })
+    }
+
+    pub(crate) fn current_process_cpu_time_ns() -> u64 {
+        let manager = THREAD_MANAGER.lock();
+        let Some(thread) = manager.busy.front() else {
+            return 0;
+        };
+        let now_ns = scheduler_time_ns();
+        thread.process.cpu_time_ns().saturating_add(
+            thread
+                .running_since_ns
+                .map_or(0, |started_ns| now_ns.saturating_sub(started_ns)),
+        )
+    }
+
+    pub(crate) fn process_cpu_time_ns(process: &Process) -> u64 {
+        let manager = THREAD_MANAGER.lock();
+        let now_ns = scheduler_time_ns();
+        process.cpu_time_ns().saturating_add(
+            manager
+                .busy
+                .front()
+                .filter(|thread| thread.process.pid() == process.pid())
+                .and_then(|thread| thread.running_since_ns)
+                .map_or(0, |started_ns| now_ns.saturating_sub(started_ns)),
+        )
+    }
+
     pub(crate) fn current_process() -> Result<Arc<Process>, Error> {
         let manager = THREAD_MANAGER.lock();
         if !manager.initialized {
@@ -1202,6 +1306,72 @@ impl ThreadManager {
         })
     }
 
+    pub(crate) fn push_cleanup_handler(
+        routine: unsafe extern "C" fn(*mut c_void),
+        argument: *mut c_void,
+    ) -> Result<(), Error> {
+        let mut manager = THREAD_MANAGER.lock();
+        let thread = manager.busy.front_mut().ok_or(Error::Srch)?;
+        thread.cleanup_handlers.try_reserve(1).map_err(|_| Error::NoMem)?;
+        thread.cleanup_handlers.push(CleanupHandler {
+            routine,
+            argument: argument as usize,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn pop_cleanup_handler(execute: bool) -> Result<(), Error> {
+        let handler = THREAD_MANAGER
+            .lock()
+            .busy
+            .front_mut()
+            .and_then(|thread| thread.cleanup_handlers.pop())
+            .ok_or(Error::Inval)?;
+        if execute {
+            unsafe { (handler.routine)(handler.argument as *mut c_void) };
+        }
+        Ok(())
+    }
+
+    pub(crate) fn run_cleanup_handlers_current() {
+        loop {
+            let handler = THREAD_MANAGER
+                .lock()
+                .busy
+                .front_mut()
+                .and_then(|thread| thread.cleanup_handlers.pop());
+            let Some(handler) = handler else {
+                return;
+            };
+            unsafe { (handler.routine)(handler.argument as *mut c_void) };
+        }
+    }
+
+    pub(crate) fn run_tls_destructors_current() {
+        const DESTRUCTOR_ITERATIONS: usize = 4;
+        for _ in 0..DESTRUCTOR_ITERATIONS {
+            for index in 0..Self::MAX_TLS_KEYS {
+                let destructor = {
+                    let mut manager = THREAD_MANAGER.lock();
+                    let key = manager.tls_keys[index];
+                    let Some(thread) = manager.busy.front_mut() else {
+                        return;
+                    };
+                    let value = thread.tls[index];
+                    if !key.active || value == 0 {
+                        None
+                    } else {
+                        thread.tls[index] = 0;
+                        key.destructor.map(|destructor| (destructor, value))
+                    }
+                };
+                if let Some((destructor, value)) = destructor {
+                    unsafe { destructor(value as *mut c_void) };
+                }
+            }
+        }
+    }
+
     pub(crate) fn cancel_current_if_requested() {
         let should_cancel = {
             let mut manager = THREAD_MANAGER.lock();
@@ -1216,6 +1386,8 @@ impl ThreadManager {
             }
         };
         if should_cancel {
+            Self::run_cleanup_handlers_current();
+            Self::run_tls_destructors_current();
             Self::exit_current(usize::MAX as *mut c_void);
         }
     }
@@ -1407,6 +1579,8 @@ impl ThreadManager {
             crate::kernel::arch::InterruptArchitecture::disable_interrupts();
         let (context, exited_process, exit_status) = {
             let mut manager = THREAD_MANAGER.lock();
+            let now_ns = scheduler_time_ns();
+            manager.account_current_cpu_time(now_ns);
             if let Some(mut current) = manager.busy.pop_front() {
                 current.result = result as usize;
                 current.state = ThreadState::Exited;
@@ -1427,6 +1601,7 @@ impl ThreadManager {
 
                 if let Some(mut next) = manager.pop_next_ready() {
                     next.state = ThreadState::Running;
+                    next.running_since_ns = Some(now_ns);
                     let context = SwitchContext {
                         old_context,
                         new_context: next.context.kernel() as *const kernel::Context,
@@ -1512,6 +1687,7 @@ impl ThreadManager {
         Self::exit_if_process_terminated();
 
         let result = unsafe { start_routine(argument) };
+        Self::run_tls_destructors_current();
         Self::exit_current(result)
     }
 }

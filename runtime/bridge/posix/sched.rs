@@ -42,11 +42,10 @@ fn set_errno(error: c_int) {
 }
 
 fn process_for_id(process_id: i32) -> Result<alloc::sync::Arc<Process>, Error> {
-    let process = ThreadManager::current_process()?;
-    if process_id == 0 || process_id == process.pid() {
-        Ok(process)
+    if process_id == 0 {
+        ThreadManager::current_process()
     } else {
-        Err(Error::Srch)
+        Process::lookup(process_id)
     }
 }
 
@@ -91,8 +90,11 @@ fn write_parameters(
     process.address_space().write(parameters as usize, bytes)
 }
 
-fn set_realtime_permission(process: &Process, policy: c_int) -> Result<(), Error> {
-    if matches!(policy, SCHED_FIFO | SCHED_RR) && !process.effective_user_is_root() {
+fn check_scheduling_permission(caller: &Process, target: &Process, policy: c_int) -> Result<(), Error> {
+    if !target.may_change_scheduling(caller) {
+        return Err(Error::Perm);
+    }
+    if matches!(policy, SCHED_FIFO | SCHED_RR) && !caller.effective_user_is_root() {
         Err(Error::Perm)
     } else {
         Ok(())
@@ -108,7 +110,16 @@ pub(crate) fn validate_scheduling_parameters(
     if !(minimum..=maximum).contains(&priority) {
         return Err(Error::Inval);
     }
-    set_realtime_permission(process, policy)
+    check_scheduling_permission(process, process, policy)
+}
+
+fn caller_can_query(target: &Process) -> Result<(), Error> {
+    let caller = ThreadManager::current_process()?;
+    if target.may_change_scheduling(&caller) {
+        Ok(())
+    } else {
+        Err(Error::Perm)
+    }
 }
 
 #[no_mangle]
@@ -142,6 +153,9 @@ pub unsafe extern "C" fn sched_getparam(
         Ok(process) => process,
         Err(error) => return fail(error),
     };
+    if let Err(error) = caller_can_query(&process) {
+        return fail(error);
+    }
     let (_, priority) = process.scheduler_parameters();
     match write_parameters(&process, parameters, SchedParam { priority }) {
         Ok(()) => 0,
@@ -152,7 +166,10 @@ pub unsafe extern "C" fn sched_getparam(
 #[no_mangle]
 pub extern "C" fn sched_getscheduler(process_id: i32) -> c_int {
     match process_for_id(process_id) {
-        Ok(process) => process.scheduler_parameters().0,
+        Ok(process) => match caller_can_query(&process) {
+            Ok(()) => process.scheduler_parameters().0,
+            Err(error) => fail(error),
+        },
         Err(error) => fail(error),
     }
 }
@@ -166,6 +183,9 @@ pub unsafe extern "C" fn sched_rr_get_interval(
         Ok(process) => process,
         Err(error) => return fail(error),
     };
+    if let Err(error) = caller_can_query(&process) {
+        return fail(error);
+    }
     if interval.is_null() {
         return fail(Error::Fault);
     }
@@ -194,6 +214,10 @@ pub unsafe extern "C" fn sched_setparam(
         Ok(process) => process,
         Err(error) => return fail(error),
     };
+    let caller = match ThreadManager::current_process() {
+        Ok(caller) => caller,
+        Err(error) => return fail(error),
+    };
     let parameters = match read_parameters(&process, parameters) {
         Ok(parameters) => parameters,
         Err(error) => return fail(error),
@@ -206,7 +230,7 @@ pub unsafe extern "C" fn sched_setparam(
     if !(minimum..=maximum).contains(&parameters.priority) {
         return fail(Error::Inval);
     }
-    if let Err(error) = set_realtime_permission(&process, policy) {
+    if let Err(error) = check_scheduling_permission(&caller, &process, policy) {
         return fail(error);
     }
     process.set_scheduler_parameters(policy, parameters.priority);
@@ -223,6 +247,10 @@ pub unsafe extern "C" fn sched_setscheduler(
         Ok(process) => process,
         Err(error) => return fail(error),
     };
+    let caller = match ThreadManager::current_process() {
+        Ok(caller) => caller,
+        Err(error) => return fail(error),
+    };
     let parameters = match read_parameters(&process, parameters) {
         Ok(parameters) => parameters,
         Err(error) => return fail(error),
@@ -234,7 +262,7 @@ pub unsafe extern "C" fn sched_setscheduler(
     if !(minimum..=maximum).contains(&parameters.priority) {
         return fail(Error::Inval);
     }
-    if let Err(error) = set_realtime_permission(&process, policy) {
+    if let Err(error) = check_scheduling_permission(&caller, &process, policy) {
         return fail(error);
     }
     process.set_scheduler_parameters(policy, parameters.priority);

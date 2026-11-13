@@ -243,6 +243,7 @@ unsafe fn timed_wait(
     let deadline_ns = i128::from(timeout.seconds) * 1_000_000_000
         + i128::from(timeout.nanoseconds);
     loop {
+        crate::kernel::scheduler::thread::ThreadManager::cancel_current_if_requested();
         if unsafe { sem_trywait(semaphore) } == 0 {
             return 0;
         }

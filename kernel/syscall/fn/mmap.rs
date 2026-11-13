@@ -51,10 +51,12 @@ impl Mmap {
         let Some(permissions) = protection_to_vm(arguments.protection) else {
             return Err(Error::Inval);
         };
+        let process = crate::kernel::scheduler::thread::ThreadManager::current_process()?;
+        let (address_space_limit, _) = process.resource_limit(9)?;
+        let address_space = process.address_space();
         let hint = (arguments.address_hint != 0).then_some(arguments.address_hint as usize);
-        crate::kernel::scheduler::thread::ThreadManager::current_process()?
-            .address_space()
-            .reserve_user_mapping(hint, length, permissions, false)
+        address_space
+            .reserve_user_mapping_limited(hint, length, permissions, address_space_limit)
             .map(|address| address as i64)
             .ok_or(Error::NoMem)
     }

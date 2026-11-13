@@ -8,7 +8,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
-use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use crate::kernel::dl::{AddressSpace, ElfKind, Error, LoadedObject, Permissions};
@@ -91,7 +90,7 @@ impl VcpuContext {
 	///
 	/// # Safety
 	/// The pointer must refer to the current running thread's stable, boxed context.
-	pub(crate) unsafe fn run(context: NonNull<Self>) -> ! {
+	pub(crate) unsafe fn run(context: core::ptr::NonNull<Self>) -> ! {
 		loop {
 			let exit = unsafe { (&mut *context.as_ptr()).restore() };
 			match exit {
@@ -445,6 +444,48 @@ impl UserAddressSpace {
 			return None;
 		}
 		self.reserve_user(None, length, USER_VM_PAGE_SIZE, permissions)
+	}
+
+	pub(crate) fn reserve_user_mapping_limited(
+		&self,
+		hint: Option<usize>,
+		length: usize,
+		permissions: i32,
+		limit: u64,
+	) -> Option<usize> {
+		if length == 0 || !(0..=4).contains(&permissions) {
+			return None;
+		}
+		let rounded_length = align_up(length, USER_VM_PAGE_SIZE)?;
+		let mut areas = self.inner.areas.lock();
+		let reserved = areas.areas.iter().fold(0usize, |total, area| {
+			total.saturating_add(area.range.end - area.range.start)
+		});
+		let requested = u64::try_from(rounded_length).ok()?;
+		if u64::try_from(reserved).ok()?.saturating_add(requested) > limit {
+			return None;
+		}
+		if let Some(address) = hint {
+			if address % USER_VM_PAGE_SIZE != 0 {
+				return None;
+			}
+			if let Some(reserved_address) = areas.reserve(
+				self.bounds()?,
+				Some(address),
+				rounded_length,
+				USER_VM_PAGE_SIZE,
+				permissions,
+			) {
+				return Some(reserved_address);
+			}
+		}
+		areas.reserve(
+			self.bounds()?,
+			None,
+			rounded_length,
+			USER_VM_PAGE_SIZE,
+			permissions,
+		)
 	}
 
 	pub(crate) fn user_range_reserved(&self, address: usize, length: usize) -> bool {

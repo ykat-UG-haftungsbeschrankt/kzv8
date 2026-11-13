@@ -417,6 +417,7 @@ fn start_request(control_block: *mut c_void, operation: Operation) -> Result<(),
 
 fn wait_for_requests(list: &[usize], timeout: Option<(i128, c_int)>) -> Result<(), c_int> {
     loop {
+        ThreadManager::cancel_current_if_requested();
         let pid = current_process()?.pid();
         {
             let requests = AIO_REQUESTS.lock();

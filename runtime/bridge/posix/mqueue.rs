@@ -267,6 +267,7 @@ fn send_message(
     }
     let process = current_process()?;
     loop {
+        ThreadManager::cancel_current_if_requested();
         let (result, notification, nonblocking) = {
             let mut state = MQUEUE_STATE.lock();
             let (descriptor_slot, queue_index) = descriptor_parts(descriptor, process.pid(), &state)?;
@@ -364,6 +365,11 @@ fn receive_message(
     }
     let mut registered_waiter = false;
     loop {
+        if ThreadManager::cancellation_requested_current() && registered_waiter {
+            unregister_receiver(descriptor, process.pid());
+            registered_waiter = false;
+        }
+        ThreadManager::cancel_current_if_requested();
         let (result, nonblocking) = {
             let mut state = MQUEUE_STATE.lock();
             let (descriptor_slot, queue_index) = descriptor_parts(descriptor, process.pid(), &state)?;

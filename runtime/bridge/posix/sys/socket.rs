@@ -90,6 +90,57 @@ unsafe fn read_sockaddr(
     ))
 }
 
+unsafe fn read_socket_family(address: *const c_void, address_length: u32) -> Result<u16, Error> {
+    if address.is_null() {
+        return Err(Error::Fault);
+    }
+    if usize::try_from(address_length).map_err(|_| Error::Inval)? < size_of::<u16>() {
+        return Err(Error::Inval);
+    }
+    let process = ThreadManager::current_process()?;
+    let mut family = [0; size_of::<u16>()];
+    process.address_space().read(address as usize, &mut family)?;
+    Ok(u16::from_ne_bytes(family))
+}
+
+unsafe fn read_local_sockaddr(
+    address: *const c_void,
+    address_length: u32,
+) -> Result<Vec<u8>, Error> {
+    if unsafe { read_socket_family(address, address_length) }? != AF_UNIX as u16 {
+        return Err(Error::AfNoSupport);
+    }
+    let address_length = usize::try_from(address_length).map_err(|_| Error::Inval)?;
+    let path_length = address_length
+        .saturating_sub(size_of::<u16>())
+        .min(108);
+    if path_length == 0 {
+        return Err(Error::Inval);
+    }
+    let process = ThreadManager::current_process()?;
+    let mut path_bytes = [0; 108];
+    process.address_space().read(
+        (address as usize)
+            .checked_add(size_of::<u16>())
+            .ok_or(Error::Fault)?,
+        &mut path_bytes[..path_length],
+    )?;
+    if path_bytes[0] == 0 {
+        return Err(Error::OpNotSupp);
+    }
+    let path_length = path_bytes[..path_length]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(path_length);
+    if path_length == 0 || path_length > 107 {
+        return Err(Error::NameTooLong);
+    }
+    let mut path = Vec::new();
+    path.try_reserve_exact(path_length).map_err(|_| Error::NoMem)?;
+    path.extend_from_slice(&path_bytes[..path_length]);
+    Ok(path)
+}
+
 unsafe fn write_sockaddr(
     output: *mut c_void,
     output_length: *mut u32,
@@ -122,6 +173,7 @@ unsafe fn write_sockaddr(
 unsafe fn write_local_sockaddr(
     output: *mut c_void,
     output_length: *mut u32,
+    path: &[u8],
 ) -> Result<(), Error> {
     if output.is_null() && output_length.is_null() {
         return Ok(());
@@ -129,16 +181,26 @@ unsafe fn write_local_sockaddr(
     if output.is_null() || output_length.is_null() {
         return Err(Error::Fault);
     }
-    let address_length = size_of::<u16>();
-    let available = unsafe { ptr::read_unaligned(output_length) } as usize;
-    if available < address_length {
-        unsafe { ptr::write_unaligned(output_length, address_length as u32) };
+    if path.len() > 107 {
+        return Err(Error::NameTooLong);
+    }
+    let required = size_of::<u16>() + if path.is_empty() { 0 } else { path.len() + 1 };
+    let process = ThreadManager::current_process()?;
+    let mut address_space = process.address_space();
+    let mut length_bytes = [0; size_of::<u32>()];
+    address_space.read(output_length as usize, &mut length_bytes)?;
+    let available = u32::from_ne_bytes(length_bytes) as usize;
+    if available < required {
+        address_space.write(output_length as usize, &(required as u32).to_ne_bytes())?;
         return Err(Error::MsgSize);
     }
-    unsafe {
-        ptr::write_unaligned(output.cast::<u16>(), AF_UNIX as u16);
-        ptr::write_unaligned(output_length, address_length as u32);
+    let mut sockaddr = [0; 110];
+    sockaddr[..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+    if !path.is_empty() {
+        sockaddr[2..2 + path.len()].copy_from_slice(path);
     }
+    address_space.write(output as usize, &sockaddr[..required])?;
+    address_space.write(output_length as usize, &(required as u32).to_ne_bytes())?;
     Ok(())
 }
 
@@ -161,9 +223,14 @@ pub unsafe extern "C" fn accept(
 ) -> c_int {
     match network::accept(socket) {
         Ok((accepted, peer_address, peer_port)) => {
-            if let Err(error) = unsafe {
-                write_sockaddr(address, address_length, peer_address, peer_port)
-            } {
+            let address_result = if network::is_local_socket_fd(accepted) {
+                network::local_socket_names(accepted, true).and_then(|peer_path| unsafe {
+                    write_local_sockaddr(address, address_length, &peer_path)
+                })
+            } else {
+                unsafe { write_sockaddr(address, address_length, peer_address, peer_port) }
+            };
+            if let Err(error) = address_result {
                 let _ = network::close(accepted);
                 return fail(error);
             }
@@ -202,6 +269,31 @@ pub unsafe extern "C" fn bind(
     address: *const c_void,
     address_length: u32,
 ) -> c_int {
+    if matches!(unsafe { read_socket_family(address, address_length) }, Ok(family) if family == AF_UNIX as u16)
+    {
+        let path = match unsafe { read_local_sockaddr(address, address_length) } {
+            Ok(path) => path,
+            Err(error) => return fail(error),
+        };
+        let path = match crate::kernel::runtime::runtime_libc::filesystem::normalize_local_socket_path(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
+                return -1;
+            }
+        };
+        if let Err(error) = crate::kernel::runtime::runtime_libc::filesystem::create_local_socket_node(&path) {
+            unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
+            return -1;
+        }
+        return match network::bind_local_socket(socket, &path) {
+            Ok(()) => 0,
+            Err(error) => {
+                let _ = crate::kernel::runtime::runtime_libc::filesystem::remove_local_socket_node(&path);
+                fail(error)
+            }
+        };
+    }
     let (address, port) = match unsafe { read_sockaddr(address, address_length) } {
         Ok(endpoint) => endpoint,
         Err(error) => return fail(error),
@@ -218,6 +310,28 @@ pub unsafe extern "C" fn connect(
     address: *const c_void,
     address_length: u32,
 ) -> c_int {
+    if matches!(unsafe { read_socket_family(address, address_length) }, Ok(family) if family == AF_UNIX as u16)
+    {
+        let path = match unsafe { read_local_sockaddr(address, address_length) } {
+            Ok(path) => path,
+            Err(error) => return fail(error),
+        };
+        let path = match crate::kernel::runtime::runtime_libc::filesystem::normalize_local_socket_path(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
+                return -1;
+            }
+        };
+        if let Err(error) = crate::kernel::runtime::runtime_libc::filesystem::check_local_socket_connect(&path) {
+            unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
+            return -1;
+        }
+        return match network::connect_local_socket(socket, &path) {
+            Ok(()) => 0,
+            Err(error) => fail(error),
+        };
+    }
     let (address, port) = match unsafe { read_sockaddr(address, address_length) } {
         Ok(endpoint) => endpoint,
         Err(error) => return fail(error),
@@ -238,7 +352,11 @@ pub unsafe extern "C" fn getpeername(
         if let Err(error) = network::validate_local_socket(socket) {
             return fail(error);
         }
-        return match unsafe { write_local_sockaddr(address, address_length) } {
+        let peer_path = match network::local_socket_names(socket, true) {
+            Ok(path) => path,
+            Err(error) => return fail(error),
+        };
+        return match unsafe { write_local_sockaddr(address, address_length, &peer_path) } {
             Ok(()) => 0,
             Err(error) => fail(error),
         };
@@ -263,7 +381,11 @@ pub unsafe extern "C" fn getsockname(
         if let Err(error) = network::validate_local_socket(socket) {
             return fail(error);
         }
-        return match unsafe { write_local_sockaddr(address, address_length) } {
+        let local_path = match network::local_socket_names(socket, false) {
+            Ok(path) => path,
+            Err(error) => return fail(error),
+        };
+        return match unsafe { write_local_sockaddr(address, address_length, &local_path) } {
             Ok(()) => 0,
             Err(error) => fail(error),
         };
@@ -371,10 +493,13 @@ pub unsafe extern "C" fn recvfrom(
     };
     if !address.is_null() {
         if network::is_local_socket_fd(socket) {
-            if let Err(error) = network::validate_local_socket(socket) {
-                return fail_io(error);
-            }
-            if let Err(error) = unsafe { write_local_sockaddr(address, address_length) } {
+            let peer_path = match network::local_socket_names(socket, true) {
+                Ok(path) => path,
+                Err(error) => return fail_io(error),
+            };
+            if let Err(error) = unsafe {
+                write_local_sockaddr(address, address_length, &peer_path)
+            } {
                 return fail_io(error);
             }
         } else {
@@ -443,12 +568,15 @@ pub unsafe extern "C" fn recvmsg(
     header.flags = 0;
     if !header.name.is_null() {
         if network::is_local_socket_fd(socket) {
-            if let Err(error) = network::validate_local_socket(socket) {
-                unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
-                return fail_io(error);
-            }
+            let peer_path = match network::local_socket_names(socket, true) {
+                Ok(path) => path,
+                Err(error) => {
+                    unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
+                    return fail_io(error);
+                }
+            };
             if let Err(error) = unsafe {
-                write_local_sockaddr(header.name, &mut header.name_length)
+                write_local_sockaddr(header.name, &mut header.name_length, &peer_path)
             } {
                 unsafe { ptr::write_unaligned(message.cast::<Msghdr>(), header) };
                 return fail_io(error);
@@ -524,6 +652,27 @@ pub unsafe extern "C" fn sendmsg(
             payload.extend_from_slice(bytes);
         }
     }
+    if network::is_local_socket_fd(socket) {
+        let destination = if header.name.is_null() {
+            None
+        } else {
+            let path = match unsafe { read_local_sockaddr(header.name, header.name_length) } {
+                Ok(path) => path,
+                Err(error) => return fail_io(error),
+            };
+            match crate::kernel::runtime::runtime_libc::filesystem::normalize_local_socket_path(&path) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
+                    return -1;
+                }
+            }
+        };
+        return match network::send_to_local_socket(socket, destination.as_deref(), &payload) {
+            Ok(amount) => amount as isize,
+            Err(error) => fail_io(error),
+        };
+    }
     let destination = if header.name.is_null() {
         None
     } else {
@@ -577,6 +726,32 @@ pub unsafe extern "C" fn sendto(
 ) -> isize {
     if flags & !MSG_SUPPORTED != 0 || (buffer.is_null() && length != 0) {
         return fail_io(Error::Inval);
+    }
+    if network::is_local_socket_fd(socket) {
+        let destination = if address.is_null() {
+            None
+        } else {
+            let path = match unsafe { read_local_sockaddr(address, address_length) } {
+                Ok(path) => path,
+                Err(error) => return fail_io(error),
+            };
+            match crate::kernel::runtime::runtime_libc::filesystem::normalize_local_socket_path(&path) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    unsafe { crate::kernel::scheduler::thread::__errno_location().write(error) };
+                    return -1;
+                }
+            }
+        };
+        let input = if length == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), length) }
+        };
+        return match network::send_to_local_socket(socket, destination.as_deref(), input) {
+            Ok(amount) => amount as isize,
+            Err(error) => fail_io(error),
+        };
     }
     let destination = if address.is_null() {
         None

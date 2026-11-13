@@ -96,6 +96,9 @@ pub(crate) fn open_master(flags: i32) -> Result<i32, Error> {
         .iter()
         .position(Option::is_none)
         .ok_or(Error::Mfile)?;
+    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+        PTY_FD_BASE + descriptor_index as i32,
+    )?;
     pairs[pty_index] = Some(Arc::clone(&pty));
     descriptors[descriptor_index] = Some(PtyDescriptor {
         pty_index,
@@ -156,6 +159,9 @@ fn open_slave(pty_index: usize, flags: i32) -> Result<i32, Error> {
         .iter()
         .position(Option::is_none)
         .ok_or(Error::Mfile)?;
+    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+        PTY_FD_BASE + descriptor_index as i32,
+    )?;
     pty.open_slave()?;
     descriptors[descriptor_index] = Some(PtyDescriptor {
         pty_index,
@@ -367,6 +373,9 @@ pub(crate) fn duplicate(
         .skip(minimum_index)
         .find_map(|(index, descriptor)| descriptor.is_none().then_some(index))
         .ok_or(Error::Mfile)?;
+    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+        PTY_FD_BASE + target_index as i32,
+    )?;
     let description = Arc::clone(&source.description);
     let mut open_description = description.lock();
     open_description.descriptor_references = open_description
@@ -389,6 +398,7 @@ pub(crate) fn duplicate_to(
 ) -> Result<i32, Error> {
     let source_index = descriptor_index(file_descriptor)?;
     let target_index = descriptor_index(new_descriptor)?;
+    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(new_descriptor)?;
     if file_descriptor == new_descriptor {
         return if close_on_exec {
             Err(Error::Inval)

@@ -7,7 +7,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::kernel::error::Error;
 use crate::kernel::ipc::{
@@ -21,7 +21,7 @@ use crate::kernel::vfs::FileHandle;
 use crate::kernel::scheduler::thread::{vm::UserAddressSpace, ThreadManager};
 use crate::kernel::signal::{
     SignalAction, SignalInfo, SignalSet, SignalState, CLD_CONTINUED, CLD_EXITED, CLD_KILLED,
-    CLD_STOPPED, MAX_SIGNAL_NUMBER, SIGCHLD, SIGCONT, SIGKILL, SIGSTOP,
+    CLD_STOPPED, MAX_SIGNAL_NUMBER, SIGCHLD, SIGCONT, SIGKILL, SIGSTOP, SIGXCPU,
     SA_NOCLDSTOP,
 };
 
@@ -49,7 +49,7 @@ const DEFAULT_RESOURCE_LIMITS: [ResourceLimit; 7] = [
     ResourceLimit { soft: u64::MAX, hard: u64::MAX },
     ResourceLimit { soft: 8 * 1024 * 1024, hard: 8 * 1024 * 1024 },
     ResourceLimit { soft: 0, hard: 0 },
-    ResourceLimit { soft: 64, hard: 64 },
+    ResourceLimit { soft: 1024, hard: 1024 },
     ResourceLimit { soft: u64::MAX, hard: u64::MAX },
 ];
 
@@ -84,6 +84,7 @@ pub(crate) struct ChildExitStatus {
     pub(crate) process_group_id: i32,
     pub(crate) code: i32,
     pub(crate) status: i32,
+    cpu_time_ns: u64,
 }
 
 struct ChildProcessRecord {
@@ -652,6 +653,9 @@ impl FileDescriptorTable {
 pub(crate) struct Process {
     pid: i32,
     active_threads: AtomicUsize,
+    cpu_time_ns: AtomicU64,
+    child_cpu_time_ns: AtomicU64,
+    cpu_limit_signals: AtomicU64,
     exit_notified: AtomicBool,
     control: IrqSpinLock<ProcessControlState>,
     pty_terminal: IrqSpinLock<Option<Arc<crate::kernel::tty::Pty>>>,
@@ -679,7 +683,7 @@ impl Process {
         namespace_set: NamespaceSet,
         credentials: Credentials,
     ) -> Result<Arc<Self>, Error> {
-        Self::new_with_control(namespace_set, credentials, None, None)
+        Self::new_with_control(namespace_set, credentials, None, None, None)
     }
 
     pub(crate) fn new_child_in_namespace_set_with_credentials(
@@ -689,6 +693,7 @@ impl Process {
     ) -> Result<Arc<Self>, Error> {
         let parent_control = *parent.control.lock();
         let filesystem_context = parent.filesystem.lock().try_clone()?;
+        let pty_terminal = parent.pty_terminal.lock().as_ref().map(Arc::clone);
         let child = Self::new_with_control(
             namespace_set,
             credentials,
@@ -697,6 +702,7 @@ impl Process {
                 ..parent_control
             }),
             Some(filesystem_context),
+            pty_terminal,
         )?;
         parent.register_child(&child)?;
         Ok(child)
@@ -707,6 +713,7 @@ impl Process {
         credentials: Credentials,
         inherited_control: Option<ProcessControlState>,
         inherited_filesystem: Option<FilesystemContext>,
+        inherited_pty_terminal: Option<Arc<crate::kernel::tty::Pty>>,
     ) -> Result<Arc<Self>, Error> {
         let pid = Self::allocate_pid()?;
         let control = inherited_control.unwrap_or(ProcessControlState {
@@ -728,9 +735,12 @@ impl Process {
         let process = Arc::new(Self {
             pid,
             active_threads: AtomicUsize::new(0),
+            cpu_time_ns: AtomicU64::new(0),
+            child_cpu_time_ns: AtomicU64::new(0),
+            cpu_limit_signals: AtomicU64::new(0),
             exit_notified: AtomicBool::new(false),
             control: IrqSpinLock::new(control),
-            pty_terminal: IrqSpinLock::new(None),
+            pty_terminal: IrqSpinLock::new(inherited_pty_terminal),
             namespace_set,
             address_space,
             signals: IrqSpinLock::new(SignalState::new()),
@@ -777,6 +787,9 @@ impl Process {
         let process = Arc::new(Self {
             pid,
             active_threads: AtomicUsize::new(0),
+            cpu_time_ns: AtomicU64::new(0),
+            child_cpu_time_ns: AtomicU64::new(0),
+            cpu_limit_signals: AtomicU64::new(0),
             exit_notified: AtomicBool::new(false),
             control: IrqSpinLock::new(control),
             pty_terminal: IrqSpinLock::new(None),
@@ -837,6 +850,34 @@ impl Process {
         registry[index].process.upgrade()
     }
 
+    pub(crate) fn lookup(pid: i32) -> Result<Arc<Self>, Error> {
+        if pid <= 0 {
+            return Err(Error::Srch);
+        }
+        let mut registry = PROCESS_REGISTRY.lock();
+        registry.retain(|entry| entry.process.strong_count() != 0);
+        Self::lookup_registered(&registry, pid).ok_or(Error::Srch)
+    }
+
+    pub(crate) fn registered_processes() -> Result<Vec<Arc<Self>>, Error> {
+        let mut registry = PROCESS_REGISTRY.lock();
+        registry.retain(|entry| entry.process.strong_count() != 0);
+        let mut processes = Vec::new();
+        processes
+            .try_reserve_exact(registry.len())
+            .map_err(|_| Error::NoMem)?;
+        processes.extend(registry.iter().filter_map(|entry| entry.process.upgrade()));
+        Ok(processes)
+    }
+
+    pub(crate) fn may_change_scheduling(&self, caller: &Process) -> bool {
+        self.may_inspect_process(caller)
+    }
+
+    pub(crate) fn may_inspect_process(&self, caller: &Process) -> bool {
+        caller.effective_user_is_root() || self.user_ids()[0] == caller.user_ids()[0]
+    }
+
     fn process_group_exists(
         registry: &[ProcessRegistryEntry],
         process_group_id: i32,
@@ -860,6 +901,18 @@ impl Process {
 
     pub(crate) const fn pid(&self) -> i32 {
         self.pid
+    }
+
+    pub(crate) fn add_cpu_time_ns(&self, elapsed_ns: u64) {
+        self.cpu_time_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn cpu_time_ns(&self) -> u64 {
+        self.cpu_time_ns.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn child_cpu_time_ns(&self) -> u64 {
+        self.child_cpu_time_ns.load(Ordering::Relaxed)
     }
 
     pub(crate) fn parent_pid(&self) -> i32 {
@@ -889,11 +942,18 @@ impl Process {
         self.control.lock().nice_priority
     }
 
-    pub(crate) fn set_nice_priority(&self, priority: i32) -> Result<(), Error> {
+    pub(crate) fn set_nice_priority(
+        &self,
+        caller: &Process,
+        priority: i32,
+    ) -> Result<(), Error> {
         if !(-20..=19).contains(&priority) {
             return Err(Error::Inval);
         }
-        let is_root = self.effective_user_is_root();
+        if !self.may_change_scheduling(caller) {
+            return Err(Error::Perm);
+        }
+        let is_root = caller.effective_user_is_root();
         let mut control = self.control.lock();
         if priority < control.nice_priority && !is_root {
             return Err(Error::Perm);
@@ -924,7 +984,41 @@ impl Process {
             return Err(Error::Perm);
         }
         control.resource_limits[index] = ResourceLimit { soft, hard };
+        if resource == 0 {
+            self.cpu_limit_signals.store(0, Ordering::Relaxed);
+        }
         Ok(())
+    }
+
+    pub(crate) fn check_cpu_limit(&self, cpu_time_ns: u64) {
+        let Ok((soft_limit, hard_limit)) = self.resource_limit(0) else {
+            return;
+        };
+        if soft_limit == u64::MAX {
+            return;
+        }
+        let elapsed_seconds = cpu_time_ns / 1_000_000_000;
+        if hard_limit != u64::MAX && elapsed_seconds >= hard_limit {
+            let _ = self.queue_signal(SignalInfo::new(SIGKILL, 0, 0, 0, 0, 0));
+            return;
+        }
+        let signal_count = self.cpu_limit_signals.load(Ordering::Relaxed);
+        let next_threshold = soft_limit.saturating_add(signal_count);
+        if elapsed_seconds < next_threshold {
+            return;
+        }
+        if self
+            .cpu_limit_signals
+            .compare_exchange(
+                signal_count,
+                signal_count.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            let _ = self.queue_signal(SignalInfo::new(SIGXCPU, 0, 0, 0, 0, 0));
+        }
     }
 
     pub(crate) fn signal_action(&self, signal_number: u8) -> Result<SignalAction, Error> {
@@ -997,9 +1091,7 @@ impl Process {
         if !first_termination {
             return;
         }
-        self.exit_notified.store(true, Ordering::Release);
         ThreadManager::wake_process_threads(self.pid);
-        self.notify_parent(CLD_KILLED, signal_number as i32);
     }
 
     pub(crate) fn stopped_by_signal(&self) -> Option<u8> {
@@ -1133,6 +1225,8 @@ impl Process {
         let status = children[index].events[event_index];
         if !no_wait {
             if matches!(status.code, CLD_EXITED | CLD_KILLED) {
+                self.child_cpu_time_ns
+                    .fetch_add(status.cpu_time_ns, Ordering::Relaxed);
                 children.remove(index);
             } else {
                 children[index].events.remove(event_index);
@@ -1156,6 +1250,7 @@ impl Process {
                 process_group_id: self.process_group_id(),
                 code,
                 status,
+                cpu_time_ns: self.cpu_time_ns(),
             });
             if code == CLD_STOPPED
                 && parent
@@ -1968,7 +2063,7 @@ impl ProcessMessage {
 mod tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicBool, AtomicUsize};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
     use super::{
         Capability, CapabilityTable, Credentials, DEFAULT_RESOURCE_LIMITS, FileDescriptorTable,
@@ -2016,6 +2111,9 @@ mod tests {
         let process = Arc::new(Process {
             pid: 1,
             active_threads: AtomicUsize::new(0),
+            cpu_time_ns: AtomicU64::new(0),
+            child_cpu_time_ns: AtomicU64::new(0),
+            cpu_limit_signals: AtomicU64::new(0),
             exit_notified: AtomicBool::new(false),
             control: IrqSpinLock::new(ProcessControlState {
                 parent_pid: None,

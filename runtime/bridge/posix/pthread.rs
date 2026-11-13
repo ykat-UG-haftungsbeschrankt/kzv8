@@ -7,11 +7,12 @@
 
 use core::ffi::{c_int, c_void};
 use core::mem::{size_of, MaybeUninit};
+use core::ptr::read_unaligned;
 
 use crate::kernel::dl::AddressSpace;
 use crate::kernel::error::Error;
 use crate::kernel::process::Process;
-use crate::kernel::scheduler::thread::ThreadManager;
+use crate::kernel::scheduler::thread::{ThreadAttributes, ThreadManager};
 
 use super::errno::{as_errno, ENOSYS};
 
@@ -19,6 +20,13 @@ const PTHREAD_CANCEL_ENABLE: c_int = 0;
 const PTHREAD_CANCEL_DISABLE: c_int = 1;
 const PTHREAD_CANCEL_DEFERRED: c_int = 0;
 const PTHREAD_CANCEL_ASYNCHRONOUS: c_int = 1;
+const PTHREAD_INHERIT_SCHED: c_int = 0;
+const PTHREAD_EXPLICIT_SCHED: c_int = 1;
+const SCHED_OTHER: c_int = 0;
+const SCHED_FIFO: c_int = 1;
+const SCHED_RR: c_int = 2;
+const SCHED_PRIORITY_MIN: c_int = 1;
+const SCHED_PRIORITY_MAX: c_int = 99;
 
 macro_rules! unsupported_pthread {
     ($name:ident($($argument:ident: $argument_type:ty),* $(,)?)) => {
@@ -29,6 +37,42 @@ macro_rules! unsupported_pthread {
     };
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_init(attributes: *mut c_void) -> c_int {
+    if attributes.is_null() {
+        return as_errno(Error::Inval);
+    }
+    unsafe {
+        attributes.cast::<ThreadAttributes>().write(ThreadAttributes {
+            stack_size: 0,
+            detach_state: 0,
+            stack_address: core::ptr::null_mut(),
+            inherit_schedule: PTHREAD_INHERIT_SCHED,
+            scheduler_policy: SCHED_OTHER,
+            scheduler_priority: 0,
+        });
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_destroy(attributes: *mut c_void) -> c_int {
+    if attributes.is_null() {
+        return as_errno(Error::Inval);
+    }
+    unsafe {
+        attributes.cast::<ThreadAttributes>().write(ThreadAttributes {
+            stack_size: 0,
+            detach_state: 0,
+            stack_address: core::ptr::null_mut(),
+            inherit_schedule: PTHREAD_INHERIT_SCHED,
+            scheduler_policy: SCHED_OTHER,
+            scheduler_priority: 0,
+        });
+    }
+    0
+}
+
 // FIXME: The kernel has no signal cancellation, priority scheduler, barrier, rwlock, or robust mutex API.
 unsupported_pthread!(pthread_atfork(
     _prepare: Option<unsafe extern "C" fn()>,
@@ -36,14 +80,91 @@ unsupported_pthread!(pthread_atfork(
     _child: Option<unsafe extern "C" fn()>,
 ));
 unsupported_pthread!(pthread_attr_getguardsize(_attributes: *const c_void, _guard_size: *mut usize));
-unsupported_pthread!(pthread_attr_getinheritsched(_attributes: *const c_void, _inherit_schedule: *mut c_int));
-unsupported_pthread!(pthread_attr_getschedparam(_attributes: *const c_void, _parameters: *mut c_void));
-unsupported_pthread!(pthread_attr_getschedpolicy(_attributes: *const c_void, _policy: *mut c_int));
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getinheritsched(
+    attributes: *const c_void,
+    inherit_schedule: *mut c_int,
+) -> c_int {
+    if attributes.is_null() || inherit_schedule.is_null() {
+        return as_errno(Error::Inval);
+    }
+    unsafe {
+        inherit_schedule.write((*attributes.cast::<ThreadAttributes>()).inherit_schedule)
+    };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getschedparam(
+    attributes: *const c_void,
+    parameters: *mut c_void,
+) -> c_int {
+    if attributes.is_null() || parameters.is_null() {
+        return as_errno(Error::Inval);
+    }
+    let priority = unsafe { (*attributes.cast::<ThreadAttributes>()).scheduler_priority };
+    unsafe { parameters.cast::<c_int>().write(priority) };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getschedpolicy(
+    attributes: *const c_void,
+    policy: *mut c_int,
+) -> c_int {
+    if attributes.is_null() || policy.is_null() {
+        return as_errno(Error::Inval);
+    }
+    unsafe { policy.write((*attributes.cast::<ThreadAttributes>()).scheduler_policy) };
+    0
+}
 unsupported_pthread!(pthread_attr_getscope(_attributes: *const c_void, _scope: *mut c_int));
 unsupported_pthread!(pthread_attr_setguardsize(_attributes: *mut c_void, _guard_size: usize));
-unsupported_pthread!(pthread_attr_setinheritsched(_attributes: *mut c_void, _inherit_schedule: c_int));
-unsupported_pthread!(pthread_attr_setschedparam(_attributes: *mut c_void, _parameters: *const c_void));
-unsupported_pthread!(pthread_attr_setschedpolicy(_attributes: *mut c_void, _policy: c_int));
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setinheritsched(
+    attributes: *mut c_void,
+    inherit_schedule: c_int,
+) -> c_int {
+    if attributes.is_null() || !matches!(inherit_schedule, PTHREAD_INHERIT_SCHED | PTHREAD_EXPLICIT_SCHED) {
+        return as_errno(Error::Inval);
+    }
+    unsafe { (*attributes.cast::<ThreadAttributes>()).inherit_schedule = inherit_schedule };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setschedparam(
+    attributes: *mut c_void,
+    parameters: *const c_void,
+) -> c_int {
+    if attributes.is_null() || parameters.is_null() {
+        return as_errno(Error::Inval);
+    }
+    let priority = unsafe { read_unaligned(parameters.cast::<c_int>()) };
+    let attributes = unsafe { &mut *attributes.cast::<ThreadAttributes>() };
+    let valid = match attributes.scheduler_policy {
+        SCHED_OTHER => priority == 0,
+        SCHED_FIFO | SCHED_RR => (SCHED_PRIORITY_MIN..=SCHED_PRIORITY_MAX).contains(&priority),
+        _ => false,
+    };
+    if !valid {
+        return as_errno(Error::Inval);
+    }
+    attributes.scheduler_priority = priority;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setschedpolicy(
+    attributes: *mut c_void,
+    policy: c_int,
+) -> c_int {
+    if attributes.is_null() || !matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR) {
+        return as_errno(Error::Inval);
+    }
+    unsafe { (*attributes.cast::<ThreadAttributes>()).scheduler_policy = policy };
+    0
+}
 unsupported_pthread!(pthread_attr_setscope(_attributes: *mut c_void, _scope: c_int));
 unsupported_pthread!(pthread_attr_setstack(_attributes: *mut c_void, _stack_address: *mut c_void, _stack_size: usize));
 
@@ -106,6 +227,9 @@ pub unsafe extern "C" fn pthread_setcancelstate(
     if let Err(error) = write_optional_int(&process, old_state, old_state_value) {
         let _ = ThreadManager::set_current_cancellation_enabled(previous);
         return as_errno(error);
+    }
+    if enabled {
+        ThreadManager::cancel_current_if_requested();
     }
     0
 }

@@ -194,6 +194,12 @@ int pthread_spin_init(pthread_spinlock_t *lock, int process_shared);
 int pthread_spin_lock(pthread_spinlock_t *lock);
 int pthread_spin_trylock(pthread_spinlock_t *lock);
 int pthread_spin_unlock(pthread_spinlock_t *lock);
+int __pthread_cleanup_push(void (*routine)(void *), void *argument);
+int __pthread_cleanup_pop(int execute);
+#define pthread_cleanup_push(routine, argument) \
+    do { (void)__pthread_cleanup_push((routine), (argument));
+#define pthread_cleanup_pop(execute) \
+        (void)__pthread_cleanup_pop((execute)); } while (0)
 void pthread_testcancel(void);
 void *pthread_getspecific(pthread_key_t key);
 int pthread_setspecific(pthread_key_t key, const void *value);

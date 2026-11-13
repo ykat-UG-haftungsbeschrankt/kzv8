@@ -10,6 +10,8 @@ use core::ffi::{c_char, c_int, c_long, c_void};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
+use crate::kernel::error::Error;
+use crate::kernel::process::Process;
 use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::signal::SignalSet;
 
@@ -21,7 +23,10 @@ use super::errno::{
 
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
 const CLOCK_MONOTONIC_RAW: i32 = 4;
+const PROCESS_CPU_CLOCK_TAG: i32 = 2;
 const SIGSET_SIZE: usize = 128;
 const PR_SET_NAME: i32 = 15;
 const PR_GET_NAME: i32 = 16;
@@ -39,6 +44,57 @@ const SC_NPROCESSORS_CONF: i32 = 83;
 const SC_NPROCESSORS_ONLN: i32 = 84;
 const SC_CLK_TCK: i32 = 2;
 static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
+
+pub(crate) fn check_descriptor_limit(file_descriptor: i32) -> Result<(), crate::kernel::error::Error> {
+    if file_descriptor < 0 {
+        return Err(crate::kernel::error::Error::Badf);
+    }
+    let process = ThreadManager::current_process()?;
+    let (soft_limit, _) = process.resource_limit(5)?;
+    if file_descriptor as u64 >= soft_limit {
+        Err(crate::kernel::error::Error::Mfile)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn process_cpu_clock_id(process_id: i32) -> Result<i32, Error> {
+    let target = if process_id == 0 {
+        ThreadManager::current_process()?
+    } else {
+        Process::lookup(process_id)?
+    };
+    let caller = ThreadManager::current_process()?;
+    if !target.may_inspect_process(&caller) {
+        return Err(Error::Perm);
+    }
+    let encoded = i64::from(target.pid())
+        .checked_mul(8)
+        .and_then(|value| value.checked_add(i64::from(PROCESS_CPU_CLOCK_TAG)))
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(Error::Overflow)?;
+    encoded.checked_neg().ok_or(Error::Overflow)
+}
+
+pub(crate) fn process_cpu_time_for_clock_id(clock_id: i32) -> Result<u64, Error> {
+    if clock_id >= 0 {
+        return Err(Error::Inval);
+    }
+    let encoded = clock_id.checked_neg().ok_or(Error::Inval)?;
+    if encoded & 0x7 != PROCESS_CPU_CLOCK_TAG {
+        return Err(Error::Inval);
+    }
+    let process_id = encoded >> 3;
+    if process_id <= 0 {
+        return Err(Error::Inval);
+    }
+    let target = Process::lookup(process_id)?;
+    let caller = ThreadManager::current_process()?;
+    if !target.may_inspect_process(&caller) {
+        return Err(Error::Perm);
+    }
+    Ok(ThreadManager::process_cpu_time_ns(&target))
+}
 
 #[repr(C)]
 pub struct Timespec {
@@ -105,6 +161,34 @@ pub unsafe extern "C" fn clock_gettime(clock_id: i32, output: *mut Timespec) -> 
         set_errno(EFAULT);
         return -1;
     }
+    let cpu_time_ns = match clock_id {
+        CLOCK_PROCESS_CPUTIME_ID => Some(ThreadManager::current_process_cpu_time_ns()),
+        CLOCK_THREAD_CPUTIME_ID => Some(ThreadManager::current_thread_cpu_time_ns()),
+        value if value < 0 => match process_cpu_time_for_clock_id(value) {
+            Ok(cpu_time_ns) => Some(cpu_time_ns),
+            Err(error) => {
+                set_errno(as_errno(error));
+                return -1;
+            }
+        },
+        _ => None,
+    };
+    if let Some(cpu_time_ns) = cpu_time_ns {
+        let seconds = match c_long::try_from(cpu_time_ns / 1_000_000_000) {
+            Ok(seconds) => seconds,
+            Err(_) => {
+                set_errno(EOVERFLOW);
+                return -1;
+            }
+        };
+        unsafe {
+            output.write(Timespec {
+                seconds,
+                nanoseconds: (cpu_time_ns % 1_000_000_000) as c_long,
+            });
+        }
+        return 0;
+    }
     let (seconds, nanoseconds) = match clock_id {
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW => {
             let now = unsafe { kz_host_time_ns() };
@@ -118,6 +202,14 @@ pub unsafe extern "C" fn clock_gettime(clock_id: i32, output: *mut Timespec) -> 
                 realtime_ns.div_euclid(1_000_000_000),
                 realtime_ns.rem_euclid(1_000_000_000),
             )
+        }
+        CLOCK_PROCESS_CPUTIME_ID => {
+            let now = ThreadManager::current_process_cpu_time_ns();
+            (i128::from(now / 1_000_000_000), i128::from(now % 1_000_000_000))
+        }
+        CLOCK_THREAD_CPUTIME_ID => {
+            let now = ThreadManager::current_thread_cpu_time_ns();
+            (i128::from(now / 1_000_000_000), i128::from(now % 1_000_000_000))
         }
         _ => {
             set_errno(EINVAL);
@@ -427,6 +519,7 @@ pub unsafe extern "C" fn sem_wait(semaphore: *mut c_void) -> i32 {
     }
     let count = unsafe { &*semaphore.cast::<AtomicU32>() };
     loop {
+        ThreadManager::cancel_current_if_requested();
         let current = count.load(Ordering::Acquire);
         if current != 0
             && count

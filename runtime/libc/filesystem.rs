@@ -6,6 +6,7 @@
  */
 
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_void, CStr};
 use core::ptr::{read_volatile, write_volatile};
@@ -148,6 +149,12 @@ struct Descriptor {
     close_on_exec: bool,
 }
 
+#[derive(Clone, Copy)]
+struct SharedDescriptorFlags {
+    append: bool,
+    nonblocking: bool,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct FileLockRecord {
@@ -200,6 +207,8 @@ pub(crate) struct FileSystemCapacity {
 struct FileSystem {
     nodes: Vec<Option<Node>>,
     descriptors: [Option<Descriptor>; DESCRIPTOR_COUNT],
+    shared_offsets: [Option<Arc<IrqSpinLock<i64>>>; DESCRIPTOR_COUNT],
+    shared_flags: [Option<Arc<IrqSpinLock<SharedDescriptorFlags>>>; DESCRIPTOR_COUNT],
     standard_descriptors: [bool; 3],
     pipes: Vec<Option<PipeBuffer>>,
     record_locks: Vec<RecordLock>,
@@ -233,6 +242,8 @@ impl FileSystem {
         Self {
             nodes: Vec::new(),
             descriptors: [None; DESCRIPTOR_COUNT],
+            shared_offsets: [const { None }; DESCRIPTOR_COUNT],
+            shared_flags: [const { None }; DESCRIPTOR_COUNT],
             standard_descriptors: [true; 3],
             pipes: Vec::new(),
             record_locks: Vec::new(),
@@ -399,7 +410,7 @@ impl FileSystem {
         if self.node_mode(descriptor.node).ok_or(EBADF)? & S_IFMT != S_IFDIR {
             return Err(ENOTDIR);
         }
-        usize::try_from(descriptor.offset).map_err(|_| EINVAL)
+        usize::try_from(self.descriptor_offset(slot, descriptor)).map_err(|_| EINVAL)
     }
 
     fn directory_path(&self, file_descriptor: i32) -> Result<Vec<u8>, i32> {
@@ -436,7 +447,8 @@ impl FileSystem {
         if self.node_mode(descriptor.node).ok_or(EBADF)? & S_IFMT != S_IFDIR {
             return Err(ENOTDIR);
         }
-        descriptor.offset = i64::try_from(position).map_err(|_| EINVAL)?;
+        let offset = i64::try_from(position).map_err(|_| EINVAL)?;
+        self.set_descriptor_offset(slot, &mut descriptor, offset);
         self.descriptors[slot] = Some(descriptor);
         Ok(())
     }
@@ -480,6 +492,28 @@ impl FileSystem {
             return Err(EBADF);
         }
         Ok(slot)
+    }
+
+    fn descriptor_offset(&self, slot: usize, descriptor: Descriptor) -> i64 {
+        self.shared_offsets[slot]
+            .as_ref()
+            .map_or(descriptor.offset, |offset| *offset.lock())
+    }
+
+    fn set_descriptor_offset(&mut self, slot: usize, descriptor: &mut Descriptor, offset: i64) {
+        descriptor.offset = offset;
+        if let Some(shared_offset) = self.shared_offsets[slot].as_ref() {
+            *shared_offset.lock() = offset;
+        }
+    }
+
+    fn descriptor_open_flags(&self, slot: usize, descriptor: Descriptor) -> SharedDescriptorFlags {
+        self.shared_flags[slot]
+            .as_ref()
+            .map_or(SharedDescriptorFlags {
+                append: descriptor.append,
+                nonblocking: descriptor.nonblocking,
+            }, |flags| *flags.lock())
     }
 
     fn parent_node(&self, path: &[u8]) -> Result<usize, i32> {
@@ -631,9 +665,48 @@ impl FileSystem {
             .resource_limit(1)
             .map_err(|error| -(error as i32))?;
         if u64::try_from(new_length).map_err(|_| EFBIG)? > soft_limit {
+            let _ = process.queue_signal(crate::kernel::signal::SignalInfo::new(
+                crate::kernel::signal::SIGXFSZ,
+                0,
+                process.pid(),
+                0,
+                0,
+                0,
+            ));
             return Err(EFBIG);
         }
         Ok(())
+    }
+
+    fn write_length_with_file_size_limit(
+        &self,
+        offset: usize,
+        requested_length: usize,
+    ) -> Result<usize, i32> {
+        let process = ThreadManager::current_process().map_err(metadata_errno)?;
+        let (soft_limit, _) = process
+            .resource_limit(1)
+            .map_err(|error| -(error as i32))?;
+        let start = u64::try_from(offset).map_err(|_| EFBIG)?;
+        let requested_end = start
+            .checked_add(u64::try_from(requested_length).map_err(|_| EFBIG)?)
+            .ok_or(EFBIG)?;
+        if requested_end <= soft_limit {
+            return Ok(requested_length);
+        }
+        let _ = process.queue_signal(crate::kernel::signal::SignalInfo::new(
+            crate::kernel::signal::SIGXFSZ,
+            0,
+            process.pid(),
+            0,
+            0,
+            0,
+        ));
+        if start >= soft_limit {
+            return Err(EFBIG);
+        }
+        let available = usize::try_from(soft_limit - start).unwrap_or(usize::MAX);
+        Ok(requested_length.min(available))
     }
 
     fn capacity(&self) -> FileSystemCapacity {
@@ -682,6 +755,10 @@ impl FileSystem {
             .iter()
             .position(Option::is_none)
             .ok_or(EMFILE)?;
+        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+            slot as i32 + FIRST_DESCRIPTOR,
+        )
+        .map_err(|error| -(error as i32))?;
         let existing = self.find_node(&path);
         if existing.is_some() && flags & O_CREAT != 0 && flags & O_EXCL != 0 {
             return Err(EEXIST);
@@ -716,6 +793,9 @@ impl FileSystem {
         }
         if node_type == S_IFBLK {
             return Err(-(KernelError::NoDev as i32));
+        }
+        if node_type == S_IFSOCK {
+            return Err(-(KernelError::Nxio as i32));
         }
         if node_type == S_IFCHR {
             let device = self
@@ -801,6 +881,11 @@ impl FileSystem {
             nonblocking: flags & O_NONBLOCK != 0,
             close_on_exec: flags & O_CLOEXEC != 0,
         });
+        self.shared_offsets[slot] = Some(Arc::new(IrqSpinLock::new(offset)));
+        self.shared_flags[slot] = Some(Arc::new(IrqSpinLock::new(SharedDescriptorFlags {
+            append: flags & O_APPEND != 0,
+            nonblocking: flags & O_NONBLOCK != 0,
+        })));
         Ok(slot as i32 + FIRST_DESCRIPTOR)
     }
 
@@ -816,6 +901,10 @@ impl FileSystem {
             .iter()
             .position(Option::is_none)
             .ok_or(EMFILE)?;
+        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+            slot as i32 + FIRST_DESCRIPTOR,
+        )
+        .map_err(|error| -(error as i32))?;
         self.descriptors[slot] = Some(Descriptor {
             node: TERMINAL_NODE,
             pipe_id: None,
@@ -826,6 +915,10 @@ impl FileSystem {
             nonblocking: flags & O_NONBLOCK != 0,
             close_on_exec: flags & O_CLOEXEC != 0,
         });
+        self.shared_flags[slot] = Some(Arc::new(IrqSpinLock::new(SharedDescriptorFlags {
+            append: false,
+            nonblocking: flags & O_NONBLOCK != 0,
+        })));
         Ok(slot as i32 + FIRST_DESCRIPTOR)
     }
 
@@ -840,6 +933,12 @@ impl FileSystem {
             .filter_map(|(index, descriptor)| descriptor.is_none().then_some(index));
         let read_slot = free_slots.next().ok_or(EMFILE)?;
         let write_slot = free_slots.next().ok_or(EMFILE)?;
+        for slot in [read_slot, write_slot] {
+            crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+                slot as i32 + FIRST_DESCRIPTOR,
+            )
+            .map_err(|error| -(error as i32))?;
+        }
         let pipe_id = if let Some(index) = self.pipes.iter().position(Option::is_none) {
             index
         } else {
@@ -868,6 +967,10 @@ impl FileSystem {
             nonblocking,
             close_on_exec,
         });
+        self.shared_flags[read_slot] = Some(Arc::new(IrqSpinLock::new(SharedDescriptorFlags {
+            append: false,
+            nonblocking,
+        })));
         self.descriptors[write_slot] = Some(Descriptor {
             node: PIPE_NODE,
             pipe_id: Some(pipe_id),
@@ -878,6 +981,10 @@ impl FileSystem {
             nonblocking,
             close_on_exec,
         });
+        self.shared_flags[write_slot] = Some(Arc::new(IrqSpinLock::new(SharedDescriptorFlags {
+            append: false,
+            nonblocking,
+        })));
         Ok((read_slot as i32 + FIRST_DESCRIPTOR, write_slot as i32 + FIRST_DESCRIPTOR))
     }
 
@@ -895,7 +1002,7 @@ impl FileSystem {
         if (require_read && !descriptor.readable) || (require_write && !descriptor.writable) {
             return Err(EBADF);
         }
-        Ok(Some(descriptor.nonblocking))
+        Ok(Some(self.descriptor_open_flags(slot, descriptor).nonblocking))
     }
 
     fn is_terminal_descriptor(&self, file_descriptor: i32) -> Result<bool, i32> {
@@ -963,10 +1070,11 @@ impl FileSystem {
         if node.mode & S_IFMT == S_IFBLK {
             return Err(-(KernelError::NoDev as i32));
         }
-        if descriptor.offset < 0 || descriptor.offset as usize >= node.data.len() {
+        let descriptor_offset = self.descriptor_offset(slot, descriptor);
+        if descriptor_offset < 0 || descriptor_offset as usize >= node.data.len() {
             return Ok(0);
         }
-        let offset = descriptor.offset as usize;
+        let offset = descriptor_offset as usize;
         let amount = length.min(node.data.len() - offset);
         for index in 0..amount {
             unsafe { write_volatile(buffer.add(index), node.data[offset + index]) };
@@ -975,7 +1083,7 @@ impl FileSystem {
             .as_mut()
             .ok_or(EBADF)?
             .accessed = current_realtime();
-        descriptor.offset += amount as i64;
+        self.set_descriptor_offset(slot, &mut descriptor, descriptor_offset + amount as i64);
         self.descriptors[slot] = Some(descriptor);
         Ok(amount)
     }
@@ -1080,7 +1188,9 @@ impl FileSystem {
         if inode_flags & INODE_FLAG_IMMUTABLE != 0 {
             return Err(EPERM);
         }
-        if descriptor.append || inode_flags & INODE_FLAG_APPEND != 0 {
+        let mut descriptor_offset = self.descriptor_offset(slot, descriptor);
+        let open_flags = self.descriptor_open_flags(slot, descriptor);
+        if open_flags.append || inode_flags & INODE_FLAG_APPEND != 0 {
             let current_length = self
                 .nodes
                 .get(descriptor.node)
@@ -1088,18 +1198,20 @@ impl FileSystem {
                 .ok_or(EBADF)?
                 .data
                 .len();
-            descriptor.offset = current_length as i64;
+            descriptor_offset = current_length as i64;
         }
-        if descriptor.offset < 0 || length > i64::MAX as usize {
+        if descriptor_offset < 0 || length > i64::MAX as usize {
             return Err(EFBIG);
         }
-        let offset = descriptor.offset as usize;
+        let offset = descriptor_offset as usize;
+        let length = self.write_length_with_file_size_limit(offset, length)?;
+        if length == 0 {
+            return Err(EFBIG);
+        }
         let end = offset.checked_add(length).ok_or(EFBIG)?;
         if end > i64::MAX as usize {
             return Err(EFBIG);
         }
-        self.check_process_file_size_limit(end)?;
-        self.check_process_file_size_limit(end)?;
         self.check_file_capacity(descriptor.node, end)?;
         let node = self.nodes[descriptor.node].as_mut().ok_or(EBADF)?;
         node.data
@@ -1114,7 +1226,7 @@ impl FileSystem {
         let now = current_realtime();
         node.modified = now;
         node.changed = now;
-        descriptor.offset = end as i64;
+        self.set_descriptor_offset(slot, &mut descriptor, end as i64);
         self.descriptors[slot] = Some(descriptor);
         Ok(length)
     }
@@ -1144,6 +1256,10 @@ impl FileSystem {
             return Ok(0);
         }
         let start = usize::try_from(offset).map_err(|_| EFBIG)?;
+        let length = self.write_length_with_file_size_limit(start, length)?;
+        if length == 0 {
+            return Err(EFBIG);
+        }
         let end = start.checked_add(length).filter(|end| *end <= i64::MAX as usize).ok_or(EFBIG)?;
         let inode_flags = self.node_metadata(descriptor.node)?.flags();
         if inode_flags & INODE_FLAG_IMMUTABLE != 0 {
@@ -1400,13 +1516,13 @@ impl FileSystem {
 
     fn seek(&mut self, file_descriptor: i32, offset: i64, origin: i32) -> Result<i64, i32> {
         let slot = self.descriptor_slot(file_descriptor)?;
-        let descriptor = self.descriptors[slot].ok_or(EBADF)?;
+        let mut descriptor = self.descriptors[slot].ok_or(EBADF)?;
         if descriptor.node == TERMINAL_NODE || descriptor.pipe_id.is_some() {
             return Err(-(KernelError::Spipe as i32));
         }
         let base = match origin {
             0 => 0,
-            1 => descriptor.offset,
+            1 => self.descriptor_offset(slot, descriptor),
             2 => self.node_length(descriptor.node).ok_or(EBADF)? as i64,
             _ => return Err(EINVAL),
         };
@@ -1414,10 +1530,8 @@ impl FileSystem {
         if position < 0 {
             return Err(EINVAL);
         }
-        self.descriptors[slot] = Some(Descriptor {
-            offset: position,
-            ..descriptor
-        });
+        self.set_descriptor_offset(slot, &mut descriptor, position);
+        self.descriptors[slot] = Some(descriptor);
         Ok(position)
     }
 
@@ -1432,6 +1546,9 @@ impl FileSystem {
         }
         let slot = self.descriptor_slot(file_descriptor)?;
         let descriptor = self.descriptors[slot].take().ok_or(EBADF)?;
+        self.shared_offsets[slot] = None;
+        self.shared_flags[slot] = None;
+        self.shared_offsets[slot] = None;
         if let Some(pipe_id) = descriptor.pipe_id {
             let empty = {
                 let pipe = self
@@ -1539,6 +1656,18 @@ impl FileSystem {
             return Err(EINVAL);
         }
         let source = self.descriptor_for_duplication(file_descriptor)?;
+        let source_offset = if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
+            None
+        } else {
+            let source_slot = self.descriptor_slot(file_descriptor)?;
+            self.shared_offsets[source_slot].as_ref().map(Arc::clone)
+        };
+        let source_flags = if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
+            None
+        } else {
+            let source_slot = self.descriptor_slot(file_descriptor)?;
+            self.shared_flags[source_slot].as_ref().map(Arc::clone)
+        };
         let target_slot = self
             .descriptors
             .iter()
@@ -1546,11 +1675,17 @@ impl FileSystem {
             .skip(minimum.saturating_sub(FIRST_DESCRIPTOR) as usize)
             .find_map(|(slot, descriptor)| descriptor.is_none().then_some(slot))
             .ok_or(EMFILE)?;
+        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+            target_slot as i32 + FIRST_DESCRIPTOR,
+        )
+        .map_err(|error| -(error as i32))?;
         self.add_descriptor_reference(source)?;
         self.descriptors[target_slot] = Some(Descriptor {
             close_on_exec,
             ..source
         });
+        self.shared_offsets[target_slot] = source_offset;
+        self.shared_flags[target_slot] = source_flags;
         Ok(target_slot as i32 + FIRST_DESCRIPTOR)
     }
 
@@ -1575,6 +1710,20 @@ impl FileSystem {
         if target_slot >= DESCRIPTOR_COUNT {
             return Err(EMFILE);
         }
+        crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(new_descriptor)
+            .map_err(|error| -(error as i32))?;
+        let source_offset = if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
+            None
+        } else {
+            let source_slot = self.descriptor_slot(file_descriptor)?;
+            self.shared_offsets[source_slot].as_ref().map(Arc::clone)
+        };
+        let source_flags = if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
+            None
+        } else {
+            let source_slot = self.descriptor_slot(file_descriptor)?;
+            self.shared_flags[source_slot].as_ref().map(Arc::clone)
+        };
         if self.descriptors[target_slot].is_some() {
             self.close(new_descriptor, process_id)?;
         }
@@ -1583,6 +1732,8 @@ impl FileSystem {
             close_on_exec,
             ..source
         });
+        self.shared_offsets[target_slot] = source_offset;
+        self.shared_flags[target_slot] = source_flags;
         Ok(new_descriptor)
     }
 
@@ -1647,14 +1798,15 @@ impl FileSystem {
     fn status_flags(&self, file_descriptor: i32) -> Result<i32, i32> {
         let slot = self.descriptor_slot(file_descriptor)?;
         let descriptor = self.descriptors[slot].ok_or(EBADF)?;
+        let open_flags = self.descriptor_open_flags(slot, descriptor);
         let access = match (descriptor.readable, descriptor.writable) {
             (true, false) => O_RDONLY,
             (false, true) => O_WRONLY,
             (true, true) => O_RDWR,
             (false, false) => return Err(EBADF),
         };
-        let append = if descriptor.append { O_APPEND } else { 0 };
-        let nonblocking = if descriptor.nonblocking { O_NONBLOCK } else { 0 };
+        let append = if open_flags.append { O_APPEND } else { 0 };
+        let nonblocking = if open_flags.nonblocking { O_NONBLOCK } else { 0 };
         Ok(access | append | nonblocking)
     }
 
@@ -1666,6 +1818,17 @@ impl FileSystem {
         let mut descriptor = self.descriptors[slot].ok_or(EBADF)?;
         descriptor.append = flags & O_APPEND != 0;
         descriptor.nonblocking = flags & O_NONBLOCK != 0;
+        if let Some(shared_flags) = self.shared_flags[slot].as_ref() {
+            *shared_flags.lock() = SharedDescriptorFlags {
+                append: descriptor.append,
+                nonblocking: descriptor.nonblocking,
+            };
+        } else {
+            self.shared_flags[slot] = Some(Arc::new(IrqSpinLock::new(SharedDescriptorFlags {
+                append: descriptor.append,
+                nonblocking: descriptor.nonblocking,
+            })));
+        }
         self.descriptors[slot] = Some(descriptor);
         Ok(())
     }
@@ -1709,6 +1872,9 @@ impl FileSystem {
             if let Some(pipe_id) = fifo_pipe_id {
                 self.pipes[pipe_id] = None;
             }
+        }
+        if mode & S_IFMT == S_IFSOCK {
+            network::unlink_local_socket_path(path);
         }
         Ok(())
     }
@@ -2331,6 +2497,7 @@ pub(crate) fn set_record_lock(
         .map_err(metadata_errno)?
         .pid();
     loop {
+        ThreadManager::cancel_current_if_requested();
         let result = FILESYSTEM
             .lock()
             .set_record_lock(file_descriptor, process_id, request);
@@ -2358,7 +2525,9 @@ pub(crate) fn pipe_nonblocking(file_descriptor: i32) -> Result<Option<bool>, i32
     let filesystem = FILESYSTEM.lock();
     let slot = filesystem.descriptor_slot(file_descriptor)?;
     let descriptor = filesystem.descriptors[slot].ok_or(EBADF)?;
-    Ok(descriptor.pipe_id.map(|_| descriptor.nonblocking))
+    Ok(descriptor
+        .pipe_id
+        .map(|_| filesystem.descriptor_open_flags(slot, descriptor).nonblocking))
 }
 
 pub(crate) fn is_pipe_descriptor(file_descriptor: i32) -> bool {
@@ -2373,6 +2542,63 @@ pub(crate) fn file_identity(path: *const c_char) -> Result<(u64, u64), i32> {
     let node = filesystem.find_node(&path).ok_or(ENOENT)?;
     let status = filesystem.stat_node(node)?;
     Ok((status.device, status.inode))
+}
+
+pub(crate) fn normalize_local_socket_path(path: &[u8]) -> Result<Vec<u8>, i32> {
+    if path.is_empty() || path.contains(&0) {
+        return Err(EINVAL);
+    }
+    let credentials = current_credentials()?;
+    let base = if path.first() == Some(&b'/') {
+        b"/".to_vec()
+    } else {
+        current_directory_path()?
+    };
+    normalize_path_from(path, &base, &credentials)
+}
+
+pub(crate) fn create_local_socket_node(path: &[u8]) -> Result<(), i32> {
+    let process = ThreadManager::current_process().map_err(metadata_errno)?;
+    let credentials = process.credentials().map_err(metadata_errno)?;
+    let path = normalize_local_socket_path(path)?;
+    let mut filesystem = FILESYSTEM.lock();
+    filesystem.check_search_permissions(&path, &credentials)?;
+    if filesystem.find_node(&path).is_some() {
+        return Err(-(KernelError::AddrInUse as i32));
+    }
+    filesystem.parent_allows_mutation(&path)?;
+    let parent = filesystem.parent_node(&path)?;
+    filesystem
+        .node_metadata(parent)?
+        .check_access(&credentials, 0o3, true)
+        .map_err(metadata_errno)?;
+    filesystem.allocate_node(
+        Some(path),
+        S_IFSOCK | (0o777 & !process.umask()),
+        true,
+        credentials.effective_user(),
+        credentials.effective_group(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn check_local_socket_connect(path: &[u8]) -> Result<(), i32> {
+    let credentials = current_credentials()?;
+    let mut filesystem = FILESYSTEM.lock();
+    filesystem.check_search_permissions(path, &credentials)?;
+    let node = filesystem.find_node(path).ok_or(ENOENT)?;
+    if filesystem.node_mode(node).ok_or(ENOENT)? & S_IFMT != S_IFSOCK {
+        return Err(-(KernelError::NotSock as i32));
+    }
+    filesystem
+        .node_metadata(node)?
+        .check_access(&credentials, 0o2, false)
+        .map_err(metadata_errno)
+}
+
+pub(crate) fn remove_local_socket_node(path: &[u8]) -> Result<(), i32> {
+    let credentials = current_credentials()?;
+    FILESYSTEM.lock().unlink(path, &credentials)
 }
 
 pub(crate) fn capacity_for_path(path: *const c_char) -> Result<FileSystemCapacity, i32> {
@@ -3507,6 +3733,7 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
     if file_descriptor == 0 {
         let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
         loop {
+            ThreadManager::cancel_current_if_requested();
             match crate::kernel::tty::read_console(output, false) {
                 Ok(amount) => {
                     dispatch_signals_before_io_return();
@@ -3533,6 +3760,7 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
     if pty::is_fd(file_descriptor) {
         let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
         loop {
+            ThreadManager::cancel_current_if_requested();
             match pty::read(file_descriptor, output) {
                 Ok(amount) => {
                     dispatch_signals_before_io_return();
@@ -3575,6 +3803,7 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
     if network::is_packet_fd(file_descriptor) {
         let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
         loop {
+            ThreadManager::cancel_current_if_requested();
             network::pump_packet_network();
             match network::read_packet_fd(file_descriptor, output) {
                 Ok(amount) => {
@@ -3613,6 +3842,7 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
         Ok(Some(nonblocking)) => {
             let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
             loop {
+                ThreadManager::cancel_current_if_requested();
                 match crate::kernel::tty::read_console(output, nonblocking) {
                     Ok(amount) => {
                         dispatch_signals_before_io_return();
@@ -3640,6 +3870,7 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
         return -1;
     }
     loop {
+        ThreadManager::cancel_current_if_requested();
         let result = {
             FILESYSTEM
                 .lock()
@@ -3704,6 +3935,7 @@ pub unsafe extern "C" fn write(
     if pty::is_fd(file_descriptor) {
         let input = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), length) };
         loop {
+            ThreadManager::cancel_current_if_requested();
             match pty::write(file_descriptor, input) {
                 Ok(amount) => return amount as isize,
                 Err(KernelError::Again) if matches!(pty::nonblocking(file_descriptor), Ok(false)) => {
@@ -3740,6 +3972,7 @@ pub unsafe extern "C" fn write(
     if network::is_packet_fd(file_descriptor) {
         let input = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), length) };
         loop {
+            ThreadManager::cancel_current_if_requested();
             match network::write_packet_fd(file_descriptor, input) {
                 Ok(amount) => return amount as isize,
                 Err(KernelError::Again) => match network::packet_nonblocking(file_descriptor) {
@@ -3780,6 +4013,7 @@ pub unsafe extern "C" fn write(
         return -1;
     }
     loop {
+        ThreadManager::cancel_current_if_requested();
         let result = {
             FILESYSTEM
                 .lock()
@@ -3812,6 +4046,7 @@ pub unsafe extern "C" fn write(
 fn write_console(buffer: *const u8, length: usize, nonblocking: bool) -> isize {
     let input = unsafe { core::slice::from_raw_parts(buffer, length) };
     loop {
+        ThreadManager::cancel_current_if_requested();
         match crate::kernel::tty::write_console(input, nonblocking) {
             Ok(written) => {
                 dispatch_signals_before_io_return();
@@ -4147,6 +4382,10 @@ pub(super) fn tmpfile_descriptor() -> Result<i32, i32> {
         .iter()
         .position(Option::is_none)
         .ok_or(EMFILE)?;
+    crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
+        slot as i32 + FIRST_DESCRIPTOR,
+    )
+    .map_err(|error| -(error as i32))?;
     let node = filesystem.allocate_node(
         None,
         S_IFREG | 0o600,
@@ -4165,6 +4404,11 @@ pub(super) fn tmpfile_descriptor() -> Result<i32, i32> {
         nonblocking: false,
         close_on_exec: false,
     });
+    filesystem.shared_offsets[slot] = Some(Arc::new(IrqSpinLock::new(0)));
+    filesystem.shared_flags[slot] = Some(Arc::new(IrqSpinLock::new(SharedDescriptorFlags {
+        append: false,
+        nonblocking: false,
+    })));
     Ok(slot as i32 + FIRST_DESCRIPTOR)
 }
 

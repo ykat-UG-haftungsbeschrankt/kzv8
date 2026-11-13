@@ -23,7 +23,10 @@ use super::errno::{as_errno, EFAULT, EINVAL, ENOSYS, EPERM};
 
 const CLOCK_REALTIME: c_int = 0;
 const CLOCK_MONOTONIC: c_int = 1;
+const CLOCK_PROCESS_CPUTIME_ID: c_int = 2;
+const CLOCK_THREAD_CPUTIME_ID: c_int = 3;
 const CLOCK_MONOTONIC_RAW: c_int = 4;
+const CLOCKS_PER_SEC: u64 = 1_000_000;
 const TIMER_ABSTIME: c_int = 1;
 const TIME_UTC: c_int = 1;
 const SIGEV_SIGNAL: c_int = 0;
@@ -364,17 +367,54 @@ fn unavailable() -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn clock() -> i64 {
-    unavailable() as i64
+    let cpu_time_ns = ThreadManager::current_process_cpu_time_ns();
+    (cpu_time_ns / (1_000_000_000 / CLOCKS_PER_SEC)) as i64
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn clock_getcpuclockid(_process_id: i32, _clock_id: *mut c_int) -> c_int {
-    ENOSYS
+pub unsafe extern "C" fn clock_getcpuclockid(process_id: i32, clock_id: *mut c_int) -> c_int {
+    if clock_id.is_null() {
+        return as_errno(Error::Fault);
+    }
+    let clock_id_value = match crate::kernel::runtime::runtime_libc::posix::process_cpu_clock_id(
+        process_id,
+    ) {
+        Ok(clock_id) => clock_id,
+        Err(error) => return as_errno(error),
+    };
+    let caller = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => return as_errno(error),
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&clock_id_value as *const c_int).cast::<u8>(),
+            size_of::<c_int>(),
+        )
+    };
+    caller
+        .address_space()
+        .write(clock_id as usize, bytes)
+        .map_or_else(as_errno, |_| 0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn clock_getres(clock_id: c_int, resolution: *mut Timespec) -> c_int {
-    if !matches!(clock_id, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW) {
+    if clock_id < 0 {
+        if let Err(error) = crate::kernel::runtime::runtime_libc::posix::process_cpu_time_for_clock_id(
+            clock_id,
+        ) {
+            set_errno(as_errno(error));
+            return -1;
+        }
+    } else if !matches!(
+        clock_id,
+        CLOCK_REALTIME
+            | CLOCK_MONOTONIC
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID
+            | CLOCK_MONOTONIC_RAW
+    ) {
         set_errno(EINVAL);
         return -1;
     }
@@ -639,6 +679,9 @@ fn dispatch_timer_notification(pid: i32, notification: TimerNotification) {
                 stack_size: attributes.stack_size,
                 detach_state: attributes.detach_state,
                 stack_address: attributes.stack_address as *mut c_void,
+                inherit_schedule: 0,
+                scheduler_policy: 0,
+                scheduler_priority: 0,
             };
             let mut thread = 0;
             let result = unsafe {

@@ -22,6 +22,13 @@ use crate::kernel::scheduler::thread::{
 
 const JOINABLE: i32 = 0;
 const DETACHED: i32 = 1;
+const INHERIT_SCHED: i32 = 0;
+const EXPLICIT_SCHED: i32 = 1;
+const SCHED_OTHER: i32 = 0;
+const SCHED_FIFO: i32 = 1;
+const SCHED_RR: i32 = 2;
+const SCHED_PRIORITY_MIN: i32 = 1;
+const SCHED_PRIORITY_MAX: i32 = 99;
 const CLOCK_REALTIME: c_int = 0;
 const CLOCK_MONOTONIC: c_int = 1;
 const CLOCK_MONOTONIC_RAW: c_int = 4;
@@ -76,6 +83,7 @@ fn mutex_lock_until(mutex: *mut c_void, deadline_ns: u64) -> i32 {
         return EAGAIN;
     }
     loop {
+        ThreadManager::cancel_current_if_requested();
         match owner.compare_exchange(0, current_id, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return 0,
             Err(existing) if existing == current_id => return EDEADLK,
@@ -172,7 +180,37 @@ pub extern "C" fn pthread_yield() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn pthread_exit(result: *mut c_void) -> ! {
+    ThreadManager::run_cleanup_handlers_current();
+    ThreadManager::run_tls_destructors_current();
     ThreadManager::exit_current(result)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __pthread_cleanup_push(
+    routine: Option<unsafe extern "C" fn(*mut c_void)>,
+    argument: *mut c_void,
+) -> i32 {
+    let Some(routine) = routine else {
+        return EINVAL;
+    };
+    ThreadManager::push_cleanup_handler(routine, argument).map_or_else(
+        |error| match error {
+            Error::NoMem => ENOMEM,
+            _ => EINVAL,
+        },
+        |_| 0,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __pthread_cleanup_pop(execute: c_int) -> i32 {
+    ThreadManager::pop_cleanup_handler(execute != 0).map_or_else(
+        |error| match error {
+            Error::Inval => EINVAL,
+            _ => EINVAL,
+        },
+        |_| 0,
+    )
 }
 
 #[allow(unused_macros)]
@@ -285,6 +323,9 @@ pub unsafe extern "C" fn pthread_attr_init(attributes: *mut c_void) -> i32 {
                 stack_size: 0,
                 detach_state: JOINABLE,
                 stack_address: core::ptr::null_mut(),
+                inherit_schedule: INHERIT_SCHED,
+                scheduler_policy: SCHED_OTHER,
+                scheduler_priority: 0,
             });
     }
     0
@@ -302,6 +343,9 @@ pub unsafe extern "C" fn pthread_attr_destroy(attributes: *mut c_void) -> i32 {
                 stack_size: 0,
                 detach_state: JOINABLE,
                 stack_address: core::ptr::null_mut(),
+                inherit_schedule: INHERIT_SCHED,
+                scheduler_policy: SCHED_OTHER,
+                scheduler_priority: 0,
             });
     }
     0
@@ -328,6 +372,86 @@ pub unsafe extern "C" fn pthread_attr_getdetachstate(
         return EINVAL;
     }
     unsafe { detach_state.write((*attributes.cast::<ThreadAttributes>()).detach_state) };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setinheritsched(
+    attributes: *mut c_void,
+    inherit_schedule: i32,
+) -> i32 {
+    if attributes.is_null() || !matches!(inherit_schedule, INHERIT_SCHED | EXPLICIT_SCHED) {
+        return EINVAL;
+    }
+    unsafe { (*attributes.cast::<ThreadAttributes>()).inherit_schedule = inherit_schedule };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getinheritsched(
+    attributes: *const c_void,
+    inherit_schedule: *mut i32,
+) -> i32 {
+    if attributes.is_null() || inherit_schedule.is_null() {
+        return EINVAL;
+    }
+    unsafe {
+        inherit_schedule.write((*attributes.cast::<ThreadAttributes>()).inherit_schedule)
+    };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setschedpolicy(
+    attributes: *mut c_void,
+    policy: i32,
+) -> i32 {
+    if attributes.is_null() || !matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR) {
+        return EINVAL;
+    }
+    unsafe { (*attributes.cast::<ThreadAttributes>()).scheduler_policy = policy };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getschedpolicy(
+    attributes: *const c_void,
+    policy: *mut i32,
+) -> i32 {
+    if attributes.is_null() || policy.is_null() {
+        return EINVAL;
+    }
+    unsafe { policy.write((*attributes.cast::<ThreadAttributes>()).scheduler_policy) };
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_setschedparam(
+    attributes: *mut c_void,
+    parameters: *const c_void,
+) -> i32 {
+    if attributes.is_null() || parameters.is_null() {
+        return EINVAL;
+    }
+    let priority = unsafe { read_unaligned(parameters.cast::<i32>()) };
+    let attributes = unsafe { &mut *attributes.cast::<ThreadAttributes>() };
+    if !valid_scheduling_parameters(attributes.scheduler_policy, priority) {
+        return EINVAL;
+    }
+    attributes.scheduler_priority = priority;
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_attr_getschedparam(
+    attributes: *const c_void,
+    parameters: *mut c_void,
+) -> i32 {
+    if attributes.is_null() || parameters.is_null() {
+        return EINVAL;
+    }
+    let priority = unsafe { (*attributes.cast::<ThreadAttributes>()).scheduler_priority };
+    unsafe { parameters.cast::<i32>().write(priority) };
     0
 }
 
@@ -390,6 +514,8 @@ pub unsafe extern "C" fn pthread_getattr_np(thread_id: usize, attributes: *mut c
     else {
         return ESRCH;
     };
+    let (scheduler_policy, scheduler_priority) =
+        ThreadManager::scheduling_parameters_for_thread(thread_id).unwrap_or((SCHED_OTHER, 0));
     unsafe {
         attributes
             .cast::<ThreadAttributes>()
@@ -397,6 +523,9 @@ pub unsafe extern "C" fn pthread_getattr_np(thread_id: usize, attributes: *mut c
                 stack_size,
                 detach_state: if detached { DETACHED } else { JOINABLE },
                 stack_address,
+                inherit_schedule: EXPLICIT_SCHED,
+                scheduler_policy,
+                scheduler_priority,
             });
     }
     0
@@ -425,20 +554,59 @@ pub unsafe extern "C" fn pthread_create(
         return EINVAL;
     }
 
-    let (stack_size, detach_state) = if attributes.is_null() {
-        (0, JOINABLE)
+    let (stack_size, detach_state, inherit_schedule, scheduler_policy, scheduler_priority) =
+        if attributes.is_null() {
+        (0, JOINABLE, INHERIT_SCHED, SCHED_OTHER, 0)
     } else {
         let attributes = unsafe { &*attributes.cast::<ThreadAttributes>() };
-        (attributes.stack_size, attributes.detach_state)
+        (
+            attributes.stack_size,
+            attributes.detach_state,
+            attributes.inherit_schedule,
+            attributes.scheduler_policy,
+            attributes.scheduler_priority,
+        )
     };
     let stack_size = if stack_size == 0 {
         ThreadStack::DEFAULT_SIZE
     } else {
         stack_size
     };
-    if stack_size < ThreadStack::MIN_SIZE || !matches!(detach_state, JOINABLE | DETACHED) {
+    if stack_size < ThreadStack::MIN_SIZE
+        || !matches!(detach_state, JOINABLE | DETACHED)
+        || !matches!(inherit_schedule, INHERIT_SCHED | EXPLICIT_SCHED)
+    {
         return EINVAL;
     }
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(_) => return EAGAIN,
+    };
+    let (stack_limit, _) = match process.resource_limit(3) {
+        Ok(limit) => limit,
+        Err(_) => return EINVAL,
+    };
+    if u64::try_from(stack_size).map_or(true, |size| size > stack_limit) {
+        return EAGAIN;
+    }
+
+    let scheduling_parameters = if inherit_schedule == INHERIT_SCHED {
+        match ThreadManager::scheduling_parameters_for_thread(ThreadManager::current_thread_id()) {
+            Ok(parameters) => parameters,
+            Err(_) => return EAGAIN,
+        }
+    } else {
+        if !valid_scheduling_parameters(scheduler_policy, scheduler_priority) {
+            return EINVAL;
+        }
+        if matches!(scheduler_policy, SCHED_FIFO | SCHED_RR)
+            && !ThreadManager::current_process()
+                .is_ok_and(|process| process.effective_user_is_root())
+        {
+            return EPERM;
+        }
+        (scheduler_policy, scheduler_priority)
+    };
 
     let start_routine = start_routine.unwrap();
     let id = match ThreadManager::create_thread(
@@ -453,8 +621,25 @@ pub unsafe extern "C" fn pthread_create(
         Err(Error::Inval) => return EINVAL,
         Err(_) => return EINVAL,
     };
+    if ThreadManager::set_scheduling_parameters_for_thread(
+        id,
+        scheduling_parameters.0,
+        scheduling_parameters.1,
+    )
+    .is_err()
+    {
+        return EAGAIN;
+    }
     unsafe { thread_id.write(id) };
     0
+}
+
+fn valid_scheduling_parameters(policy: i32, priority: i32) -> bool {
+    match policy {
+        SCHED_OTHER => priority == 0,
+        SCHED_FIFO | SCHED_RR => (SCHED_PRIORITY_MIN..=SCHED_PRIORITY_MAX).contains(&priority),
+        _ => false,
+    }
 }
 
 #[no_mangle]
@@ -473,6 +658,10 @@ pub unsafe extern "C" fn pthread_join(thread_id: usize, result: *mut *mut c_void
     if !ThreadManager::switch_current(ThreadState::Blocked) {
         ThreadManager::cancel_join_by_id(thread_id);
         return EDEADLK;
+    }
+    if ThreadManager::cancellation_requested_current() {
+        ThreadManager::cancel_join_by_id(thread_id);
+        ThreadManager::cancel_current_if_requested();
     }
 
     let value = match ThreadManager::finish_join_by_id(thread_id) {
@@ -550,6 +739,7 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> i32 {
         return EAGAIN;
     }
     loop {
+        ThreadManager::cancel_current_if_requested();
         match owner.compare_exchange(0, current_id, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return 0,
             Err(existing) if existing == current_id => return EDEADLK,
@@ -630,6 +820,13 @@ pub unsafe extern "C" fn pthread_cond_wait(condition: *mut c_void, mutex: *mut c
 
     let condition_generation = unsafe { &(*condition.cast::<PthreadCondition>()).generation };
     while condition_generation.load(Ordering::Acquire) == generation {
+        if ThreadManager::cancellation_requested_current() {
+            let lock_status = unsafe { pthread_mutex_lock(mutex) };
+            if lock_status != 0 {
+                return lock_status;
+            }
+            ThreadManager::cancel_current_if_requested();
+        }
         if !ThreadManager::switch_current(ThreadState::Ready) {
             let lock_status = unsafe { pthread_mutex_lock(mutex) };
             return if lock_status == 0 {
@@ -639,7 +836,11 @@ pub unsafe extern "C" fn pthread_cond_wait(condition: *mut c_void, mutex: *mut c
             };
         }
     }
-    unsafe { pthread_mutex_lock(mutex) }
+    let lock_status = unsafe { pthread_mutex_lock(mutex) };
+    if lock_status == 0 {
+        ThreadManager::cancel_current_if_requested();
+    }
+    lock_status
 }
 
 #[no_mangle]

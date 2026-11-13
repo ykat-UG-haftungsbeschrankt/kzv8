@@ -89,6 +89,7 @@ fn wait_for_child(
     nowait: bool,
 ) -> Result<Option<ChildExitStatus>, Error> {
     loop {
+        ThreadManager::cancel_current_if_requested();
         match process.child_wait_status(
             process_id,
             wait_exited,

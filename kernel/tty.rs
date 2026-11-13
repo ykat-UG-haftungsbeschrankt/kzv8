@@ -906,6 +906,7 @@ pub(crate) fn write_console(input: &[u8], nonblocking: bool) -> Result<usize, Er
     }
     let mut written = 0;
     while written < input.len() {
+        ThreadManager::cancel_current_if_requested();
         let (attributes, output_stopped, column) = {
             let terminal = CONSOLE_TTY.lock();
             (
@@ -1240,6 +1241,7 @@ pub(crate) fn read_console(
             None
         };
         loop {
+            ThreadManager::cancel_current_if_requested();
             poll_input()?;
             if delivered < output.len() {
                 let mut terminal = CONSOLE_TTY.lock();

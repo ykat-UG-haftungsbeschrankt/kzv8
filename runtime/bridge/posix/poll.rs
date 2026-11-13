@@ -53,6 +53,7 @@ fn poll_inner(
     }
     let started = now_ns();
     loop {
+        ThreadManager::cancel_current_if_requested();
         let mut ready_count = 0;
         let descriptors = if descriptor_count == 0 {
             &mut [][..]
