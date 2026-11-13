@@ -38,11 +38,44 @@ struct ProcessRegistryEntry {
 }
 
 #[derive(Clone, Copy)]
+struct ResourceLimit {
+    soft: u64,
+    hard: u64,
+}
+
+const DEFAULT_RESOURCE_LIMITS: [ResourceLimit; 7] = [
+    ResourceLimit { soft: u64::MAX, hard: u64::MAX },
+    ResourceLimit { soft: u64::MAX, hard: u64::MAX },
+    ResourceLimit { soft: u64::MAX, hard: u64::MAX },
+    ResourceLimit { soft: 8 * 1024 * 1024, hard: 8 * 1024 * 1024 },
+    ResourceLimit { soft: 0, hard: 0 },
+    ResourceLimit { soft: 64, hard: 64 },
+    ResourceLimit { soft: u64::MAX, hard: u64::MAX },
+];
+
+#[derive(Clone, Copy)]
 struct ProcessControlState {
     parent_pid: Option<i32>,
     process_group_id: i32,
     session_id: i32,
     controlling_terminal: bool,
+    scheduler_policy: i32,
+    scheduler_priority: i32,
+    nice_priority: i32,
+    resource_limits: [ResourceLimit; 7],
+}
+
+fn resource_limit_index(resource: i32) -> Option<usize> {
+    match resource {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        4 => Some(4),
+        5 => Some(5),
+        9 => Some(6),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -621,6 +654,7 @@ pub(crate) struct Process {
     active_threads: AtomicUsize,
     exit_notified: AtomicBool,
     control: IrqSpinLock<ProcessControlState>,
+    pty_terminal: IrqSpinLock<Option<Arc<crate::kernel::tty::Pty>>>,
     namespace_set: NamespaceSet,
     address_space: UserAddressSpace,
     signals: IrqSpinLock<SignalState>,
@@ -680,6 +714,10 @@ impl Process {
             process_group_id: pid,
             session_id: pid,
             controlling_terminal: false,
+            scheduler_policy: 0,
+            scheduler_priority: 0,
+            nice_priority: 0,
+            resource_limits: DEFAULT_RESOURCE_LIMITS,
         });
         let address_space = UserAddressSpace::new()?;
         let capabilities = CapabilityTable::new()?;
@@ -692,6 +730,7 @@ impl Process {
             active_threads: AtomicUsize::new(0),
             exit_notified: AtomicBool::new(false),
             control: IrqSpinLock::new(control),
+            pty_terminal: IrqSpinLock::new(None),
             namespace_set,
             address_space,
             signals: IrqSpinLock::new(SignalState::new()),
@@ -721,6 +760,10 @@ impl Process {
                 process_group_id: pid,
                 session_id: pid,
                 controlling_terminal: false,
+                scheduler_policy: 0,
+                scheduler_priority: 0,
+                nice_priority: 0,
+                resource_limits: DEFAULT_RESOURCE_LIMITS,
             },
             |parent| ProcessControlState {
                 parent_pid: Some(parent.pid),
@@ -736,6 +779,7 @@ impl Process {
             active_threads: AtomicUsize::new(0),
             exit_notified: AtomicBool::new(false),
             control: IrqSpinLock::new(control),
+            pty_terminal: IrqSpinLock::new(None),
             namespace_set: parent.map_or_else(NamespaceSet::root, |parent| parent.namespace_set()),
             address_space: UserAddressSpace::new_test_stub(),
             signals: IrqSpinLock::new(SignalState::new()),
@@ -828,6 +872,59 @@ impl Process {
 
     pub(crate) fn session_id(&self) -> i32 {
         self.control.lock().session_id
+    }
+
+    pub(crate) fn scheduler_parameters(&self) -> (i32, i32) {
+        let control = self.control.lock();
+        (control.scheduler_policy, control.scheduler_priority)
+    }
+
+    pub(crate) fn set_scheduler_parameters(&self, policy: i32, priority: i32) {
+        let mut control = self.control.lock();
+        control.scheduler_policy = policy;
+        control.scheduler_priority = priority;
+    }
+
+    pub(crate) fn nice_priority(&self) -> i32 {
+        self.control.lock().nice_priority
+    }
+
+    pub(crate) fn set_nice_priority(&self, priority: i32) -> Result<(), Error> {
+        if !(-20..=19).contains(&priority) {
+            return Err(Error::Inval);
+        }
+        let is_root = self.effective_user_is_root();
+        let mut control = self.control.lock();
+        if priority < control.nice_priority && !is_root {
+            return Err(Error::Perm);
+        }
+        control.nice_priority = priority;
+        Ok(())
+    }
+
+    pub(crate) fn resource_limit(&self, resource: i32) -> Result<(u64, u64), Error> {
+        let index = resource_limit_index(resource).ok_or(Error::Inval)?;
+        let limit = self.control.lock().resource_limits[index];
+        Ok((limit.soft, limit.hard))
+    }
+
+    pub(crate) fn set_resource_limit(
+        &self,
+        resource: i32,
+        soft: u64,
+        hard: u64,
+    ) -> Result<(), Error> {
+        if soft > hard {
+            return Err(Error::Inval);
+        }
+        let is_root = self.effective_user_is_root();
+        let index = resource_limit_index(resource).ok_or(Error::Inval)?;
+        let mut control = self.control.lock();
+        if hard > control.resource_limits[index].hard && !is_root {
+            return Err(Error::Perm);
+        }
+        control.resource_limits[index] = ResourceLimit { soft, hard };
+        Ok(())
     }
 
     pub(crate) fn signal_action(&self, signal_number: u8) -> Result<SignalAction, Error> {
@@ -1323,18 +1420,27 @@ impl Process {
         control.session_id = self.pid;
         control.process_group_id = self.pid;
         control.controlling_terminal = false;
+        self.pty_terminal.lock().take();
         Ok(self.pid)
     }
 
     pub(crate) fn controlling_terminal_session(&self) -> Result<i32, Error> {
         let _registry = PROCESS_REGISTRY.lock();
         let control = *self.control.lock();
-        if !control.controlling_terminal
-            || !crate::kernel::tty::session_owns_console(control.session_id)
+        if control.controlling_terminal
+            && crate::kernel::tty::session_owns_console(control.session_id)
         {
-            return Err(Error::NotTty);
+            return Ok(control.session_id);
         }
-        Ok(control.session_id)
+        if self
+            .pty_terminal
+            .lock()
+            .as_ref()
+            .is_some_and(|terminal| terminal.session_owns(control.session_id))
+        {
+            return Ok(control.session_id);
+        }
+        Err(Error::NotTty)
     }
 
     pub(crate) fn acquire_console_terminal(&self, no_controlling_terminal: bool) {
@@ -1346,6 +1452,7 @@ impl Process {
         if control.controlling_terminal
             || control.session_id != self.pid
             || control.process_group_id != self.pid
+            || self.pty_terminal.lock().is_some()
         {
             return;
         }
@@ -1354,16 +1461,54 @@ impl Process {
         }
     }
 
+    pub(crate) fn acquire_pty_terminal(
+        &self,
+        terminal: Arc<crate::kernel::tty::Pty>,
+        no_controlling_terminal: bool,
+    ) {
+        if no_controlling_terminal {
+            return;
+        }
+        let _registry = PROCESS_REGISTRY.lock();
+        let control = *self.control.lock();
+        if control.controlling_terminal
+            || control.session_id != self.pid
+            || control.process_group_id != self.pid
+            || self.pty_terminal.lock().is_some()
+        {
+            return;
+        }
+        if terminal.acquire_session(control.session_id, control.process_group_id) {
+            *self.pty_terminal.lock() = Some(terminal);
+        }
+    }
+
+    pub(crate) fn controlling_pty_terminal(
+        &self,
+    ) -> Option<Arc<crate::kernel::tty::Pty>> {
+        let session_id = self.control.lock().session_id;
+        self.pty_terminal
+            .lock()
+            .as_ref()
+            .filter(|terminal| terminal.session_owns(session_id))
+            .map(Arc::clone)
+    }
+
     pub(crate) fn terminal_foreground_process_group(&self) -> Result<i32, Error> {
         let _registry = PROCESS_REGISTRY.lock();
         let control = *self.control.lock();
-        if !control.controlling_terminal
-            || !crate::kernel::tty::session_owns_console(control.session_id)
+        if control.controlling_terminal
+            && crate::kernel::tty::session_owns_console(control.session_id)
         {
-            return Err(Error::NotTty);
+            return crate::kernel::tty::foreground_process_group(control.session_id)
+                .ok_or(Error::NotTty);
         }
-        let session_id = control.session_id;
-        crate::kernel::tty::foreground_process_group(session_id).ok_or(Error::NotTty)
+        self.pty_terminal
+            .lock()
+            .as_ref()
+            .filter(|terminal| terminal.session_owns(control.session_id))
+            .and_then(|terminal| terminal.foreground_process_group(control.session_id))
+            .ok_or(Error::NotTty)
     }
 
     pub(crate) fn set_terminal_foreground_process_group(
@@ -1375,14 +1520,25 @@ impl Process {
         }
         let control = *self.control.lock();
         let session_id = control.session_id;
-        if !control.controlling_terminal
-            || !crate::kernel::tty::session_owns_console(session_id)
-        {
+        let pty_terminal = self.pty_terminal.lock().as_ref().map(Arc::clone);
+        let console_terminal = control.controlling_terminal
+            && crate::kernel::tty::session_owns_console(session_id);
+        let owns_pty = pty_terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.session_owns(session_id));
+        if !console_terminal && !owns_pty {
             return Err(Error::NotTty);
         }
-        if crate::kernel::tty::foreground_process_group(session_id)
-            .is_some_and(|foreground| foreground != control.process_group_id)
-        {
+        let foreground_process_group = if console_terminal {
+            crate::kernel::tty::foreground_process_group(session_id)
+        } else {
+            pty_terminal
+                .as_ref()
+                .and_then(|terminal| terminal.foreground_process_group(session_id))
+        };
+        if foreground_process_group.is_some_and(|foreground| {
+            foreground != control.process_group_id
+        }) {
             Self::signal_terminal_process_group(
                 session_id,
                 control.process_group_id,
@@ -1399,7 +1555,14 @@ impl Process {
                 Error::Srch
             });
         }
-        if !crate::kernel::tty::set_foreground_process_group(session_id, process_group_id) {
+        let updated = if console_terminal {
+            crate::kernel::tty::set_foreground_process_group(session_id, process_group_id)
+        } else {
+            pty_terminal.as_ref().is_some_and(|terminal| {
+                terminal.set_foreground_process_group(session_id, process_group_id)
+            })
+        };
+        if !updated {
             return Err(Error::NotTty);
         }
         Ok(())
@@ -1808,9 +1971,9 @@ mod tests {
     use core::sync::atomic::{AtomicBool, AtomicUsize};
 
     use super::{
-        Capability, CapabilityTable, Credentials, FileDescriptorTable, FilesystemContext, GroupId,
-        KernelObjectRef, KernelObjectTable, NamespaceSet, Process, ProcessControlState,
-        SignalState, UserAddressSpace, UserId,
+        Capability, CapabilityTable, Credentials, DEFAULT_RESOURCE_LIMITS, FileDescriptorTable,
+        FilesystemContext, GroupId, KernelObjectRef, KernelObjectTable, NamespaceSet, Process,
+        ProcessControlState, SignalState, UserAddressSpace, UserId,
     };
     use crate::kernel::ipc::Endpoint;
     use crate::kernel::scheduler::sync::IrqSpinLock;
@@ -1859,7 +2022,12 @@ mod tests {
                 process_group_id: 1,
                 session_id: 1,
                 controlling_terminal: false,
+                scheduler_policy: 0,
+                scheduler_priority: 0,
+                nice_priority: 0,
+                resource_limits: DEFAULT_RESOURCE_LIMITS,
             }),
+            pty_terminal: IrqSpinLock::new(None),
             namespace_set: NamespaceSet::root(),
             address_space: UserAddressSpace::new_test_stub(),
             signals: IrqSpinLock::new(SignalState::new()),

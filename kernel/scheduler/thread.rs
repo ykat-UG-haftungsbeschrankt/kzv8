@@ -25,6 +25,9 @@ use crate::kernel::signal::{SignalInfo, SignalQueue, SignalSet};
 
 use super::sync::IrqSpinLock;
 
+const SCHED_FIFO_POLICY: i32 = 1;
+const SCHED_RR_POLICY: i32 = 2;
+
 #[path = "thread/kernel.rs"]
 pub(crate) mod kernel;
 #[path = "thread/userspace.rs"]
@@ -117,6 +120,7 @@ pub(crate) struct Thread {
     // Thread IDs intentionally use the stable address of the Thread inside its Box.
     pub(crate) id: usize,
     process: Arc<Process>,
+    scheduler_override: Option<(i32, i32)>,
     pub(crate) context: ExecutionContext,
     pub(crate) state: ThreadState,
     pub(crate) start_routine: Option<StartRoutine>,
@@ -130,6 +134,8 @@ pub(crate) struct Thread {
     pending_signals: SignalQueue,
     signal_wait_set: Option<SignalSet>,
     signal_wake_pending: bool,
+    cancellation_requested: bool,
+    cancellation_enabled: bool,
     sleep_deadline_ns: Option<u64>,
     process_stop_wait: bool,
     process_stop_wake: bool,
@@ -139,10 +145,25 @@ pub(crate) struct Thread {
 }
 
 impl Thread {
+    fn scheduler_parameters(&self) -> (i32, i32) {
+        self.scheduler_override
+            .unwrap_or_else(|| self.process.scheduler_parameters())
+    }
+
+    fn scheduling_rank(&self) -> i32 {
+        let (policy, priority) = self.scheduler_parameters();
+        if matches!(policy, SCHED_FIFO_POLICY | SCHED_RR_POLICY) {
+            100 + priority
+        } else {
+            20 - self.process.nice_priority()
+        }
+    }
+
     fn main(stack_address: usize, stack_size: usize, process: Arc<Process>) -> Self {
         Self {
             id: 0,
             process,
+            scheduler_override: None,
             context: ExecutionContext::Kernel(kernel::Context::main()),
             state: ThreadState::Running,
             start_routine: None,
@@ -156,6 +177,8 @@ impl Thread {
             pending_signals: SignalQueue::new(),
             signal_wait_set: None,
             signal_wake_pending: false,
+            cancellation_requested: false,
+            cancellation_enabled: true,
             sleep_deadline_ns: None,
             process_stop_wait: false,
             process_stop_wake: false,
@@ -176,6 +199,7 @@ impl Thread {
         Self {
             id: 0,
             process,
+            scheduler_override: None,
             context: ExecutionContext::Kernel(context),
             state: ThreadState::Ready,
             start_routine: Some(start_routine),
@@ -189,6 +213,8 @@ impl Thread {
             pending_signals: SignalQueue::new(),
             signal_wait_set: None,
             signal_wake_pending: false,
+            cancellation_requested: false,
+            cancellation_enabled: true,
             sleep_deadline_ns: None,
             process_stop_wait: false,
             process_stop_wake: false,
@@ -207,6 +233,7 @@ impl Thread {
         Self {
             id: 0,
             process,
+            scheduler_override: None,
             context: ExecutionContext::Userspace(context),
             state: ThreadState::Ready,
             start_routine: None,
@@ -220,6 +247,8 @@ impl Thread {
             pending_signals: SignalQueue::new(),
             signal_wait_set: None,
             signal_wake_pending: false,
+            cancellation_requested: false,
+            cancellation_enabled: true,
             sleep_deadline_ns: None,
             process_stop_wait: false,
             process_stop_wake: false,
@@ -239,6 +268,7 @@ impl Thread {
         Self {
             id: 0,
             process,
+            scheduler_override: None,
             context: ExecutionContext::Vm(context),
             state: ThreadState::Ready,
             start_routine: None,
@@ -252,6 +282,8 @@ impl Thread {
             pending_signals: SignalQueue::new(),
             signal_wait_set: None,
             signal_wake_pending: false,
+            cancellation_requested: false,
+            cancellation_enabled: true,
             sleep_deadline_ns: None,
             process_stop_wait: false,
             process_stop_wake: false,
@@ -393,6 +425,19 @@ impl ThreadManager {
         thread.state = ThreadState::Ready;
         self.ready.push_back(thread);
         true
+    }
+
+    fn pop_next_ready(&mut self) -> Option<Box<ListNode<Thread>>> {
+        let highest_priority = self
+            .ready
+            .iter()
+            .map(Thread::scheduling_rank)
+            .max()?;
+        let node = self
+            .ready
+            .find(|thread| thread.scheduling_rank() == highest_priority)?;
+        // SAFETY: `find` returns a node owned by the ready list.
+        unsafe { ListNode::remove(&mut self.ready, node) }
     }
 
     pub(crate) fn initialize() -> bool {
@@ -722,7 +767,7 @@ impl ThreadManager {
                     manager.busy.push_back(current);
                 }
 
-                if let Some(mut next) = manager.ready.pop_front() {
+                if let Some(mut next) = manager.pop_next_ready() {
                     next.state = ThreadState::Running;
                     let context = SwitchContext {
                         old_context,
@@ -779,7 +824,20 @@ impl ThreadManager {
             .unwrap_or_else(crate::kernel::arch::TimerArchitecture::fallback_time_ns);
         Process::tick_alarms(now_ns);
         Self::wake_expired_sleepers(now_ns);
-        let _ = Self::switch_current(ThreadState::Ready);
+        let should_preempt = {
+            let manager = THREAD_MANAGER.lock();
+            manager.busy.front().is_some_and(|current| {
+                let (policy, _) = current.process.scheduler_parameters();
+                policy != SCHED_FIFO_POLICY
+                    || manager
+                        .ready
+                        .iter()
+                        .any(|thread| thread.scheduling_rank() > current.scheduling_rank())
+            })
+        };
+        if should_preempt {
+            let _ = Self::switch_current(ThreadState::Ready);
+        }
     }
 
     fn wake_expired_sleepers(now_ns: u64) {
@@ -1110,6 +1168,85 @@ impl ThreadManager {
         thread.state != ThreadState::Exited && thread.process.pid() == process_id
     }
 
+    pub(crate) fn request_cancellation(
+        thread_id: usize,
+        process_id: i32,
+    ) -> Result<(), Error> {
+        let mut manager = THREAD_MANAGER.lock();
+        let node = manager.thread_node_by_id(thread_id).ok_or(Error::Srch)?;
+        let state = {
+            let thread = manager.thread_ref(node);
+            if thread.state == ThreadState::Exited || thread.process.pid() != process_id {
+                return Err(Error::Srch);
+            }
+            thread.state
+        };
+        manager.thread_mut(node).cancellation_requested = true;
+        if state == ThreadState::Blocked {
+            manager.wake_blocked(node);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_current_cancellation_enabled(enabled: bool) -> Result<bool, Error> {
+        let mut manager = THREAD_MANAGER.lock();
+        let thread = manager.busy.front_mut().ok_or(Error::Srch)?;
+        let previous = thread.cancellation_enabled;
+        thread.cancellation_enabled = enabled;
+        Ok(previous)
+    }
+
+    pub(crate) fn cancellation_requested_current() -> bool {
+        THREAD_MANAGER.lock().busy.front().is_some_and(|thread| {
+            thread.cancellation_enabled && thread.cancellation_requested
+        })
+    }
+
+    pub(crate) fn cancel_current_if_requested() {
+        let should_cancel = {
+            let mut manager = THREAD_MANAGER.lock();
+            let Some(thread) = manager.busy.front_mut() else {
+                return;
+            };
+            if thread.cancellation_enabled && thread.cancellation_requested {
+                thread.cancellation_requested = false;
+                true
+            } else {
+                false
+            }
+        };
+        if should_cancel {
+            Self::exit_current(usize::MAX as *mut c_void);
+        }
+    }
+
+    pub(crate) fn scheduling_parameters_for_thread(
+        thread_id: usize,
+    ) -> Result<(i32, i32), Error> {
+        let manager = THREAD_MANAGER.lock();
+        let node = manager.thread_node_by_id(thread_id).ok_or(Error::Srch)?;
+        let thread = manager.thread_ref(node);
+        if thread.state == ThreadState::Exited {
+            return Err(Error::Srch);
+        }
+        Ok(thread.scheduler_parameters())
+    }
+
+    pub(crate) fn set_scheduling_parameters_for_thread(
+        thread_id: usize,
+        policy: i32,
+        priority: i32,
+    ) -> Result<(), Error> {
+        let mut manager = THREAD_MANAGER.lock();
+        let node = manager.thread_node_by_id(thread_id).ok_or(Error::Srch)?;
+        let thread = manager.thread_mut(node);
+        if thread.state == ThreadState::Exited {
+            return Err(Error::Srch);
+        }
+        thread.scheduler_override = Some((policy, priority));
+        Ok(())
+    }
+
     fn thread_attributes(&self, thread: NonNull<Thread>) -> (*mut c_void, usize, bool) {
         let thread = self.thread_ref_from_pointer(thread);
         let (stack_address, stack_size) = thread.stack_bounds();
@@ -1288,7 +1425,7 @@ impl ThreadManager {
                     manager.busy.push_back(current);
                 }
 
-                if let Some(mut next) = manager.ready.pop_front() {
+                if let Some(mut next) = manager.pop_next_ready() {
                     next.state = ThreadState::Running;
                     let context = SwitchContext {
                         old_context,

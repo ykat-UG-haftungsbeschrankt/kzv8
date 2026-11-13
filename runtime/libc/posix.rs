@@ -290,6 +290,7 @@ pub unsafe extern "C" fn nanosleep(request: *const Timespec, remaining: *mut Tim
         set_errno(EINVAL);
         return -1;
     }
+    ThreadManager::cancel_current_if_requested();
     let now = unsafe { kz_host_time_ns() };
     let seconds = request.seconds as u64;
     let nanoseconds = request.nanoseconds as u64;
@@ -300,6 +301,7 @@ pub unsafe extern "C" fn nanosleep(request: *const Timespec, remaining: *mut Tim
     let deadline = now.saturating_add(duration);
     let mut interrupted = false;
     loop {
+        ThreadManager::cancel_current_if_requested();
         if crate::kernel::runtime::runtime_posix::signal::dispatch_pending_signals().is_some() {
             interrupted = true;
             break;

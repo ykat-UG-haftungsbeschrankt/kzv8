@@ -14,6 +14,7 @@ pub(crate) mod math;
 pub(crate) mod mmap;
 pub(crate) mod network;
 pub(crate) mod posix;
+pub(crate) mod pty;
 pub(crate) mod pthread;
 pub(crate) mod smoke;
 pub(crate) mod stdio;

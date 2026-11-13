@@ -5,16 +5,20 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+
 use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::driver::virtio::console::Console;
 use crate::kernel::error::Error;
 use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::scheduler::sync::IrqSpinLock;
-use crate::kernel::signal::{SIGINT, SIGQUIT, SIGTSTP};
+use crate::kernel::signal::{SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU};
 
 const CONTROL_CHARACTER_COUNT: usize = 32;
 const COOKED_INPUT_CAPACITY: usize = 16 * 1024;
 const CANONICAL_LINE_CAPACITY: usize = 4096;
+const PTY_BUFFER_CAPACITY: usize = 16 * 1024;
 const VINTR: usize = 0;
 const VQUIT: usize = 1;
 const VERASE: usize = 2;
@@ -133,6 +137,578 @@ impl ConsoleTtyState {
 }
 
 static CONSOLE_TTY: IrqSpinLock<ConsoleTtyState> = IrqSpinLock::new(ConsoleTtyState::new());
+
+pub(crate) struct Pty {
+    state: IrqSpinLock<PtyState>,
+}
+
+struct PtyState {
+    master_to_slave: VecDeque<u8>,
+    slave_to_master: VecDeque<u8>,
+    master_descriptors: usize,
+    slave_descriptors: usize,
+    slave_unlocked: bool,
+    output_stopped: bool,
+    canonical_line: [u8; CANONICAL_LINE_CAPACITY],
+    canonical_length: usize,
+    eof_pending: bool,
+    output_column: usize,
+    attributes: TerminalAttributes,
+    window_size: WindowSize,
+    session_id: Option<i32>,
+    foreground_process_group_id: Option<i32>,
+}
+
+impl Pty {
+    pub(crate) fn new() -> Result<Arc<Self>, Error> {
+        let mut master_to_slave = VecDeque::new();
+        master_to_slave
+            .try_reserve_exact(PTY_BUFFER_CAPACITY)
+            .map_err(|_| Error::NoMem)?;
+        let mut slave_to_master = VecDeque::new();
+        slave_to_master
+            .try_reserve_exact(PTY_BUFFER_CAPACITY)
+            .map_err(|_| Error::NoMem)?;
+        Ok(Arc::new(Self {
+            state: IrqSpinLock::new(PtyState {
+                master_to_slave,
+                slave_to_master,
+                master_descriptors: 1,
+                slave_descriptors: 0,
+                slave_unlocked: false,
+                output_stopped: false,
+                canonical_line: [0; CANONICAL_LINE_CAPACITY],
+                canonical_length: 0,
+                eof_pending: false,
+                output_column: 0,
+                attributes: TerminalAttributes::default_console(),
+                window_size: WindowSize {
+                    rows: 25,
+                    columns: 80,
+                    x_pixels: 0,
+                    y_pixels: 0,
+                },
+                session_id: None,
+                foreground_process_group_id: None,
+            }),
+        }))
+    }
+
+    pub(crate) fn acquire_session(&self, session_id: i32, process_group_id: i32) -> bool {
+        let mut state = self.state.lock();
+        match state.session_id {
+            Some(owner) => owner == session_id,
+            None => {
+                state.session_id = Some(session_id);
+                state.foreground_process_group_id = Some(process_group_id);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn session_owns(&self, session_id: i32) -> bool {
+        self.state.lock().session_id == Some(session_id)
+    }
+
+    pub(crate) fn foreground_process_group(&self, session_id: i32) -> Option<i32> {
+        let state = self.state.lock();
+        (state.session_id == Some(session_id))
+            .then_some(state.foreground_process_group_id)
+            .flatten()
+    }
+
+    pub(crate) fn set_foreground_process_group(
+        &self,
+        session_id: i32,
+        process_group_id: i32,
+    ) -> bool {
+        let mut state = self.state.lock();
+        if state.session_id != Some(session_id) {
+            return false;
+        }
+        state.foreground_process_group_id = Some(process_group_id);
+        true
+    }
+
+    pub(crate) fn release_session(&self, session_id: i32) -> bool {
+        let mut state = self.state.lock();
+        if state.session_id != Some(session_id) {
+            return false;
+        }
+        state.session_id = None;
+        state.foreground_process_group_id = None;
+        true
+    }
+
+    fn check_background_read(&self) -> Result<(), Error> {
+        let (session_id, foreground) = {
+            let state = self.state.lock();
+            (state.session_id, state.foreground_process_group_id)
+        };
+        let (Some(session_id), Some(foreground)) = (session_id, foreground) else {
+            return Ok(());
+        };
+        let Ok(process) = ThreadManager::current_process() else {
+            return Ok(());
+        };
+        if process.session_id() != session_id || process.process_group_id() == foreground {
+            return Ok(());
+        }
+        match crate::kernel::process::Process::signal_terminal_process_group(
+            session_id,
+            process.process_group_id(),
+            SIGTTIN,
+        ) {
+            Ok(()) | Err(Error::Srch) => Err(Error::Intr),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn check_background_write(&self) -> Result<(), Error> {
+        let (session_id, foreground, to_stop) = {
+            let state = self.state.lock();
+            (
+                state.session_id,
+                state.foreground_process_group_id,
+                state.attributes.local_flags & TOSTOP != 0,
+            )
+        };
+        if !to_stop {
+            return Ok(());
+        }
+        let (Some(session_id), Some(foreground)) = (session_id, foreground) else {
+            return Ok(());
+        };
+        let Ok(process) = ThreadManager::current_process() else {
+            return Ok(());
+        };
+        if process.session_id() != session_id || process.process_group_id() == foreground {
+            return Ok(());
+        }
+        match crate::kernel::process::Process::signal_terminal_process_group(
+            session_id,
+            process.process_group_id(),
+            SIGTTOU,
+        ) {
+            Ok(()) | Err(Error::Srch) => Err(Error::Intr),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn unlock_slave(&self) -> Result<(), Error> {
+        let mut state = self.state.lock();
+        if state.master_descriptors == 0 {
+            return Err(Error::Badf);
+        }
+        state.slave_unlocked = true;
+        Ok(())
+    }
+
+    pub(crate) fn open_slave(&self) -> Result<(), Error> {
+        let mut state = self.state.lock();
+        if state.master_descriptors == 0 {
+            return Err(Error::NoDev);
+        }
+        if !state.slave_unlocked {
+            return Err(Error::Acces);
+        }
+        state.slave_descriptors = state
+            .slave_descriptors
+            .checked_add(1)
+            .ok_or(Error::Mfile)?;
+        Ok(())
+    }
+
+    pub(crate) fn duplicate_master(&self) -> Result<(), Error> {
+        let mut state = self.state.lock();
+        if state.master_descriptors == 0 {
+            return Err(Error::Badf);
+        }
+        state.master_descriptors = state.master_descriptors.checked_add(1).ok_or(Error::Mfile)?;
+        Ok(())
+    }
+
+    pub(crate) fn duplicate_slave(&self) -> Result<(), Error> {
+        let mut state = self.state.lock();
+        if state.slave_descriptors == 0 {
+            return Err(Error::Badf);
+        }
+        state.slave_descriptors = state.slave_descriptors.checked_add(1).ok_or(Error::Mfile)?;
+        Ok(())
+    }
+
+    pub(crate) fn close_master(&self) {
+        let mut state = self.state.lock();
+        state.master_descriptors = state.master_descriptors.saturating_sub(1);
+    }
+
+    pub(crate) fn close_slave(&self) {
+        let mut state = self.state.lock();
+        state.slave_descriptors = state.slave_descriptors.saturating_sub(1);
+    }
+
+    pub(crate) fn flush_input(&self) {
+        let mut state = self.state.lock();
+        state.master_to_slave.clear();
+        state.canonical_length = 0;
+        state.eof_pending = false;
+    }
+
+    pub(crate) fn flush_output(&self) {
+        self.state.lock().slave_to_master.clear();
+    }
+
+    pub(crate) fn flow(&self, action: i32) -> Result<(), Error> {
+        let mut state = self.state.lock();
+        match action {
+            0 => state.output_stopped = true,
+            1 => state.output_stopped = false,
+            2 | 3 => {
+                let control_index = if action == 2 { VSTOP } else { VSTART };
+                let character = state.attributes.control_characters[control_index];
+                if state.master_to_slave.len() == PTY_BUFFER_CAPACITY {
+                    return Err(Error::Again);
+                }
+                state.master_to_slave.push_back(character);
+            }
+            _ => return Err(Error::Inval),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn master_read(&self, output: &mut [u8]) -> Result<usize, Error> {
+        let mut state = self.state.lock();
+        if state.master_descriptors == 0 {
+            return Err(Error::Badf);
+        }
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if state.slave_to_master.is_empty() {
+            return if state.slave_descriptors != 0 {
+                Err(Error::Again)
+            } else {
+                Ok(0)
+            };
+        }
+        let amount = output.len().min(state.slave_to_master.len());
+        for (destination, byte) in output[..amount]
+            .iter_mut()
+            .zip(state.slave_to_master.drain(..amount))
+        {
+            *destination = byte;
+        }
+        Ok(amount)
+    }
+
+    pub(crate) fn master_write(&self, input: &[u8]) -> Result<usize, Error> {
+        let (written, signal) = {
+            let mut state = self.state.lock();
+            if state.master_descriptors == 0 {
+                return Err(Error::Badf);
+            }
+            if state.slave_descriptors == 0 {
+                return Err(Error::Io);
+            }
+            let mut written = 0;
+            let mut signal = None;
+            for input_byte in input {
+                let mut byte = *input_byte;
+                if byte == b'\r' && state.attributes.input_flags & IGNCR != 0 {
+                    written += 1;
+                    continue;
+                }
+                if byte == b'\r' && state.attributes.input_flags & ICRNL != 0 {
+                    byte = b'\n';
+                } else if byte == b'\n' && state.attributes.input_flags & INLCR != 0 {
+                    byte = b'\r';
+                }
+                if state.attributes.input_flags & ISTRIP != 0 {
+                    byte &= 0x7f;
+                }
+                if state.attributes.input_flags & IXON != 0 {
+                    if byte == state.attributes.control_characters[VSTOP] {
+                        state.output_stopped = true;
+                        written += 1;
+                        continue;
+                    }
+                    if byte == state.attributes.control_characters[VSTART] {
+                        state.output_stopped = false;
+                        written += 1;
+                        continue;
+                    }
+                }
+                if state.attributes.local_flags & ISIG != 0 {
+                    let signal_number = if byte == state.attributes.control_characters[VINTR] {
+                        Some(SIGINT)
+                    } else if byte == state.attributes.control_characters[VQUIT] {
+                        Some(SIGQUIT)
+                    } else if byte == state.attributes.control_characters[VSUSP] {
+                        Some(SIGTSTP)
+                    } else {
+                        None
+                    };
+                    if let Some(signal_number) = signal_number {
+                        signal = state
+                            .session_id
+                            .zip(state.foreground_process_group_id)
+                            .map(|(session_id, process_group_id)| {
+                                (session_id, process_group_id, signal_number)
+                            });
+                        written += 1;
+                        continue;
+                    }
+                }
+                if state.attributes.local_flags & ICANON != 0 {
+                    if byte == state.attributes.control_characters[VERASE] {
+                        if state.canonical_length != 0 {
+                            state.canonical_length -= 1;
+                            if state.attributes.local_flags & ECHOE != 0 {
+                                for echo_byte in [8, b' ', 8] {
+                                    if state.slave_to_master.len() < PTY_BUFFER_CAPACITY {
+                                        state.slave_to_master.push_back(echo_byte);
+                                    }
+                                }
+                            }
+                        }
+                        written += 1;
+                        continue;
+                    }
+                    if byte == state.attributes.control_characters[VKILL] {
+                        state.canonical_length = 0;
+                        if state.attributes.local_flags & ECHOK != 0
+                            && state.slave_to_master.len() < PTY_BUFFER_CAPACITY
+                        {
+                            state.slave_to_master.push_back(b'\n');
+                        }
+                        written += 1;
+                        continue;
+                    }
+                    if byte == state.attributes.control_characters[VEOF] {
+                        if state.canonical_length != 0 {
+                            let line_length = state.canonical_length;
+                            if state.master_to_slave.len() + line_length > PTY_BUFFER_CAPACITY {
+                                break;
+                            }
+                            for index in 0..line_length {
+                                let byte = state.canonical_line[index];
+                                state.master_to_slave.push_back(byte);
+                            }
+                            state.canonical_length = 0;
+                        } else {
+                            state.eof_pending = true;
+                        }
+                        written += 1;
+                        continue;
+                    }
+                    let end_of_line = state.attributes.control_characters[VEOL];
+                    let line_ending = byte == b'\n'
+                        || (end_of_line != 0 && byte == end_of_line);
+                    if line_ending
+                        && state.master_to_slave.len() + state.canonical_length + 1
+                            > PTY_BUFFER_CAPACITY
+                    {
+                        break;
+                    }
+                    if state.canonical_length == CANONICAL_LINE_CAPACITY {
+                        if state.attributes.local_flags & ECHO != 0
+                            && state.slave_to_master.len() < PTY_BUFFER_CAPACITY
+                        {
+                            state.slave_to_master.push_back(7);
+                        }
+                        written += 1;
+                        continue;
+                    }
+                    let line_index = state.canonical_length;
+                    state.canonical_line[line_index] = byte;
+                    state.canonical_length += 1;
+                    if state.attributes.local_flags & ECHO != 0
+                        || (byte == b'\n' && state.attributes.local_flags & ECHONL != 0)
+                    {
+                        if state.slave_to_master.len() < PTY_BUFFER_CAPACITY {
+                            state.slave_to_master.push_back(byte);
+                        }
+                    }
+                    if line_ending {
+                        let line_length = state.canonical_length;
+                        for index in 0..line_length {
+                            let byte = state.canonical_line[index];
+                            state.master_to_slave.push_back(byte);
+                        }
+                        state.canonical_length = 0;
+                    }
+                } else {
+                    if state.master_to_slave.len() == PTY_BUFFER_CAPACITY {
+                        break;
+                    }
+                    state.master_to_slave.push_back(byte);
+                    if state.attributes.local_flags & ECHO != 0
+                        && state.slave_to_master.len() < PTY_BUFFER_CAPACITY
+                    {
+                        state.slave_to_master.push_back(byte);
+                    }
+                }
+                written += 1;
+            }
+            (written, signal)
+        };
+        if let Some((session_id, process_group_id, signal_number)) = signal {
+            match crate::kernel::process::Process::signal_terminal_process_group(
+                session_id,
+                process_group_id,
+                signal_number,
+            ) {
+                Ok(()) | Err(Error::Srch) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if written == 0 && !input.is_empty() {
+            Err(Error::Again)
+        } else {
+            Ok(written)
+        }
+    }
+
+    pub(crate) fn slave_read(&self, output: &mut [u8]) -> Result<usize, Error> {
+        self.check_background_read()?;
+        let mut state = self.state.lock();
+        if state.slave_descriptors == 0 {
+            return Err(Error::Badf);
+        }
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if state.master_to_slave.is_empty() {
+            return if state.eof_pending {
+                state.eof_pending = false;
+                Ok(0)
+            } else if state.master_descriptors != 0 {
+                Err(Error::Again)
+            } else {
+                Ok(0)
+            };
+        }
+        let amount = output.len().min(state.master_to_slave.len());
+        for (destination, byte) in output[..amount]
+            .iter_mut()
+            .zip(state.master_to_slave.drain(..amount))
+        {
+            *destination = byte;
+        }
+        Ok(amount)
+    }
+
+    pub(crate) fn slave_write(&self, input: &[u8]) -> Result<usize, Error> {
+        self.check_background_write()?;
+        let mut state = self.state.lock();
+        if state.slave_descriptors == 0 {
+            return Err(Error::Badf);
+        }
+        if state.master_descriptors == 0 {
+            return Err(Error::Io);
+        }
+        if state.output_stopped && !input.is_empty() {
+            return Err(Error::Again);
+        }
+        let mut written = 0;
+        for byte in input {
+            let mut output = [0; 2];
+            let output_length = if state.attributes.output_flags & OPOST == 0 {
+                output[0] = *byte;
+                1
+            } else if *byte == b'\r' && state.attributes.output_flags & OCRNL != 0 {
+                output[0] = b'\n';
+                1
+            } else if *byte == b'\r'
+                && state.attributes.output_flags & ONOCR != 0
+                && state.output_column == 0
+            {
+                written += 1;
+                continue;
+            } else if *byte == b'\n' && state.attributes.output_flags & ONLCR != 0 {
+                output = [b'\r', b'\n'];
+                2
+            } else {
+                output[0] = *byte;
+                1
+            };
+            let available = PTY_BUFFER_CAPACITY.saturating_sub(state.slave_to_master.len());
+            if available < output_length {
+                break;
+            }
+            state.slave_to_master.extend(output[..output_length].iter().copied());
+            match byte {
+                b'\r' => state.output_column = 0,
+                b'\n' if state.attributes.output_flags & ONLRET != 0 => {
+                    state.output_column = 0;
+                }
+                8 => state.output_column = state.output_column.saturating_sub(1),
+                _ => state.output_column = state.output_column.saturating_add(1),
+            }
+            written += 1;
+        }
+        if written == 0 && !input.is_empty() {
+            Err(Error::Again)
+        } else {
+            Ok(written)
+        }
+    }
+
+    pub(crate) fn attributes(&self) -> Result<TerminalAttributes, Error> {
+        Ok(self.state.lock().attributes)
+    }
+
+    pub(crate) fn set_attributes(&self, attributes: TerminalAttributes) -> Result<(), Error> {
+        validate_attributes(attributes)?;
+        self.state.lock().attributes = attributes;
+        Ok(())
+    }
+
+    pub(crate) fn window_size(&self) -> Result<WindowSize, Error> {
+        Ok(self.state.lock().window_size)
+    }
+
+    pub(crate) fn set_window_size(&self, size: WindowSize) -> Result<(), Error> {
+        self.state.lock().window_size = size;
+        Ok(())
+    }
+
+    pub(crate) fn master_readiness(&self, events: i16) -> Result<i16, Error> {
+        let state = self.state.lock();
+        if state.master_descriptors == 0 {
+            return Err(Error::Badf);
+        }
+        let mut ready = 0;
+        if events & 0x001 != 0 && (!state.slave_to_master.is_empty() || state.slave_descriptors == 0) {
+            ready |= 0x001;
+        }
+        if events & 0x004 != 0 && state.slave_descriptors != 0 && state.master_to_slave.len() < PTY_BUFFER_CAPACITY {
+            ready |= 0x004;
+        }
+        if state.slave_descriptors == 0 {
+            ready |= 0x010;
+        }
+        Ok(ready)
+    }
+
+    pub(crate) fn slave_readiness(&self, events: i16) -> Result<i16, Error> {
+        let state = self.state.lock();
+        if state.slave_descriptors == 0 {
+            return Err(Error::Badf);
+        }
+        let mut ready = 0;
+        if events & 0x001 != 0 && (!state.master_to_slave.is_empty() || state.master_descriptors == 0) {
+            ready |= 0x001;
+        }
+        if events & 0x004 != 0 && state.master_descriptors != 0 && state.slave_to_master.len() < PTY_BUFFER_CAPACITY {
+            ready |= 0x004;
+        }
+        if state.master_descriptors == 0 {
+            ready |= 0x010;
+        }
+        Ok(ready)
+    }
+}
 
 pub(crate) const fn is_standard_terminal_descriptor(file_descriptor: i32) -> bool {
     file_descriptor >= 0 && file_descriptor <= 2
@@ -745,4 +1321,40 @@ fn monotonic_time_ns() -> u64 {
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     *CONSOLE_TTY.lock() = ConsoleTtyState::new();
+}
+
+#[cfg(test)]
+mod pty_tests {
+    use super::*;
+
+    #[test]
+    fn pty_requires_unlock_and_delivers_canonical_input() {
+        let pty = Pty::new().unwrap();
+        assert!(matches!(pty.open_slave(), Err(Error::Acces)));
+        pty.unlock_slave().unwrap();
+        pty.open_slave().unwrap();
+
+        assert_eq!(pty.master_write(b"one"), Ok(3));
+        let mut slave_input = [0; 8];
+        assert!(matches!(pty.slave_read(&mut slave_input), Err(Error::Again)));
+        assert_eq!(pty.master_write(b"\n"), Ok(1));
+        assert_eq!(pty.slave_read(&mut slave_input), Ok(4));
+        assert_eq!(&slave_input[..4], b"one\n");
+
+        let mut master_output = [0; 8];
+        assert_eq!(pty.master_read(&mut master_output), Ok(4));
+        assert_eq!(&master_output[..4], b"one\n");
+    }
+
+    #[test]
+    fn pty_slave_output_applies_newline_postprocessing() {
+        let pty = Pty::new().unwrap();
+        pty.unlock_slave().unwrap();
+        pty.open_slave().unwrap();
+        assert_eq!(pty.slave_write(b"out\n"), Ok(4));
+
+        let mut master_output = [0; 8];
+        assert_eq!(pty.master_read(&mut master_output), Ok(5));
+        assert_eq!(&master_output[..5], b"out\r\n");
+    }
 }

@@ -9,7 +9,7 @@ use core::ffi::{c_char, c_int};
 use core::mem::{size_of, MaybeUninit};
 
 use crate::kernel::dl::AddressSpace;
-use crate::kernel::runtime::runtime_libc::{filesystem, network};
+use crate::kernel::runtime::runtime_libc::{filesystem, network, pty};
 use crate::kernel::scheduler::thread::ThreadManager;
 
 use super::errno::{as_errno, EFAULT, EINVAL, ENOSYS};
@@ -84,6 +84,51 @@ pub unsafe extern "C" fn fcntl(
     command: c_int,
     argument: usize,
 ) -> c_int {
+    if pty::is_fd(file_descriptor) {
+        return match command {
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                let Ok(minimum) = c_int::try_from(argument) else {
+                    set_errno(EINVAL);
+                    return -1;
+                };
+                pty::duplicate(
+                    file_descriptor,
+                    minimum,
+                    command == F_DUPFD_CLOEXEC,
+                )
+                .unwrap_or_else(|error| {
+                    set_errno(-(error as i32));
+                    -1
+                })
+            }
+            F_GETFD => pty::descriptor_flags(file_descriptor).unwrap_or_else(|error| {
+                set_errno(-(error as i32));
+                -1
+            }),
+            F_SETFD => match pty::set_descriptor_flags(file_descriptor, argument as c_int) {
+                Ok(()) => 0,
+                Err(error) => {
+                    set_errno(-(error as i32));
+                    -1
+                }
+            },
+            F_GETFL => pty::status_flags(file_descriptor).unwrap_or_else(|error| {
+                set_errno(-(error as i32));
+                -1
+            }),
+            F_SETFL => match pty::set_status_flags(file_descriptor, argument as c_int) {
+                Ok(()) => 0,
+                Err(error) => {
+                    set_errno(-(error as i32));
+                    -1
+                }
+            },
+            _ => {
+                set_errno(ENOSYS);
+                -1
+            }
+        };
+    }
     if network::is_socket_fd(file_descriptor) {
         return match command {
             F_DUPFD | F_DUPFD_CLOEXEC => {

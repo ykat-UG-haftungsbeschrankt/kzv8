@@ -33,16 +33,16 @@ This list records kernel or runtime-kernel facilities indicated by `ENOSYS` stub
 
 ## Scheduling and Accounting
 
-- [ ] Expose scheduling policy and priority changes/queries, including real-time policies and round-robin intervals, for the `sched_*` and pthread scheduling APIs.
+- [ ] Implement process and pthread-thread scheduling policy/priority queries for `SCHED_OTHER`, `SCHED_FIFO`, and `SCHED_RR`, including priority ranges and the 10 ms RR interval. The scheduler chooses the highest-priority ready thread; FIFO runs until yield or higher-priority preemption, while RR rotates on ticks. `SCHED_SPORADIC`, arbitrary target PIDs, and `pthread_attr_*sched*` bookkeeping remain unsupported.
 - [x] Add realtime clock adjustment policy for `clock_settime`, keeping realtime updates separate from the monotonic clock used for elapsed-time waits.
-- [ ] Add resource-limit state and accounting for CPU time, child usage, priorities, and process/thread clocks. Wire `getrlimit`/`setrlimit`, `getrusage`, `times`, `getpriority`, and CPU-clock queries.
-- [ ] Add cancellation-point support; timed pthread condition and mutex waits now convert absolute clock deadlines to the existing monotonic scheduler clock and reacquire the mutex before returning. Keep barriers, rwlocks, spinlocks, and attribute bookkeeping in the userspace synchronization layer where possible.
+- [ ] Add resource-limit state and accounting for CPU time, child usage, priorities, and process/thread clocks. `getrlimit`/`setrlimit` store inherited soft/hard values for the seven resource IDs declared in the local ABI, with hard-limit privilege checks; soft `RLIMIT_FSIZE` is enforced for writes, positioned writes, truncation, and allocation. `getpriority`/`setpriority` support `PRIO_PROCESS` for the current process. `SIGXFSZ`, other limit enforcement/accounting, process-group/user priority targeting, and `getrusage`, `times`, and CPU-clock queries remain.
+- [ ] Add complete cancellation-point support. Deferred cancellation requests, enable/disable state, `pthread_testcancel`, and checks in `read`, `write`, `nanosleep`, and timed condition waits (after mutex reacquisition) are implemented. Asynchronous cancellation, cleanup handlers, cancellation-safe TLS destructors, and remaining blocking cancellation points are unsupported; timed pthread mutex/condition waits still use monotonic deadlines.
 - [x] Add POSIX timer object lifecycle and notification semantics on top of the existing event timer queue; implement create/delete/get/set/overrun operations.
 - [x] Add asynchronous I/O request tracking, completion results, queued cancellation, and suspend/list-wait operations for the POSIX AIO APIs.
 
 ## Devices and Networking
 
-- [ ] Add pseudoterminals (PTYs) with independent master/slave device state and session integration.
+- [x] Add pseudoterminals with independent bounded master/slave queues, `posix_openpt`/`/dev/ptmx`, `grantpt`/`unlockpt`, `ptsname*`, and `/dev/pts/N` opens. PTY descriptors support duplication, nonblocking I/O, poll readiness, termios/window-size control, canonical input/echo, output processing, terminal signals, session ownership, and foreground process-group checks. Noncanonical `VMIN`/`VTIME` timing and packet-mode PTYs remain unsupported.
 - [x] Add generic descriptor-based device-control dispatch for `ioctl`/`posix_devctl` and terminal window-size operations. Terminal attributes and line discipline use the existing TTY bridge.
 - [x] Implement unnamed `AF_UNIX` `SOCK_STREAM` `socketpair` endpoints with bounded in-memory duplex queues, nonblocking mode, shutdown/EOF, descriptor duplication, and poll readiness.
 - [ ] Add pathname-based local sockets, ancillary-message passing, and out-of-band socket support needed by the remaining socket stubs.

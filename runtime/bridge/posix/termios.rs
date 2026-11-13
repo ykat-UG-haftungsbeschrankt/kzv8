@@ -108,6 +108,9 @@ pub unsafe extern "C" fn tcdrain(file_descriptor: c_int) -> c_int {
         set_errno(error);
         return -1;
     }
+    if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
+        return 0;
+    }
     kernel_result(crate::kernel::tty::drain_output())
 }
 
@@ -116,6 +119,12 @@ pub unsafe extern "C" fn tcflow(file_descriptor: c_int, action: c_int) -> c_int 
     if let Err(error) = validate_terminal(file_descriptor) {
         set_errno(error);
         return -1;
+    }
+    if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
+        return match crate::kernel::runtime::runtime_libc::pty::flow(file_descriptor, action) {
+            Ok(()) => 0,
+            Err(error) => kernel_result(Err(error)),
+        };
     }
     kernel_result(crate::kernel::tty::flow(action))
 }
@@ -126,12 +135,34 @@ pub unsafe extern "C" fn tcflush(file_descriptor: c_int, queue_selector: c_int) 
         set_errno(error);
         return -1;
     }
+    let is_pty = crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor);
     match queue_selector {
+        TCIFLUSH if is_pty => {
+            return match crate::kernel::runtime::runtime_libc::pty::flush_input(file_descriptor) {
+                Ok(()) => 0,
+                Err(error) => kernel_result(Err(error)),
+            };
+        }
         TCIFLUSH => crate::kernel::tty::flush_input(),
+        TCOFLUSH if is_pty => {
+            return match crate::kernel::runtime::runtime_libc::pty::flush_output(file_descriptor) {
+                Ok(()) => 0,
+                Err(error) => kernel_result(Err(error)),
+            };
+        }
         TCOFLUSH => crate::kernel::tty::flush_output(),
         TCIOFLUSH => {
-            crate::kernel::tty::flush_input();
-            crate::kernel::tty::flush_output();
+            if is_pty {
+                if let Err(error) = crate::kernel::runtime::runtime_libc::pty::flush_input(file_descriptor) {
+                    return kernel_result(Err(error));
+                }
+                if let Err(error) = crate::kernel::runtime::runtime_libc::pty::flush_output(file_descriptor) {
+                    return kernel_result(Err(error));
+                }
+            } else {
+                crate::kernel::tty::flush_input();
+                crate::kernel::tty::flush_output();
+            }
         }
         _ => {
             set_errno(EINVAL);
@@ -151,7 +182,14 @@ pub unsafe extern "C" fn tcgetattr(file_descriptor: c_int, attributes: *mut Term
         set_errno(error);
         return -1;
     }
-    let attributes_value = crate::kernel::tty::attributes();
+    let attributes_value = if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
+        match crate::kernel::runtime::runtime_libc::pty::attributes(file_descriptor) {
+            Ok(attributes) => attributes,
+            Err(error) => return kernel_result(Err(error)),
+        }
+    } else {
+        crate::kernel::tty::attributes()
+    };
     unsafe {
         core::ptr::write_volatile(
             attributes,
@@ -215,7 +253,14 @@ pub unsafe extern "C" fn tcgetwinsize(file_descriptor: c_int, size: *mut c_void)
         set_errno(error);
         return -1;
     }
-    let window = crate::kernel::tty::window_size();
+    let window = if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
+        match crate::kernel::runtime::runtime_libc::pty::window_size(file_descriptor) {
+            Ok(window) => window,
+            Err(error) => return kernel_result(Err(error)),
+        }
+    } else {
+        crate::kernel::tty::window_size()
+    };
     unsafe {
         core::ptr::write_volatile(
             size.cast::<WindowSize>(),
@@ -261,18 +306,24 @@ pub unsafe extern "C" fn tcsetattr(
         set_errno(EINVAL);
         return -1;
     }
-    if actions != TCSANOW {
+    let is_pty = crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor);
+    if actions != TCSANOW && !is_pty {
         if let Err(error) = crate::kernel::tty::drain_output() {
             set_errno(as_errno(error));
             return -1;
         }
     }
     if actions == TCSAFLUSH {
-        crate::kernel::tty::flush_input();
+        if is_pty {
+            if let Err(error) = crate::kernel::runtime::runtime_libc::pty::flush_input(file_descriptor) {
+                return kernel_result(Err(error));
+            }
+        } else {
+            crate::kernel::tty::flush_input();
+        }
     }
     let attributes = unsafe { core::ptr::read_volatile(attributes) };
-    kernel_result(crate::kernel::tty::set_attributes(
-        crate::kernel::tty::TerminalAttributes {
+    let attributes = crate::kernel::tty::TerminalAttributes {
             input_flags: attributes.input_flags,
             output_flags: attributes.output_flags,
             control_flags: attributes.control_flags,
@@ -280,8 +331,15 @@ pub unsafe extern "C" fn tcsetattr(
             control_characters: attributes.control_characters,
             input_speed: attributes.input_speed,
             output_speed: attributes.output_speed,
-        },
-    ))
+        };
+    if is_pty {
+        kernel_result(crate::kernel::runtime::runtime_libc::pty::set_attributes(
+            file_descriptor,
+            attributes,
+        ))
+    } else {
+        kernel_result(crate::kernel::tty::set_attributes(attributes))
+    }
 }
 
 #[no_mangle]

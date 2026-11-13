@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #ifndef KZ_POSIX_PTHREAD_H_
 #define KZ_POSIX_PTHREAD_H_
 
@@ -84,6 +91,8 @@ int pthread_barrierattr_init(pthread_barrierattr_t *attributes);
 int pthread_barrierattr_setpshared(pthread_barrierattr_t *attributes, int process_shared);
 
 int pthread_cancel(pthread_t thread);
+int pthread_setcancelstate(int state, int *old_state);
+int pthread_setcanceltype(int cancel_type, int *old_type);
 int pthread_cond_broadcast(pthread_cond_t *condition);
 int pthread_cond_clockwait(pthread_cond_t *KZ_POSIX_RESTRICT condition,
                            pthread_mutex_t *KZ_POSIX_RESTRICT mutex, clockid_t clock_id,

@@ -8,10 +8,12 @@
 use core::ffi::{c_char, c_int, c_long, c_longlong, c_void};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};
-use super::errno::{ENOSYS, ENOMEM};
+use crate::kernel::dl::AddressSpace;
+use super::errno::{as_errno, EFAULT, ENOSYS, ENOMEM, ERANGE};
 
 const RAND_MAX: c_int = 32767;
 static RANDOM_STATE: AtomicU32 = AtomicU32::new(1);
+static mut PTSNAME_BUFFER: [u8; 32] = [0; 32];
 
 type PlainCompare = Option<unsafe extern "C" fn(*const c_void, *const c_void) -> c_int>;
 type ContextCompare = Option<
@@ -368,23 +370,103 @@ pub unsafe extern "C" fn mkdtemp(_template_name: *mut c_char) -> *mut c_char {
     core::ptr::null_mut()
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn posix_openpt(_flags: c_int) -> c_int {
-    set_errno(ENOSYS);
-    -1
+fn format_pty_name(index: usize, output: &mut [u8; 32]) -> usize {
+    let prefix = b"/dev/pts/";
+    output[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0; usize::BITS as usize / 3 + 1];
+    let mut value = index;
+    let mut digit_count = 0;
+    loop {
+        digits[digit_count] = b'0' + (value % 10) as u8;
+        digit_count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for (offset, digit) in digits[..digit_count].iter().rev().enumerate() {
+        output[prefix.len() + offset] = *digit;
+    }
+    let length = prefix.len() + digit_count;
+    output[length] = 0;
+    length + 1
+}
+
+fn pty_error(error: crate::kernel::error::Error) -> c_int {
+    as_errno(error)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ptsname(_file_descriptor: c_int) -> *mut c_char {
-    set_errno(ENOSYS);
-    core::ptr::null_mut()
+pub unsafe extern "C" fn posix_openpt(flags: c_int) -> c_int {
+    match crate::kernel::runtime::runtime_libc::pty::open_master(flags) {
+        Ok(file_descriptor) => file_descriptor,
+        Err(error) => {
+            set_errno(pty_error(error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn grantpt(file_descriptor: c_int) -> c_int {
+    match crate::kernel::runtime::runtime_libc::pty::pty_index(file_descriptor) {
+        Ok(_) => 0,
+        Err(error) => {
+            set_errno(pty_error(error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn unlockpt(file_descriptor: c_int) -> c_int {
+    match crate::kernel::runtime::runtime_libc::pty::unlock_slave(file_descriptor) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_errno(pty_error(error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ptsname(file_descriptor: c_int) -> *mut c_char {
+    let index = match crate::kernel::runtime::runtime_libc::pty::pty_index(file_descriptor) {
+        Ok(index) => index,
+        Err(error) => {
+            set_errno(pty_error(error));
+            return core::ptr::null_mut();
+        }
+    };
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(PTSNAME_BUFFER) };
+    let _length = format_pty_name(index, buffer);
+    buffer.as_mut_ptr().cast()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ptsname_r(
-    _file_descriptor: c_int,
-    _buffer: *mut c_char,
-    _buffer_size: usize,
+    file_descriptor: c_int,
+    buffer: *mut c_char,
+    buffer_size: usize,
 ) -> c_int {
-    ENOSYS
+    if buffer.is_null() {
+        return EFAULT;
+    }
+    let index = match crate::kernel::runtime::runtime_libc::pty::pty_index(file_descriptor) {
+        Ok(index) => index,
+        Err(error) => return pty_error(error),
+    };
+    let mut name = [0; 32];
+    let length = format_pty_name(index, &mut name);
+    if buffer_size < length {
+        return ERANGE;
+    }
+    let process = match crate::kernel::scheduler::thread::ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => return pty_error(error),
+    };
+    match process.address_space().write(buffer as usize, &name[..length]) {
+        Ok(()) => 0,
+        Err(error) => pty_error(error),
+    }
 }

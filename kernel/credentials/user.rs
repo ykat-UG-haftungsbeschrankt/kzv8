@@ -7,21 +7,6 @@
 
 //@READONLY
 
-use crate::kernel::lib::hashmap::HashMap;
-use alloc::sync::Arc;
-
-pub(crate) struct UserId {
-    id: usize,
-}
-
-pub(crate) struct IUser {
-    id: UserId,
-    username: Arc<String>,
-    password: String,
-}
-
-type User = Arc<IUser>;
-
 pub(crate) impl IUser {
     pub(crate) fn new() -> Option<Arc<Self>> {
         Some(Arc::new(Self {
@@ -32,11 +17,12 @@ pub(crate) impl IUser {
             password: String::new(),
         }))
     }
-}
-
-pub(crate) struct UserIndex {
-    users: HashMap<usize, User>,
-    users_by_name: HashMap<Arc<String>, User>,
+    pub(crate) fn id(&self) -> UserId {
+        self.id
+    }
+    pub(crate) fn username(&self) -> Arc<String> {
+        self.username.clone()
+    }
 }
 
 pub(crate) impl UserIndex {

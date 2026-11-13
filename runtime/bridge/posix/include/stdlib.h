@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2026 ykat UG (haftungsbeschraenkt) - All Rights Reserved
+ *
+ * Permission for non-commercial use is hereby granted,
+ * free of charge, without warranty of any kind.
+ */
+
 #ifndef KZ_POSIX_STDLIB_H_
 #define KZ_POSIX_STDLIB_H_
 
@@ -61,6 +68,8 @@ int mkostemp(char *template_name, int flags);
 int mkstemp(char *template_name);
 int posix_memalign(void **output, size_t alignment, size_t size);
 int posix_openpt(int flags);
+int grantpt(int file_descriptor);
+int unlockpt(int file_descriptor);
 char *ptsname(int file_descriptor);
 int ptsname_r(int file_descriptor, char *buffer, size_t buffer_size);
 void *realloc(void *pointer, size_t size);

@@ -314,7 +314,10 @@ pub unsafe extern "C" fn lchown(path: *const c_char, owner: u32, group: u32) -> 
 
 #[no_mangle]
 pub extern "C" fn dup(file_descriptor: c_int) -> c_int {
-    let result = if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
+    let result = if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
+        crate::kernel::runtime::runtime_libc::pty::duplicate(file_descriptor, 0, false)
+            .map_err(|error| -(error as i32))
+    } else if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
         crate::kernel::runtime::runtime_libc::network::duplicate_socket(file_descriptor, 0, false)
             .map_err(|error| -(error as i32))
     } else if crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor) {
@@ -334,7 +337,14 @@ pub extern "C" fn dup(file_descriptor: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn dup2(file_descriptor: c_int, new_descriptor: c_int) -> c_int {
-    let result = if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
+    let result = if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
+        crate::kernel::runtime::runtime_libc::pty::duplicate_to(
+            file_descriptor,
+            new_descriptor,
+            false,
+        )
+        .map_err(|error| -(error as i32))
+    } else if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
         crate::kernel::runtime::runtime_libc::network::duplicate_socket_to(
             file_descriptor,
             new_descriptor,
@@ -374,7 +384,14 @@ pub extern "C" fn dup3(
         set_errno(EINVAL);
         return -1;
     }
-    let result = if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
+    let result = if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
+        crate::kernel::runtime::runtime_libc::pty::duplicate_to(
+            file_descriptor,
+            new_descriptor,
+            flags & O_CLOEXEC != 0,
+        )
+        .map_err(|error| -(error as i32))
+    } else if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
         crate::kernel::runtime::runtime_libc::network::duplicate_socket_to(
             file_descriptor,
             new_descriptor,

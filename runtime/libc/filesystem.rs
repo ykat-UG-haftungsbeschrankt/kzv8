@@ -23,6 +23,7 @@ use super::errno::{
     ENOMEM, ENOTDIR, ENOTEMPTY, ENOTTY, EOVERFLOW, EPERM, ERANGE,
 };
 use super::network;
+use super::pty;
 
 const O_ACCMODE: i32 = 0o3;
 const O_RDONLY: i32 = 0o0;
@@ -624,6 +625,17 @@ impl FileSystem {
         Ok(())
     }
 
+    fn check_process_file_size_limit(&self, new_length: usize) -> Result<(), i32> {
+        let process = ThreadManager::current_process().map_err(metadata_errno)?;
+        let (soft_limit, _) = process
+            .resource_limit(1)
+            .map_err(|error| -(error as i32))?;
+        if u64::try_from(new_length).map_err(|_| EFBIG)? > soft_limit {
+            return Err(EFBIG);
+        }
+        Ok(())
+    }
+
     fn capacity(&self) -> FileSystemCapacity {
         let allocated_bytes = self.nodes.iter().flatten().fold(0usize, |total, node| {
             total
@@ -1086,6 +1098,8 @@ impl FileSystem {
         if end > i64::MAX as usize {
             return Err(EFBIG);
         }
+        self.check_process_file_size_limit(end)?;
+        self.check_process_file_size_limit(end)?;
         self.check_file_capacity(descriptor.node, end)?;
         let node = self.nodes[descriptor.node].as_mut().ok_or(EBADF)?;
         node.data
@@ -1172,6 +1186,7 @@ impl FileSystem {
         if length > i64::MAX as usize {
             return Err(EFBIG);
         }
+        self.check_process_file_size_limit(length)?;
         self.check_file_capacity(node_index, length)?;
         let node = self.nodes.get_mut(node_index).and_then(Option::as_mut).ok_or(EBADF)?;
         if length > node.data.len() {
@@ -2382,6 +2397,13 @@ pub(crate) fn capacity_for_descriptor(
 }
 
 pub(crate) fn sync_descriptor(file_descriptor: i32, data_only: bool) -> Result<(), i32> {
+    if pty::is_fd(file_descriptor) {
+        return if pty::has_fd(file_descriptor) {
+            Err(EINVAL)
+        } else {
+            Err(EBADF)
+        };
+    }
     if network::is_socket_fd(file_descriptor) {
         return if network::has_socket_fd(file_descriptor) {
             Err(EINVAL)
@@ -2595,6 +2617,13 @@ pub(crate) fn poll_readiness(file_descriptor: i32, events: i16) -> i16 {
     const POLLOUT: i16 = 0x004;
     const POLLNVAL: i16 = 0x020;
 
+    if pty::is_fd(file_descriptor) {
+        return match pty::readiness(file_descriptor, events) {
+            Ok(readiness) => readiness,
+            Err(KernelError::Badf) => POLLNVAL,
+            Err(_) => 0x008,
+        };
+    }
     if network::is_socket_fd(file_descriptor) {
         return match network::readiness(file_descriptor, events) {
             Ok(readiness) => readiness,
@@ -2769,6 +2798,18 @@ fn path_c_string(path: &[u8]) -> Result<Vec<u8>, i32> {
 
 #[no_mangle]
 pub unsafe extern "C" fn kz_rust_open(path: *const c_char, flags: i32, mode: u32) -> i32 {
+    if path.is_null() {
+        return fail(EFAULT);
+    }
+    let requested_path = unsafe { CStr::from_ptr(path) }.to_bytes();
+    if requested_path == b"/dev/ptmx" {
+        return pty::open_master(flags)
+            .map_or_else(|error| fail(-(error as i32)), |descriptor| descriptor);
+    }
+    if requested_path.starts_with(b"/dev/pts/") {
+        return pty::open_slave_path(requested_path, flags)
+            .map_or_else(|error| fail(-(error as i32)), |descriptor| descriptor);
+    }
     with_path_follow(path, flags & O_NOFOLLOW == 0, |path| {
         if path.as_slice() == b"/dev/tty" || path.as_slice() == b"/dev/console" {
             let access = flags & O_ACCMODE;
@@ -2783,6 +2824,10 @@ pub unsafe extern "C" fn kz_rust_open(path: *const c_char, flags: i32, mode: u32
                 process
                     .controlling_terminal_session()
                     .map_err(|_| -(KernelError::Nxio as i32))?;
+                if let Some(terminal) = process.controlling_pty_terminal() {
+                    return pty::open_slave_for(terminal, flags)
+                        .map_err(|error| -(error as i32));
+                }
             }
             if path.as_slice() == b"/dev/console" {
                 let credentials = process.credentials().map_err(metadata_errno)?;
@@ -2831,6 +2876,17 @@ pub unsafe extern "C" fn kz_rust_openat(
     flags: i32,
     mode: u32,
 ) -> i32 {
+    if !path.is_null() {
+        let requested_path = unsafe { CStr::from_ptr(path) }.to_bytes();
+        if requested_path == b"/dev/ptmx" {
+            return pty::open_master(flags)
+                .map_or_else(|error| fail(-(error as i32)), |descriptor| descriptor);
+        }
+        if requested_path.starts_with(b"/dev/pts/") {
+            return pty::open_slave_path(requested_path, flags)
+                .map_or_else(|error| fail(-(error as i32)), |descriptor| descriptor);
+        }
+    }
     with_path_at_follow(directory_descriptor, path, flags & O_NOFOLLOW == 0, |path| {
         let path = path_c_string(&path)?;
         let descriptor = unsafe { kz_rust_open(path.as_ptr().cast(), flags, mode) };
@@ -3390,6 +3446,9 @@ pub extern "C" fn kz_rust_fchdir(file_descriptor: i32) -> i32 {
 }
 
 pub(crate) fn is_terminal_descriptor(file_descriptor: i32) -> Result<bool, i32> {
+    if pty::has_fd(file_descriptor) {
+        return Ok(true);
+    }
     FILESYSTEM.lock().is_terminal_descriptor(file_descriptor)
 }
 
@@ -3444,6 +3503,7 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
     if length == 0 {
         return 0;
     }
+    ThreadManager::cancel_current_if_requested();
     if file_descriptor == 0 {
         let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
         loop {
@@ -3469,6 +3529,35 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
     if file_descriptor < FIRST_DESCRIPTOR && file_descriptor != 0 {
         set_errno(EBADF);
         return -1;
+    }
+    if pty::is_fd(file_descriptor) {
+        let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
+        loop {
+            match pty::read(file_descriptor, output) {
+                Ok(amount) => {
+                    dispatch_signals_before_io_return();
+                    return amount as isize;
+                }
+                Err(KernelError::Again) if matches!(pty::nonblocking(file_descriptor), Ok(false)) => {
+                    if ThreadManager::current_signal_wake_pending() && !restart_interrupted_io() {
+                        set_interrupted_io_errno();
+                        return -1;
+                    }
+                    crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+                }
+                Err(KernelError::Intr) => {
+                    if restart_interrupted_io() {
+                        continue;
+                    }
+                    set_interrupted_io_errno();
+                    return -1;
+                }
+                Err(error) => {
+                    set_errno(-(error as i32));
+                    return -1;
+                }
+            }
+        }
     }
     if network::is_socket_fd(file_descriptor) {
         let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
@@ -3604,12 +3693,39 @@ pub unsafe extern "C" fn write(
     if length == 0 {
         return 0;
     }
+    ThreadManager::cancel_current_if_requested();
     if file_descriptor == 1 || file_descriptor == 2 {
         return write_console(buffer.cast::<u8>(), length, false);
     }
     if file_descriptor < FIRST_DESCRIPTOR {
         set_errno(EBADF);
         return -1;
+    }
+    if pty::is_fd(file_descriptor) {
+        let input = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), length) };
+        loop {
+            match pty::write(file_descriptor, input) {
+                Ok(amount) => return amount as isize,
+                Err(KernelError::Again) if matches!(pty::nonblocking(file_descriptor), Ok(false)) => {
+                    if ThreadManager::current_signal_wake_pending() && !restart_interrupted_io() {
+                        set_interrupted_io_errno();
+                        return -1;
+                    }
+                    crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+                }
+                Err(KernelError::Intr) => {
+                    if restart_interrupted_io() {
+                        continue;
+                    }
+                    set_interrupted_io_errno();
+                    return -1;
+                }
+                Err(error) => {
+                    set_errno(-(error as i32));
+                    return -1;
+                }
+            }
+        }
     }
     if network::is_socket_fd(file_descriptor) {
         let input = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), length) };
@@ -3728,6 +3844,12 @@ pub extern "C" fn close(file_descriptor: i32) -> i32 {
             Err(error) => fail(error),
         };
     }
+    if pty::is_fd(file_descriptor) {
+        return match pty::close(file_descriptor) {
+            Ok(()) => 0,
+            Err(error) => fail(-(error as i32)),
+        };
+    }
     if network::is_socket_fd(file_descriptor) {
         return match network::close(file_descriptor) {
             Ok(()) => 0,
@@ -3826,6 +3948,27 @@ fn fill_status(output: *mut c_void, status: CStat) {
     unsafe { output.cast::<CStat>().write(status) };
 }
 
+fn pty_status(file_descriptor: i32) -> Result<CStat, i32> {
+    let index = pty::device_index(file_descriptor).map_err(|error| -(error as i32))?;
+    Ok(CStat {
+        device: 1,
+        inode: index as u64 + 1,
+        links: 1,
+        mode: S_IFCHR | 0o620,
+        user: 0,
+        group: 0,
+        pad: 0,
+        special_device: (136 << 8) | index as u64,
+        size: 0,
+        block_size: 4096,
+        blocks: 0,
+        accessed: Timespec { seconds: 0, nanoseconds: 0 },
+        modified: Timespec { seconds: 0, nanoseconds: 0 },
+        changed: Timespec { seconds: 0, nanoseconds: 0 },
+        reserved: [0; 3],
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn fstat(file_descriptor: i32, output: *mut c_void) -> i32 {
     if output.is_null() {
@@ -3867,6 +4010,8 @@ pub unsafe extern "C" fn fstat(file_descriptor: i32, output: *mut c_void) -> i32
             changed: Timespec { seconds: 0, nanoseconds: 0 },
             reserved: [0; 3],
         })
+    } else if pty::has_fd(file_descriptor) {
+        pty_status(file_descriptor)
     } else if (0..=2).contains(&file_descriptor) {
         if !standard_descriptor_is_open(file_descriptor).unwrap_or(false) {
             return fail(EBADF);
@@ -4034,6 +4179,9 @@ pub(super) fn fd_access(
 }
 
 pub(super) fn status_for_fd(file_descriptor: i32) -> Result<CStat, i32> {
+    if pty::has_fd(file_descriptor) {
+        return pty_status(file_descriptor);
+    }
     if (0..=2).contains(&file_descriptor) {
         return Ok(CStat {
             device: 1,
@@ -4438,7 +4586,14 @@ pub unsafe extern "C" fn kz_rust_ioctl(
         }
         let mut address_space = process.address_space();
         if request == TIOCGWINSZ {
-            let size = crate::kernel::tty::window_size();
+            let size = if pty::is_fd(file_descriptor) {
+                match pty::window_size(file_descriptor) {
+                    Ok(size) => size,
+                    Err(error) => return fail(-(error as i32)),
+                }
+            } else {
+                crate::kernel::tty::window_size()
+            };
             let output = CWindowSize {
                 rows: size.rows,
                 columns: size.columns,
@@ -4470,12 +4625,17 @@ pub unsafe extern "C" fn kz_rust_ioctl(
         if let Err(error) = address_space.read(argument as usize, bytes) {
             return fail(-(error as i32));
         }
-        crate::kernel::tty::set_window_size(crate::kernel::tty::WindowSize {
+        let size = crate::kernel::tty::WindowSize {
             rows: input.rows,
             columns: input.columns,
             x_pixels: input.x_pixels,
             y_pixels: input.y_pixels,
-        });
+        };
+        if pty::is_fd(file_descriptor) {
+            return pty::set_window_size(file_descriptor, size)
+                .map_or_else(|error| fail(-(error as i32)), |_| 0);
+        }
+        crate::kernel::tty::set_window_size(size);
         return 0;
     }
     if request != FS_IOC_GETFLAGS && request != FS_IOC_SETFLAGS {

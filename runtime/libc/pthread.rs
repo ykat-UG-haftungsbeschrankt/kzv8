@@ -125,6 +125,13 @@ pub(crate) unsafe fn timed_condition_wait(
     }
     let condition_generation = unsafe { &(*condition.cast::<PthreadCondition>()).generation };
     loop {
+        if ThreadManager::cancellation_requested_current() {
+            let lock_status = unsafe { pthread_mutex_lock(mutex) };
+            if lock_status != 0 {
+                return lock_status;
+            }
+            ThreadManager::cancel_current_if_requested();
+        }
         if condition_generation.load(Ordering::Acquire) != generation {
             return unsafe { pthread_mutex_lock(mutex) };
         }

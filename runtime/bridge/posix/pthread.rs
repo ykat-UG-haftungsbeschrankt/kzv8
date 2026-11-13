@@ -6,7 +6,19 @@
  */
 
 use core::ffi::{c_int, c_void};
-use super::errno::ENOSYS;
+use core::mem::{size_of, MaybeUninit};
+
+use crate::kernel::dl::AddressSpace;
+use crate::kernel::error::Error;
+use crate::kernel::process::Process;
+use crate::kernel::scheduler::thread::ThreadManager;
+
+use super::errno::{as_errno, ENOSYS};
+
+const PTHREAD_CANCEL_ENABLE: c_int = 0;
+const PTHREAD_CANCEL_DISABLE: c_int = 1;
+const PTHREAD_CANCEL_DEFERRED: c_int = 0;
+const PTHREAD_CANCEL_ASYNCHRONOUS: c_int = 1;
 
 macro_rules! unsupported_pthread {
     ($name:ident($($argument:ident: $argument_type:ty),* $(,)?)) => {
@@ -43,7 +55,81 @@ unsupported_pthread!(pthread_barrierattr_getpshared(_attributes: *const c_void, 
 unsupported_pthread!(pthread_barrierattr_init(_attributes: *mut c_void));
 unsupported_pthread!(pthread_barrierattr_setpshared(_attributes: *mut c_void, _process_shared: c_int));
 
-unsupported_pthread!(pthread_cancel(_thread: usize));
+fn write_optional_int(
+    process: &Process,
+    output: *mut c_int,
+    value: c_int,
+) -> Result<(), Error> {
+    if output.is_null() {
+        return Ok(());
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts((&value as *const c_int).cast::<u8>(), size_of::<c_int>())
+    };
+    process.address_space().write(output as usize, bytes)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_cancel(thread: usize) -> c_int {
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => return as_errno(error),
+    };
+    match ThreadManager::request_cancellation(thread, process.pid()) {
+        Ok(()) => 0,
+        Err(error) => as_errno(error),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setcancelstate(
+    state: c_int,
+    old_state: *mut c_int,
+) -> c_int {
+    if !matches!(state, PTHREAD_CANCEL_ENABLE | PTHREAD_CANCEL_DISABLE) {
+        return as_errno(Error::Inval);
+    }
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => return as_errno(error),
+    };
+    let enabled = state == PTHREAD_CANCEL_ENABLE;
+    let previous = match ThreadManager::set_current_cancellation_enabled(enabled) {
+        Ok(previous) => previous,
+        Err(error) => return as_errno(error),
+    };
+    let old_state_value = if previous {
+        PTHREAD_CANCEL_ENABLE
+    } else {
+        PTHREAD_CANCEL_DISABLE
+    };
+    if let Err(error) = write_optional_int(&process, old_state, old_state_value) {
+        let _ = ThreadManager::set_current_cancellation_enabled(previous);
+        return as_errno(error);
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setcanceltype(
+    cancel_type: c_int,
+    old_type: *mut c_int,
+) -> c_int {
+    if cancel_type == PTHREAD_CANCEL_ASYNCHRONOUS {
+        return ENOSYS;
+    }
+    if cancel_type != PTHREAD_CANCEL_DEFERRED {
+        return as_errno(Error::Inval);
+    }
+    let process = match ThreadManager::current_process() {
+        Ok(process) => process,
+        Err(error) => return as_errno(error),
+    };
+    match write_optional_int(&process, old_type, PTHREAD_CANCEL_DEFERRED) {
+        Ok(()) => 0,
+        Err(error) => as_errno(error),
+    }
+}
 #[no_mangle]
 pub unsafe extern "C" fn pthread_cond_clockwait(
     condition: *mut c_void,
@@ -78,10 +164,134 @@ unsupported_pthread!(pthread_condattr_setclock(_attributes: *mut c_void, _clock_
 unsupported_pthread!(pthread_condattr_setpshared(_attributes: *mut c_void, _process_shared: c_int));
 
 unsupported_pthread!(pthread_getcpuclockid(_thread: usize, _clock_id: *mut c_int));
-unsupported_pthread!(pthread_setschedparam(_thread: usize, _policy: c_int, _parameters: *const c_void));
-unsupported_pthread!(pthread_setschedprio(_thread: usize, _priority: c_int));
 unsupported_pthread!(pthread_setconcurrency(_concurrency: c_int));
 unsupported_pthread!(pthread_getconcurrency());
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SchedParam {
+    priority: c_int,
+}
+
+fn scheduling_process(thread: usize) -> Result<alloc::sync::Arc<Process>, Error> {
+    let process = ThreadManager::current_process()?;
+    if ThreadManager::thread_belongs_to_process(thread, process.pid()) {
+        Ok(process)
+    } else {
+        Err(Error::Srch)
+    }
+}
+
+fn read_sched_param(process: &Process, parameters: *const c_void) -> Result<SchedParam, Error> {
+    if parameters.is_null() {
+        return Err(Error::Fault);
+    }
+    let mut value = MaybeUninit::<SchedParam>::uninit();
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<SchedParam>())
+    };
+    process.address_space().read(parameters as usize, bytes)?;
+    Ok(unsafe { value.assume_init() })
+}
+
+fn write_sched_outputs(
+    process: &Process,
+    policy: *mut c_int,
+    parameters: *mut c_void,
+    policy_value: c_int,
+    priority: c_int,
+) -> Result<(), Error> {
+    if policy.is_null() || parameters.is_null() {
+        return Err(Error::Fault);
+    }
+    let parameter_value = SchedParam { priority };
+    let policy_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&policy_value as *const c_int).cast::<u8>(),
+            size_of::<c_int>(),
+        )
+    };
+    let parameter_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&parameter_value as *const SchedParam).cast::<u8>(),
+            size_of::<SchedParam>(),
+        )
+    };
+    let mut address_space = process.address_space();
+    address_space.write(policy as usize, policy_bytes)?;
+    address_space.write(parameters as usize, parameter_bytes)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_getschedparam(
+    thread: usize,
+    policy: *mut c_int,
+    parameters: *mut c_void,
+) -> c_int {
+    let process = match scheduling_process(thread) {
+        Ok(process) => process,
+        Err(error) => return as_errno(error),
+    };
+    let (policy_value, priority) =
+        match ThreadManager::scheduling_parameters_for_thread(thread) {
+            Ok(parameters) => parameters,
+            Err(error) => return as_errno(error),
+        };
+    match write_sched_outputs(&process, policy, parameters, policy_value, priority) {
+        Ok(()) => 0,
+        Err(error) => as_errno(error),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setschedparam(
+    thread: usize,
+    policy: c_int,
+    parameters: *const c_void,
+) -> c_int {
+    let process = match scheduling_process(thread) {
+        Ok(process) => process,
+        Err(error) => return as_errno(error),
+    };
+    let parameters = match read_sched_param(&process, parameters) {
+        Ok(parameters) => parameters,
+        Err(error) => return as_errno(error),
+    };
+    if let Err(error) = super::sched::validate_scheduling_parameters(
+        &process,
+        policy,
+        parameters.priority,
+    ) {
+        return as_errno(error);
+    }
+    match ThreadManager::set_scheduling_parameters_for_thread(
+        thread,
+        policy,
+        parameters.priority,
+    ) {
+        Ok(()) => 0,
+        Err(error) => as_errno(error),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setschedprio(thread: usize, priority: c_int) -> c_int {
+    let process = match scheduling_process(thread) {
+        Ok(process) => process,
+        Err(error) => return as_errno(error),
+    };
+    let (policy, _) = match ThreadManager::scheduling_parameters_for_thread(thread) {
+        Ok(parameters) => parameters,
+        Err(error) => return as_errno(error),
+    };
+    if let Err(error) = super::sched::validate_scheduling_parameters(&process, policy, priority) {
+        return as_errno(error);
+    }
+    match ThreadManager::set_scheduling_parameters_for_thread(thread, policy, priority) {
+        Ok(()) => 0,
+        Err(error) => as_errno(error),
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_clocklock(
@@ -145,4 +355,6 @@ unsupported_pthread!(pthread_spin_trylock(_lock: *mut c_int));
 unsupported_pthread!(pthread_spin_unlock(_lock: *mut c_int));
 
 #[no_mangle]
-pub unsafe extern "C" fn pthread_testcancel() {}
+pub unsafe extern "C" fn pthread_testcancel() {
+    ThreadManager::cancel_current_if_requested();
+}
