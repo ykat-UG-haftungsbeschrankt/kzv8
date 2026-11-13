@@ -9,7 +9,7 @@ use core::ffi::{c_int, c_void};
 use core::ptr::read_unaligned;
 use core::sync::atomic::Ordering;
 
-use super::errno::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOMEM, ENOSYS, EPERM, ESRCH, ETIMEDOUT};
+use super::errno::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOMEM, EPERM, ESRCH, ETIMEDOUT};
 #[allow(unused_imports)]
 use crate::kernel::arch::traits::{
     CpuArchitecture as _, InterruptArchitecture as _, ThreadArchitecture as _, TimerArchitecture as _,
@@ -294,25 +294,6 @@ pub unsafe extern "C" fn pthread_once(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pthread_getschedparam(
-    thread_id: usize,
-    policy: *mut i32,
-    parameters: *mut c_void,
-) -> i32 {
-    if policy.is_null() || parameters.is_null() {
-        return EINVAL;
-    }
-    if !ThreadManager::contains_thread_by_id(thread_id) {
-        return ESRCH;
-    }
-    unsafe {
-        policy.write(0);
-        parameters.cast::<i32>().write(0);
-    }
-    0
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn pthread_attr_init(attributes: *mut c_void) -> i32 {
     if attributes.is_null() {
         return EINVAL;
@@ -579,18 +560,6 @@ pub unsafe extern "C" fn pthread_getattr_np(thread_id: usize, attributes: *mut c
             });
     }
     0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pthread_kill(thread_id: usize, signal_number: i32) -> i32 {
-    if !ThreadManager::contains_thread_by_id(thread_id) {
-        return ESRCH;
-    }
-    if signal_number == 0 {
-        0
-    } else {
-        ENOSYS
-    }
 }
 
 #[no_mangle]

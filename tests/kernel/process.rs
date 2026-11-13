@@ -341,7 +341,11 @@ impl Process {
         parent.set_process_group(child.pid(), 0).unwrap();
         assert_eq!(child.process_group_id(), child.pid());
         assert_eq!(child.create_session(), Err(crate::kernel::error::Error::Perm));
-        child
+        assert_eq!(
+            child.set_terminal_foreground_process_group(child.pid()),
+            Err(Error::Intr)
+        );
+        parent
             .set_terminal_foreground_process_group(child.pid())
             .unwrap();
         assert_eq!(parent.terminal_foreground_process_group(), Ok(child.pid()));
@@ -362,6 +366,9 @@ impl Process {
             session_child.set_process_group(parent.pid(), 0),
             Err(crate::kernel::error::Error::Perm)
         );
+        child
+            .set_terminal_foreground_process_group(parent.process_group_id())
+            .unwrap();
         assert_eq!(
             parent.set_terminal_foreground_process_group(session_child.pid()),
             Err(crate::kernel::error::Error::Perm)
@@ -414,10 +421,12 @@ impl Process {
             CLD_CONTINUED
         );
 
+        child.thread_started();
         child
             .queue_signal(SignalInfo::new(SIGKILL, 0, parent.pid(), 0, 0, 0))
             .unwrap();
         assert_eq!(child.termination_signal(), Some(SIGKILL));
+        child.thread_exited(0);
         let killed = parent
             .take_pending_signal(SignalSet::from_signal(SIGCHLD))
             .unwrap();

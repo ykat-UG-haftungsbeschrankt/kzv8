@@ -970,11 +970,6 @@ pub extern "C" fn __ctype_b_loc() -> *mut *const u16 {
 }
 
 #[no_mangle]
-pub extern "C" fn setpriority(_which: i32, _who: i32, _priority: i32) -> i32 {
-    0
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn __open64_2(path: *const c_char, flags: i32) -> i32 {
     if flags & 0o100 != 0 {
         set_errno(EINVAL);
@@ -1053,22 +1048,6 @@ pub unsafe extern "C" fn time(result: *mut i64) -> i64 {
         unsafe { result.write(seconds) };
     }
     seconds
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn sigaction(
-    _signal_number: i32,
-    _action: *const c_void,
-    _old_action: *mut c_void,
-) -> i32 {
-    set_errno(ENOSYS);
-    -1
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn sigaltstack(_stack: *const c_void, _old_stack: *mut c_void) -> i32 {
-    set_errno(ENOSYS);
-    -1
 }
 
 #[no_mangle]

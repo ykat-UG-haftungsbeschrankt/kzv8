@@ -17,6 +17,7 @@ use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::signal::SignalSet;
 
 use super::errno::as_errno;
+use super::exec::read_guest_string;
 use super::sched::{self, SchedParam};
 
 const POSIX_SPAWN_RESETIDS: i16 = 0x01;

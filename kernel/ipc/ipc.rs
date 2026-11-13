@@ -46,7 +46,7 @@ fn record_message_received() {
 
 impl CapabilityRights {
 	const fn is_subset_of(self, rights: Self) -> bool {
-		rights.contains(self)
+		rights.0 & self.0 == self.0
 	}
 }
 

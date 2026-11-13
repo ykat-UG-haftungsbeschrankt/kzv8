@@ -55,7 +55,7 @@ struct PreparedImage {
     stack_pointer: usize,
 }
 
-fn read_guest_string(process: &Process, address: usize) -> Result<Vec<u8>, c_int> {
+pub(super) fn read_guest_string(process: &Process, address: usize) -> Result<Vec<u8>, c_int> {
     if address == 0 {
         return Err(EFAULT);
     }

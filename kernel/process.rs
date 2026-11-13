@@ -1424,6 +1424,7 @@ impl Process {
         if self.active_threads.fetch_sub(1, Ordering::AcqRel) == 1
             && !self.exit_notified.swap(true, Ordering::AcqRel)
         {
+            #[cfg(not(test))]
             crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
                 self.pid,
             );

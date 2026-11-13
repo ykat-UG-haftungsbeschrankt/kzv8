@@ -7,28 +7,19 @@
 
 use core::ffi::{c_int, c_void};
 use core::mem::{size_of, MaybeUninit};
-use core::ptr::read_unaligned;
 
 use crate::kernel::dl::AddressSpace;
 use crate::kernel::error::Error;
 use crate::kernel::process::Process;
-use crate::kernel::scheduler::thread::{ThreadAttributes, ThreadManager};
+use crate::kernel::scheduler::thread::ThreadManager;
 
 use super::errno::{as_errno, ENOSYS};
-use super::sched::{self, SchedParam};
+use super::sched::SchedParam;
 
 const PTHREAD_CANCEL_ENABLE: c_int = 0;
 const PTHREAD_CANCEL_DISABLE: c_int = 1;
 const PTHREAD_CANCEL_DEFERRED: c_int = 0;
 const PTHREAD_CANCEL_ASYNCHRONOUS: c_int = 1;
-const PTHREAD_INHERIT_SCHED: c_int = 0;
-const PTHREAD_EXPLICIT_SCHED: c_int = 1;
-const SCHED_OTHER: c_int = 0;
-const SCHED_FIFO: c_int = 1;
-const SCHED_RR: c_int = 2;
-const SCHED_SPORADIC: c_int = 3;
-const SCHED_PRIORITY_MIN: c_int = 1;
-const SCHED_PRIORITY_MAX: c_int = 99;
 
 macro_rules! unsupported_pthread {
     ($name:ident($($argument:ident: $argument_type:ty),* $(,)?)) => {
@@ -39,50 +30,6 @@ macro_rules! unsupported_pthread {
     };
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_init(attributes: *mut c_void) -> c_int {
-    if attributes.is_null() {
-        return as_errno(Error::Inval);
-    }
-    unsafe {
-        attributes.cast::<ThreadAttributes>().write(ThreadAttributes {
-            stack_size: 0,
-            detach_state: 0,
-            stack_address: core::ptr::null_mut(),
-            inherit_schedule: PTHREAD_INHERIT_SCHED,
-            scheduler_policy: SCHED_OTHER,
-            scheduler_priority: 0,
-            sporadic_low_priority: 0,
-            sporadic_period_ns: 0,
-            sporadic_budget_ns: 0,
-            sporadic_max_replenishments: 0,
-        });
-    }
-    0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_destroy(attributes: *mut c_void) -> c_int {
-    if attributes.is_null() {
-        return as_errno(Error::Inval);
-    }
-    unsafe {
-        attributes.cast::<ThreadAttributes>().write(ThreadAttributes {
-            stack_size: 0,
-            detach_state: 0,
-            stack_address: core::ptr::null_mut(),
-            inherit_schedule: PTHREAD_INHERIT_SCHED,
-            scheduler_policy: SCHED_OTHER,
-            scheduler_priority: 0,
-            sporadic_low_priority: 0,
-            sporadic_period_ns: 0,
-            sporadic_budget_ns: 0,
-            sporadic_max_replenishments: 0,
-        });
-    }
-    0
-}
-
 // FIXME: The kernel has no signal cancellation, priority scheduler, barrier, rwlock, or robust mutex API.
 unsupported_pthread!(pthread_atfork(
     _prepare: Option<unsafe extern "C" fn()>,
@@ -90,114 +37,8 @@ unsupported_pthread!(pthread_atfork(
     _child: Option<unsafe extern "C" fn()>,
 ));
 unsupported_pthread!(pthread_attr_getguardsize(_attributes: *const c_void, _guard_size: *mut usize));
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_getinheritsched(
-    attributes: *const c_void,
-    inherit_schedule: *mut c_int,
-) -> c_int {
-    if attributes.is_null() || inherit_schedule.is_null() {
-        return as_errno(Error::Inval);
-    }
-    unsafe {
-        inherit_schedule.write((*attributes.cast::<ThreadAttributes>()).inherit_schedule)
-    };
-    0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_getschedparam(
-    attributes: *const c_void,
-    parameters: *mut c_void,
-) -> c_int {
-    if attributes.is_null() || parameters.is_null() {
-        return as_errno(Error::Inval);
-    }
-    let attributes = unsafe { &*attributes.cast::<ThreadAttributes>() };
-    let scheduling = crate::kernel::process::SchedulingParameters {
-        policy: attributes.scheduler_policy,
-        priority: attributes.scheduler_priority,
-        sporadic: (attributes.scheduler_policy == SCHED_SPORADIC).then_some(
-            crate::kernel::process::SporadicParameters {
-                low_priority: attributes.sporadic_low_priority,
-                replenishment_period_ns: attributes.sporadic_period_ns,
-                initial_budget_ns: attributes.sporadic_budget_ns,
-                max_replenishments: attributes.sporadic_max_replenishments,
-            },
-        ),
-    };
-    unsafe {
-        parameters
-            .cast::<SchedParam>()
-            .write(sched::sched_param_for_configuration(scheduling))
-    };
-    0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_getschedpolicy(
-    attributes: *const c_void,
-    policy: *mut c_int,
-) -> c_int {
-    if attributes.is_null() || policy.is_null() {
-        return as_errno(Error::Inval);
-    }
-    unsafe { policy.write((*attributes.cast::<ThreadAttributes>()).scheduler_policy) };
-    0
-}
 unsupported_pthread!(pthread_attr_getscope(_attributes: *const c_void, _scope: *mut c_int));
 unsupported_pthread!(pthread_attr_setguardsize(_attributes: *mut c_void, _guard_size: usize));
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_setinheritsched(
-    attributes: *mut c_void,
-    inherit_schedule: c_int,
-) -> c_int {
-    if attributes.is_null() || !matches!(inherit_schedule, PTHREAD_INHERIT_SCHED | PTHREAD_EXPLICIT_SCHED) {
-        return as_errno(Error::Inval);
-    }
-    unsafe { (*attributes.cast::<ThreadAttributes>()).inherit_schedule = inherit_schedule };
-    0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_setschedparam(
-    attributes: *mut c_void,
-    parameters: *const c_void,
-) -> c_int {
-    if attributes.is_null() || parameters.is_null() {
-        return as_errno(Error::Inval);
-    }
-    let parameter = unsafe { read_unaligned(parameters.cast::<SchedParam>()) };
-    let attributes = unsafe { &mut *attributes.cast::<ThreadAttributes>() };
-    let scheduling = match sched::scheduling_configuration_from_param(
-        attributes.scheduler_policy,
-        parameter,
-    ) {
-        Ok(scheduling) => scheduling,
-        Err(error) => return as_errno(error),
-    };
-    attributes.scheduler_priority = scheduling.priority;
-    if let Some(sporadic) = scheduling.sporadic {
-        attributes.sporadic_low_priority = sporadic.low_priority;
-        attributes.sporadic_period_ns = sporadic.replenishment_period_ns;
-        attributes.sporadic_budget_ns = sporadic.initial_budget_ns;
-        attributes.sporadic_max_replenishments = sporadic.max_replenishments;
-    }
-    0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pthread_attr_setschedpolicy(
-    attributes: *mut c_void,
-    policy: c_int,
-) -> c_int {
-    if attributes.is_null()
-        || !matches!(policy, SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_SPORADIC)
-    {
-        return as_errno(Error::Inval);
-    }
-    unsafe { (*attributes.cast::<ThreadAttributes>()).scheduler_policy = policy };
-    0
-}
 unsupported_pthread!(pthread_attr_setscope(_attributes: *mut c_void, _scope: c_int));
 unsupported_pthread!(pthread_attr_setstack(_attributes: *mut c_void, _stack_address: *mut c_void, _stack_size: usize));
 

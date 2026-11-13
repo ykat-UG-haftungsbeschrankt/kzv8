@@ -376,7 +376,7 @@ impl UserAddressSpace {
 			}
 			areas
 		};
-		let child = Self::new()?;
+		let mut child = Self::new()?;
 		let mut page_contents = alloc::boxed::Box::new([0; USER_VM_PAGE_SIZE]);
 		for (range, page_states) in areas {
 			let length = range.end.checked_sub(range.start).ok_or(Error::Overflow)?;
