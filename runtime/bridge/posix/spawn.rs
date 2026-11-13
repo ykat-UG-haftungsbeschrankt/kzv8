@@ -16,7 +16,7 @@ use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::signal::SignalSet;
 
-use super::errno::{as_errno, ENOSYS};
+use super::errno::as_errno;
 use super::sched::{self, SchedParam};
 
 const POSIX_SPAWN_RESETIDS: i16 = 0x01;
@@ -48,9 +48,22 @@ struct SpawnAttributesEntry {
     attributes: SpawnAttributes,
 }
 
+pub(super) enum SpawnFileAction {
+    Close(i32),
+    Dup2 { source: i32, destination: i32 },
+    Open {
+        file_descriptor: i32,
+        path: Vec<u8>,
+        flags: i32,
+        mode: u32,
+    },
+    Chdir(Vec<u8>),
+    Fchdir(i32),
+}
+
 struct SpawnFileActionsEntry {
     address: usize,
-    action_count: usize,
+    actions: Vec<SpawnFileAction>,
 }
 
 static SPAWN_ATTRIBUTES: IrqSpinLock<Vec<SpawnAttributesEntry>> = IrqSpinLock::new(Vec::new());
@@ -72,16 +85,63 @@ pub(crate) fn spawn_attributes(address: *const c_void) -> Result<Option<SpawnAtt
         .ok_or(as_errno(Error::Inval))
 }
 
-pub(crate) fn file_actions_are_empty(address: *const c_void) -> Result<bool, c_int> {
+pub(super) fn file_actions_snapshot(
+    address: *const c_void,
+) -> Result<Vec<SpawnFileAction>, c_int> {
     if address.is_null() {
-        return Ok(true);
+        return Ok(Vec::new());
     }
-    SPAWN_FILE_ACTIONS
-        .lock()
+    let entries = SPAWN_FILE_ACTIONS.lock();
+    let actions = entries
         .iter()
         .find(|entry| entry.address == address as usize)
-        .map(|entry| entry.action_count == 0)
-        .ok_or(as_errno(Error::Inval))
+        .map(|entry| &entry.actions)
+        .ok_or(as_errno(Error::Inval))?;
+    let mut snapshot = Vec::new();
+    snapshot.try_reserve_exact(actions.len()).map_err(|_| as_errno(Error::NoMem))?;
+    for action in actions {
+        snapshot.push(clone_file_action(action)?);
+    }
+    Ok(snapshot)
+}
+
+fn clone_file_action(action: &SpawnFileAction) -> Result<SpawnFileAction, c_int> {
+    match action {
+        SpawnFileAction::Close(file_descriptor) => Ok(SpawnFileAction::Close(*file_descriptor)),
+        SpawnFileAction::Dup2 { source, destination } => Ok(SpawnFileAction::Dup2 {
+            source: *source,
+            destination: *destination,
+        }),
+        SpawnFileAction::Open {
+            file_descriptor,
+            path,
+            flags,
+            mode,
+        } => {
+            let mut path_copy = Vec::new();
+            path_copy
+                .try_reserve_exact(path.len())
+                .map_err(|_| as_errno(Error::NoMem))?;
+            path_copy.extend_from_slice(path);
+            Ok(SpawnFileAction::Open {
+                file_descriptor: *file_descriptor,
+                path: path_copy,
+                flags: *flags,
+                mode: *mode,
+            })
+        }
+        SpawnFileAction::Chdir(path) => {
+            let mut path_copy = Vec::new();
+            path_copy
+                .try_reserve_exact(path.len())
+                .map_err(|_| as_errno(Error::NoMem))?;
+            path_copy.extend_from_slice(path);
+            Ok(SpawnFileAction::Chdir(path_copy))
+        }
+        SpawnFileAction::Fchdir(file_descriptor) => {
+            Ok(SpawnFileAction::Fchdir(*file_descriptor))
+        }
+    }
 }
 
 fn read_signal_set(process: &Process, address: *const c_void) -> Result<SignalSet, c_int> {
@@ -366,13 +426,27 @@ pub unsafe extern "C" fn posix_spawnattr_setsigdefault(
     })
 }
 
-macro_rules! unsupported_spawn {
-    ($name:ident($($argument:ident: $argument_type:ty),* $(,)?)) => {
-        #[no_mangle]
-        pub unsafe extern "C" fn $name($($argument: $argument_type),*) -> c_int {
-            ENOSYS
-        }
+fn append_file_action(actions: *mut c_void, action: SpawnFileAction) -> c_int {
+    if actions.is_null() {
+        return as_errno(Error::Inval);
+    }
+    let mut entries = SPAWN_FILE_ACTIONS.lock();
+    let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.address == actions as usize)
+    else {
+        return as_errno(Error::Inval);
     };
+    if entry.actions.try_reserve(1).is_err() {
+        return as_errno(Error::NoMem);
+    }
+    entry.actions.push(action);
+    0
+}
+
+fn read_file_action_path(path: *const c_char) -> Result<Vec<u8>, c_int> {
+    let process = current_process()?;
+    read_guest_string(&process, path as usize)
 }
 
 #[no_mangle]
@@ -419,17 +493,80 @@ pub unsafe extern "C" fn posix_spawnp(
     }
 }
 
-unsupported_spawn!(posix_spawn_file_actions_addchdir(_actions: *mut c_void, _path: *const c_char));
-unsupported_spawn!(posix_spawn_file_actions_addclose(_actions: *mut c_void, _file_descriptor: c_int));
-unsupported_spawn!(posix_spawn_file_actions_adddup2(_actions: *mut c_void, _source: c_int, _destination: c_int));
-unsupported_spawn!(posix_spawn_file_actions_addfchdir(_actions: *mut c_void, _file_descriptor: c_int));
-unsupported_spawn!(posix_spawn_file_actions_addopen(
-    _actions: *mut c_void,
-    _file_descriptor: c_int,
-    _path: *const c_char,
-    _flags: c_int,
-    _mode: u32,
-));
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn_file_actions_addchdir(
+    actions: *mut c_void,
+    path: *const c_char,
+) -> c_int {
+    let path = match read_file_action_path(path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    append_file_action(actions, SpawnFileAction::Chdir(path))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn_file_actions_addclose(
+    actions: *mut c_void,
+    file_descriptor: c_int,
+) -> c_int {
+    if file_descriptor < 0 {
+        return as_errno(Error::Inval);
+    }
+    append_file_action(actions, SpawnFileAction::Close(file_descriptor))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn_file_actions_adddup2(
+    actions: *mut c_void,
+    source: c_int,
+    destination: c_int,
+) -> c_int {
+    if source < 0 || destination < 0 {
+        return as_errno(Error::Inval);
+    }
+    append_file_action(
+        actions,
+        SpawnFileAction::Dup2 { source, destination },
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn_file_actions_addfchdir(
+    actions: *mut c_void,
+    file_descriptor: c_int,
+) -> c_int {
+    if file_descriptor < 0 {
+        return as_errno(Error::Inval);
+    }
+    append_file_action(actions, SpawnFileAction::Fchdir(file_descriptor))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn posix_spawn_file_actions_addopen(
+    actions: *mut c_void,
+    file_descriptor: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: u32,
+) -> c_int {
+    if file_descriptor < 0 {
+        return as_errno(Error::Inval);
+    }
+    let path = match read_file_action_path(path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    append_file_action(
+        actions,
+        SpawnFileAction::Open {
+            file_descriptor,
+            path,
+            flags,
+            mode,
+        },
+    )
+}
 #[no_mangle]
 pub unsafe extern "C" fn posix_spawn_file_actions_init(actions: *mut c_void) -> c_int {
     if actions.is_null() {
@@ -444,7 +581,7 @@ pub unsafe extern "C" fn posix_spawn_file_actions_init(actions: *mut c_void) -> 
     }
     entries.push(SpawnFileActionsEntry {
         address: actions as usize,
-        action_count: 0,
+        actions: Vec::new(),
     });
     0
 }

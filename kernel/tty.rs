@@ -743,6 +743,5 @@ fn monotonic_time_ns() -> u64 {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_for_test() {
-    *CONSOLE_TTY.lock() = ConsoleTtyState::new();
-}
+#[path = "../tests/kernel/tty.rs"]
+pub(crate) mod tests;

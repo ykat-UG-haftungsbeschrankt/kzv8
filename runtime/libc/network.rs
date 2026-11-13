@@ -133,12 +133,14 @@ struct SocketDescriptor {
 
 #[derive(Clone)]
 struct SocketFd {
+    owner_process_id: i32,
     description: Arc<IrqSpinLock<SocketDescriptor>>,
     close_on_exec: bool,
 }
 
 #[derive(Clone)]
 struct PacketDescriptor {
+    owner_process_id: i32,
     device: Arc<TunDevice>,
     mode: Option<TunTapMode>,
     no_packet_info: bool,
@@ -212,6 +214,7 @@ struct LocalOpenDescription {
 
 #[derive(Clone)]
 struct LocalSocketFd {
+    owner_process_id: i32,
     description: Arc<IrqSpinLock<LocalOpenDescription>>,
     close_on_exec: bool,
 }
@@ -239,26 +242,71 @@ pub(crate) fn is_socket_fd(file_descriptor: i32) -> bool {
 }
 
 pub(crate) fn has_socket_fd(file_descriptor: i32) -> bool {
-    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+    ThreadManager::current_process().ok().is_some_and(|process| {
+        has_socket_fd_for_process(process.pid(), file_descriptor)
+    })
+}
+
+pub(crate) fn has_socket_fd_for_process(process_id: i32, file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
         if alias.kind != crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket {
             return false;
         }
-        return has_socket_fd(alias.backing);
+        return local_socket_index_direct_for_process(process_id, alias.backing).is_ok()
+            || socket_index_direct_for_process(process_id, alias.backing).is_ok();
     }
-    if let Ok(index) = local_socket_index(file_descriptor) {
-        return LOCAL_SOCKETS.lock()[index].is_some();
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return false;
     }
-    socket_index(file_descriptor)
+    if let Ok(index) = local_socket_index_for_process(process_id, file_descriptor) {
+        return LOCAL_SOCKETS.lock()[index]
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.owner_process_id == process_id);
+    }
+    socket_index_for_process(process_id, file_descriptor)
         .ok()
-        .is_some_and(|index| SOCKETS.lock()[index].is_some())
+        .is_some_and(|index| {
+            SOCKETS.lock()[index]
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+        })
+}
+
+pub(crate) fn socket_backing_is_open_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> bool {
+    local_socket_index_direct_for_process(process_id, file_descriptor).is_ok()
+        || socket_index_direct_for_process(process_id, file_descriptor).is_ok()
 }
 
 pub(crate) fn is_local_socket_fd(file_descriptor: i32) -> bool {
-    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+    ThreadManager::current_process().ok().is_some_and(|process| {
+        is_local_socket_fd_for_process(process.pid(), file_descriptor)
+    })
+}
+
+fn is_local_socket_fd_for_process(process_id: i32, file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
         return alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket
-            && is_local_socket_fd(alias.backing);
+            && local_socket_index_direct_for_process(process_id, alias.backing).is_ok();
     }
-    local_socket_index(file_descriptor).is_ok()
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return false;
+    }
+    local_socket_index_for_process(process_id, file_descriptor).is_ok()
 }
 
 pub(crate) fn same_socket_table(source: i32, target: i32) -> bool {
@@ -270,10 +318,45 @@ pub(crate) fn same_socket_table(source: i32, target: i32) -> bool {
 }
 
 fn local_socket_index(file_descriptor: i32) -> Result<usize, Error> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+    let process_id = ThreadManager::current_process()?.pid();
+    local_socket_index_for_process(process_id, file_descriptor)
+}
+
+fn local_socket_index_for_process(process_id: i32, file_descriptor: i32) -> Result<usize, Error> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_for_process(
+        process_id,
         file_descriptor,
         crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket,
     )?;
+    let index = file_descriptor
+        .checked_sub(LOCAL_SOCKET_FD_BASE)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(Error::BadFd)?;
+    if index >= LOCAL_SOCKET_COUNT
+        || !LOCAL_SOCKETS.lock()[index]
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+    {
+        return Err(Error::BadFd);
+    }
+    Ok(index)
+}
+
+fn local_socket_index_direct_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<usize, Error> {
+    let index = local_socket_slot_index(file_descriptor)?;
+    if !LOCAL_SOCKETS.lock()[index]
+        .as_ref()
+        .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+    {
+        return Err(Error::BadFd);
+    }
+    Ok(index)
+}
+
+fn local_socket_slot_index(file_descriptor: i32) -> Result<usize, Error> {
     let index = file_descriptor
         .checked_sub(LOCAL_SOCKET_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())
@@ -283,6 +366,14 @@ fn local_socket_index(file_descriptor: i32) -> Result<usize, Error> {
 
 fn local_socket_descriptor(file_descriptor: i32) -> Result<LocalSocketFd, Error> {
     let index = local_socket_index(file_descriptor)?;
+    LOCAL_SOCKETS.lock()[index].clone().ok_or(Error::BadFd)
+}
+
+fn local_socket_descriptor_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<LocalSocketFd, Error> {
+    let index = local_socket_index_for_process(process_id, file_descriptor)?;
     LOCAL_SOCKETS.lock()[index].clone().ok_or(Error::BadFd)
 }
 
@@ -484,6 +575,7 @@ pub(crate) fn connect_local_socket(file_descriptor: i32, path: &[u8]) -> Result<
 }
 
 fn accept_local_socket(file_descriptor: i32) -> Result<i32, Error> {
+    let process_id = ThreadManager::current_process()?.pid();
     let listener_description = local_socket_description(file_descriptor)?;
     let (listener, listener_path, nonblocking) = {
         let state = listener_description.lock();
@@ -496,7 +588,8 @@ fn accept_local_socket(file_descriptor: i32) -> Result<i32, Error> {
     loop {
         ThreadManager::cancel_current_if_requested();
         let mut sockets = LOCAL_SOCKETS.lock();
-        let target_index = available_local_socket_index(&sockets).ok_or(Error::Mfile)?;
+        let target_index = available_local_socket_index(&sockets, process_id)
+            .ok_or(Error::Mfile)?;
         crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
             LOCAL_SOCKET_FD_BASE + target_index as i32,
         )?;
@@ -509,6 +602,7 @@ fn accept_local_socket(file_descriptor: i32) -> Result<i32, Error> {
         };
         if let Some(pending) = pending {
             let accepted = LocalSocketFd {
+                owner_process_id: process_id,
                 description: Arc::new(IrqSpinLock::new(LocalOpenDescription {
                     pair: Some(pending.pair),
                     side: 1,
@@ -548,14 +642,39 @@ pub(crate) fn is_packet_fd(file_descriptor: i32) -> bool {
 }
 
 pub(crate) fn has_packet_fd(file_descriptor: i32) -> bool {
-    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+    ThreadManager::current_process().ok().is_some_and(|process| {
+        has_packet_fd_for_process(process.pid(), file_descriptor)
+    })
+}
+
+pub(crate) fn has_packet_fd_for_process(process_id: i32, file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
         return alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet
-            && has_packet_fd(alias.backing);
+            && packet_index_direct_for_process(process_id, alias.backing).is_ok();
     }
-    packet_index(file_descriptor)
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return false;
+    }
+    packet_index_for_process(process_id, file_descriptor)
         .ok()
-        .and_then(|index| PACKET_DEVICES.lock()[index].as_ref().map(|_| ()))
-        .is_some()
+        .is_some_and(|index| {
+            PACKET_DEVICES.lock()[index]
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+        })
+}
+
+pub(crate) fn packet_backing_is_open_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> bool {
+    packet_index_direct_for_process(process_id, file_descriptor).is_ok()
 }
 
 pub(crate) fn interface_list() -> Result<Vec<(u32, [u8; 16])>, Error> {
@@ -603,6 +722,15 @@ pub(crate) fn tun_device_by_name(name: &[u8]) -> Result<Arc<TunDevice>, Error> {
 }
 
 pub(crate) fn open_tun_device(nonblocking: bool, close_on_exec: bool) -> Result<i32, Error> {
+    let process_id = ThreadManager::current_process()?.pid();
+    open_tun_device_for_process(nonblocking, close_on_exec, process_id)
+}
+
+pub(crate) fn open_tun_device_for_process(
+    nonblocking: bool,
+    close_on_exec: bool,
+    process_id: i32,
+) -> Result<i32, Error> {
     let device = TunDevice::new()?;
     let mut devices = PACKET_DEVICES.lock();
     let index = devices
@@ -611,7 +739,10 @@ pub(crate) fn open_tun_device(nonblocking: bool, close_on_exec: bool) -> Result<
         .find_map(|(index, descriptor)| {
             let target = PACKET_FD_BASE + index as i32;
             (descriptor.is_none()
-                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(target))
+                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                    process_id,
+                    target,
+                ))
             .then_some(index)
         })
         .ok_or(Error::Mfile)?;
@@ -619,6 +750,7 @@ pub(crate) fn open_tun_device(nonblocking: bool, close_on_exec: bool) -> Result<
         PACKET_FD_BASE + index as i32,
     )?;
     devices[index] = Some(PacketDescriptor {
+        owner_process_id: process_id,
         device,
         mode: None,
         no_packet_info: false,
@@ -1026,7 +1158,37 @@ pub(crate) fn pump_packet_network() {
 }
 
 pub(crate) fn close_packet_fd(file_descriptor: i32) -> Result<(), Error> {
-    let index = packet_index(file_descriptor)?;
+    let process_id = ThreadManager::current_process()?.pid();
+    close_packet_fd_for_process(process_id, file_descriptor)
+}
+
+pub(crate) fn close_packet_fd_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<(), Error> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        if alias.kind != crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet {
+            return Err(Error::BadFd);
+        }
+        return close_packet_fd_direct_for_process(process_id, alias.backing);
+    }
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return Err(Error::BadFd);
+    }
+    close_packet_fd_direct_for_process(process_id, file_descriptor)
+}
+
+pub(crate) fn close_packet_fd_direct_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<(), Error> {
+    let index = packet_index_direct_for_process(process_id, file_descriptor)?;
     let descriptor = PACKET_DEVICES.lock()[index].take().ok_or(Error::BadFd)?;
     let still_open = PACKET_DEVICES
         .lock()
@@ -1044,11 +1206,35 @@ pub(crate) fn duplicate_packet_fd(
     minimum: i32,
     close_on_exec: bool,
 ) -> Result<i32, Error> {
-    duplicate_packet_fd_internal(file_descriptor, minimum, close_on_exec, true)
+    let process_id = ThreadManager::current_process()?.pid();
+    duplicate_packet_fd_internal(
+        file_descriptor,
+        minimum,
+        close_on_exec,
+        true,
+        process_id,
+        process_id,
+    )
 }
 
 pub(crate) fn duplicate_packet_fd_backing(file_descriptor: i32) -> Result<i32, Error> {
-    duplicate_packet_fd_internal(file_descriptor, PACKET_FD_BASE, false, false)
+    let process_id = ThreadManager::current_process()?.pid();
+    duplicate_packet_fd_for_process(file_descriptor, process_id, process_id)
+}
+
+pub(crate) fn duplicate_packet_fd_for_process(
+    file_descriptor: i32,
+    source_process_id: i32,
+    target_process_id: i32,
+) -> Result<i32, Error> {
+    duplicate_packet_fd_internal(
+        file_descriptor,
+        PACKET_FD_BASE,
+        false,
+        false,
+        source_process_id,
+        target_process_id,
+    )
 }
 
 fn duplicate_packet_fd_internal(
@@ -1056,11 +1242,13 @@ fn duplicate_packet_fd_internal(
     minimum: i32,
     close_on_exec: bool,
     enforce_limit: bool,
+    source_process_id: i32,
+    target_process_id: i32,
 ) -> Result<i32, Error> {
     if minimum < 0 {
         return Err(Error::Inval);
     }
-    let source_index = packet_index(file_descriptor)?;
+    let source_index = packet_index_for_process(source_process_id, file_descriptor)?;
     let first = usize::try_from(minimum.saturating_sub(PACKET_FD_BASE))
         .unwrap_or(0)
         .min(PACKET_DEVICE_COUNT);
@@ -1073,7 +1261,10 @@ fn duplicate_packet_fd_internal(
         .find_map(|(index, descriptor)| {
             let target = PACKET_FD_BASE + index as i32;
             (descriptor.is_none()
-                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(target))
+                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                    target_process_id,
+                    target,
+                ))
             .then_some(index)
         })
         .ok_or(Error::Mfile)?;
@@ -1083,6 +1274,7 @@ fn duplicate_packet_fd_internal(
         )?;
     }
     devices[target_index] = Some(PacketDescriptor {
+        owner_process_id: target_process_id,
         close_on_exec,
         ..source
     });
@@ -1094,17 +1286,25 @@ pub(crate) fn duplicate_packet_fd_to(
     target: i32,
     close_on_exec: bool,
 ) -> Result<i32, Error> {
-    let source_index = packet_index(file_descriptor)?;
-    let target_index = packet_index(target)?;
+    let process_id = ThreadManager::current_process()?.pid();
+    let source_index = packet_index_for_process(process_id, file_descriptor)?;
+    let target_index = packet_slot_index(target)?;
     if file_descriptor == target {
         return if close_on_exec { Err(Error::Inval) } else { Ok(target) };
     }
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(target)?;
-    if PACKET_DEVICES.lock()[target_index].is_some() {
-        close_packet_fd(target)?;
+    let target_owner = PACKET_DEVICES.lock()[target_index]
+        .as_ref()
+        .map(|existing| existing.owner_process_id);
+    if let Some(target_owner) = target_owner {
+        if target_owner != process_id {
+            return Err(Error::BadFd);
+        }
+        close_packet_fd_for_process(process_id, target)?;
     }
     let mut devices = PACKET_DEVICES.lock();
     let mut descriptor = devices[source_index].as_ref().cloned().ok_or(Error::BadFd)?;
+    descriptor.owner_process_id = process_id;
     descriptor.close_on_exec = close_on_exec;
     devices[target_index] = Some(descriptor);
     Ok(target)
@@ -1168,6 +1368,7 @@ pub(crate) fn create_socket(
     if domain != AF_INET {
         return Err(Error::AfNoSupport);
     }
+    let process_id = ThreadManager::current_process()?.pid();
     let nonblocking = socket_type & SOCK_NONBLOCK != 0;
     let close_on_exec = socket_type & SOCK_CLOEXEC != 0;
     let socket_type = socket_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC | SOCK_CLOFORK);
@@ -1211,7 +1412,10 @@ pub(crate) fn create_socket(
         .find_map(|(index, descriptor)| {
             let target = SOCKET_FD_BASE + index as i32;
             (descriptor.is_none()
-                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(target))
+                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                    process_id,
+                    target,
+                ))
             .then_some(index)
         })
         .ok_or(Error::Mfile)?;
@@ -1225,22 +1429,30 @@ pub(crate) fn create_socket(
         return Err(error);
     }
     sockets[index] = Some(SocketFd {
+        owner_process_id: process_id,
         description: Arc::new(IrqSpinLock::new(descriptor)),
         close_on_exec,
     });
     Ok(SOCKET_FD_BASE + index as i32)
 }
 
-fn available_local_socket_index(sockets: &[Option<LocalSocketFd>; LOCAL_SOCKET_COUNT]) -> Option<usize> {
+fn available_local_socket_index(
+    sockets: &[Option<LocalSocketFd>; LOCAL_SOCKET_COUNT],
+    process_id: i32,
+) -> Option<usize> {
     sockets.iter().enumerate().find_map(|(index, socket)| {
         let descriptor = LOCAL_SOCKET_FD_BASE + index as i32;
         (socket.is_none()
-            && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(descriptor))
+            && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                process_id,
+                descriptor,
+            ))
         .then_some(index)
     })
 }
 
 fn create_local_socket(socket_type: i32, protocol: i32) -> Result<i32, Error> {
+    let process_id = ThreadManager::current_process()?.pid();
     let nonblocking = socket_type & SOCK_NONBLOCK != 0;
     let close_on_exec = socket_type & SOCK_CLOEXEC != 0;
     if socket_type & !(SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC | SOCK_CLOFORK) != 0
@@ -1250,11 +1462,12 @@ fn create_local_socket(socket_type: i32, protocol: i32) -> Result<i32, Error> {
         return Err(Error::SockTypeNoSupport);
     }
     let mut sockets = LOCAL_SOCKETS.lock();
-    let index = available_local_socket_index(&sockets).ok_or(Error::Mfile)?;
+    let index = available_local_socket_index(&sockets, process_id).ok_or(Error::Mfile)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
         LOCAL_SOCKET_FD_BASE + index as i32,
     )?;
     sockets[index] = Some(LocalSocketFd {
+        owner_process_id: process_id,
         description: Arc::new(IrqSpinLock::new(LocalOpenDescription {
             pair: None,
             side: 0,
@@ -1281,6 +1494,7 @@ pub(crate) fn create_local_socket_pair(
     if domain != AF_UNIX {
         return Err(Error::AfNoSupport);
     }
+    let process_id = ThreadManager::current_process()?.pid();
     let nonblocking = socket_type & SOCK_NONBLOCK != 0;
     let close_on_exec = socket_type & SOCK_CLOEXEC != 0;
     if socket_type & !(SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC | SOCK_CLOFORK) != 0
@@ -1291,7 +1505,7 @@ pub(crate) fn create_local_socket_pair(
     }
     let pair = empty_local_pair()?;
     let mut sockets = LOCAL_SOCKETS.lock();
-    let first = available_local_socket_index(&sockets).ok_or(Error::Mfile)?;
+    let first = available_local_socket_index(&sockets, process_id).ok_or(Error::Mfile)?;
     let second = sockets
         .iter()
         .enumerate()
@@ -1299,7 +1513,10 @@ pub(crate) fn create_local_socket_pair(
             let descriptor = LOCAL_SOCKET_FD_BASE + index as i32;
             (index != first
                 && socket.is_none()
-                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(descriptor))
+                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                    process_id,
+                    descriptor,
+                ))
             .then_some(index)
         })
         .ok_or(Error::Mfile)?;
@@ -1310,6 +1527,7 @@ pub(crate) fn create_local_socket_pair(
     }
     for (index, side) in [(first, 0), (second, 1)] {
         sockets[index] = Some(LocalSocketFd {
+            owner_process_id: process_id,
             description: Arc::new(IrqSpinLock::new(LocalOpenDescription {
                 pair: Some(Arc::clone(&pair)),
                 side,
@@ -1408,6 +1626,7 @@ pub(crate) fn accept(file_descriptor: i32) -> Result<(i32, Ipv4Address, u16), Er
         return accept_local_socket(file_descriptor)
             .map(|descriptor| (descriptor, Ipv4Address([0; 4]), 0));
     }
+    let process_id = ThreadManager::current_process()?.pid();
     let listener_index = socket_index(file_descriptor)?;
     let listener = socket_descriptor(listener_index)?;
     if listener.socket_type != SocketType::Stream || listener.state != SocketState::Listening {
@@ -1449,7 +1668,10 @@ pub(crate) fn accept(file_descriptor: i32) -> Result<(i32, Ipv4Address, u16), Er
             let Some(index) = sockets.iter().enumerate().find_map(|(index, descriptor)| {
                 let target = SOCKET_FD_BASE + index as i32;
                 (descriptor.is_none()
-                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(target))
+                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                        process_id,
+                        target,
+                    ))
                 .then_some(index)
             }) else {
                 drop(sockets);
@@ -1464,6 +1686,7 @@ pub(crate) fn accept(file_descriptor: i32) -> Result<(i32, Ipv4Address, u16), Er
                 return Err(error);
             }
             sockets[index] = Some(SocketFd {
+                owner_process_id: process_id,
                 description: Arc::new(IrqSpinLock::new(descriptor)),
                 close_on_exec: false,
             });
@@ -2057,8 +2280,18 @@ fn clone_local_control_message(message: &LocalControlMessage) -> Result<LocalCon
 }
 
 fn close_local_rights(rights: Vec<i32>) {
+    let Ok(process) = ThreadManager::current_process() else {
+        return;
+    };
+    close_local_rights_for_process(process.pid(), rights);
+}
+
+fn close_local_rights_for_process(process_id: i32, rights: Vec<i32>) {
     for descriptor in rights {
-        let _ = crate::kernel::runtime::runtime_libc::filesystem::close_descriptor(descriptor);
+        let _ = crate::kernel::runtime::runtime_libc::filesystem::close_descriptor_for_process(
+            process_id,
+            descriptor,
+        );
     }
 }
 
@@ -2088,10 +2321,37 @@ fn ensure_udp_binding(
 }
 
 pub(crate) fn close(file_descriptor: i32) -> Result<(), Error> {
-    if is_local_socket_fd(file_descriptor) {
-        return close_local_socket(file_descriptor);
+    let process_id = ThreadManager::current_process()?.pid();
+    close_for_process(process_id, file_descriptor)
+}
+
+pub(crate) fn close_for_process(process_id: i32, file_descriptor: i32) -> Result<(), Error> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        if alias.kind != crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket {
+            return Err(Error::BadFd);
+        }
+        return close_direct_for_process(process_id, alias.backing);
     }
-    let index = socket_index(file_descriptor)?;
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return Err(Error::BadFd);
+    }
+    close_direct_for_process(process_id, file_descriptor)
+}
+
+pub(crate) fn close_direct_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<(), Error> {
+    if local_socket_index_direct_for_process(process_id, file_descriptor).is_ok() {
+        return close_local_socket_direct_for_process(process_id, file_descriptor);
+    }
+    let index = socket_index_direct_for_process(process_id, file_descriptor)?;
     let entry = SOCKETS.lock()[index].take().ok_or(Error::BadFd)?;
     let descriptor = {
         let mut description = entry.description.lock();
@@ -2120,47 +2380,151 @@ pub(crate) fn close(file_descriptor: i32) -> Result<(), Error> {
 }
 
 pub(crate) fn close_on_exec_descriptors() -> Result<(), Error> {
+    let process_id = ThreadManager::current_process()?.pid();
+    close_on_exec_descriptors_for_process(process_id)
+}
+
+pub(crate) fn close_on_exec_descriptors_for_process(process_id: i32) -> Result<(), Error> {
     let mut descriptors = Vec::new();
     {
         let sockets = SOCKETS.lock();
         descriptors
-            .try_reserve(sockets.iter().flatten().filter(|fd| fd.close_on_exec).count())
+            .try_reserve(
+                sockets
+                    .iter()
+                    .flatten()
+                    .filter(|fd| fd.owner_process_id == process_id && fd.close_on_exec)
+                    .count(),
+            )
             .map_err(|_| Error::NoMem)?;
         descriptors.extend(sockets.iter().enumerate().filter_map(|(index, fd)| {
             fd.as_ref()
-                .is_some_and(|fd| fd.close_on_exec)
+                .is_some_and(|fd| fd.owner_process_id == process_id && fd.close_on_exec)
                 .then_some(SOCKET_FD_BASE + index as i32)
         }));
     }
     {
         let sockets = LOCAL_SOCKETS.lock();
         descriptors
-            .try_reserve(sockets.iter().flatten().filter(|fd| fd.close_on_exec).count())
+            .try_reserve(
+                sockets
+                    .iter()
+                    .flatten()
+                    .filter(|fd| fd.owner_process_id == process_id && fd.close_on_exec)
+                    .count(),
+            )
             .map_err(|_| Error::NoMem)?;
         descriptors.extend(sockets.iter().enumerate().filter_map(|(index, fd)| {
             fd.as_ref()
-                .is_some_and(|fd| fd.close_on_exec)
+                .is_some_and(|fd| fd.owner_process_id == process_id && fd.close_on_exec)
                 .then_some(LOCAL_SOCKET_FD_BASE + index as i32)
         }));
     }
     {
         let devices = PACKET_DEVICES.lock();
         descriptors
-            .try_reserve(devices.iter().flatten().filter(|fd| fd.close_on_exec).count())
+            .try_reserve(
+                devices
+                    .iter()
+                    .flatten()
+                    .filter(|fd| fd.owner_process_id == process_id && fd.close_on_exec)
+                    .count(),
+            )
             .map_err(|_| Error::NoMem)?;
         descriptors.extend(devices.iter().enumerate().filter_map(|(index, fd)| {
             fd.as_ref()
-                .is_some_and(|fd| fd.close_on_exec)
+                .is_some_and(|fd| fd.owner_process_id == process_id && fd.close_on_exec)
                 .then_some(PACKET_FD_BASE + index as i32)
         }));
     }
     for descriptor in descriptors {
-        let _ = close(descriptor).or_else(|_| close_packet_fd(descriptor));
+        let _ = close_for_process(process_id, descriptor)
+            .or_else(|_| close_packet_fd_for_process(process_id, descriptor));
     }
     Ok(())
 }
 
-fn available_socket_index(minimum: i32) -> Result<usize, Error> {
+pub(crate) fn direct_descriptors_for_process(
+    process_id: i32,
+) -> Result<
+    Vec<(
+        i32,
+        crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
+        bool,
+    )>,
+    Error,
+> {
+    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
+
+    let mut process_descriptors = Vec::new();
+    {
+        let sockets = SOCKETS.lock();
+        process_descriptors
+            .try_reserve_exact(
+                sockets
+                    .iter()
+                    .flatten()
+                    .filter(|descriptor| descriptor.owner_process_id == process_id)
+                    .count(),
+            )
+            .map_err(|_| Error::NoMem)?;
+        process_descriptors.extend(sockets.iter().enumerate().filter_map(|(index, descriptor)| {
+            descriptor
+                .as_ref()
+                .filter(|descriptor| descriptor.owner_process_id == process_id)
+                .map(|descriptor| {
+                    (SOCKET_FD_BASE + index as i32, DescriptorKind::Socket, descriptor.close_on_exec)
+                })
+        }));
+    }
+    {
+        let sockets = LOCAL_SOCKETS.lock();
+        process_descriptors
+            .try_reserve_exact(
+                sockets
+                    .iter()
+                    .flatten()
+                    .filter(|descriptor| descriptor.owner_process_id == process_id)
+                    .count(),
+            )
+            .map_err(|_| Error::NoMem)?;
+        process_descriptors.extend(sockets.iter().enumerate().filter_map(|(index, descriptor)| {
+            descriptor
+                .as_ref()
+                .filter(|descriptor| descriptor.owner_process_id == process_id)
+                .map(|descriptor| {
+                    (
+                        LOCAL_SOCKET_FD_BASE + index as i32,
+                        DescriptorKind::Socket,
+                        descriptor.close_on_exec,
+                    )
+                })
+        }));
+    }
+    {
+        let devices = PACKET_DEVICES.lock();
+        process_descriptors
+            .try_reserve_exact(
+                devices
+                    .iter()
+                    .flatten()
+                    .filter(|descriptor| descriptor.owner_process_id == process_id)
+                    .count(),
+            )
+            .map_err(|_| Error::NoMem)?;
+        process_descriptors.extend(devices.iter().enumerate().filter_map(|(index, descriptor)| {
+            descriptor
+                .as_ref()
+                .filter(|descriptor| descriptor.owner_process_id == process_id)
+                .map(|descriptor| {
+                    (PACKET_FD_BASE + index as i32, DescriptorKind::Packet, descriptor.close_on_exec)
+                })
+        }));
+    }
+    Ok(process_descriptors)
+}
+
+fn available_socket_index(minimum: i32, process_id: i32) -> Result<usize, Error> {
     if minimum < 0 {
         return Err(Error::Inval);
     }
@@ -2175,7 +2539,10 @@ fn available_socket_index(minimum: i32) -> Result<usize, Error> {
         .find_map(|(index, descriptor)| {
             let target = SOCKET_FD_BASE + index as i32;
             (descriptor.is_none()
-                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(target))
+                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                    process_id,
+                    target,
+                ))
             .then_some(index)
         })
         .ok_or(Error::Mfile)
@@ -2186,11 +2553,35 @@ pub(crate) fn duplicate_socket(
     minimum: i32,
     close_on_exec: bool,
 ) -> Result<i32, Error> {
-    duplicate_socket_internal(file_descriptor, minimum, close_on_exec, true)
+    let process_id = ThreadManager::current_process()?.pid();
+    duplicate_socket_internal(
+        file_descriptor,
+        minimum,
+        close_on_exec,
+        true,
+        process_id,
+        process_id,
+    )
 }
 
 pub(crate) fn duplicate_socket_backing(file_descriptor: i32) -> Result<i32, Error> {
-    duplicate_socket_internal(file_descriptor, 0, false, false)
+    let process_id = ThreadManager::current_process()?.pid();
+    duplicate_socket_for_process(file_descriptor, process_id, process_id)
+}
+
+pub(crate) fn duplicate_socket_for_process(
+    file_descriptor: i32,
+    source_process_id: i32,
+    target_process_id: i32,
+) -> Result<i32, Error> {
+    duplicate_socket_internal(
+        file_descriptor,
+        0,
+        false,
+        false,
+        source_process_id,
+        target_process_id,
+    )
 }
 
 fn duplicate_socket_internal(
@@ -2198,12 +2589,14 @@ fn duplicate_socket_internal(
     minimum: i32,
     close_on_exec: bool,
     enforce_limit: bool,
+    source_process_id: i32,
+    target_process_id: i32,
 ) -> Result<i32, Error> {
     if minimum < 0 {
         return Err(Error::Inval);
     }
-    if is_local_socket_fd(file_descriptor) {
-        let source = local_socket_descriptor(file_descriptor)?;
+    if is_local_socket_fd_for_process(source_process_id, file_descriptor) {
+        let source = local_socket_descriptor_for_process(source_process_id, file_descriptor)?;
         let start = usize::try_from(minimum.saturating_sub(LOCAL_SOCKET_FD_BASE).max(0))
             .unwrap_or(LOCAL_SOCKET_COUNT)
             .min(LOCAL_SOCKET_COUNT);
@@ -2215,7 +2608,10 @@ fn duplicate_socket_internal(
             .find_map(|(index, descriptor)| {
                 let target = LOCAL_SOCKET_FD_BASE + index as i32;
                 (descriptor.is_none()
-                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(target))
+                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                        target_process_id,
+                        target,
+                    ))
                 .then_some(index)
             })
             .ok_or(Error::Mfile)?;
@@ -2234,14 +2630,15 @@ fn duplicate_socket_internal(
                 .ok_or(Error::Mfile)?;
         }
         sockets[target_index] = Some(LocalSocketFd {
+            owner_process_id: target_process_id,
             description: source.description,
             close_on_exec,
         });
         return Ok(target);
     }
-    let source_index = socket_index(file_descriptor)?;
+    let source_index = socket_index_for_process(source_process_id, file_descriptor)?;
     let source = SOCKETS.lock()[source_index].clone().ok_or(Error::BadFd)?;
-    let target_index = available_socket_index(minimum)?;
+    let target_index = available_socket_index(minimum, target_process_id)?;
     let target = SOCKET_FD_BASE + target_index as i32;
     if enforce_limit {
         crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(target)?;
@@ -2254,6 +2651,7 @@ fn duplicate_socket_internal(
             .ok_or(Error::Mfile)?;
     }
     SOCKETS.lock()[target_index] = Some(SocketFd {
+        owner_process_id: target_process_id,
         description: source.description,
         close_on_exec,
     });
@@ -2265,15 +2663,22 @@ pub(crate) fn duplicate_socket_to(
     target: i32,
     close_on_exec: bool,
 ) -> Result<i32, Error> {
+    let process_id = ThreadManager::current_process()?.pid();
     if file_descriptor == target {
         return if close_on_exec { Err(Error::Inval) } else { Ok(target) };
     }
-    if is_local_socket_fd(file_descriptor) {
-        let target_index = local_socket_index(target)?;
-        if LOCAL_SOCKETS.lock()[target_index].is_some() {
-            close_local_socket(target)?;
+    if is_local_socket_fd_for_process(process_id, file_descriptor) {
+        let target_index = local_socket_slot_index(target)?;
+        let target_owner = LOCAL_SOCKETS.lock()[target_index]
+            .as_ref()
+            .map(|descriptor| descriptor.owner_process_id);
+        if let Some(target_owner) = target_owner {
+            if target_owner != process_id {
+                return Err(Error::BadFd);
+            }
+            close_local_socket_for_process(process_id, target)?;
         }
-        let source = local_socket_descriptor(file_descriptor)?;
+        let source = local_socket_descriptor_for_process(process_id, file_descriptor)?;
         crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(target)?;
         let mut description = source.description.lock();
         if description.closed {
@@ -2285,15 +2690,22 @@ pub(crate) fn duplicate_socket_to(
             .ok_or(Error::Mfile)?;
         drop(description);
         LOCAL_SOCKETS.lock()[target_index] = Some(LocalSocketFd {
+            owner_process_id: process_id,
             description: source.description,
             close_on_exec,
         });
         return Ok(target);
     }
-    let source_index = socket_index(file_descriptor)?;
-    let target_index = socket_index(target)?;
-    if SOCKETS.lock()[target_index].is_some() {
-        close(target)?;
+    let source_index = socket_index_for_process(process_id, file_descriptor)?;
+    let target_index = socket_slot_index(target)?;
+    let target_owner = SOCKETS.lock()[target_index]
+        .as_ref()
+        .map(|descriptor| descriptor.owner_process_id);
+    if let Some(target_owner) = target_owner {
+        if target_owner != process_id {
+            return Err(Error::BadFd);
+        }
+        close_for_process(process_id, target)?;
     }
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(target)?;
     let source = SOCKETS.lock()[source_index].clone().ok_or(Error::BadFd)?;
@@ -2304,6 +2716,7 @@ pub(crate) fn duplicate_socket_to(
         .ok_or(Error::Mfile)?;
     drop(description);
     SOCKETS.lock()[target_index] = Some(SocketFd {
+        owner_process_id: process_id,
         description: source.description,
         close_on_exec,
     });
@@ -2342,7 +2755,37 @@ pub(crate) fn set_descriptor_flags(file_descriptor: i32, flags: i32) -> Result<(
 }
 
 fn close_local_socket(file_descriptor: i32) -> Result<(), Error> {
-    let index = local_socket_index(file_descriptor)?;
+    let process_id = ThreadManager::current_process()?.pid();
+    close_local_socket_for_process(process_id, file_descriptor)
+}
+
+fn close_local_socket_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<(), Error> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        if alias.kind != crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket {
+            return Err(Error::BadFd);
+        }
+        return close_local_socket_direct_for_process(process_id, alias.backing);
+    }
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return Err(Error::BadFd);
+    }
+    close_local_socket_direct_for_process(process_id, file_descriptor)
+}
+
+fn close_local_socket_direct_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<(), Error> {
+    let index = local_socket_index_direct_for_process(process_id, file_descriptor)?;
     let descriptor = LOCAL_SOCKETS.lock()[index].take().ok_or(Error::BadFd)?;
     let mut close_rights = Vec::new();
     let (pair, side, listener, local_path) = {
@@ -2387,7 +2830,7 @@ fn close_local_socket(file_descriptor: i32) -> Result<(), Error> {
                     .is_some_and(|existing| !Arc::ptr_eq(&existing, &descriptor.description))
         });
     }
-    close_local_rights(close_rights);
+    close_local_rights_for_process(process_id, close_rights);
     Ok(())
 }
 
@@ -2764,10 +3207,31 @@ fn active_context<R>(operation: impl FnOnce(&mut TcpContext) -> R) -> Result<R, 
 }
 
 fn socket_index(file_descriptor: i32) -> Result<usize, Error> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+    let process_id = ThreadManager::current_process()?.pid();
+    socket_index_for_process(process_id, file_descriptor)
+}
+
+fn socket_index_for_process(process_id: i32, file_descriptor: i32) -> Result<usize, Error> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_for_process(
+        process_id,
         file_descriptor,
         crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket,
     )?;
+    socket_index_direct_for_process(process_id, file_descriptor)
+}
+
+fn socket_index_direct_for_process(process_id: i32, file_descriptor: i32) -> Result<usize, Error> {
+    let index = socket_slot_index(file_descriptor)?;
+    if !SOCKETS.lock()[index]
+        .as_ref()
+        .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+    {
+        return Err(Error::BadFd);
+    }
+    Ok(index)
+}
+
+fn socket_slot_index(file_descriptor: i32) -> Result<usize, Error> {
     let index = file_descriptor
         .checked_sub(SOCKET_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())
@@ -2776,10 +3240,31 @@ fn socket_index(file_descriptor: i32) -> Result<usize, Error> {
 }
 
 fn packet_index(file_descriptor: i32) -> Result<usize, Error> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+    let process_id = ThreadManager::current_process()?.pid();
+    packet_index_for_process(process_id, file_descriptor)
+}
+
+fn packet_index_for_process(process_id: i32, file_descriptor: i32) -> Result<usize, Error> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_for_process(
+        process_id,
         file_descriptor,
         crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet,
     )?;
+    packet_index_direct_for_process(process_id, file_descriptor)
+}
+
+fn packet_index_direct_for_process(process_id: i32, file_descriptor: i32) -> Result<usize, Error> {
+    let index = packet_slot_index(file_descriptor)?;
+    if !PACKET_DEVICES.lock()[index]
+        .as_ref()
+        .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+    {
+        return Err(Error::BadFd);
+    }
+    Ok(index)
+}
+
+fn packet_slot_index(file_descriptor: i32) -> Result<usize, Error> {
     let index = file_descriptor
         .checked_sub(PACKET_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())
@@ -2789,6 +3274,15 @@ fn packet_index(file_descriptor: i32) -> Result<usize, Error> {
 
 fn packet_descriptor(file_descriptor: i32) -> Result<PacketDescriptor, Error> {
     PACKET_DEVICES.lock()[packet_index(file_descriptor)?]
+        .clone()
+        .ok_or(Error::BadFd)
+}
+
+fn packet_descriptor_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<PacketDescriptor, Error> {
+    PACKET_DEVICES.lock()[packet_index_for_process(process_id, file_descriptor)?]
         .clone()
         .ok_or(Error::BadFd)
 }

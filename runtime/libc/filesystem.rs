@@ -141,6 +141,7 @@ struct Node {
 
 #[derive(Clone, Copy)]
 struct Descriptor {
+    owner_process_id: i32,
     node: usize,
     pipe_id: Option<usize>,
     offset: i64,
@@ -174,6 +175,13 @@ struct RecordLock {
     start: i64,
     end: Option<i64>,
     lock_type: i16,
+}
+
+#[derive(Clone, Copy)]
+struct StandardDescriptorState {
+    process_id: i32,
+    open: [bool; 3],
+    close_on_exec: [bool; 3],
 }
 
 struct PipeBuffer {
@@ -211,8 +219,6 @@ struct FileSystem {
     descriptors: [Option<Descriptor>; DESCRIPTOR_COUNT],
     shared_offsets: [Option<Arc<IrqSpinLock<i64>>>; DESCRIPTOR_COUNT],
     shared_flags: [Option<Arc<IrqSpinLock<SharedDescriptorFlags>>>; DESCRIPTOR_COUNT],
-    standard_descriptors: [bool; 3],
-    standard_close_on_exec: [bool; 3],
     pipes: Vec<Option<PipeBuffer>>,
     record_locks: Vec<RecordLock>,
     root_metadata: Option<NodeMetadata>,
@@ -247,8 +253,6 @@ impl FileSystem {
             descriptors: [None; DESCRIPTOR_COUNT],
             shared_offsets: [const { None }; DESCRIPTOR_COUNT],
             shared_flags: [const { None }; DESCRIPTOR_COUNT],
-            standard_descriptors: [true; 3],
-            standard_close_on_exec: [false; 3],
             pipes: Vec::new(),
             record_locks: Vec::new(),
             root_metadata: None,
@@ -418,7 +422,18 @@ impl FileSystem {
     }
 
     fn directory_path(&self, file_descriptor: i32) -> Result<Vec<u8>, i32> {
-        let slot = self.descriptor_slot(file_descriptor)?;
+        let process_id = ThreadManager::current_process()
+            .map_err(metadata_errno)?
+            .pid();
+        self.directory_path_for_process(process_id, file_descriptor)
+    }
+
+    fn directory_path_for_process(
+        &self,
+        process_id: i32,
+        file_descriptor: i32,
+    ) -> Result<Vec<u8>, i32> {
+        let slot = self.descriptor_slot_for_process(process_id, file_descriptor)?;
         let descriptor = self.descriptors[slot].ok_or(EBADF)?;
         if self.node_mode(descriptor.node).ok_or(EBADF)? & S_IFMT != S_IFDIR {
             return Err(ENOTDIR);
@@ -488,22 +503,54 @@ impl FileSystem {
     }
 
     fn descriptor_slot(&self, file_descriptor: i32) -> Result<usize, i32> {
-        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+        let process_id = ThreadManager::current_process()
+            .map_err(metadata_errno)?
+            .pid();
+        self.descriptor_slot_for_process(process_id, file_descriptor)
+    }
+
+    fn descriptor_slot_for_process(
+        &self,
+        process_id: i32,
+        file_descriptor: i32,
+    ) -> Result<usize, i32> {
+        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_for_process(
+            process_id,
             file_descriptor,
             crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::File,
         )
         .map_err(|_| EBADF)?;
+        self.descriptor_slot_direct_for_process(process_id, file_descriptor)
+    }
+
+    fn descriptor_slot_direct_for_process(
+        &self,
+        process_id: i32,
+        file_descriptor: i32,
+    ) -> Result<usize, i32> {
         if file_descriptor < FIRST_DESCRIPTOR {
             return Err(EBADF);
         }
         let slot = (file_descriptor - FIRST_DESCRIPTOR) as usize;
-        if slot >= DESCRIPTOR_COUNT || self.descriptors[slot].is_none() {
+        if slot >= DESCRIPTOR_COUNT
+            || !self.descriptors[slot]
+                .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+        {
             return Err(EBADF);
         }
         Ok(slot)
     }
 
     fn available_descriptor_slot(&self, minimum: i32) -> Option<usize> {
+        let process_id = ThreadManager::current_process().ok()?.pid();
+        self.available_descriptor_slot_for_process(process_id, minimum)
+    }
+
+    fn available_descriptor_slot_for_process(
+        &self,
+        process_id: i32,
+        minimum: i32,
+    ) -> Option<usize> {
         self.descriptors
             .iter()
             .enumerate()
@@ -511,7 +558,8 @@ impl FileSystem {
             .find_map(|(slot, descriptor)| {
                 let file_descriptor = FIRST_DESCRIPTOR + slot as i32;
                 (descriptor.is_none()
-                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
+                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                        process_id,
                         file_descriptor,
                     ))
                 .then_some(slot)
@@ -765,6 +813,7 @@ impl FileSystem {
         flags: i32,
         mode: u32,
         credentials: &Credentials,
+        process_id: i32,
     ) -> Result<i32, i32> {
         let access = flags & O_ACCMODE;
         if flags & !O_SUPPORTED != 0 || access == O_ACCMODE {
@@ -774,7 +823,9 @@ impl FileSystem {
             return Err(EINVAL);
         }
         self.check_search_permissions(&path, credentials)?;
-        let slot = self.available_descriptor_slot(FIRST_DESCRIPTOR).ok_or(EMFILE)?;
+        let slot = self
+            .available_descriptor_slot_for_process(process_id, FIRST_DESCRIPTOR)
+            .ok_or(EMFILE)?;
         crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
             slot as i32 + FIRST_DESCRIPTOR,
         )
@@ -892,6 +943,7 @@ impl FileSystem {
             0
         };
         self.descriptors[slot] = Some(Descriptor {
+            owner_process_id: process_id,
             node: node_index,
             pipe_id: fifo_pipe_id,
             offset,
@@ -909,19 +961,22 @@ impl FileSystem {
         Ok(slot as i32 + FIRST_DESCRIPTOR)
     }
 
-    fn open_terminal(&mut self, flags: i32) -> Result<i32, i32> {
+    fn open_terminal(&mut self, flags: i32, process_id: i32) -> Result<i32, i32> {
         let access = flags & O_ACCMODE;
         if flags & !(O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY) != 0
             || access == O_ACCMODE
         {
             return Err(EINVAL);
         }
-        let slot = self.available_descriptor_slot(FIRST_DESCRIPTOR).ok_or(EMFILE)?;
+        let slot = self
+            .available_descriptor_slot_for_process(process_id, FIRST_DESCRIPTOR)
+            .ok_or(EMFILE)?;
         crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
             slot as i32 + FIRST_DESCRIPTOR,
         )
         .map_err(|error| -(error as i32))?;
         self.descriptors[slot] = Some(Descriptor {
+            owner_process_id: process_id,
             node: TERMINAL_NODE,
             pipe_id: None,
             offset: 0,
@@ -938,7 +993,7 @@ impl FileSystem {
         Ok(slot as i32 + FIRST_DESCRIPTOR)
     }
 
-    fn create_pipe(&mut self, flags: i32) -> Result<(i32, i32), i32> {
+    fn create_pipe(&mut self, flags: i32, process_id: i32) -> Result<(i32, i32), i32> {
         if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
             return Err(EINVAL);
         }
@@ -949,7 +1004,8 @@ impl FileSystem {
             .filter_map(|(index, descriptor)| {
                 let file_descriptor = FIRST_DESCRIPTOR + index as i32;
                 (descriptor.is_none()
-                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
+                    && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                        process_id,
                         file_descriptor,
                     ))
                 .then_some(index)
@@ -981,6 +1037,7 @@ impl FileSystem {
         let nonblocking = flags & O_NONBLOCK != 0;
         let close_on_exec = flags & O_CLOEXEC != 0;
         self.descriptors[read_slot] = Some(Descriptor {
+            owner_process_id: process_id,
             node: PIPE_NODE,
             pipe_id: Some(pipe_id),
             offset: 0,
@@ -995,6 +1052,7 @@ impl FileSystem {
             nonblocking,
         })));
         self.descriptors[write_slot] = Some(Descriptor {
+            owner_process_id: process_id,
             node: PIPE_NODE,
             pipe_id: Some(pipe_id),
             offset: 0,
@@ -1560,15 +1618,25 @@ impl FileSystem {
 
     fn close(&mut self, file_descriptor: i32, process_id: i32) -> Result<(), i32> {
         if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
-            let descriptor = &mut self.standard_descriptors[file_descriptor as usize];
-            if !*descriptor {
-                return Err(EBADF);
-            }
-            *descriptor = false;
-            self.standard_close_on_exec[file_descriptor as usize] = false;
-            return Ok(());
+            return close_standard_descriptor_for_process(process_id, file_descriptor);
         }
-        let slot = self.descriptor_slot(file_descriptor)?;
+        let slot = self.descriptor_slot_for_process(process_id, file_descriptor)?;
+        self.close_slot(slot, process_id)
+    }
+
+    fn close_direct_for_process(
+        &mut self,
+        file_descriptor: i32,
+        process_id: i32,
+    ) -> Result<(), i32> {
+        if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
+            return close_standard_descriptor_for_process(process_id, file_descriptor);
+        }
+        let slot = self.descriptor_slot_direct_for_process(process_id, file_descriptor)?;
+        self.close_slot(slot, process_id)
+    }
+
+    fn close_slot(&mut self, slot: usize, process_id: i32) -> Result<(), i32> {
         let descriptor = self.descriptors[slot].take().ok_or(EBADF)?;
         self.shared_offsets[slot] = None;
         self.shared_flags[slot] = None;
@@ -1624,13 +1692,10 @@ impl FileSystem {
     }
 
     fn standard_descriptor_is_open(&self, file_descriptor: i32) -> Result<bool, i32> {
-        if !crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
-            return Err(EBADF);
-        }
-        self.standard_descriptors
-            .get(file_descriptor as usize)
-            .copied()
-            .ok_or(EBADF)
+        let process_id = ThreadManager::current_process()
+            .map_err(metadata_errno)?
+            .pid();
+        standard_descriptor_is_open_for_process(process_id, file_descriptor)
     }
 
     fn sync_descriptor(&self, file_descriptor: i32, data_only: bool) -> Result<(), i32> {
@@ -1650,13 +1715,17 @@ impl FileSystem {
         }
     }
 
-    fn descriptor_for_duplication(&self, file_descriptor: i32) -> Result<Descriptor, i32> {
-        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
+    fn descriptor_for_duplication_for_process(
+        &self,
+        process_id: i32,
+        file_descriptor: i32,
+    ) -> Result<Descriptor, i32> {
         if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
-            if !self.standard_descriptor_is_open(file_descriptor)? {
+            if !standard_descriptor_is_open_for_process(process_id, file_descriptor)? {
                 return Err(EBADF);
             }
             return Ok(Descriptor {
+                owner_process_id: process_id,
                 node: TERMINAL_NODE,
                 pipe_id: None,
                 offset: 0,
@@ -1667,7 +1736,7 @@ impl FileSystem {
                 close_on_exec: false,
             });
         }
-        let slot = self.descriptor_slot(file_descriptor)?;
+        let slot = self.descriptor_slot_direct_for_process(process_id, file_descriptor)?;
         self.descriptors[slot].ok_or(EBADF)
     }
 
@@ -1676,12 +1745,32 @@ impl FileSystem {
         file_descriptor: i32,
         minimum: i32,
         close_on_exec: bool,
+        process_id: i32,
     ) -> Result<i32, i32> {
-        self.duplicate_internal(file_descriptor, minimum, close_on_exec, true)
+        self.duplicate_internal(
+            file_descriptor,
+            minimum,
+            close_on_exec,
+            true,
+            process_id,
+            process_id,
+        )
     }
 
-    fn duplicate_backing(&mut self, file_descriptor: i32) -> Result<i32, i32> {
-        self.duplicate_internal(file_descriptor, FIRST_DESCRIPTOR, false, false)
+    fn duplicate_backing_for_process(
+        &mut self,
+        file_descriptor: i32,
+        source_process_id: i32,
+        target_process_id: i32,
+    ) -> Result<i32, i32> {
+        self.duplicate_internal(
+            file_descriptor,
+            FIRST_DESCRIPTOR,
+            false,
+            false,
+            source_process_id,
+            target_process_id,
+        )
     }
 
     fn duplicate_internal(
@@ -1690,25 +1779,34 @@ impl FileSystem {
         minimum: i32,
         close_on_exec: bool,
         enforce_limit: bool,
+        source_process_id: i32,
+        target_process_id: i32,
     ) -> Result<i32, i32> {
         if minimum < 0 {
             return Err(EINVAL);
         }
-        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
-        let source = self.descriptor_for_duplication(file_descriptor)?;
+        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_for_process(
+            source_process_id,
+            file_descriptor,
+            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::File,
+        )
+        .map_err(|_| EBADF)?;
+        let source = self.descriptor_for_duplication_for_process(source_process_id, file_descriptor)?;
         let source_offset = if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
             None
         } else {
-            let source_slot = self.descriptor_slot(file_descriptor)?;
+            let source_slot = self.descriptor_slot_direct_for_process(source_process_id, file_descriptor)?;
             self.shared_offsets[source_slot].as_ref().map(Arc::clone)
         };
         let source_flags = if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
             None
         } else {
-            let source_slot = self.descriptor_slot(file_descriptor)?;
+            let source_slot = self.descriptor_slot_direct_for_process(source_process_id, file_descriptor)?;
             self.shared_flags[source_slot].as_ref().map(Arc::clone)
         };
-        let target_slot = self.available_descriptor_slot(minimum).ok_or(EMFILE)?;
+        let target_slot = self
+            .available_descriptor_slot_for_process(target_process_id, minimum)
+            .ok_or(EMFILE)?;
         if enforce_limit {
             crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
                 target_slot as i32 + FIRST_DESCRIPTOR,
@@ -1717,6 +1815,7 @@ impl FileSystem {
         }
         self.add_descriptor_reference(source)?;
         self.descriptors[target_slot] = Some(Descriptor {
+            owner_process_id: target_process_id,
             close_on_exec,
             ..source
         });
@@ -1732,8 +1831,13 @@ impl FileSystem {
         close_on_exec: bool,
         process_id: i32,
     ) -> Result<i32, i32> {
-        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
-        let source = self.descriptor_for_duplication(file_descriptor)?;
+        let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_for_process(
+            process_id,
+            file_descriptor,
+            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::File,
+        )
+        .map_err(|_| EBADF)?;
+        let source = self.descriptor_for_duplication_for_process(process_id, file_descriptor)?;
         if file_descriptor == new_descriptor {
             if close_on_exec {
                 return Err(EINVAL);
@@ -1752,13 +1856,13 @@ impl FileSystem {
         let source_offset = if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
             None
         } else {
-            let source_slot = self.descriptor_slot(file_descriptor)?;
+            let source_slot = self.descriptor_slot_direct_for_process(process_id, file_descriptor)?;
             self.shared_offsets[source_slot].as_ref().map(Arc::clone)
         };
         let source_flags = if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
             None
         } else {
-            let source_slot = self.descriptor_slot(file_descriptor)?;
+            let source_slot = self.descriptor_slot_direct_for_process(process_id, file_descriptor)?;
             self.shared_flags[source_slot].as_ref().map(Arc::clone)
         };
         if self.descriptors[target_slot].is_some() {
@@ -1766,6 +1870,7 @@ impl FileSystem {
         }
         self.add_descriptor_reference(source)?;
         self.descriptors[target_slot] = Some(Descriptor {
+            owner_process_id: process_id,
             close_on_exec,
             ..source
         });
@@ -1817,8 +1922,14 @@ impl FileSystem {
 
     fn descriptor_flags(&self, file_descriptor: i32) -> Result<i32, i32> {
         if (0..3).contains(&file_descriptor) {
-            self.standard_descriptor_is_open(file_descriptor)?;
-            return Ok(i32::from(self.standard_close_on_exec[file_descriptor as usize]));
+            if !self.standard_descriptor_is_open(file_descriptor)? {
+                return Err(EBADF);
+            }
+            let process_id = ThreadManager::current_process()
+                .map_err(metadata_errno)?
+                .pid();
+            let state = standard_state_for_process(process_id)?;
+            return Ok(i32::from(state.close_on_exec[file_descriptor as usize]));
         }
         let slot = self.descriptor_slot(file_descriptor)?;
         let descriptor = self.descriptors[slot].ok_or(EBADF)?;
@@ -1830,9 +1941,14 @@ impl FileSystem {
             return Err(EINVAL);
         }
         if (0..3).contains(&file_descriptor) {
-            self.standard_descriptor_is_open(file_descriptor)?;
-            self.standard_close_on_exec[file_descriptor as usize] = flags & 1 != 0;
-            return Ok(());
+            let process_id = ThreadManager::current_process()
+                .map_err(metadata_errno)?
+                .pid();
+            return set_standard_close_on_exec_for_process(
+                process_id,
+                file_descriptor,
+                flags & 1 != 0,
+            );
         }
         let slot = self.descriptor_slot(file_descriptor)?;
         let mut descriptor = self.descriptors[slot].ok_or(EBADF)?;
@@ -2466,6 +2582,117 @@ impl FileSystem {
 }
 
 static FILESYSTEM: IrqSpinLock<FileSystem> = IrqSpinLock::new(FileSystem::new());
+static STANDARD_DESCRIPTOR_STATES: IrqSpinLock<Vec<StandardDescriptorState>> =
+    IrqSpinLock::new(Vec::new());
+
+pub(crate) fn direct_descriptors_for_process(
+    process_id: i32,
+) -> Result<Vec<(i32, bool)>, i32> {
+    let filesystem = FILESYSTEM.lock();
+    let mut process_descriptors = Vec::new();
+    process_descriptors
+        .try_reserve_exact(
+            filesystem
+                .descriptors
+                .iter()
+                .flatten()
+                .filter(|descriptor| descriptor.owner_process_id == process_id)
+                .count(),
+        )
+        .map_err(|_| ENOMEM)?;
+    process_descriptors.extend(filesystem.descriptors.iter().enumerate().filter_map(
+        |(index, descriptor)| {
+            descriptor
+                .as_ref()
+                .filter(|descriptor| descriptor.owner_process_id == process_id)
+                .map(|descriptor| {
+                    (FIRST_DESCRIPTOR + index as i32, descriptor.close_on_exec)
+                })
+        },
+    ));
+    Ok(process_descriptors)
+}
+
+fn standard_state_mut(
+    states: &mut Vec<StandardDescriptorState>,
+    process_id: i32,
+) -> Result<&mut StandardDescriptorState, i32> {
+    if let Some(index) = states.iter().position(|state| state.process_id == process_id) {
+        return Ok(&mut states[index]);
+    }
+    states.try_reserve(1).map_err(|_| ENOMEM)?;
+    states.push(StandardDescriptorState {
+        process_id,
+        open: [true; 3],
+        close_on_exec: [false; 3],
+    });
+    states.last_mut().ok_or(ENOMEM)
+}
+
+fn standard_state_for_process(process_id: i32) -> Result<StandardDescriptorState, i32> {
+    let mut states = STANDARD_DESCRIPTOR_STATES.lock();
+    Ok(*standard_state_mut(&mut states, process_id)?)
+}
+
+fn standard_descriptor_is_open_for_process(process_id: i32, file_descriptor: i32) -> Result<bool, i32> {
+    if !crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
+        return Err(EBADF);
+    }
+    let state = standard_state_for_process(process_id)?;
+    state.open.get(file_descriptor as usize).copied().ok_or(EBADF)
+}
+
+fn close_standard_descriptor_for_process(process_id: i32, file_descriptor: i32) -> Result<(), i32> {
+    if !crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
+        return Err(EBADF);
+    }
+    let mut states = STANDARD_DESCRIPTOR_STATES.lock();
+    let state = standard_state_mut(&mut states, process_id)?;
+    let index = file_descriptor as usize;
+    if !state.open.get(index).copied().ok_or(EBADF)? {
+        return Err(EBADF);
+    }
+    state.open[index] = false;
+    state.close_on_exec[index] = false;
+    Ok(())
+}
+
+fn set_standard_close_on_exec_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+    enabled: bool,
+) -> Result<(), i32> {
+    if !standard_descriptor_is_open_for_process(process_id, file_descriptor)? {
+        return Err(EBADF);
+    }
+    let mut states = STANDARD_DESCRIPTOR_STATES.lock();
+    let state = standard_state_mut(&mut states, process_id)?;
+    state.close_on_exec[file_descriptor as usize] = enabled;
+    Ok(())
+}
+
+pub(crate) fn inherit_standard_descriptors(
+    parent_process_id: i32,
+    child_process_id: i32,
+) -> Result<(), i32> {
+    let parent = standard_state_for_process(parent_process_id)?;
+    let mut states = STANDARD_DESCRIPTOR_STATES.lock();
+    if states.iter().any(|state| state.process_id == child_process_id) {
+        return Err(EBUSY);
+    }
+    states.try_reserve(1).map_err(|_| ENOMEM)?;
+    states.push(StandardDescriptorState {
+        process_id: child_process_id,
+        ..parent
+    });
+    Ok(())
+}
+
+fn remove_standard_descriptors_for_process(process_id: i32) {
+    STANDARD_DESCRIPTOR_STATES
+        .lock()
+        .retain(|state| state.process_id != process_id);
+}
 
 pub(crate) fn read_directory(file_descriptor: i32) -> Result<Vec<DirectoryEntry>, i32> {
     FILESYSTEM.lock().read_directory(file_descriptor)
@@ -2473,6 +2700,15 @@ pub(crate) fn read_directory(file_descriptor: i32) -> Result<Vec<DirectoryEntry>
 
 pub(crate) fn directory_position(file_descriptor: i32) -> Result<usize, i32> {
     FILESYSTEM.lock().directory_position(file_descriptor)
+}
+
+pub(crate) fn directory_path_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<Vec<u8>, i32> {
+    FILESYSTEM
+        .lock()
+        .directory_path_for_process(process_id, file_descriptor)
 }
 
 pub(crate) fn set_directory_position(file_descriptor: i32, position: usize) -> Result<(), i32> {
@@ -2486,13 +2722,31 @@ pub(crate) fn duplicate(
     minimum: i32,
     close_on_exec: bool,
 ) -> Result<i32, i32> {
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
     FILESYSTEM
         .lock()
-        .duplicate(file_descriptor, minimum, close_on_exec)
+        .duplicate(file_descriptor, minimum, close_on_exec, process_id)
 }
 
 pub(crate) fn duplicate_backing(file_descriptor: i32) -> Result<i32, i32> {
-    FILESYSTEM.lock().duplicate_backing(file_descriptor)
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
+    duplicate_backing_for_process(file_descriptor, process_id, process_id)
+}
+
+pub(crate) fn duplicate_backing_for_process(
+    file_descriptor: i32,
+    source_process_id: i32,
+    target_process_id: i32,
+) -> Result<i32, i32> {
+    FILESYSTEM.lock().duplicate_backing_for_process(
+        file_descriptor,
+        source_process_id,
+        target_process_id,
+    )
 }
 
 pub(crate) fn duplicate_to(
@@ -2568,7 +2822,10 @@ pub(crate) fn set_record_lock(
 }
 
 pub(crate) fn create_pipe(flags: i32) -> Result<(i32, i32), i32> {
-    FILESYSTEM.lock().create_pipe(flags)
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
+    FILESYSTEM.lock().create_pipe(flags, process_id)
 }
 
 pub(crate) fn pipe_nonblocking(file_descriptor: i32) -> Result<Option<bool>, i32> {
@@ -2584,6 +2841,15 @@ pub(crate) fn is_pipe_descriptor(file_descriptor: i32) -> bool {
     pipe_nonblocking(file_descriptor).is_ok_and(|nonblocking| nonblocking.is_some())
 }
 
+fn is_pipe_descriptor_for_process(process_id: i32, file_descriptor: i32) -> bool {
+    let filesystem = FILESYSTEM.lock();
+    filesystem
+        .descriptor_slot_for_process(process_id, file_descriptor)
+        .ok()
+        .and_then(|slot| filesystem.descriptors[slot])
+        .is_some_and(|descriptor| descriptor.pipe_id.is_some())
+}
+
 pub(crate) fn file_identity(path: *const c_char) -> Result<(u64, u64), i32> {
     let path = unsafe { normalize_path(path) }?;
     let credentials = current_credentials()?;
@@ -2595,8 +2861,23 @@ pub(crate) fn file_identity(path: *const c_char) -> Result<(u64, u64), i32> {
 }
 
 pub(crate) fn executable_snapshot(path: *const c_char) -> Result<Vec<u8>, i32> {
-    let path = unsafe { normalize_path(path) }?;
-    let credentials = current_credentials()?;
+    if path.is_null() {
+        return Err(EFAULT);
+    }
+    let requested = unsafe { CStr::from_ptr(path) }.to_bytes();
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
+    executable_snapshot_for_process(requested, process_id)
+}
+
+pub(crate) fn executable_snapshot_for_process(
+    requested: &[u8],
+    process_id: i32,
+) -> Result<Vec<u8>, i32> {
+    let path = normalize_path_for_process(requested, process_id, true)?;
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let credentials = process.credentials().map_err(metadata_errno)?;
     let mut filesystem = FILESYSTEM.lock();
     filesystem.check_search_permissions(&path, &credentials)?;
     let node_index = filesystem.find_node(&path).ok_or(ENOENT)?;
@@ -2724,7 +3005,6 @@ pub(crate) fn capacity_for_descriptor(
 }
 
 pub(crate) fn sync_descriptor(file_descriptor: i32, data_only: bool) -> Result<(), i32> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if pty::is_fd(file_descriptor) {
         return if pty::has_fd(file_descriptor) {
             Err(EINVAL)
@@ -2917,6 +3197,36 @@ fn normalize_path_from_depth(
     Ok(output)
 }
 
+fn normalize_path_for_process(
+    input: &[u8],
+    process_id: i32,
+    follow_final: bool,
+) -> Result<Vec<u8>, i32> {
+    if input.is_empty() {
+        return Err(ENOENT);
+    }
+    if input.contains(&0) {
+        return Err(EINVAL);
+    }
+    if input.len() > PATH_MAX {
+        return Err(ENAMETOOLONG);
+    }
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let credentials = process.credentials().map_err(metadata_errno)?;
+    let current_directory = if input.first() == Some(&b'/') {
+        None
+    } else {
+        Some(process.current_directory().map_err(metadata_errno)?)
+    };
+    normalize_path_from_depth(
+        input,
+        current_directory.as_deref().unwrap_or(b"/"),
+        &credentials,
+        follow_final,
+        0,
+    )
+}
+
 fn pop_path_component(path: &mut Vec<u8>) {
     if path.len() > 1 {
         while path.len() > 1 && path.last() != Some(&b'/') {
@@ -2957,7 +3267,7 @@ pub(crate) fn poll_readiness(file_descriptor: i32, events: i16) -> i16 {
     const POLLOUT: i16 = 0x004;
     const POLLNVAL: i16 = 0x020;
 
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
+    let has_alias = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor).is_some();
     if pty::is_fd(file_descriptor) {
         return match pty::readiness(file_descriptor, events) {
             Ok(readiness) => readiness,
@@ -2979,7 +3289,7 @@ pub(crate) fn poll_readiness(file_descriptor: i32, events: i16) -> i16 {
             Err(_) => 0x008,
         };
     }
-    if file_descriptor == 0 {
+    if !has_alias && file_descriptor == 0 {
         if !standard_descriptor_is_open(file_descriptor).unwrap_or(false) {
             return POLLNVAL;
         }
@@ -2989,7 +3299,7 @@ pub(crate) fn poll_readiness(file_descriptor: i32, events: i16) -> i16 {
             0
         };
     }
-    if file_descriptor == 1 || file_descriptor == 2 {
+    if !has_alias && (file_descriptor == 1 || file_descriptor == 2) {
         if !standard_descriptor_is_open(file_descriptor).unwrap_or(false) {
             return POLLNVAL;
         }
@@ -3183,7 +3493,7 @@ pub unsafe extern "C" fn kz_rust_open(path: *const c_char, flags: i32, mode: u32
                     .check_access(&credentials, requested, false)
                     .map_err(metadata_errno)?;
             }
-            let descriptor = FILESYSTEM.lock().open_terminal(flags)?;
+            let descriptor = FILESYSTEM.lock().open_terminal(flags, process.pid())?;
             if path.as_slice() == b"/dev/console" {
                 process.acquire_console_terminal(flags & O_NOCTTY != 0);
             }
@@ -3206,8 +3516,85 @@ pub unsafe extern "C" fn kz_rust_open(path: *const c_char, flags: i32, mode: u32
             .map_err(|error| -(error as i32))?;
         FILESYSTEM
             .lock()
-            .open(path, flags, mode & !process.umask(), &credentials)
+            .open(path, flags, mode & !process.umask(), &credentials, process.pid())
     })
+}
+
+pub(crate) fn open_for_process(
+    requested_path: &[u8],
+    flags: i32,
+    mode: u32,
+    process_id: i32,
+) -> Result<(i32, crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind), i32> {
+    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
+
+    let path = normalize_path_for_process(requested_path, process_id, flags & O_NOFOLLOW == 0)?;
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    if path == b"/dev/ptmx" {
+        return pty::open_master_for_process(flags, process_id)
+            .map(|descriptor| (descriptor, DescriptorKind::Pty))
+            .map_err(|error| -(error as i32));
+    }
+    if path.starts_with(b"/dev/pts/") {
+        return pty::open_slave_path_for_process(&path, flags, process_id)
+            .map(|descriptor| (descriptor, DescriptorKind::Pty))
+            .map_err(|error| -(error as i32));
+    }
+    if path == b"/dev/tty" || path == b"/dev/console" {
+        let access = flags & O_ACCMODE;
+        if flags & !(O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY) != 0
+            || access == O_ACCMODE
+        {
+            return Err(EINVAL);
+        }
+        if path == b"/dev/tty" {
+            process
+                .controlling_terminal_session()
+                .map_err(|_| -(KernelError::Nxio as i32))?;
+            if let Some(terminal) = process.controlling_pty_terminal() {
+                return pty::open_slave_for_process(terminal, flags, process_id)
+                    .map(|descriptor| (descriptor, DescriptorKind::Pty))
+                    .map_err(|error| -(error as i32));
+            }
+        }
+        if path == b"/dev/console" {
+            let credentials = process.credentials().map_err(metadata_errno)?;
+            let requested = match access {
+                O_RDONLY => 0o4,
+                O_WRONLY => 0o2,
+                O_RDWR => 0o6,
+                _ => return Err(EINVAL),
+            };
+            NodeMetadata::with_owner_and_mode(UserId::ROOT, GroupId::ROOT, 0o600)
+                .map_err(metadata_errno)?
+                .check_access(&credentials, requested, false)
+                .map_err(metadata_errno)?;
+        }
+        let descriptor = FILESYSTEM.lock().open_terminal(flags, process_id)?;
+        if path == b"/dev/console" {
+            process.acquire_console_terminal(flags & O_NOCTTY != 0);
+        }
+        return Ok((descriptor, DescriptorKind::File));
+    }
+    if path == b"/dev/net/tun" {
+        if flags & O_ACCMODE != O_RDWR
+            || flags & !(O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY) != 0
+        {
+            return Err(EINVAL);
+        }
+        return network::open_tun_device_for_process(
+            flags & O_NONBLOCK != 0,
+            flags & O_CLOEXEC != 0,
+            process_id,
+        )
+        .map(|descriptor| (descriptor, DescriptorKind::Packet))
+        .map_err(|error| -(error as i32));
+    }
+    let credentials = process.credentials().map_err(metadata_errno)?;
+    FILESYSTEM
+        .lock()
+        .open(path, flags, mode & !process.umask(), &credentials, process_id)
+        .map(|descriptor| (descriptor, DescriptorKind::File))
 }
 
 #[no_mangle]
@@ -3751,11 +4138,16 @@ pub extern "C" fn kz_rust_fchown(file_descriptor: i32, owner: u32, group: u32) -
 fn change_current_directory(path: Vec<u8>) -> Result<(), i32> {
     let process = crate::kernel::scheduler::thread::ThreadManager::current_process()
         .map_err(|error| -(error as i32))?;
+    change_current_directory_for_process(process.pid(), &path)
+}
+
+fn change_current_directory_for_process(process_id: i32, path: &[u8]) -> Result<(), i32> {
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
     let credentials = process.credentials().map_err(metadata_errno)?;
     {
         let mut filesystem = FILESYSTEM.lock();
-        filesystem.check_search_permissions(&path, &credentials)?;
-        let index = filesystem.find_node(&path).ok_or(ENOENT)?;
+        filesystem.check_search_permissions(path, &credentials)?;
+        let index = filesystem.find_node(path).ok_or(ENOENT)?;
         if filesystem.node_mode(index).ok_or(ENOENT)? & S_IFMT != S_IFDIR {
             return Err(ENOTDIR);
         }
@@ -3765,8 +4157,18 @@ fn change_current_directory(path: Vec<u8>) -> Result<(), i32> {
             .map_err(metadata_errno)?;
     }
     process
-        .set_current_directory(&path)
+        .set_current_directory(path)
         .map_err(|error| -(error as i32))
+}
+
+pub(crate) fn chdir_for_process(process_id: i32, path: &[u8]) -> Result<(), i32> {
+    let path = normalize_path_for_process(path, process_id, true)?;
+    change_current_directory_for_process(process_id, &path)
+}
+
+pub(crate) fn fchdir_for_process(process_id: i32, file_descriptor: i32) -> Result<(), i32> {
+    let path = directory_path_for_process(process_id, file_descriptor)?;
+    change_current_directory_for_process(process_id, &path)
 }
 
 #[no_mangle]
@@ -3776,18 +4178,17 @@ pub unsafe extern "C" fn kz_rust_chdir(path: *const c_char) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn kz_rust_fchdir(file_descriptor: i32) -> i32 {
-    let path = match FILESYSTEM.lock().directory_path(file_descriptor) {
-        Ok(path) => path,
-        Err(error) => return fail(error),
+    let process_id = match ThreadManager::current_process() {
+        Ok(process) => process.pid(),
+        Err(error) => return fail(metadata_errno(error)),
     };
-    match change_current_directory(path) {
+    match fchdir_for_process(process_id, file_descriptor) {
         Ok(()) => 0,
         Err(error) => fail(error),
     }
 }
 
 pub(crate) fn is_terminal_descriptor(file_descriptor: i32) -> Result<bool, i32> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if pty::has_fd(file_descriptor) {
         return Ok(true);
     }
@@ -3795,11 +4196,30 @@ pub(crate) fn is_terminal_descriptor(file_descriptor: i32) -> Result<bool, i32> 
 }
 
 pub(crate) fn descriptor_is_open(file_descriptor: i32) -> Result<bool, i32> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return descriptor_backing_is_open_for_process(process_id, alias.kind, alias.backing)
+            .then_some(true)
+            .ok_or(EBADF);
+    }
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return Err(EBADF);
+    }
     if (0..3).contains(&file_descriptor) {
-        FILESYSTEM.lock().standard_descriptor_is_open(file_descriptor)
+        standard_descriptor_is_open_for_process(process_id, file_descriptor)
     } else {
-        FILESYSTEM.lock().descriptor_slot(file_descriptor).map(|_| true)
+        FILESYSTEM
+            .lock()
+            .descriptor_slot_direct_for_process(process_id, file_descriptor)
+            .map(|_| true)
     }
 }
 
@@ -3811,59 +4231,74 @@ pub(crate) fn close_descriptor(file_descriptor: i32) -> Result<(), i32> {
     let process_id = ThreadManager::current_process()
         .map_err(metadata_errno)?
         .pid();
-    let pipe = is_pipe_descriptor(file_descriptor);
-    let result = if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::remove(file_descriptor) {
-        match alias.kind {
-            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::File => {
-                FILESYSTEM.lock().close(alias.backing, process_id)
-            }
-            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Socket => {
-                network::close(alias.backing).map_err(|error| -(error as i32))
-            }
-            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Packet => {
-                network::close_packet_fd(alias.backing).map_err(|error| -(error as i32))
-            }
-            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty => {
-                pty::close(alias.backing).map_err(|error| -(error as i32))
-            }
-        }
+    close_descriptor_for_process(process_id, file_descriptor)
+}
+
+pub(crate) fn close_descriptor_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<(), i32> {
+    let pipe = is_pipe_descriptor_for_process(process_id, file_descriptor);
+    let result = if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::remove_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        close_descriptor_backing_for_process(process_id, alias.kind, alias.backing)
+    } else if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        Err(EBADF)
     } else if (0..=2).contains(&file_descriptor) {
         FILESYSTEM.lock().close(file_descriptor, process_id)
-    } else if pty::is_fd(file_descriptor) {
-        pty::close(file_descriptor).map_err(|error| -(error as i32))
-    } else if network::is_socket_fd(file_descriptor) {
-        network::close(file_descriptor).map_err(|error| -(error as i32))
-    } else if network::is_packet_fd(file_descriptor) {
-        network::close_packet_fd(file_descriptor).map_err(|error| -(error as i32))
+    } else if pty::has_fd_for_process(process_id, file_descriptor) {
+        pty::close_for_process(process_id, file_descriptor).map_err(|error| -(error as i32))
+    } else if network::has_socket_fd_for_process(process_id, file_descriptor) {
+        network::close_for_process(process_id, file_descriptor).map_err(|error| -(error as i32))
+    } else if network::has_packet_fd_for_process(process_id, file_descriptor) {
+        network::close_packet_fd_for_process(process_id, file_descriptor)
+            .map_err(|error| -(error as i32))
     } else {
         FILESYSTEM.lock().close(file_descriptor, process_id)
     };
     if result.is_ok() && pipe {
-        wake_pipe_waiters();
+        ThreadManager::wake_blocked_process_threads(process_id);
     }
     result
 }
 
 pub(crate) fn close_on_exec_descriptors() -> Result<(), i32> {
-    let aliases = crate::kernel::runtime::runtime_libc::fd_alias::close_on_exec_targets()
-        .map_err(|error| -(error as i32))?;
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
+    close_on_exec_descriptors_for_process(process_id)
+}
+
+pub(crate) fn close_on_exec_descriptors_for_process(process_id: i32) -> Result<(), i32> {
+    let aliases = crate::kernel::runtime::runtime_libc::fd_alias::close_on_exec_targets_for_process(
+        process_id,
+    )
+    .map_err(|error| -(error as i32))?;
     for file_descriptor in aliases {
-        let _ = close_descriptor(file_descriptor);
+        let _ = close_descriptor_for_process(process_id, file_descriptor);
     }
+    let standard_state = standard_state_for_process(process_id)?;
     let file_descriptors = {
         let filesystem = FILESYSTEM.lock();
         let count = filesystem
             .descriptors
             .iter()
             .flatten()
-            .filter(|descriptor| descriptor.close_on_exec)
+            .filter(|descriptor| {
+                descriptor.owner_process_id == process_id && descriptor.close_on_exec
+            })
             .count()
-            + filesystem.standard_close_on_exec.iter().filter(|enabled| **enabled).count();
+            + standard_state.close_on_exec.iter().filter(|enabled| **enabled).count();
         let mut file_descriptors = Vec::new();
         file_descriptors.try_reserve_exact(count).map_err(|_| ENOMEM)?;
         file_descriptors.extend(
-            filesystem
-                .standard_close_on_exec
+            standard_state
+                .close_on_exec
                 .iter()
                 .enumerate()
                 .filter_map(|(index, enabled)| enabled.then_some(index as i32)),
@@ -3875,20 +4310,467 @@ pub(crate) fn close_on_exec_descriptors() -> Result<(), i32> {
                 .enumerate()
                 .filter_map(|(index, descriptor)| {
                     descriptor
-                        .is_some_and(|descriptor| descriptor.close_on_exec)
+                        .is_some_and(|descriptor| {
+                            descriptor.owner_process_id == process_id
+                                && descriptor.close_on_exec
+                        })
                         .then_some(FIRST_DESCRIPTOR + index as i32)
                 }),
         );
         file_descriptors
     };
     for file_descriptor in file_descriptors {
-        let _ = close_descriptor(file_descriptor);
+        let _ = close_descriptor_for_process(process_id, file_descriptor);
     }
-    crate::kernel::runtime::runtime_libc::network::close_on_exec_descriptors()
+    crate::kernel::runtime::runtime_libc::network::close_on_exec_descriptors_for_process(process_id)
         .map_err(|error| -(error as i32))?;
-    crate::kernel::runtime::runtime_libc::pty::close_on_exec_descriptors()
+    crate::kernel::runtime::runtime_libc::pty::close_on_exec_descriptors_for_process(process_id)
         .map_err(|error| -(error as i32))?;
     Ok(())
+}
+
+fn close_descriptor_backing_for_process(
+    process_id: i32,
+    kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
+    backing: i32,
+) -> Result<(), i32> {
+    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
+
+    match kind {
+        DescriptorKind::File => FILESYSTEM.lock().close_direct_for_process(backing, process_id),
+        DescriptorKind::Socket => crate::kernel::runtime::runtime_libc::network::close_direct_for_process(
+            process_id,
+            backing,
+        )
+        .map_err(|error| -(error as i32)),
+        DescriptorKind::Packet => crate::kernel::runtime::runtime_libc::network::close_packet_fd_direct_for_process(
+            process_id,
+            backing,
+        )
+        .map_err(|error| -(error as i32)),
+        DescriptorKind::Pty => crate::kernel::runtime::runtime_libc::pty::close_direct_for_process(
+            process_id,
+            backing,
+        )
+        .map_err(|error| -(error as i32)),
+    }
+}
+
+fn duplicate_descriptor_backing_for_process(
+    source_process_id: i32,
+    source: i32,
+    target_process_id: i32,
+    kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
+) -> Result<i32, i32> {
+    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
+
+    match kind {
+        DescriptorKind::File => FILESYSTEM.lock().duplicate_backing_for_process(
+            source,
+            source_process_id,
+            target_process_id,
+        ),
+        DescriptorKind::Socket => crate::kernel::runtime::runtime_libc::network::duplicate_socket_for_process(
+            source,
+            source_process_id,
+            target_process_id,
+        )
+        .map_err(|error| -(error as i32)),
+        DescriptorKind::Packet => crate::kernel::runtime::runtime_libc::network::duplicate_packet_fd_for_process(
+            source,
+            source_process_id,
+            target_process_id,
+        )
+        .map_err(|error| -(error as i32)),
+        DescriptorKind::Pty => crate::kernel::runtime::runtime_libc::pty::duplicate_for_process(
+            source,
+            source_process_id,
+            target_process_id,
+        )
+        .map_err(|error| -(error as i32)),
+    }
+}
+
+fn clone_descriptor_alias_for_process(
+    source_process_id: i32,
+    source: i32,
+    target_process_id: i32,
+    target: i32,
+    kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
+    close_on_exec: bool,
+) -> Result<(), i32> {
+    prepare_alias_target_for_process(target_process_id, target)?;
+    let backing = duplicate_descriptor_backing_for_process(
+        source_process_id,
+        source,
+        target_process_id,
+        kind,
+    )?;
+    let alias = crate::kernel::runtime::runtime_libc::fd_alias::DescriptorAlias {
+        target,
+        backing,
+        kind,
+        close_on_exec,
+    };
+    if let Err(error) = crate::kernel::runtime::runtime_libc::fd_alias::install_for_process(
+        target_process_id,
+        alias,
+    ) {
+        let _ = close_descriptor_backing_for_process(target_process_id, kind, backing);
+        return Err(-(error as i32));
+    }
+    Ok(())
+}
+
+fn prepare_alias_target_for_process(process_id: i32, target: i32) -> Result<(), i32> {
+    let aliases = crate::kernel::runtime::runtime_libc::fd_alias::aliases_for_process(process_id)
+        .map_err(|error| -(error as i32))?;
+    for alias in aliases
+        .into_iter()
+        .filter(|alias| alias.backing == target && alias.target != target)
+    {
+        let replacement = duplicate_descriptor_backing_for_process(
+            process_id,
+            alias.target,
+            process_id,
+            alias.kind,
+        )?;
+        if let Err(error) = crate::kernel::runtime::runtime_libc::fd_alias::replace_backing_for_process(
+            process_id,
+            alias.target,
+            alias.backing,
+            replacement,
+        ) {
+            let _ = close_descriptor_backing_for_process(process_id, alias.kind, replacement);
+            return Err(-(error as i32));
+        }
+        if let Err(error) = close_descriptor_backing_for_process(process_id, alias.kind, alias.backing) {
+            let _ = crate::kernel::runtime::runtime_libc::fd_alias::replace_backing_for_process(
+                process_id,
+                alias.target,
+                replacement,
+                alias.backing,
+            );
+            let _ = close_descriptor_backing_for_process(process_id, alias.kind, replacement);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn inherited_target_is_alias_backing(
+    aliases: &[crate::kernel::runtime::runtime_libc::fd_alias::DescriptorAlias],
+    target: i32,
+) -> bool {
+    aliases
+        .iter()
+        .any(|alias| alias.target == target || alias.backing == target)
+}
+
+pub(crate) fn inherit_descriptors_for_process(
+    parent_process_id: i32,
+    child_process_id: i32,
+    additional_targets: &[i32],
+) -> Result<(), i32> {
+    let result = (|| {
+        inherit_standard_descriptors(parent_process_id, child_process_id)?;
+        let aliases = crate::kernel::runtime::runtime_libc::fd_alias::aliases_for_process(
+            parent_process_id,
+        )
+        .map_err(|error| -(error as i32))?;
+
+        let file_descriptors = direct_descriptors_for_process(parent_process_id)?;
+        let network_descriptors =
+            crate::kernel::runtime::runtime_libc::network::direct_descriptors_for_process(
+                parent_process_id,
+            )
+            .map_err(|error| -(error as i32))?;
+        let pty_descriptors =
+            crate::kernel::runtime::runtime_libc::pty::direct_descriptors_for_process(
+                parent_process_id,
+            )
+            .map_err(|error| -(error as i32))?;
+        let target_count = aliases
+            .len()
+            .checked_add(file_descriptors.len())
+            .and_then(|count| count.checked_add(network_descriptors.len()))
+            .and_then(|count| count.checked_add(pty_descriptors.len()))
+            .and_then(|count| count.checked_add(additional_targets.len()))
+            .ok_or(ENOMEM)?;
+        let mut targets = Vec::new();
+        targets.try_reserve_exact(target_count).map_err(|_| ENOMEM)?;
+        targets.extend(aliases.iter().map(|alias| alias.target));
+        targets.extend(
+            file_descriptors
+                .iter()
+                .map(|(target, _)| *target)
+                .filter(|target| !inherited_target_is_alias_backing(&aliases, *target)),
+        );
+        targets.extend(
+            network_descriptors
+                .iter()
+                .map(|(target, _, _)| *target)
+                .filter(|target| !inherited_target_is_alias_backing(&aliases, *target)),
+        );
+        targets.extend(
+            pty_descriptors
+                .iter()
+                .map(|(target, _)| *target)
+                .filter(|target| !inherited_target_is_alias_backing(&aliases, *target)),
+        );
+        targets.extend_from_slice(additional_targets);
+        crate::kernel::runtime::runtime_libc::fd_alias::reserve_targets_for_process(
+            child_process_id,
+            &targets,
+        )
+        .map_err(|error| -(error as i32))?;
+
+        for alias in aliases.iter().copied() {
+            clone_descriptor_alias_for_process(
+                parent_process_id,
+                alias.target,
+                child_process_id,
+                alias.target,
+                alias.kind,
+                alias.close_on_exec,
+            )?;
+        }
+
+        for (target, close_on_exec) in file_descriptors {
+            if !inherited_target_is_alias_backing(&aliases, target) {
+                clone_descriptor_alias_for_process(
+                    parent_process_id,
+                    target,
+                    child_process_id,
+                    target,
+                    crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::File,
+                    close_on_exec,
+                )?;
+            }
+        }
+
+        for (target, kind, close_on_exec) in network_descriptors {
+            if !inherited_target_is_alias_backing(&aliases, target) {
+                clone_descriptor_alias_for_process(
+                    parent_process_id,
+                    target,
+                    child_process_id,
+                    target,
+                    kind,
+                    close_on_exec,
+                )?;
+            }
+        }
+
+        for (target, close_on_exec) in pty_descriptors {
+            if !inherited_target_is_alias_backing(&aliases, target) {
+                clone_descriptor_alias_for_process(
+                    parent_process_id,
+                    target,
+                    child_process_id,
+                    target,
+                    crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty,
+                    close_on_exec,
+                )?;
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        cleanup_process_descriptors_for_process(child_process_id);
+    }
+    result
+}
+
+pub(crate) fn descriptor_kind_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind, i32> {
+    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
+
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        let valid = descriptor_backing_is_open_for_process(process_id, alias.kind, alias.backing);
+        return valid.then_some(alias.kind).ok_or(EBADF);
+    }
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return Err(EBADF);
+    }
+    if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor)
+        && standard_descriptor_is_open_for_process(process_id, file_descriptor)?
+    {
+        return Ok(DescriptorKind::File);
+    }
+    if crate::kernel::runtime::runtime_libc::pty::has_fd_for_process(process_id, file_descriptor) {
+        return Ok(DescriptorKind::Pty);
+    }
+    if crate::kernel::runtime::runtime_libc::network::has_socket_fd_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return Ok(DescriptorKind::Socket);
+    }
+    if crate::kernel::runtime::runtime_libc::network::has_packet_fd_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return Ok(DescriptorKind::Packet);
+    }
+    if has_file_descriptor_for_process(process_id, file_descriptor) {
+        return Ok(DescriptorKind::File);
+    }
+    Err(EBADF)
+}
+
+fn has_file_descriptor_for_process(process_id: i32, file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return alias.kind
+            == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::File
+            && FILESYSTEM
+                .lock()
+                .descriptor_slot_direct_for_process(process_id, alias.backing)
+                .is_ok();
+    }
+    if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor) {
+        return standard_descriptor_is_open_for_process(process_id, file_descriptor)
+            .unwrap_or(false);
+    }
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return false;
+    }
+    FILESYSTEM
+        .lock()
+        .descriptor_slot_for_process(process_id, file_descriptor)
+        .is_ok()
+}
+
+fn descriptor_backing_is_open_for_process(
+    process_id: i32,
+    kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
+    backing: i32,
+) -> bool {
+    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
+
+    match kind {
+        DescriptorKind::File => FILESYSTEM
+            .lock()
+            .descriptor_slot_direct_for_process(process_id, backing)
+            .is_ok(),
+        DescriptorKind::Socket => crate::kernel::runtime::runtime_libc::network::socket_backing_is_open_for_process(
+            process_id,
+            backing,
+        ),
+        DescriptorKind::Packet => crate::kernel::runtime::runtime_libc::network::packet_backing_is_open_for_process(
+            process_id,
+            backing,
+        ),
+        DescriptorKind::Pty => crate::kernel::runtime::runtime_libc::pty::backing_is_open_for_process(
+            process_id,
+            backing,
+        ),
+    }
+}
+
+pub(crate) fn duplicate_descriptor_for_process(
+    source_process_id: i32,
+    source: i32,
+    target_process_id: i32,
+) -> Result<i32, i32> {
+    let kind = descriptor_kind_for_process(source_process_id, source)?;
+    duplicate_descriptor_backing_for_process(source_process_id, source, target_process_id, kind)
+}
+
+pub(crate) fn duplicate_descriptor_to_process(
+    source_process_id: i32,
+    source: i32,
+    target_process_id: i32,
+    target: i32,
+    close_on_exec: bool,
+) -> Result<i32, i32> {
+    let kind = descriptor_kind_for_process(source_process_id, source)?;
+    if source == target {
+        return Ok(target);
+    }
+    let _ = close_descriptor_for_process(target_process_id, target);
+    clone_descriptor_alias_for_process(
+        source_process_id,
+        source,
+        target_process_id,
+        target,
+        kind,
+        close_on_exec,
+    )?;
+    Ok(target)
+}
+
+pub(crate) fn install_open_descriptor_for_process(
+    process_id: i32,
+    target: i32,
+    backing: i32,
+    kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
+    close_on_exec: bool,
+) -> Result<(), i32> {
+    prepare_alias_target_for_process(process_id, target)?;
+    let alias = crate::kernel::runtime::runtime_libc::fd_alias::DescriptorAlias {
+        target,
+        backing,
+        kind,
+        close_on_exec,
+    };
+    if let Err(error) = crate::kernel::runtime::runtime_libc::fd_alias::install_for_process(
+        process_id,
+        alias,
+    ) {
+        let _ = close_descriptor_backing_for_process(process_id, kind, backing);
+        return Err(-(error as i32));
+    }
+    Ok(())
+}
+
+pub(crate) fn cleanup_process_descriptors_for_process(process_id: i32) {
+    let aliases = crate::kernel::runtime::runtime_libc::fd_alias::remove_all_for_process(
+        process_id,
+    );
+    match aliases {
+        Ok(aliases) => {
+            for alias in aliases {
+                let _ = close_descriptor_backing_for_process(
+                    process_id,
+                    alias.kind,
+                    alias.backing,
+                );
+            }
+        }
+        Err(_) => {
+            while let Some(alias) =
+                crate::kernel::runtime::runtime_libc::fd_alias::take_one_for_process(process_id)
+            {
+                let _ = close_descriptor_backing_for_process(
+                    process_id,
+                    alias.kind,
+                    alias.backing,
+                );
+            }
+        }
+    }
+    for file_descriptor in 0..=415 {
+        let _ = close_descriptor_for_process(process_id, file_descriptor);
+    }
+    remove_standard_descriptors_for_process(process_id);
+    crate::kernel::runtime::runtime_libc::fd_alias::release_reserved_targets_for_process(
+        process_id,
+    );
 }
 
 fn standard_descriptor_is_open(file_descriptor: i32) -> Result<bool, i32> {
@@ -3942,8 +4824,9 @@ fn wait_for_blocking_pipe(file_descriptor: i32) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length: usize) -> isize {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
-    if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor)
+    let has_alias = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor).is_some();
+    if !has_alias
+        && crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor)
         && (file_descriptor != 0 || !standard_descriptor_is_open(file_descriptor).unwrap_or(false))
     {
         set_errno(EBADF);
@@ -3961,7 +4844,7 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
         return 0;
     }
     ThreadManager::cancel_current_if_requested();
-    if file_descriptor == 0 {
+    if !has_alias && file_descriptor == 0 {
         let output = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
         loop {
             ThreadManager::cancel_current_if_requested();
@@ -3984,7 +4867,7 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
             }
         }
     }
-    if file_descriptor < FIRST_DESCRIPTOR && file_descriptor != 0 {
+    if !has_alias && file_descriptor < FIRST_DESCRIPTOR && file_descriptor != 0 {
         set_errno(EBADF);
         return -1;
     }
@@ -4140,8 +5023,9 @@ pub unsafe extern "C" fn write(
     buffer: *const c_void,
     length: usize,
 ) -> isize {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
-    if crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor)
+    let has_alias = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor).is_some();
+    if !has_alias
+        && crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor)
         && (file_descriptor == 0 || !standard_descriptor_is_open(file_descriptor).unwrap_or(false))
     {
         set_errno(EBADF);
@@ -4159,10 +5043,10 @@ pub unsafe extern "C" fn write(
         return 0;
     }
     ThreadManager::cancel_current_if_requested();
-    if file_descriptor == 1 || file_descriptor == 2 {
+    if !has_alias && (file_descriptor == 1 || file_descriptor == 2) {
         return write_console(buffer.cast::<u8>(), length, false);
     }
-    if file_descriptor < FIRST_DESCRIPTOR {
+    if !has_alias && file_descriptor < FIRST_DESCRIPTOR {
         set_errno(EBADF);
         return -1;
     }
@@ -4575,9 +5459,12 @@ pub unsafe extern "C" fn stat64(path: *const c_char, output: *mut c_void) -> i32
 
 pub(super) fn tmpfile_descriptor() -> Result<i32, i32> {
     let credentials = current_credentials()?;
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
     let mut filesystem = FILESYSTEM.lock();
     let slot = filesystem
-        .available_descriptor_slot(FIRST_DESCRIPTOR)
+        .available_descriptor_slot_for_process(process_id, FIRST_DESCRIPTOR)
         .ok_or(EMFILE)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
         slot as i32 + FIRST_DESCRIPTOR,
@@ -4592,6 +5479,7 @@ pub(super) fn tmpfile_descriptor() -> Result<i32, i32> {
     )?;
     filesystem.nodes[node].as_mut().ok_or(ENOMEM)?.open_count = 1;
     filesystem.descriptors[slot] = Some(Descriptor {
+        owner_process_id: process_id,
         node,
         pipe_id: None,
         offset: 0,

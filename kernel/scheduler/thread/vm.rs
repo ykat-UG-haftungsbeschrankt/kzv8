@@ -270,6 +270,10 @@ impl UserAreas {
 	}
 }
 
+#[cfg(test)]
+#[path = "../../../tests/kernel/scheduler/thread/vm.rs"]
+pub(crate) mod tests;
+
 struct UserAddressSpaceInner {
 	root: usize,
 	base: usize,
@@ -346,17 +350,79 @@ impl UserAddressSpace {
 		})
 	}
 
-	#[cfg(test)]
-	pub(crate) fn new_test_stub() -> Self {
-		Self {
-			inner: Arc::new(UserAddressSpaceInner {
-				root: 0,
-				base: 0,
-				length: 0,
-				areas: IrqSpinLock::new(UserAreas::new()),
-				test_stub: true,
-			}),
+	pub(crate) fn fork_clone(&self) -> Result<Self, Error> {
+		#[cfg(test)]
+		if self.inner.test_stub {
+			return Ok(Self::new_test_stub());
 		}
+
+		let areas = {
+			let source_areas = self.inner.areas.lock();
+			let mut areas = Vec::new();
+			areas
+				.try_reserve_exact(source_areas.areas.len())
+				.map_err(|_| Error::NoMem)?;
+			for area in &source_areas.areas {
+				let mut page_states = Vec::new();
+				page_states
+					.try_reserve_exact(area.page_states.len())
+					.map_err(|_| Error::NoMem)?;
+				page_states.extend(
+					area.page_states
+						.iter()
+						.map(|state| state.load(Ordering::Acquire)),
+				);
+				areas.push((area.range.clone(), page_states));
+			}
+			areas
+		};
+		let child = Self::new()?;
+		let mut page_contents = alloc::boxed::Box::new([0; USER_VM_PAGE_SIZE]);
+		for (range, page_states) in areas {
+			let length = range.end.checked_sub(range.start).ok_or(Error::Overflow)?;
+			child
+				.reserve_user_mapping(Some(range.start), length, 0, true)
+				.ok_or(Error::NoMem)?;
+			for (page_index, state) in page_states.into_iter().enumerate() {
+				let address = range
+					.start
+					.checked_add(page_index.checked_mul(USER_VM_PAGE_SIZE).ok_or(Error::Overflow)?)
+					.ok_or(Error::Overflow)?;
+				let permissions = (state & VM_PERMISSION_MASK) as i32;
+				if state & (VM_OWNED | VM_BORROWED) == 0 {
+					if !child.protect_user_mapping(address, USER_VM_PAGE_SIZE, permissions) {
+						return Err(Error::NoMem);
+					}
+					continue;
+				}
+				let copied = self.activate(|| {
+					if !crate::kernel::arch::MemoryArchitecture::page_is_mapped(address) {
+						return false;
+					}
+					// The page is mapped in this address space; kernel-mode reads bypass its user permissions.
+					unsafe {
+						core::ptr::copy_nonoverlapping(
+							address as *const u8,
+							page_contents.as_mut_ptr(),
+							USER_VM_PAGE_SIZE,
+						)
+					};
+					true
+				});
+				if copied != Some(true)
+					|| !child.protect_user_mapping(address, USER_VM_PAGE_SIZE, 2)
+					|| !child.resolve_page_fault(
+						address,
+						crate::kernel::memory::r#virtual::FaultAccess::Write,
+					)
+					|| child.write(address, page_contents.as_slice()).is_err()
+					|| !child.protect_user_mapping(address, USER_VM_PAGE_SIZE, permissions)
+				{
+					return Err(Error::NoMem);
+				}
+			}
+		}
+		Ok(child)
 	}
 
 	pub(crate) fn root(&self) -> usize {

@@ -18,6 +18,13 @@
 ## Validation
 - Run code reformatting, compilation/builds, and smoke checks only when explicitly requested by the user.
 
+## Kernel Testing Layout
+- Put kernel unit tests and test-only helpers in `tests/kernel/`, mirroring the tested module's path (for example, `kernel/net/tcp/connection.rs` uses `tests/kernel/net/tcp/connection.rs`). Do not add inline `#[test]` bodies to files under `kernel/`.
+- Keep only a minimal `#[cfg(test)]` path-module hook in the owning kernel module so Cargo discovers the tests as descendants of that module and their existing private access is preserved.
+- When adding, moving, splitting, or renaming a kernel module, update its mirrored test file and owner-side path hook together. When changing module behavior or API, update or add the corresponding tests in the same change so implementation and coverage remain synchronized.
+- Keep other kernel-side `#[cfg(test)]` code only when structurally required by the test build, such as test stubs, architecture shims, or test-only state. Keep test cases and test-specific helper logic in `tests/kernel/`.
+- Keep Cargo unit tests on the Cargo test harness; do not route them through `runtime/run.rs`. Runtime smoke checks are separate from unit tests.
+
 ## Kernel Errors
 - Define all kernel error codes in `kernel/error.rs`; do not define kernel error codes elsewhere.
 - Kernel Functions that report errors must return an appropriate code from `kernel/error.rs`; do not introduce module-local error enums or numeric error codes.

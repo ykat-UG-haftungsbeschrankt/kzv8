@@ -40,6 +40,7 @@ struct PtyOpenDescription {
 }
 
 struct PtyDescriptor {
+    owner_process_id: i32,
     pty_index: usize,
     description: Arc<IrqSpinLock<PtyOpenDescription>>,
     close_on_exec: bool,
@@ -51,7 +52,13 @@ static DESCRIPTORS: IrqSpinLock<[Option<PtyDescriptor>; PTY_DESCRIPTOR_COUNT]> =
     IrqSpinLock::new([const { None }; PTY_DESCRIPTOR_COUNT]);
 
 fn descriptor_index(file_descriptor: i32) -> Result<usize, Error> {
-    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve(
+    let process_id = ThreadManager::current_process()?.pid();
+    descriptor_index_for_process(process_id, file_descriptor)
+}
+
+fn descriptor_index_for_process(process_id: i32, file_descriptor: i32) -> Result<usize, Error> {
+    let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_for_process(
+        process_id,
         file_descriptor,
         crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty,
     )?;
@@ -59,9 +66,36 @@ fn descriptor_index(file_descriptor: i32) -> Result<usize, Error> {
         .checked_sub(PTY_FD_BASE)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or(Error::Badf)?;
-    (index < PTY_DESCRIPTOR_COUNT)
-        .then_some(index)
-        .ok_or(Error::Badf)
+    if index >= PTY_DESCRIPTOR_COUNT
+        || !DESCRIPTORS.lock()[index]
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+    {
+        return Err(Error::Badf);
+    }
+    Ok(index)
+}
+
+fn descriptor_slot_index(file_descriptor: i32) -> Result<usize, Error> {
+    let index = file_descriptor
+        .checked_sub(PTY_FD_BASE)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(Error::Badf)?;
+    (index < PTY_DESCRIPTOR_COUNT).then_some(index).ok_or(Error::Badf)
+}
+
+fn descriptor_index_direct_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<usize, Error> {
+    let index = descriptor_slot_index(file_descriptor)?;
+    if !DESCRIPTORS.lock()[index]
+        .as_ref()
+        .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+    {
+        return Err(Error::Badf);
+    }
+    Ok(index)
 }
 
 pub(crate) fn is_fd(file_descriptor: i32) -> bool {
@@ -72,20 +106,44 @@ pub(crate) fn is_fd(file_descriptor: i32) -> bool {
 }
 
 pub(crate) fn has_fd(file_descriptor: i32) -> bool {
-    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+    ThreadManager::current_process().ok().is_some_and(|process| {
+        has_fd_for_process(process.pid(), file_descriptor)
+    })
+}
+
+pub(crate) fn has_fd_for_process(process_id: i32, file_descriptor: i32) -> bool {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
         return alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty
-            && descriptor_index(alias.backing)
+            && descriptor_index_direct_for_process(process_id, alias.backing)
                 .ok()
                 .is_some_and(|index| DESCRIPTORS.lock()[index].is_some());
     }
-    descriptor_index(file_descriptor)
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return false;
+    }
+    descriptor_index_for_process(process_id, file_descriptor)
         .ok()
-        .is_some_and(|index| DESCRIPTORS.lock()[index].is_some())
+        .is_some_and(|index| {
+            DESCRIPTORS.lock()[index]
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.owner_process_id == process_id)
+        })
+}
+
+pub(crate) fn backing_is_open_for_process(process_id: i32, file_descriptor: i32) -> bool {
+    descriptor_index_direct_for_process(process_id, file_descriptor).is_ok()
 }
 
 fn available_descriptor_index(
     descriptors: &IrqSpinGuard<'_, [Option<PtyDescriptor>; PTY_DESCRIPTOR_COUNT]>,
     minimum: usize,
+    process_id: i32,
 ) -> Option<usize> {
     descriptors
         .iter()
@@ -94,7 +152,8 @@ fn available_descriptor_index(
         .find_map(|(index, descriptor)| {
             let file_descriptor = PTY_FD_BASE + index as i32;
             (descriptor.is_none()
-                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target(
+                && !crate::kernel::runtime::runtime_libc::fd_alias::contains_target_for_process(
+                    process_id,
                     file_descriptor,
                 ))
             .then_some(index)
@@ -107,6 +166,7 @@ fn descriptor(file_descriptor: i32) -> Result<PtyDescriptor, Error> {
         .get(descriptor_index(file_descriptor)?)
         .and_then(Option::as_ref)
         .map(|descriptor| PtyDescriptor {
+            owner_process_id: descriptor.owner_process_id,
             pty_index: descriptor.pty_index,
             description: Arc::clone(&descriptor.description),
             close_on_exec: descriptor.close_on_exec,
@@ -115,6 +175,11 @@ fn descriptor(file_descriptor: i32) -> Result<PtyDescriptor, Error> {
 }
 
 pub(crate) fn open_master(flags: i32) -> Result<i32, Error> {
+    let process_id = ThreadManager::current_process()?.pid();
+    open_master_for_process(flags, process_id)
+}
+
+pub(crate) fn open_master_for_process(flags: i32, process_id: i32) -> Result<i32, Error> {
     if flags & !(O_NONBLOCK | O_NOCTTY | O_CLOEXEC | O_ACCMODE) != 0
         || flags & O_ACCMODE != O_RDWR
     {
@@ -124,12 +189,14 @@ pub(crate) fn open_master(flags: i32) -> Result<i32, Error> {
     let mut pairs = PTYS.lock();
     let pty_index = pairs.iter().position(Option::is_none).ok_or(Error::Mfile)?;
     let mut descriptors = DESCRIPTORS.lock();
-    let descriptor_index = available_descriptor_index(&descriptors, 0).ok_or(Error::Mfile)?;
+    let descriptor_index =
+        available_descriptor_index(&descriptors, 0, process_id).ok_or(Error::Mfile)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
         PTY_FD_BASE + descriptor_index as i32,
     )?;
     pairs[pty_index] = Some(Arc::clone(&pty));
     descriptors[descriptor_index] = Some(PtyDescriptor {
+        owner_process_id: process_id,
         pty_index,
         description: Arc::new(IrqSpinLock::new(PtyOpenDescription {
             pty,
@@ -145,6 +212,15 @@ pub(crate) fn open_master(flags: i32) -> Result<i32, Error> {
 }
 
 pub(crate) fn open_slave_path(path: &[u8], flags: i32) -> Result<i32, Error> {
+    let process_id = ThreadManager::current_process()?.pid();
+    open_slave_path_for_process(path, flags, process_id)
+}
+
+pub(crate) fn open_slave_path_for_process(
+    path: &[u8],
+    flags: i32,
+    process_id: i32,
+) -> Result<i32, Error> {
     let pty_index = parse_pty_path(path)?;
     let pty = PTYS
         .lock()
@@ -152,8 +228,8 @@ pub(crate) fn open_slave_path(path: &[u8], flags: i32) -> Result<i32, Error> {
         .and_then(Option::as_ref)
         .map(Arc::clone)
         .ok_or(Error::NoEnt)?;
-    let descriptor = open_slave(pty_index, flags)?;
-    if let Ok(process) = ThreadManager::current_process() {
+    let descriptor = open_slave(pty_index, flags, process_id)?;
+    if let Ok(process) = crate::kernel::process::Process::lookup(process_id) {
         process.acquire_pty_terminal(Arc::clone(&pty), flags & O_NOCTTY != 0);
     }
     Ok(descriptor)
@@ -163,15 +239,24 @@ pub(crate) fn open_slave_for(
     terminal: Arc<Pty>,
     flags: i32,
 ) -> Result<i32, Error> {
+    let process_id = ThreadManager::current_process()?.pid();
+    open_slave_for_process(terminal, flags, process_id)
+}
+
+pub(crate) fn open_slave_for_process(
+    terminal: Arc<Pty>,
+    flags: i32,
+    process_id: i32,
+) -> Result<i32, Error> {
     let pty_index = PTYS
         .lock()
         .iter()
         .position(|entry| entry.as_ref().is_some_and(|pty| Arc::ptr_eq(pty, &terminal)))
         .ok_or(Error::NoEnt)?;
-    open_slave(pty_index, flags)
+    open_slave(pty_index, flags, process_id)
 }
 
-fn open_slave(pty_index: usize, flags: i32) -> Result<i32, Error> {
+fn open_slave(pty_index: usize, flags: i32, process_id: i32) -> Result<i32, Error> {
     if flags & !(O_NONBLOCK | O_NOCTTY | O_CLOEXEC | O_ACCMODE) != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
@@ -184,12 +269,14 @@ fn open_slave(pty_index: usize, flags: i32) -> Result<i32, Error> {
         .map(Arc::clone)
         .ok_or(Error::NoEnt)?;
     let mut descriptors = DESCRIPTORS.lock();
-    let descriptor_index = available_descriptor_index(&descriptors, 0).ok_or(Error::Mfile)?;
+    let descriptor_index =
+        available_descriptor_index(&descriptors, 0, process_id).ok_or(Error::Mfile)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
         PTY_FD_BASE + descriptor_index as i32,
     )?;
     pty.open_slave()?;
     descriptors[descriptor_index] = Some(PtyDescriptor {
+        owner_process_id: process_id,
         pty_index,
         description: Arc::new(IrqSpinLock::new(PtyOpenDescription {
             pty,
@@ -384,11 +471,35 @@ pub(crate) fn duplicate(
     minimum: i32,
     close_on_exec: bool,
 ) -> Result<i32, Error> {
-    duplicate_internal(file_descriptor, minimum, close_on_exec, true)
+    let process_id = ThreadManager::current_process()?.pid();
+    duplicate_internal(
+        file_descriptor,
+        minimum,
+        close_on_exec,
+        true,
+        process_id,
+        process_id,
+    )
 }
 
 pub(crate) fn duplicate_backing(file_descriptor: i32) -> Result<i32, Error> {
-    duplicate_internal(file_descriptor, PTY_FD_BASE, false, false)
+    let process_id = ThreadManager::current_process()?.pid();
+    duplicate_for_process(file_descriptor, process_id, process_id)
+}
+
+pub(crate) fn duplicate_for_process(
+    file_descriptor: i32,
+    source_process_id: i32,
+    target_process_id: i32,
+) -> Result<i32, Error> {
+    duplicate_internal(
+        file_descriptor,
+        PTY_FD_BASE,
+        false,
+        false,
+        source_process_id,
+        target_process_id,
+    )
 }
 
 fn duplicate_internal(
@@ -396,17 +507,24 @@ fn duplicate_internal(
     minimum: i32,
     close_on_exec: bool,
     enforce_limit: bool,
+    source_process_id: i32,
+    target_process_id: i32,
 ) -> Result<i32, Error> {
     if minimum < 0 {
         return Err(Error::Inval);
     }
-    let source_index = descriptor_index(file_descriptor)?;
+    let source_index = descriptor_index_for_process(source_process_id, file_descriptor)?;
     let mut descriptors = DESCRIPTORS.lock();
     let source = descriptors[source_index].as_ref().ok_or(Error::Badf)?;
     let minimum_index = usize::try_from(minimum.saturating_sub(PTY_FD_BASE))
         .unwrap_or(0)
         .min(PTY_DESCRIPTOR_COUNT);
-    let target_index = available_descriptor_index(&descriptors, minimum_index).ok_or(Error::Mfile)?;
+    let target_index = available_descriptor_index(
+        &descriptors,
+        minimum_index,
+        target_process_id,
+    )
+    .ok_or(Error::Mfile)?;
     if enforce_limit {
         crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(
             PTY_FD_BASE + target_index as i32,
@@ -420,6 +538,7 @@ fn duplicate_internal(
         .ok_or(Error::Mfile)?;
     drop(open_description);
     descriptors[target_index] = Some(PtyDescriptor {
+        owner_process_id: target_process_id,
         pty_index: source.pty_index,
         description,
         close_on_exec,
@@ -432,8 +551,9 @@ pub(crate) fn duplicate_to(
     new_descriptor: i32,
     close_on_exec: bool,
 ) -> Result<i32, Error> {
-    let source_index = descriptor_index(file_descriptor)?;
-    let target_index = descriptor_index(new_descriptor)?;
+    let process_id = ThreadManager::current_process()?.pid();
+    let source_index = descriptor_index_for_process(process_id, file_descriptor)?;
+    let target_index = descriptor_slot_index(new_descriptor)?;
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(new_descriptor)?;
     if file_descriptor == new_descriptor {
         return if close_on_exec {
@@ -441,6 +561,12 @@ pub(crate) fn duplicate_to(
         } else {
             Ok(new_descriptor)
         };
+    }
+    let target_owner = DESCRIPTORS.lock()[target_index]
+        .as_ref()
+        .map(|descriptor| descriptor.owner_process_id);
+    if target_owner.is_some_and(|owner| owner != process_id) {
+        return Err(Error::Badf);
     }
     let replaced = {
         let mut descriptors = DESCRIPTORS.lock();
@@ -453,6 +579,7 @@ pub(crate) fn duplicate_to(
             .ok_or(Error::Mfile)?;
         drop(open_description);
         let replacement = PtyDescriptor {
+            owner_process_id: process_id,
             pty_index: source.pty_index,
             description,
             close_on_exec,
@@ -466,30 +593,90 @@ pub(crate) fn duplicate_to(
 }
 
 pub(crate) fn close(file_descriptor: i32) -> Result<(), Error> {
-    let index = descriptor_index(file_descriptor)?;
+    let process_id = ThreadManager::current_process()?.pid();
+    close_for_process(process_id, file_descriptor)
+}
+
+pub(crate) fn close_for_process(process_id: i32, file_descriptor: i32) -> Result<(), Error> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        if alias.kind != crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty {
+            return Err(Error::Badf);
+        }
+        return close_direct_for_process(process_id, alias.backing);
+    }
+    if crate::kernel::runtime::runtime_libc::fd_alias::is_backing_for_process(
+        process_id,
+        file_descriptor,
+    ) {
+        return Err(Error::Badf);
+    }
+    close_direct_for_process(process_id, file_descriptor)
+}
+
+pub(crate) fn close_direct_for_process(
+    process_id: i32,
+    file_descriptor: i32,
+) -> Result<(), Error> {
+    let index = descriptor_index_direct_for_process(process_id, file_descriptor)?;
     let descriptor = DESCRIPTORS.lock()[index].take().ok_or(Error::Badf)?;
     close_entry(descriptor);
     Ok(())
 }
 
 pub(crate) fn close_on_exec_descriptors() -> Result<(), Error> {
+    let process_id = ThreadManager::current_process()?.pid();
+    close_on_exec_descriptors_for_process(process_id)
+}
+
+pub(crate) fn close_on_exec_descriptors_for_process(process_id: i32) -> Result<(), Error> {
     let descriptors = {
         let descriptors = DESCRIPTORS.lock();
         let mut close_descriptors = Vec::new();
-        close_descriptors
-            .try_reserve(descriptors.iter().flatten().filter(|fd| fd.close_on_exec).count())
+        close_descriptors.try_reserve(
+            descriptors
+                .iter()
+                .flatten()
+                .filter(|fd| fd.owner_process_id == process_id && fd.close_on_exec)
+                .count(),
+        )
             .map_err(|_| Error::NoMem)?;
         close_descriptors.extend(descriptors.iter().enumerate().filter_map(|(index, fd)| {
             fd.as_ref()
-                .is_some_and(|fd| fd.close_on_exec)
+                .is_some_and(|fd| fd.owner_process_id == process_id && fd.close_on_exec)
                 .then_some(PTY_FD_BASE + index as i32)
         }));
         close_descriptors
     };
     for file_descriptor in descriptors {
-        let _ = close(file_descriptor);
+        let _ = close_for_process(process_id, file_descriptor);
     }
     Ok(())
+}
+
+pub(crate) fn direct_descriptors_for_process(
+    process_id: i32,
+) -> Result<Vec<(i32, bool)>, Error> {
+    let descriptors = DESCRIPTORS.lock();
+    let mut process_descriptors = Vec::new();
+    process_descriptors
+        .try_reserve_exact(
+            descriptors
+                .iter()
+                .flatten()
+                .filter(|descriptor| descriptor.owner_process_id == process_id)
+                .count(),
+        )
+        .map_err(|_| Error::NoMem)?;
+    process_descriptors.extend(descriptors.iter().enumerate().filter_map(|(index, descriptor)| {
+        descriptor
+            .as_ref()
+            .filter(|descriptor| descriptor.owner_process_id == process_id)
+            .map(|descriptor| (PTY_FD_BASE + index as i32, descriptor.close_on_exec))
+    }));
+    Ok(process_descriptors)
 }
 
 fn close_entry(descriptor: PtyDescriptor) {

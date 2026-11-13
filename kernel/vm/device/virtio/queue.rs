@@ -120,17 +120,8 @@ pub(crate) struct GuestVirtQueue {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::GuestVirtQueue;
-
-    #[test]
-    fn configured_queue_maximum_exceeds_previous_fixed_limit() {
-        let mut queue = GuestVirtQueue::new(256);
-        assert_eq!(queue.max_size(), 256);
-        assert!(queue.set_size(256));
-        assert_eq!(queue.size(), 256);
-    }
-}
+#[path = "../../../../tests/kernel/vm/device/virtio/queue.rs"]
+mod tests;
 
 impl GuestVirtQueue {
     pub(crate) const fn new(max_size: u16) -> Self {

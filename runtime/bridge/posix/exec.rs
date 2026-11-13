@@ -17,7 +17,7 @@ use crate::kernel::scheduler::thread::{ThreadManager, ThreadStack};
 use crate::kernel::signal::SignalSet;
 use crate::kernel::scheduler::thread::vm::UserAddressSpace;
 
-use super::errno::{as_errno, E2BIG, EFAULT, EINVAL, ENOMEM, ENOSYS};
+use super::errno::{as_errno, E2BIG, EFAULT, EINVAL, ENOMEM};
 
 const EACCES: c_int = as_errno(crate::kernel::error::Error::Acces);
 const ENOENT: c_int = as_errno(crate::kernel::error::Error::NoEnt);
@@ -39,6 +39,7 @@ const POSIX_SPAWN_SETSIGMASK: i16 = 0x08;
 const POSIX_SPAWN_SETSCHEDPARAM: i16 = 0x10;
 const POSIX_SPAWN_SETSCHEDULER: i16 = 0x20;
 const POSIX_SPAWN_SETSID: i16 = 0x40;
+const O_CLOEXEC: i32 = 0o2000000;
 
 struct EmptySymbolResolver;
 
@@ -111,19 +112,6 @@ fn read_guest_vector(
         strings.push(string);
     }
     Err(E2BIG)
-}
-
-fn c_path(path: &[u8]) -> Result<Vec<u8>, c_int> {
-    if path.is_empty() || path.contains(&0) {
-        return Err(EINVAL);
-    }
-    let mut terminated = Vec::new();
-    terminated
-        .try_reserve_exact(path.len().checked_add(1).ok_or(E2BIG)?)
-        .map_err(|_| ENOMEM)?;
-    terminated.extend_from_slice(path);
-    terminated.push(0);
-    Ok(terminated)
 }
 
 fn write_stack_string(
@@ -201,9 +189,9 @@ fn prepare_image(
     arguments: &[Vec<u8>],
     environment: &[Vec<u8>],
 ) -> Result<PreparedImage, c_int> {
-    let path = c_path(executable)?;
-    let image_bytes = crate::kernel::runtime::runtime_libc::filesystem::executable_snapshot(
-        path.as_ptr().cast(),
+    let image_bytes = crate::kernel::runtime::runtime_libc::filesystem::executable_snapshot_for_process(
+        executable,
+        process.pid(),
     )?;
     prepare_image_bytes(process, executable, image_bytes, arguments, environment)
 }
@@ -371,10 +359,26 @@ pub(crate) unsafe fn posix_spawn(
     if process_id_output.is_null() {
         return EFAULT;
     }
-    match super::spawn::file_actions_are_empty(file_actions) {
-        Ok(true) => {}
-        Ok(false) => return ENOSYS,
+    let file_actions = match super::spawn::file_actions_snapshot(file_actions) {
+        Ok(actions) => actions,
         Err(error) => return error,
+    };
+    let mut reserved_targets = Vec::new();
+    if reserved_targets.try_reserve_exact(file_actions.len()).is_err() {
+        return ENOMEM;
+    }
+    for action in &file_actions {
+        match action {
+            super::spawn::SpawnFileAction::Close(file_descriptor)
+            | super::spawn::SpawnFileAction::Open {
+                file_descriptor, ..
+            } => reserved_targets.push(*file_descriptor),
+            super::spawn::SpawnFileAction::Dup2 { destination, .. } => {
+                reserved_targets.push(*destination)
+            }
+            super::spawn::SpawnFileAction::Chdir(_)
+            | super::spawn::SpawnFileAction::Fchdir(_) => {}
+        }
     }
     let attributes = match super::spawn::spawn_attributes(attributes) {
         Ok(attributes) => attributes,
@@ -404,14 +408,6 @@ pub(crate) unsafe fn posix_spawn(
         Ok(values) => values,
         Err(error) => return error,
     };
-    let candidate = match find_executable(&parent, &requested, &environment, search_path) {
-        Ok(path) => path,
-        Err(error) => return error,
-    };
-    let image = match prepare_image(&parent, &candidate, &arguments, &environment) {
-        Ok(image) => image,
-        Err(error) => return error,
-    };
     let mut credentials = match parent.credentials() {
         Ok(credentials) => credentials,
         Err(error) => return as_errno(error),
@@ -419,16 +415,31 @@ pub(crate) unsafe fn posix_spawn(
     if attributes.is_some_and(|attributes| attributes.flags & POSIX_SPAWN_RESETIDS != 0) {
         credentials.reset_effective_ids();
     }
+    let address_space = match UserAddressSpace::new() {
+        Ok(address_space) => address_space,
+        Err(error) => return as_errno(error),
+    };
     let child = match Process::new_child_with_address_space(
         &parent,
         parent.namespace_set(),
         credentials,
-        image.address_space.clone(),
+        address_space,
     ) {
         Ok(child) => child,
         Err(error) => return as_errno(error),
     };
     let child_id = child.pid();
+    if let Err(error) = crate::kernel::runtime::runtime_libc::filesystem::inherit_descriptors_for_process(
+        parent.pid(),
+        child_id,
+        &reserved_targets,
+    ) {
+        crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
+            child_id,
+        );
+        parent.discard_unstarted_child(child_id);
+        return error;
+    }
     child.inherit_spawn_signal_state(
         &parent,
         attributes
@@ -463,10 +474,51 @@ pub(crate) unsafe fn posix_spawn(
             Ok(())
         })();
         if let Err(error) = operation {
+            crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
+                child_id,
+            );
             parent.discard_unstarted_child(child_id);
             return as_errno(error);
         }
     }
+    if let Err(error) = apply_spawn_file_actions(child_id, &file_actions) {
+        crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
+            child_id,
+        );
+        parent.discard_unstarted_child(child_id);
+        return error;
+    }
+    let candidate = match find_executable(&child, &requested, &environment, search_path) {
+        Ok(path) => path,
+        Err(error) => {
+            crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
+                child_id,
+            );
+            parent.discard_unstarted_child(child_id);
+            return error;
+        }
+    };
+    let image = match prepare_image(&child, &candidate, &arguments, &environment) {
+        Ok(image) => image,
+        Err(error) => {
+            crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
+                child_id,
+            );
+            parent.discard_unstarted_child(child_id);
+            return error;
+        }
+    };
+    child.replace_address_space(image.address_space.clone());
+    if let Err(error) = crate::kernel::runtime::runtime_libc::filesystem::close_on_exec_descriptors_for_process(
+        child_id,
+    ) {
+        crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
+            child_id,
+        );
+        parent.discard_unstarted_child(child_id);
+        return error;
+    }
+    crate::kernel::runtime::runtime_libc::fd_alias::release_reserved_targets_for_process(child_id);
     let signal_mask = if let Some(attributes) = attributes {
         if attributes.flags & POSIX_SPAWN_SETSIGMASK != 0 {
             attributes.signal_mask
@@ -488,6 +540,9 @@ pub(crate) unsafe fn posix_spawn(
         false,
         signal_mask,
     ) {
+        crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
+            child_id,
+        );
         parent.discard_unstarted_child(child_id);
         return as_errno(error);
     }
@@ -502,6 +557,68 @@ pub(crate) unsafe fn posix_spawn(
         return as_errno(error);
     }
     0
+}
+
+fn apply_spawn_file_actions(
+    process_id: i32,
+    actions: &[super::spawn::SpawnFileAction],
+) -> Result<(), c_int> {
+    for action in actions {
+        match action {
+            super::spawn::SpawnFileAction::Close(file_descriptor) => {
+                crate::kernel::runtime::runtime_libc::filesystem::close_descriptor_for_process(
+                    process_id,
+                    *file_descriptor,
+                )?;
+            }
+            super::spawn::SpawnFileAction::Dup2 { source, destination } => {
+                crate::kernel::runtime::runtime_libc::filesystem::duplicate_descriptor_to_process(
+                    process_id,
+                    *source,
+                    process_id,
+                    *destination,
+                    false,
+                )?;
+            }
+            super::spawn::SpawnFileAction::Open {
+                file_descriptor,
+                path,
+                flags,
+                mode,
+            } => {
+                let _ = crate::kernel::runtime::runtime_libc::filesystem::close_descriptor_for_process(
+                    process_id,
+                    *file_descriptor,
+                );
+                let (backing, kind) = crate::kernel::runtime::runtime_libc::filesystem::open_for_process(
+                    path,
+                    *flags,
+                    *mode,
+                    process_id,
+                )?;
+                crate::kernel::runtime::runtime_libc::filesystem::install_open_descriptor_for_process(
+                    process_id,
+                    *file_descriptor,
+                    backing,
+                    kind,
+                    flags & O_CLOEXEC != 0,
+                )?;
+            }
+            super::spawn::SpawnFileAction::Chdir(path) => {
+                crate::kernel::runtime::runtime_libc::filesystem::chdir_for_process(
+                    process_id,
+                    path,
+                )?;
+            }
+            super::spawn::SpawnFileAction::Fchdir(file_descriptor) => {
+                crate::kernel::runtime::runtime_libc::filesystem::fchdir_for_process(
+                    process_id,
+                    *file_descriptor,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn find_executable(
@@ -537,9 +654,9 @@ fn find_executable(
             candidate.push(b'/');
         }
         candidate.extend_from_slice(requested);
-        let path = c_path(&candidate)?;
-        match crate::kernel::runtime::runtime_libc::filesystem::executable_snapshot(
-            path.as_ptr().cast(),
+        match crate::kernel::runtime::runtime_libc::filesystem::executable_snapshot_for_process(
+            &candidate,
+            process.pid(),
         ) {
             Ok(_) => return Ok(candidate),
             Err(error) if error == ENOENT => {}
@@ -550,7 +667,6 @@ fn find_executable(
         }
         start = end + 1;
     }
-    let _ = process;
     Err(ENOENT)
 }
 

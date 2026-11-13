@@ -312,184 +312,29 @@ pub unsafe extern "C" fn lchown(path: *const c_char, owner: u32, group: u32) -> 
     unsafe { kz_rust_lchown(path, owner, group) }
 }
 
-fn descriptor_has_kind(
-    kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
-    file_descriptor: c_int,
-) -> bool {
-    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
-
-    match kind {
-        DescriptorKind::File => crate::kernel::runtime::runtime_libc::filesystem::descriptor_is_open(
-            file_descriptor,
-        )
-        .unwrap_or(false),
-        DescriptorKind::Socket => {
-            crate::kernel::runtime::runtime_libc::network::has_socket_fd(file_descriptor)
-        }
-        DescriptorKind::Packet => {
-            crate::kernel::runtime::runtime_libc::network::has_packet_fd(file_descriptor)
-        }
-        DescriptorKind::Pty => crate::kernel::runtime::runtime_libc::pty::has_fd(file_descriptor),
-    }
-}
-
-fn descriptor_kind(
-    file_descriptor: c_int,
-) -> Result<crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind, c_int> {
-    use crate::kernel::runtime::runtime_libc::fd_alias::{self, DescriptorKind};
-
-    if let Some(alias) = fd_alias::get(file_descriptor) {
-        return descriptor_has_kind(alias.kind, alias.backing)
-            .then_some(alias.kind)
-            .ok_or(EBADF);
-    }
-    let kind = if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
-        DescriptorKind::Pty
-    } else if crate::kernel::runtime::runtime_libc::network::is_socket_fd(file_descriptor) {
-        DescriptorKind::Socket
-    } else if crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor) {
-        DescriptorKind::Packet
-    } else if crate::kernel::runtime::runtime_libc::filesystem::descriptor_is_open(file_descriptor)
-        .unwrap_or(false)
-    {
-        DescriptorKind::File
-    } else {
-        return Err(EBADF);
-    };
-    descriptor_has_kind(kind, file_descriptor)
-        .then_some(kind)
-        .ok_or(EBADF)
-}
-
-fn direct_descriptor_target(
-    kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
-    source_descriptor: c_int,
-    file_descriptor: c_int,
-) -> bool {
-    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
-
-    match kind {
-        DescriptorKind::File => {
-            crate::kernel::runtime::runtime_libc::filesystem::is_direct_fd_number(file_descriptor)
-        }
-        DescriptorKind::Socket => {
-            crate::kernel::runtime::runtime_libc::network::same_socket_table(
-                source_descriptor,
-                file_descriptor,
-            )
-        }
-        DescriptorKind::Packet => {
-            crate::kernel::runtime::runtime_libc::network::is_packet_fd(file_descriptor)
-        }
-        DescriptorKind::Pty => crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor),
-    }
-}
-
-fn duplicate_descriptor_backing(
-    kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
-    file_descriptor: c_int,
-) -> Result<c_int, c_int> {
-    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
-
-    match kind {
-        DescriptorKind::File => {
-            crate::kernel::runtime::runtime_libc::filesystem::duplicate_backing(file_descriptor)
-        }
-        DescriptorKind::Socket => crate::kernel::runtime::runtime_libc::network::duplicate_socket_backing(
-            file_descriptor,
-        )
-        .map_err(|error| -(error as c_int)),
-        DescriptorKind::Packet => {
-            crate::kernel::runtime::runtime_libc::network::duplicate_packet_fd_backing(file_descriptor)
-            .map_err(|error| -(error as c_int))
-        }
-        DescriptorKind::Pty => crate::kernel::runtime::runtime_libc::pty::duplicate_backing(
-            file_descriptor,
-        )
-        .map_err(|error| -(error as c_int)),
-    }
-}
-
-fn duplicate_descriptor_to_backend(
-    kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
-    file_descriptor: c_int,
-    new_descriptor: c_int,
-    close_on_exec: bool,
-) -> Result<c_int, c_int> {
-    use crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind;
-
-    match kind {
-        DescriptorKind::File => crate::kernel::runtime::runtime_libc::filesystem::duplicate_to(
-            file_descriptor,
-            new_descriptor,
-            close_on_exec,
-        ),
-        DescriptorKind::Socket => crate::kernel::runtime::runtime_libc::network::duplicate_socket_to(
-            file_descriptor,
-            new_descriptor,
-            close_on_exec,
-        )
-        .map_err(|error| -(error as c_int)),
-        DescriptorKind::Packet => {
-            crate::kernel::runtime::runtime_libc::network::duplicate_packet_fd_to(
-                file_descriptor,
-                new_descriptor,
-                close_on_exec,
-            )
-            .map_err(|error| -(error as c_int))
-        }
-        DescriptorKind::Pty => crate::kernel::runtime::runtime_libc::pty::duplicate_to(
-            file_descriptor,
-            new_descriptor,
-            close_on_exec,
-        )
-        .map_err(|error| -(error as c_int)),
-    }
-}
-
 fn duplicate_descriptor_to(
     file_descriptor: c_int,
     new_descriptor: c_int,
     close_on_exec: bool,
 ) -> Result<c_int, c_int> {
-    use crate::kernel::runtime::runtime_libc::fd_alias::{self, DescriptorAlias};
-
     if new_descriptor < 0 {
         return Err(EBADF);
     }
-    let kind = descriptor_kind(file_descriptor)?;
     if file_descriptor == new_descriptor {
         return Ok(new_descriptor);
     }
     crate::kernel::runtime::runtime_libc::posix::check_descriptor_limit(new_descriptor)
         .map_err(|error| -(error as c_int))?;
-
-    let target_is_alias = fd_alias::get(new_descriptor).is_some();
-    if !target_is_alias && direct_descriptor_target(kind, file_descriptor, new_descriptor) {
-        return duplicate_descriptor_to_backend(kind, file_descriptor, new_descriptor, close_on_exec);
-    }
-
-    fd_alias::reserve_one().map_err(|error| -(error as c_int))?;
-    let backing = duplicate_descriptor_backing(kind, file_descriptor)?;
-    if target_is_alias || descriptor_kind(new_descriptor).is_ok() {
-        if let Err(error) = crate::kernel::runtime::runtime_libc::filesystem::close_descriptor(
-            new_descriptor,
-        ) {
-            let _ = crate::kernel::runtime::runtime_libc::filesystem::close_descriptor(backing);
-            return Err(error);
-        }
-    }
-    let alias = DescriptorAlias {
-        target: new_descriptor,
-        backing,
-        kind,
+    let process_id = ThreadManager::current_process()
+        .map_err(as_errno)?
+        .pid();
+    crate::kernel::runtime::runtime_libc::filesystem::duplicate_descriptor_to_process(
+        process_id,
+        file_descriptor,
+        process_id,
+        new_descriptor,
         close_on_exec,
-    };
-    if let Err(error) = fd_alias::install(alias) {
-        let _ = crate::kernel::runtime::runtime_libc::filesystem::close_descriptor(backing);
-        return Err(-(error as c_int));
-    }
-    Ok(new_descriptor)
+    )
 }
 
 #[no_mangle]

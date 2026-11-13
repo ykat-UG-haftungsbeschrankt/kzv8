@@ -6,15 +6,16 @@
  */
 
 use alloc::vec::Vec;
+
 use crate::kernel::lib::alignment::align_up;
 use crate::kernel::lib::endian;
+use super::dl::{copy_file_range, read_exact, ObjectState, PAGE_SIZE};
 use super::{
-    AddressSpace, Error, FileSource, Permissions, PermissionsApi as _, SymbolResolver,
+    AddressSpace, Error, FileSource, ObjectKind, Permissions, PermissionsApi as _, SymbolResolver,
 };
 
 const ELF_HEADER_SIZE: usize = 64;
 const PROGRAM_HEADER_SIZE: usize = 56;
-const PAGE_SIZE: usize = 4096;
 const MAX_PROGRAM_HEADERS: usize = 4096;
 const MAX_IMAGE_SIZE: usize = 1 << 28;
 const MAX_IMAGE_ALIGNMENT: usize = 1 << 30;
@@ -79,10 +80,8 @@ const STT_TLS: u8 = 6;
 const STT_GNU_IFUNC: u8 = 10;
 const R_NONE: u32 = 0;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ElfKind {
-    Executable,
-    SharedObject,
+pub(super) fn matches(magic: &[u8; 4]) -> bool {
+    *magic == [0x7f, b'E', b'L', b'F']
 }
 
 struct DynamicInfo {
@@ -114,14 +113,6 @@ struct Relocation {
     addend: Option<i64>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ObjectState {
-    RelocationPending,
-    ReadyToSeal,
-    Sealed,
-    Failed,
-}
-
 #[derive(Clone, Copy)]
 struct ProgramHeader {
     kind: u32,
@@ -149,7 +140,7 @@ struct FileRange {
 
 struct ParsedElf<'a, F> {
     source: &'a F,
-    kind: ElfKind,
+    kind: ObjectKind,
     fixed_address: bool,
     entry: u64,
     program_headers: Vec<ProgramHeader>,
@@ -160,8 +151,8 @@ struct ParsedElf<'a, F> {
     alignment: usize,
 }
 
-pub(crate) struct LoadedObject {
-    kind: ElfKind,
+pub(super) struct ElfLoadedObject {
+    kind: ObjectKind,
     mapping_base: usize,
     mapping_length: usize,
     load_bias: usize,
@@ -174,11 +165,11 @@ pub(crate) struct LoadedObject {
     state: ObjectState,
 }
 
-impl LoadedObject {
+impl ElfLoadedObject {
     pub(crate) fn load<F: FileSource, A: AddressSpace>(
         source: &F,
         address_space: &mut A,
-        kind: ElfKind,
+        kind: ObjectKind,
         preferred_address: Option<usize>,
     ) -> Result<Self, Error> {
         let parsed = ParsedElf::parse(source, kind)?;
@@ -217,7 +208,7 @@ impl LoadedObject {
         result
     }
 
-    pub(crate) const fn kind(&self) -> ElfKind {
+    pub(crate) const fn kind(&self) -> ObjectKind {
         self.kind
     }
 
@@ -229,8 +220,8 @@ impl LoadedObject {
         self.mapping_length
     }
 
-    pub(crate) const fn load_bias(&self) -> usize {
-        self.load_bias
+    pub(crate) const fn load_bias(&self) -> i128 {
+        self.load_bias as i128
     }
 
     pub(crate) const fn entry(&self) -> Option<usize> {
@@ -285,17 +276,21 @@ impl LoadedObject {
             .map(|symbol| symbol.size)
     }
 
-    pub(super) fn exported_symbols(&self) -> impl Iterator<Item = (&[u8], usize, bool)> + '_ {
-        self.symbols.iter().filter_map(|symbol| {
-            if !is_exported(symbol) {
-                return None;
+    pub(super) fn for_each_exported_symbol<'a>(
+        &'a self,
+        visitor: &mut dyn FnMut(&'a [u8], usize, bool),
+    ) {
+        for symbol in &self.symbols {
+            if is_exported(symbol) {
+                if let Some(address) = symbol.address {
+                    visitor(
+                        &symbol.name,
+                        address,
+                        symbol.binding == STB_WEAK,
+                    );
+                }
             }
-            Some((
-                symbol.name.as_slice(),
-                symbol.address?,
-                symbol.binding == STB_WEAK,
-            ))
-        })
+        }
     }
 
     pub(crate) fn relocate<A: AddressSpace, R: SymbolResolver>(
@@ -567,7 +562,7 @@ impl LoadedObject {
             .map_err(|_| Error::NoMem)?;
         load_ranges.extend_from_slice(&parsed.load_ranges);
 
-        let entry = if parsed.kind != ElfKind::Executable || parsed.entry == 0 {
+        let entry = if parsed.kind != ObjectKind::Executable || parsed.entry == 0 {
             None
         } else {
             Some(
@@ -598,7 +593,7 @@ impl LoadedObject {
 }
 
 impl<'a, F: FileSource> ParsedElf<'a, F> {
-    fn parse(source: &'a F, requested_kind: ElfKind) -> Result<Self, Error> {
+    fn parse(source: &'a F, requested_kind: ObjectKind) -> Result<Self, Error> {
         if source.len() < ELF_HEADER_SIZE as u64 {
             return Err(Error::NoExec);
         }
@@ -617,8 +612,8 @@ impl<'a, F: FileSource> ParsedElf<'a, F> {
 
         let elf_type = endian::read_u16(&header, 16).ok_or(Error::NoExec)?;
         let kind = match (elf_type, requested_kind) {
-            (ET_EXEC, ElfKind::Executable) => ElfKind::Executable,
-            (ET_EXEC, ElfKind::SharedObject) => return Err(Error::NoExec),
+            (ET_EXEC, ObjectKind::Executable) => ObjectKind::Executable,
+            (ET_EXEC, ObjectKind::SharedObject) => return Err(Error::NoExec),
             (ET_DYN, requested_kind) => requested_kind,
             _ => return Err(Error::OpNotSupp),
         };
@@ -760,7 +755,7 @@ impl<'a, F: FileSource> ParsedElf<'a, F> {
         {
             return Err(Error::NoExec);
         }
-        if kind == ElfKind::Executable && (entry == 0 || !has_executable_entry) {
+        if kind == ObjectKind::Executable && (entry == 0 || !has_executable_entry) {
             return Err(Error::NoExec);
         }
         for relro in program_headers
@@ -1545,48 +1540,6 @@ fn signed_32(value: i128) -> Result<u64, Error> {
         return Err(Error::Libbad);
     }
     Ok(value as i32 as u32 as u64)
-}
-
-fn copy_file_range<F: FileSource, A: AddressSpace>(
-    source: &F,
-    address_space: &mut A,
-    file_offset: u64,
-    target_address: usize,
-    length: u64,
-) -> Result<(), Error> {
-    let mut buffer = [0u8; 1024];
-    let mut copied = 0u64;
-    while copied < length {
-        let count = usize::try_from((length - copied).min(buffer.len() as u64))
-            .map_err(|_| Error::Overflow)?;
-        let offset = file_offset.checked_add(copied).ok_or(Error::Overflow)?;
-        read_exact(source, offset, &mut buffer[..count])?;
-        let address = target_address
-            .checked_add(usize::try_from(copied).map_err(|_| Error::Overflow)?)
-            .ok_or(Error::Overflow)?;
-        address_space.write(address, &buffer[..count])?;
-        copied += count as u64;
-    }
-    Ok(())
-}
-
-fn read_exact<F: FileSource>(
-    source: &F,
-    offset: u64,
-    buffer: &mut [u8],
-) -> Result<(), Error> {
-    let mut read = 0usize;
-    while read < buffer.len() {
-        let current_offset = offset
-            .checked_add(read as u64)
-            .ok_or(Error::Overflow)?;
-        let count = source.read_at(current_offset, &mut buffer[read..])?;
-        if count == 0 || count > buffer.len() - read {
-            return Err(Error::Io);
-        }
-        read += count;
-    }
-    Ok(())
 }
 
 fn validate_page_permissions(ranges: &[LoadRange]) -> Result<(), Error> {

@@ -66,6 +66,7 @@ impl DlFailure {
 struct LoadedLibrary {
     path: Vec<u8>,
     dependencies: Vec<Vec<u8>>,
+    dependency_aliases: Vec<(Vec<u8>, Vec<u8>)>,
     object: LoadedObject,
     global: bool,
 }
@@ -73,6 +74,7 @@ struct LoadedLibrary {
 struct StagedLibrary {
     path: Vec<u8>,
     dependencies: Vec<Vec<u8>>,
+    dependency_aliases: Vec<(Vec<u8>, Vec<u8>)>,
     object: LoadedObject,
 }
 
@@ -102,6 +104,7 @@ impl LoaderState {
 struct PendingLibrary {
     path: Vec<u8>,
     bytes: Option<Vec<u8>>,
+    inherited_rpaths: Vec<Vec<u8>>,
 }
 
 static LOADERS: IrqSpinLock<LoaderState> = IrqSpinLock::new(LoaderState::new());
@@ -288,6 +291,17 @@ fn library_dependencies(pid: i32, path: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(library.dependencies.clone())
 }
 
+fn library_search_paths(pid: i32, path: &[u8]) -> Result<Option<Vec<Vec<u8>>>, Error> {
+    let loaders = LOADERS.lock();
+    let Some(process) = loaders.processes.iter().find(|process| process.pid == pid) else {
+        return Ok(None);
+    };
+    let Some(library) = process.libraries.iter().find(|library| library.path == path) else {
+        return Ok(None);
+    };
+    copy_strings(library.object.search_paths()).map(Some)
+}
+
 fn path_is_pending(pending: &[PendingLibrary], path: &[u8]) -> bool {
     pending.iter().any(|library| library.path == path)
 }
@@ -312,30 +326,102 @@ fn join_path(directory: &[u8], name: &[u8]) -> Result<Vec<u8>, Error> {
     normalize_path(&joined, b"/")
 }
 
-fn dependency_candidates(parent: &[u8], name: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+fn parent_directory(parent: &[u8]) -> &[u8] {
+    let directory_end = parent.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
+    if directory_end == 0 {
+        b"/"
+    } else {
+        &parent[..directory_end]
+    }
+}
+
+fn expand_macho_path(parent: &[u8], path: &[u8]) -> Result<Vec<u8>, Error> {
+    const LOADER_PATH: &[u8] = b"@loader_path";
+    const EXECUTABLE_PATH: &[u8] = b"@executable_path";
+
+    if path == EXECUTABLE_PATH || path.starts_with(b"@executable_path/") {
+        return Err(Error::OpNotSupp);
+    }
+    if path == LOADER_PATH {
+        return normalize_path(parent_directory(parent), b"/");
+    }
+    if let Some(suffix) = path.strip_prefix(b"@loader_path/") {
+        return join_path(parent_directory(parent), suffix);
+    }
+    if path.first() == Some(&b'/') {
+        return normalize_path(path, b"/");
+    }
+    if path.starts_with(b"@rpath") {
+        return Err(Error::OpNotSupp);
+    }
+    if path.starts_with(b"@") {
+        return Err(Error::OpNotSupp);
+    }
+    if path.contains(&b'/') {
+        return join_path(parent_directory(parent), path);
+    }
+    normalize_path(path, parent_directory(parent))
+}
+
+fn inherited_search_paths(
+    parent: &[u8],
+    inherited: &[Vec<u8>],
+    local: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, Error> {
+    let mut paths = copy_strings(inherited)?;
+    for path in local {
+        let expanded = expand_macho_path(parent, path)?;
+        if !paths.iter().any(|existing| *existing == expanded) {
+            paths.try_reserve(1).map_err(|_| Error::NoMem)?;
+            paths.push(expanded);
+        }
+    }
+    Ok(paths)
+}
+
+fn dependency_candidates(
+    parent: &[u8],
+    name: &[u8],
+    search_paths: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, Error> {
     let mut candidates = Vec::new();
-    candidates.try_reserve(5).map_err(|_| Error::NoMem)?;
+    candidates
+        .try_reserve(5usize.saturating_add(search_paths.len()))
+        .map_err(|_| Error::NoMem)?;
+    if name.starts_with(b"@rpath/") {
+        let suffix = &name[b"@rpath/".len()..];
+        if suffix.is_empty() {
+            return Err(Error::NoExec);
+        }
+        for search_path in search_paths {
+            let directory = expand_macho_path(parent, search_path)?;
+            let candidate = join_path(&directory, suffix)?;
+            if !candidates.iter().any(|existing| *existing == candidate) {
+                candidates.push(candidate);
+            }
+        }
+        return Ok(candidates);
+    }
+    if name == b"@executable_path" || name.starts_with(b"@executable_path/") {
+        return Err(Error::OpNotSupp);
+    }
+    if name == b"@loader_path" || name.starts_with(b"@loader_path/") {
+        candidates.push(expand_macho_path(parent, name)?);
+        return Ok(candidates);
+    }
+    if name.starts_with(b"@") {
+        return Err(Error::OpNotSupp);
+    }
     if name.contains(&b'/') {
         if name.first() == Some(&b'/') {
             candidates.push(normalize_path(name, b"/")?);
         } else {
-            let directory_end = parent.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
-            let directory = if directory_end == 0 {
-                b"/".as_slice()
-            } else {
-                &parent[..directory_end]
-            };
-            candidates.push(join_path(directory, name)?);
+            candidates.push(join_path(parent_directory(parent), name)?);
         }
         return Ok(candidates);
     }
 
-    let directory_end = parent.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
-    let directory = if directory_end == 0 {
-        b"/".as_slice()
-    } else {
-        &parent[..directory_end]
-    };
+    let directory = parent_directory(parent);
     for search_directory in [directory, b"/lib", b"/usr/lib", b"/lib64", b"/usr/lib64"] {
         let candidate = join_path(search_directory, name)?;
         if !candidates.iter().any(|existing| *existing == candidate) {
@@ -349,10 +435,12 @@ fn resolve_dependency(
     pid: i32,
     parent: &[u8],
     name: &[u8],
+    search_paths: &[Vec<u8>],
     pending: &[PendingLibrary],
     staged: &[StagedLibrary],
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), DlFailure> {
-    let candidates = dependency_candidates(parent, name).map_err(DlFailure::from_kernel)?;
+    let candidates =
+        dependency_candidates(parent, name, search_paths).map_err(DlFailure::from_kernel)?;
     for candidate in candidates {
         if path_is_pending(pending, &candidate)
             || path_is_staged(staged, &candidate)
@@ -387,6 +475,7 @@ fn stage_load_graph(
     pending.push(PendingLibrary {
         path: copy_bytes(root).map_err(DlFailure::from_kernel)?,
         bytes: None,
+        inherited_rpaths: Vec::new(),
     });
     let mut visited = Vec::<Vec<u8>>::new();
     let mut staged = Vec::<StagedLibrary>::new();
@@ -402,6 +491,15 @@ fn stage_load_graph(
             visited.push(copy_bytes(&current.path).map_err(DlFailure::from_kernel)?);
 
             if let Some(dependencies) = library_dependencies(pid, &current.path) {
+                let local_rpaths = library_search_paths(pid, &current.path)
+                    .map_err(DlFailure::from_kernel)?
+                    .unwrap_or_default();
+                let search_paths = inherited_search_paths(
+                    &current.path,
+                    &current.inherited_rpaths,
+                    &local_rpaths,
+                )
+                .map_err(DlFailure::from_kernel)?;
                 for dependency in dependencies {
                     if !visited.iter().any(|path| *path == dependency)
                         && !path_is_pending(&pending, &dependency)
@@ -412,6 +510,8 @@ fn stage_load_graph(
                         pending.push(PendingLibrary {
                             path: dependency,
                             bytes: None,
+                            inherited_rpaths: copy_strings(&search_paths)
+                                .map_err(DlFailure::from_kernel)?,
                         });
                     }
                 }
@@ -439,18 +539,50 @@ fn stage_load_graph(
             staged.push(StagedLibrary {
                 path: staged_path,
                 dependencies: Vec::new(),
+                dependency_aliases: Vec::new(),
                 object,
             });
+            let search_paths = inherited_search_paths(
+                &path,
+                &current.inherited_rpaths,
+                staged[staged_index].object.search_paths(),
+            )
+            .map_err(DlFailure::from_kernel)?;
             let needed = copy_strings(staged[staged_index].object.needed())
                 .map_err(DlFailure::from_kernel)?;
             staged[staged_index]
                 .dependencies
                 .try_reserve(needed.len())
                 .map_err(|_| DlFailure::from_kernel(Error::NoMem))?;
+            staged[staged_index]
+                .dependency_aliases
+                .try_reserve(needed.len())
+                .map_err(|_| DlFailure::from_kernel(Error::NoMem))?;
 
-            for name in needed {
-                let (dependency, contents) =
-                    resolve_dependency(pid, &path, &name, &pending, &staged)?;
+            for (dependency_index, name) in needed.into_iter().enumerate() {
+                let weak_dependency = staged[staged_index]
+                    .object
+                    .dependency_is_weak(dependency_index);
+                let (dependency, contents) = match resolve_dependency(
+                    pid,
+                    &path,
+                    &name,
+                    &search_paths,
+                    &pending,
+                    &staged,
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(error)
+                        if weak_dependency && error.errno == as_errno(Error::NoEnt) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                staged[staged_index].dependency_aliases.push((
+                    copy_bytes(&name).map_err(DlFailure::from_kernel)?,
+                    copy_bytes(&dependency).map_err(DlFailure::from_kernel)?,
+                ));
                 if !staged[staged_index]
                     .dependencies
                     .iter()
@@ -471,6 +603,8 @@ fn stage_load_graph(
                     pending.push(PendingLibrary {
                         path: dependency,
                         bytes: contents,
+                        inherited_rpaths: copy_strings(&search_paths)
+                            .map_err(DlFailure::from_kernel)?,
                     });
                 } else if contents.is_none()
                     && library_dependencies(pid, &dependency).is_some()
@@ -483,6 +617,8 @@ fn stage_load_graph(
                     pending.push(PendingLibrary {
                         path: dependency,
                         bytes: None,
+                        inherited_rpaths: copy_strings(&search_paths)
+                            .map_err(DlFailure::from_kernel)?,
                     });
                 }
             }
@@ -723,9 +859,13 @@ fn commit_staged(
                 return Err(DlFailure::from_kernel(Error::Inval));
             };
             let mut objects = Vec::new();
+            let mut named_dependencies = Vec::new();
             if objects
                 .try_reserve(loader.libraries.len() + before.len() + after.len())
                 .is_err()
+                || named_dependencies
+                    .try_reserve(current.dependency_aliases.len())
+                    .is_err()
             {
                 Err(Error::NoMem)
             } else {
@@ -737,8 +877,32 @@ fn commit_staged(
                 for library in before.iter().chain(after.iter()) {
                     objects.push(&library.object);
                 }
-                SymbolScope::new(&objects)
-                    .and_then(|mut scope| current.object.relocate(address_space, &mut scope))
+                let mut missing_dependency = false;
+                for (name, path) in &current.dependency_aliases {
+                    let dependency = loader
+                        .libraries
+                        .iter()
+                        .find(|library| library.path == *path)
+                        .map(|library| &library.object)
+                        .or_else(|| {
+                            before
+                                .iter()
+                                .chain(after.iter())
+                                .find(|library| library.path == *path)
+                                .map(|library| &library.object)
+                        });
+                    let Some(dependency) = dependency else {
+                        missing_dependency = true;
+                        break;
+                    };
+                    named_dependencies.push((name.as_slice(), dependency));
+                }
+                if missing_dependency {
+                    Err(Error::NoEnt)
+                } else {
+                    SymbolScope::with_dependencies(&objects, &named_dependencies)
+                        .and_then(|mut scope| current.object.relocate(address_space, &mut scope))
+                }
             }
         };
         if let Err(error) = relocation {
@@ -759,6 +923,7 @@ fn commit_staged(
         loader.libraries.push(LoadedLibrary {
             path: library.path,
             dependencies: library.dependencies,
+            dependency_aliases: library.dependency_aliases,
             object: library.object,
             global: false,
         });

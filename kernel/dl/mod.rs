@@ -7,10 +7,22 @@
 
 mod dl;
 mod elf;
-
-pub(crate) use elf::{ElfKind, LoadedObject};
+mod mach_o;
+mod pe;
 
 pub(crate) use crate::kernel::error::Error;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObjectKind {
+    Executable,
+    SharedObject,
+}
+
+pub(crate) type ElfKind = ObjectKind;
+
+pub(crate) struct LoadedObject {
+    state: dl::LoadedObjectState,
+}
 
 pub(crate) trait FileSource {
     /// Return the exact byte length of this random-access source.
@@ -70,6 +82,22 @@ pub(crate) trait AddressSpace {
 
 pub(crate) trait SymbolResolver {
     fn resolve(&mut self, name: &[u8]) -> Option<ResolvedSymbol>;
+
+    fn resolve_in(&mut self, _library: &[u8], name: &[u8]) -> Option<ResolvedSymbol> {
+        self.resolve(name)
+    }
+
+    fn resolve_ordinal_in(
+        &mut self,
+        _library: &[u8],
+        _ordinal: u32,
+    ) -> Option<ResolvedSymbol> {
+        None
+    }
+
+    fn resolve_weak(&mut self, name: &[u8]) -> Option<ResolvedSymbol> {
+        self.resolve(name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,4 +117,9 @@ pub(crate) struct SymbolScope<'a> {
 
 pub(crate) trait SymbolScopeApi<'a>: Sized {
     fn new(objects: &[&'a LoadedObject]) -> Result<Self, Error>;
+
+    fn with_dependencies(
+        objects: &[&'a LoadedObject],
+        dependencies: &[(&'a [u8], &'a LoadedObject)],
+    ) -> Result<Self, Error>;
 }
