@@ -5,31 +5,31 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::kernel::block::request::{Operation, Request};
 use crate::kernel::driver::virtio::block;
 use crate::kernel::error::Error;
+
+use super::{BlockDeviceApi, Operation, Request};
 
 pub(crate) struct BlockDevice {
     device: block::BlockDevice,
 }
 
-impl BlockDevice {
-    pub(crate) fn initialize() -> Option<Self> {
+impl BlockDeviceApi for BlockDevice {
+    fn initialize() -> Option<Self> {
         Some(Self {
             device: block::BlockDevice::initialize()?,
         })
     }
 
-    pub(crate) fn capacity_sectors(&self) -> u64 {
+    fn capacity_sectors(&self) -> u64 {
         self.device.capacity_sectors()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn interrupt_slot(&self) -> usize {
+    fn interrupt_slot(&self) -> usize {
         self.device.interrupt_slot()
     }
 
-    pub(crate) fn submit<'a>(
+    fn submit<'a>(
         &'a self,
         request: Request<'a>,
     ) -> Result<block::BlockTransfer<'a>, Error> {

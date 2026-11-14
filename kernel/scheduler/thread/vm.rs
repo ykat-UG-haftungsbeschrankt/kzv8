@@ -5,8 +5,6 @@
  * free of charge, without warranty of any kind.
  */
 
-#[cfg(feature = "virtualization")]
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -20,112 +18,15 @@ use crate::kernel::arch::traits::{
 	ThreadArchitecture as _,
 };
 use crate::kernel::lib::alignment::align_up;
-#[cfg(feature = "virtualization")]
-use crate::kernel::lib::hashmap::HashMap;
-use crate::kernel::lib::interval::IntervalTree;
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 #[cfg(feature = "virtualization")]
 use crate::kernel::vm::device::passthru::{PassthroughDevice, PciFunction};
 
 #[cfg(feature = "virtualization")]
-struct PendingPassthroughUnplug {
-	function: PciFunction,
-	result: IrqSpinLock<Option<Result<(), crate::kernel::arch::VirtualizationError>>>,
-}
-
-#[cfg(feature = "virtualization")]
-struct PassthroughControlState {
-	requests: VecDeque<Arc<PendingPassthroughUnplug>>,
-	closed: bool,
-}
-
-#[cfg(feature = "virtualization")]
-struct PassthroughControl {
-	state: IrqSpinLock<PassthroughControlState>,
-}
-
-#[cfg(feature = "virtualization")]
-pub(crate) struct PassthroughUnplugTicket {
-	request: Arc<PendingPassthroughUnplug>,
-}
-
-#[cfg(feature = "virtualization")]
-#[derive(Clone)]
-pub(crate) struct PassthroughControlHandle {
-	control: Arc<PassthroughControl>,
-}
-
-#[cfg(feature = "virtualization")]
-impl PassthroughUnplugTicket {
-	/// Returns the unplug result once the vCPU reaches its next safe point.
-	pub(crate) fn try_result(
-		&self,
-	) -> Option<Result<(), crate::kernel::arch::VirtualizationError>> {
-		*self.request.result.lock()
-	}
-}
-
-#[cfg(feature = "virtualization")]
-impl PassthroughControlHandle {
-	/// Queues a forced unplug; poll the returned ticket for completion.
-	pub(crate) fn request_unplug(
-		&self,
-		function: PciFunction,
-	) -> Result<PassthroughUnplugTicket, crate::kernel::arch::VirtualizationError> {
-		self.control.request(function)
-	}
-}
-
-#[cfg(feature = "virtualization")]
-impl PassthroughControl {
-	fn new() -> Self {
-		Self {
-			state: IrqSpinLock::new(PassthroughControlState {
-				requests: VecDeque::new(),
-				closed: false,
-			}),
-		}
-	}
-
-	fn request(
-		&self,
-		function: PciFunction,
-	) -> Result<PassthroughUnplugTicket, crate::kernel::arch::VirtualizationError> {
-		let mut state = self.state.lock();
-		if state.closed || state.requests.iter().any(|request| request.function == function) {
-			return Err(crate::kernel::arch::VirtualizationError::Unsupported);
-		}
-		state
-			.requests
-			.try_reserve(1)
-			.map_err(|_| crate::kernel::arch::VirtualizationError::ResourceExhausted)?;
-		let request = Arc::new(PendingPassthroughUnplug {
-			function,
-			result: IrqSpinLock::new(None),
-		});
-		state.requests.push_back(Arc::clone(&request));
-		Ok(PassthroughUnplugTicket { request })
-	}
-
-	fn take_request(&self) -> Option<Arc<PendingPassthroughUnplug>> {
-		self.state.lock().requests.pop_front()
-	}
-
-	fn close(&self, error: crate::kernel::arch::VirtualizationError) {
-		let mut state = self.state.lock();
-		state.closed = true;
-		while let Some(request) = state.requests.pop_front() {
-			*request.result.lock() = Some(Err(error));
-		}
-	}
-}
-
-#[cfg(feature = "virtualization")]
 pub(crate) struct VcpuContext {
 	kernel: super::kernel::Context,
-	passthrough: HashMap<PciFunction, PassthroughDevice>,
-	passthrough_control: Arc<PassthroughControl>,
+	passthrough: Vec<PassthroughDevice>,
 	guest: <crate::kernel::arch::VirtualizationArchitecture as crate::kernel::arch::traits::VirtualizationArchitecture>::GuestContext,
 }
 
@@ -140,8 +41,7 @@ impl VcpuContext {
 		let kernel = super::kernel::Context::load(kernel_stack, kernel_entry);
 		Ok(Self {
 			kernel,
-			passthrough: HashMap::new(),
-			passthrough_control: Arc::new(PassthroughControl::new()),
+			passthrough: Vec::new(),
 			guest,
 		})
 	}
@@ -153,101 +53,13 @@ impl VcpuContext {
 		function: PciFunction,
 	) -> Result<Self, crate::kernel::arch::VirtualizationError> {
 		let mut context = Self::load(kernel_stack, kernel_entry, image)?;
-		let device = PassthroughDevice::attach(&mut context.guest, function)?;
-		if let Err((_function, mut device)) = context.passthrough.insert(function, device) {
-			if !device.detach() {
-				crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
-					&mut context.guest,
-				);
-			}
-			return Err(crate::kernel::arch::VirtualizationError::ResourceExhausted);
-		}
-		Ok(context)
-	}
-
-	pub(crate) fn passthrough_control_handle(&self) -> PassthroughControlHandle {
-		PassthroughControlHandle {
-			control: Arc::clone(&self.passthrough_control),
-		}
-	}
-
-	fn unplug_passthrough(
-		&mut self,
-		function: PciFunction,
-	) -> (Result<(), crate::kernel::arch::VirtualizationError>, bool) {
-		let Some(mapping) = self
+		context
 			.passthrough
-			.get(&function)
-			.map(PassthroughDevice::guest_mmio_mapping)
-		else {
-			return (Err(crate::kernel::arch::VirtualizationError::Unsupported), false);
-		};
-		let Some(device) = self.passthrough.get_mut(&function) else {
-			return (Err(crate::kernel::arch::VirtualizationError::Unsupported), false);
-		};
-		if !device.detach() {
-			crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
-				&mut self.guest,
-			);
-			return (
-				Err(crate::kernel::arch::VirtualizationError::HostSetupFailed),
-				true,
-			);
-		}
-		let (guest_address, host_address, length) = mapping;
-		if let Err(error) = crate::kernel::arch::VirtualizationArchitecture::unmap_guest_mmio(
-			&mut self.guest,
-			guest_address,
-			host_address,
-			length,
-		) {
-			crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
-				&mut self.guest,
-			);
-			return (Err(error), true);
-		}
-		if let Err(error) = crate::kernel::arch::VirtualizationArchitecture::write_guest_memory(
-			&mut self.guest,
-			crate::kernel::vm::device::passthru::GUEST_INFO_ADDRESS,
-			&[0; crate::kernel::vm::device::passthru::GUEST_INFO_SIZE],
-		) {
-			crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
-				&mut self.guest,
-			);
-			return (Err(error), true);
-		}
-		let _removed = self.passthrough.remove(&function);
-		(Ok(()), false)
-	}
-
-	fn process_passthrough_requests(&mut self) -> bool {
-		while let Some(request) = self.passthrough_control.take_request() {
-			let (result, must_stop) = self.unplug_passthrough(request.function);
-			*request.result.lock() = Some(result);
-			if must_stop {
-				self.passthrough_control
-					.close(crate::kernel::arch::VirtualizationError::HostSetupFailed);
-				return true;
-			}
-		}
-		loop {
-			let mut missing_function = None;
-			self.passthrough.for_each_mut(|function, device| {
-				if missing_function.is_none() && device.is_missing() {
-					missing_function = Some(*function);
-				}
-			});
-			let Some(function) = missing_function else {
-				break;
-			};
-			let (_result, must_stop) = self.unplug_passthrough(function);
-			if must_stop {
-				self.passthrough_control
-					.close(crate::kernel::arch::VirtualizationError::HostSetupFailed);
-				return true;
-			}
-		}
-		false
+			.try_reserve(1)
+			.map_err(|_| crate::kernel::arch::VirtualizationError::ResourceExhausted)?;
+		let device = PassthroughDevice::attach(&mut context.guest, function)?;
+		context.passthrough.push(device);
+		Ok(context)
 	}
 
 	pub(super) fn kernel(&self) -> &super::kernel::Context {
@@ -282,18 +94,7 @@ impl VcpuContext {
 	/// The pointer must refer to the current running thread's stable, boxed context.
 	pub(crate) unsafe fn run(context: core::ptr::NonNull<Self>) -> ! {
 		loop {
-			let exit = unsafe {
-				let context = &mut *context.as_ptr();
-				let exit = context.restore();
-				match &exit {
-					Ok(_) if context.process_passthrough_requests() => {
-						super::ThreadManager::exit_current(core::ptr::null_mut());
-					}
-					Err(error) => context.passthrough_control.close(*error),
-					_ => {}
-				}
-				exit
-			};
+			let exit = unsafe { (&mut *context.as_ptr()).restore() };
 			match exit {
 				#[cfg(target_arch = "x86_64")]
 				Ok(exit)
@@ -324,14 +125,12 @@ impl VcpuContext {
 #[cfg(feature = "virtualization")]
 impl Drop for VcpuContext {
 	fn drop(&mut self) {
-		self.passthrough_control
-			.close(crate::kernel::arch::VirtualizationError::HostSetupFailed);
 		let mut retain_guest_memory = false;
-		self.passthrough.for_each_mut(|_, device| {
+		for device in &mut self.passthrough {
 			if !device.detach() {
 				retain_guest_memory = true;
 			}
-		});
+		}
 		if retain_guest_memory {
 			crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
 				&mut self.guest,
@@ -348,19 +147,25 @@ const VM_OWNED: u16 = 1 << 8;
 const VM_BORROWED: u16 = 1 << 9;
 
 struct UserArea {
-	//@FIXME: INDEXTYPE(page_states); direct per-page state array; Vec indexing is O(1), keep Vec.
+	range: Range<usize>,
 	page_states: Vec<AtomicU16>,
 }
 
 struct UserAreas {
-	areas: IntervalTree<UserArea>,
+	areas: Vec<UserArea>,
 }
 
 impl UserAreas {
 	const fn new() -> Self {
-		Self {
-			areas: IntervalTree::new(),
-		}
+		Self { areas: Vec::new() }
+	}
+
+	fn area_index(&self, address: usize) -> Option<usize> {
+		let index = self
+			.areas
+			.partition_point(|area| area.range.start <= address)
+			.checked_sub(1)?;
+		(self.areas[index].range.end > address).then_some(index)
 	}
 
 	fn reserve(
@@ -382,15 +187,41 @@ impl UserAreas {
 		let alignment = alignment.max(USER_VM_PAGE_SIZE);
 		let range = if let Some(address) = hint {
 			let end = address.checked_add(length)?;
+			let insertion = self
+				.areas
+				.partition_point(|area| area.range.start < address);
 			if address < bounds.start || address % alignment != 0 || end > bounds.end {
 				return None;
 			}
-			if self.areas.find_overlap(address..end).is_some() {
+			if insertion > 0 && self.areas[insertion - 1].range.end > address {
+				return None;
+			}
+			if insertion < self.areas.len() && self.areas[insertion].range.start < end {
 				return None;
 			}
 			address..end
 		} else {
-			self.areas.first_fit(bounds, length, alignment)?
+			let mut cursor = bounds.start;
+			let mut fit = None;
+			for area in &self.areas {
+				let start = align_up(cursor, alignment)?;
+				let end = start.checked_add(length)?;
+				if end <= area.range.start {
+					fit = Some(start..end);
+					break;
+				}
+				cursor = cursor.max(area.range.end);
+			}
+			if let Some(fit) = fit {
+				fit
+			} else {
+				let start = align_up(cursor, alignment)?;
+				let end = start.checked_add(length)?;
+				if end > bounds.end {
+					return None;
+				}
+				start..end
+			}
 		};
 
 		let page_count = length / USER_VM_PAGE_SIZE;
@@ -403,9 +234,17 @@ impl UserAreas {
 		let mut page_states = Vec::new();
 		page_states.try_reserve_exact(page_count).ok()?;
 		page_states.resize_with(page_count, || AtomicU16::new(state));
-		self.areas
-			.insert(range.clone(), UserArea { page_states })
-			.ok()?;
+		self.areas.try_reserve(1).ok()?;
+		let insertion = self
+			.areas
+			.partition_point(|area| area.range.start < range.start);
+		self.areas.insert(
+			insertion,
+			UserArea {
+				range: range.clone(),
+				page_states,
+			},
+		);
 		Some(range.start)
 	}
 
@@ -413,13 +252,14 @@ impl UserAreas {
 		if range.start == range.end {
 			return true;
 		}
-		let Some((area_range, area)) = self.areas.find_point(range.start) else {
+		let Some(area_index) = self.area_index(range.start) else {
 			return false;
 		};
-		if range.end > area_range.end {
+		let area = &self.areas[area_index];
+		if range.end > area.range.end {
 			return false;
 		}
-		let first_page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
+		let first_page = (range.start - area.range.start) / USER_VM_PAGE_SIZE;
 		let page_count = (range.end - range.start) / USER_VM_PAGE_SIZE;
 		(first_page..first_page + page_count).all(|page| {
 			area.page_states.get(page).is_some_and(|state| {
@@ -458,9 +298,9 @@ impl Drop for UserAddressSpaceInner {
 		}
 		{
 			let areas = self.areas.lock();
-			areas.areas.visit_all(|range, area| {
+			for area in &areas.areas {
 				for (page, state) in area.page_states.iter().enumerate() {
-					let address = range.start + page * USER_VM_PAGE_SIZE;
+					let address = area.range.start + page * USER_VM_PAGE_SIZE;
 					if let Some(physical_address) =
 						crate::kernel::arch::MemoryArchitecture::unmap_page(address)
 					{
@@ -474,7 +314,7 @@ impl Drop for UserAddressSpaceInner {
 						}
 					}
 				}
-			});
+			}
 		}
 		if !crate::kernel::arch::MemoryArchitecture::activate_address_space(previous_root)
 			|| !crate::kernel::arch::MemoryArchitecture::destroy_address_space(
@@ -522,29 +362,21 @@ impl UserAddressSpace {
 			areas
 				.try_reserve_exact(source_areas.areas.len())
 				.map_err(|_| Error::NoMem)?;
-			let mut allocation_failed = false;
-			source_areas.areas.visit_all(|range, area| {
-				if allocation_failed {
-					return;
-				}
+			for area in &source_areas.areas {
 				let mut page_states = Vec::new();
-				if page_states.try_reserve_exact(area.page_states.len()).is_err() {
-					allocation_failed = true;
-					return;
-				}
+				page_states
+					.try_reserve_exact(area.page_states.len())
+					.map_err(|_| Error::NoMem)?;
 				page_states.extend(
 					area.page_states
 						.iter()
 						.map(|state| state.load(Ordering::Acquire)),
 				);
-				areas.push((range.clone(), page_states));
-			});
-			if allocation_failed {
-				return Err(Error::NoMem);
+				areas.push((area.range.clone(), page_states));
 			}
 			areas
 		};
-		let mut child = Self::new()?;
+		let child = Self::new()?;
 		let mut page_contents = alloc::boxed::Box::new([0; USER_VM_PAGE_SIZE]);
 		for (range, page_states) in areas {
 			let length = range.end.checked_sub(range.start).ok_or(Error::Overflow)?;
@@ -694,9 +526,8 @@ impl UserAddressSpace {
 		}
 		let rounded_length = align_up(length, USER_VM_PAGE_SIZE)?;
 		let mut areas = self.inner.areas.lock();
-		let mut reserved = 0usize;
-		areas.areas.visit_all(|range, _| {
-			reserved = reserved.saturating_add(range.end - range.start);
+		let reserved = areas.areas.iter().fold(0usize, |total, area| {
+			total.saturating_add(area.range.end - area.range.start)
 		});
 		let requested = u64::try_from(rounded_length).ok()?;
 		if u64::try_from(reserved).ok()?.saturating_add(requested) > limit {
@@ -783,66 +614,40 @@ impl UserAddressSpace {
 		};
 		self.activate(|| {
 			let mut areas = self.inner.areas.lock();
-			let Some((area_range, area)) = areas.areas.find_point(range.start) else {
-				return None;
+			let Some(area_index) = areas.area_index(range.start) else {
+			return None;
 			};
-			let area_range = area_range.clone();
-			if range.end > area_range.end || (exact && range != area_range) {
-				return None;
-			}
-			let first_page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
-			let end_page = (range.end - area_range.start) / USER_VM_PAGE_SIZE;
-			if (first_page..end_page).any(|page| {
-				area.page_states[page].load(Ordering::Acquire) & (VM_RESERVED | VM_USER)
-					!= (VM_RESERVED | VM_USER)
-			}) {
-				return None;
-			}
-			let prefix_range = (first_page != 0).then(|| area_range.start..range.start);
-			let suffix_range = (end_page != area.page_states.len())
-				.then(|| range.end..area_range.end);
-			// Stage replacement keys first so allocation failure leaves the original interval intact.
-			if let Some(prefix) = &prefix_range {
-				if areas
-					.areas
-					.insert(prefix.clone(), UserArea { page_states: Vec::new() })
-					.is_err()
-				{
+			let (area_range, first_page, end_page, prefix_pages, suffix_pages) = {
+				let area = &areas.areas[area_index];
+				let area_range = area.range.clone();
+				if range.end > area_range.end || (exact && range != area_range) {
 					return None;
 				}
-			}
-			if let Some(suffix) = &suffix_range {
-				if areas
-					.areas
-					.insert(suffix.clone(), UserArea { page_states: Vec::new() })
-					.is_err()
-				{
-					if let Some(prefix) = &prefix_range {
-						let _removed = areas.areas.remove(prefix);
-					}
+				let first_page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
+				let end_page = (range.end - area_range.start) / USER_VM_PAGE_SIZE;
+				if (first_page..end_page).any(|page| {
+					area.page_states[page].load(Ordering::Acquire) & (VM_RESERVED | VM_USER)
+						!= (VM_RESERVED | VM_USER)
+				}) {
 					return None;
 				}
+				(
+					area_range,
+					first_page,
+					end_page,
+					first_page,
+					area.page_states.len() - end_page,
+				)
+			};
+			if prefix_pages != 0
+				&& suffix_pages != 0
+				&& areas.areas.try_reserve(1).is_err()
+			{
+				return None;
 			}
-			let mut area = areas
-				.areas
-				.remove(&area_range)
-				.expect("original user-area interval must remain while staging split");
+			let mut area = areas.areas.remove(area_index);
 			let suffix_states = area.page_states.split_off(end_page);
 			let released_states = area.page_states.split_off(first_page);
-			if let Some(prefix) = &prefix_range {
-				let prefix_area = areas
-					.areas
-					.get_mut(prefix)
-					.expect("staged user-area prefix must exist");
-				prefix_area.page_states = core::mem::take(&mut area.page_states);
-			}
-			if let Some(suffix) = &suffix_range {
-				let suffix_area = areas
-					.areas
-					.get_mut(suffix)
-					.expect("staged user-area suffix must exist");
-				suffix_area.page_states = suffix_states;
-			}
 			let resident_bytes = released_states
 				.iter()
 				.filter(|state| state.load(Ordering::Acquire) & VM_OWNED != 0)
@@ -865,6 +670,33 @@ impl UserAddressSpace {
 					}
 				}
 			}
+			match (prefix_pages != 0, suffix_pages != 0) {
+				(true, true) => {
+					area.range = area_range.start..range.start;
+					areas.areas.insert(area_index, area);
+					areas.areas.insert(
+						area_index + 1,
+						UserArea {
+							range: range.end..area_range.end,
+							page_states: suffix_states,
+						},
+					);
+				}
+				(true, false) => {
+					area.range = area_range.start..range.start;
+					areas.areas.insert(area_index, area);
+				}
+				(false, true) => {
+					areas.areas.insert(
+						area_index,
+						UserArea {
+							range: range.end..area_range.end,
+							page_states: suffix_states,
+						},
+					);
+				}
+				(false, false) => {}
+			}
 			Some((range.end.saturating_sub(range.start) as u64, resident_bytes, released))
 		})
 		.flatten()
@@ -878,19 +710,16 @@ impl UserAddressSpace {
 			return false;
 		};
 		self.activate(|| {
-			let mut areas = self.inner.areas.lock();
-			let Some((area_range, _)) = areas.areas.find_point(range.start) else {
+			let areas = self.inner.areas.lock();
+			let Some(area_index) = areas.area_index(range.start) else {
 				return false;
 			};
-			let area_range = area_range.clone();
-			let Some(area) = areas.areas.get_mut(&area_range) else {
-				return false;
-			};
-			if range.end > area_range.end {
+			let area = &areas.areas[area_index];
+			if range.end > area.range.end {
 				return false;
 			}
-			let first_page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
-			let end_page = (range.end - area_range.start) / USER_VM_PAGE_SIZE;
+			let first_page = (range.start - area.range.start) / USER_VM_PAGE_SIZE;
+			let end_page = (range.end - area.range.start) / USER_VM_PAGE_SIZE;
 			if (first_page..end_page).any(|page| {
 				area.page_states[page].load(Ordering::Acquire) & (VM_RESERVED | VM_USER)
 					!= (VM_RESERVED | VM_USER)
@@ -946,15 +775,12 @@ impl UserAddressSpace {
 			return false;
 		};
 		self.activate(|| {
-			let mut areas = self.inner.areas.lock();
-			let Some((area_range, _)) = areas.areas.find_point(range.start) else {
+			let areas = self.inner.areas.lock();
+			let Some(area_index) = areas.area_index(range.start) else {
 				return false;
 			};
-			let area_range = area_range.clone();
-			let Some(area) = areas.areas.get_mut(&area_range) else {
-				return false;
-			};
-			let page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
+			let area = &areas.areas[area_index];
+			let page = (range.start - area.range.start) / USER_VM_PAGE_SIZE;
 			let Some(state) = area
 				.page_states
 				.get(page)
@@ -999,15 +825,12 @@ impl UserAddressSpace {
 			return (false, false);
 		};
 		self.activate(|| {
-			let mut areas = self.inner.areas.lock();
-			let Some((area_range, _)) = areas.areas.find_point(range.start) else {
+			let areas = self.inner.areas.lock();
+			let Some(area_index) = areas.area_index(range.start) else {
 				return (false, false);
 			};
-			let area_range = area_range.clone();
-			let Some(area) = areas.areas.get_mut(&area_range) else {
-				return (false, false);
-			};
-			let page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
+			let area = &areas.areas[area_index];
+			let page = (range.start - area.range.start) / USER_VM_PAGE_SIZE;
 			let Some(state) = area
 				.page_states
 				.get(page)

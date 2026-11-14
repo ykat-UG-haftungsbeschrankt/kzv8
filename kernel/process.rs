@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::kernel::error::Error;
+pub(crate) use crate::kernel::credentials::{GroupId, UserId};
 use crate::kernel::ipc::{
     CallFuture, CallTicket, Capability, CapabilityApi as _, CapabilityRights, Endpoint,
     EndpointApi as _, MessageBody, MessageBodyApi as _, ReceivedMessage,
@@ -19,8 +20,7 @@ use crate::kernel::ipc::{
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::namespace::NamespaceSet;
 use crate::kernel::scheduler::sync::IrqSpinLock;
-use crate::kernel::lib::stack::Stack;
-use crate::kernel::vfs::{DirectoryHandle, FileHandle};
+use crate::kernel::vfs::FileHandle;
 use crate::kernel::scheduler::thread::{vm::UserAddressSpace, ThreadManager};
 use crate::kernel::signal::{
     SignalAction, SignalInfo, SignalSet, SignalState, CLD_CONTINUED, CLD_EXITED, CLD_KILLED,
@@ -33,7 +33,6 @@ const FIRST_FILE_DESCRIPTOR: u32 = 3;
 const CHILD_EVENT_CAPACITY: usize = 8;
 pub(crate) const MAX_SUPPLEMENTARY_GROUPS: usize = 64;
 static NEXT_PROCESS_ID: AtomicU32 = AtomicU32::new(1);
-//@FIXME: INDEXTYPE(PROCESS_REGISTRY); PID-sorted search is O(log n), but stale-entry sweeps and ordered updates are O(n); add a HashMap<i32, Weak<Process>> side index for expected O(1) PID lookup while retaining Vec iteration.
 static PROCESS_REGISTRY: IrqSpinLock<Vec<ProcessRegistryEntry>> = IrqSpinLock::new(Vec::new());
 
 struct ProcessRegistryEntry {
@@ -282,58 +281,35 @@ pub(crate) struct ChildExitStatus {
 struct ChildProcessRecord {
     process_id: i32,
     process_group_id: i32,
-    //@FIXME: INDEXTYPE(events); matching and ordered remove(index) are O(n); a sqrt-decomposed block sequence makes indexed removal O(sqrt n), but matching still scans O(n).
     events: Vec<ChildExitStatus>,
 }
 
 struct FilesystemContext {
-	current_directory: DirectoryHandle,
+    current_directory: Vec<u8>,
     umask: u32,
 }
 
 impl FilesystemContext {
     fn root() -> Result<Self, Error> {
+        let mut current_directory = Vec::new();
+        current_directory.try_reserve_exact(1).map_err(|_| Error::NoMem)?;
+        current_directory.push(b'/');
         Ok(Self {
-            current_directory: DirectoryHandle::root(),
+            current_directory,
             umask: 0o022,
         })
     }
 
     fn try_clone(&self) -> Result<Self, Error> {
+        let mut current_directory = Vec::new();
+        current_directory
+            .try_reserve_exact(self.current_directory.len())
+            .map_err(|_| Error::NoMem)?;
+        current_directory.extend_from_slice(&self.current_directory);
         Ok(Self {
-            current_directory: self.current_directory.clone(),
+            current_directory,
             umask: self.umask,
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct UserId(u32);
-
-impl UserId {
-    pub(crate) const ROOT: Self = Self(0);
-
-    pub(crate) const fn new(id: u32) -> Self {
-        Self(id)
-    }
-
-    pub(crate) const fn raw(self) -> u32 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct GroupId(u32);
-
-impl GroupId {
-    pub(crate) const ROOT: Self = Self(0);
-
-    pub(crate) const fn new(id: u32) -> Self {
-        Self(id)
-    }
-
-    pub(crate) const fn raw(self) -> u32 {
-        self.0
     }
 }
 
@@ -344,7 +320,6 @@ pub(crate) struct Credentials {
     real_group: GroupId,
     effective_group: GroupId,
     saved_group: GroupId,
-    //@FIXME: INDEXTYPE(supplementary_groups); sparse group IDs and slice API favor Vec; process setter caps at 64, but Credentials::new does not enforce that limit.
     supplementary_groups: Vec<GroupId>,
 }
 
@@ -419,7 +394,7 @@ impl Credentials {
     }
 
     pub(crate) const fn is_root(&self) -> bool {
-        self.effective_user.0 == 0
+        self.effective_user.raw() == 0
     }
 
     fn try_clone(&self) -> Result<Self, Error> {
@@ -658,10 +633,8 @@ impl CapabilitySlot {
 }
 
 struct CapabilityTable {
-    //@FIXME: INDEXTYPE(slots); generation-checked direct-index capability table; Vec access is O(1), keep Vec.
     slots: Vec<CapabilitySlot>,
-    //@FIXME: INDEXTYPE(free_slots); LIFO free-index stack; Stack makes the allocation order explicit.
-    free_slots: Stack<usize>,
+    free_slots: Vec<usize>,
 }
 
 impl CapabilityTable {
@@ -671,19 +644,21 @@ impl CapabilityTable {
             .try_reserve_exact(INITIAL_CAPABILITY_SLOTS)
             .map_err(|_| Error::NoMem)?;
         slots.resize_with(INITIAL_CAPABILITY_SLOTS, CapabilitySlot::empty);
-        let mut free_slots = Stack::new();
-        for index in (0..INITIAL_CAPABILITY_SLOTS).rev() {
-            free_slots.try_push(index).map_err(|_| Error::NoMem)?;
-        }
+        let mut free_slots = Vec::new();
+        free_slots
+            .try_reserve_exact(INITIAL_CAPABILITY_SLOTS)
+            .map_err(|_| Error::NoMem)?;
+        free_slots.extend((0..INITIAL_CAPABILITY_SLOTS).rev());
         Ok(Self { slots, free_slots })
     }
 
     fn insert(&mut self, capability: Capability) -> Result<CapabilityHandle, Error> {
         if self.free_slots.is_empty() {
             self.slots.try_reserve(1).map_err(|_| Error::NoMem)?;
+            self.free_slots.try_reserve(1).map_err(|_| Error::NoMem)?;
             let index = self.slots.len();
-            self.free_slots.try_push(index).map_err(|_| Error::NoMem)?;
             self.slots.push(CapabilitySlot::empty());
+            self.free_slots.push(index);
         }
         let index = self.free_slots.pop().ok_or(Error::Proto)?;
         let slot = &mut self.slots[index];
@@ -705,13 +680,13 @@ impl CapabilityTable {
 
     fn remove(&mut self, handle: CapabilityHandle) -> Result<Capability, Error> {
         let (index, generation) = handle.parts();
-        let slot = self.slots.get(index).ok_or(Error::Badf)?;
-        if slot.generation != generation || slot.capability.is_none() {
+        let slot = self.slots.get_mut(index).ok_or(Error::Badf)?;
+        if slot.generation != generation {
             return Err(Error::Badf);
         }
-        self.free_slots.try_push(index).map_err(|_| Error::NoMem)?;
-        let slot = self.slots.get_mut(index).ok_or(Error::Badf)?;
+        self.free_slots.try_reserve(1).map_err(|_| Error::NoMem)?;
         let capability = slot.capability.take().ok_or(Error::Badf)?;
+        self.free_slots.push(index);
         Ok(capability)
     }
 }
@@ -792,7 +767,6 @@ impl KernelObjectTable {
 }
 
 struct FileDescriptorTable {
-    //@FIXME: INDEXTYPE(entries); direct descriptor-indexed array; lookup/removal are O(1), add a free-index stack for O(1) hole allocation if needed.
     entries: Vec<Option<KernelObjectRef>>,
 }
 
@@ -858,7 +832,6 @@ pub(crate) struct Process {
     capabilities: IrqSpinLock<CapabilityTable>,
     kernel_objects: IrqSpinLock<KernelObjectTable>,
     file_descriptors: IrqSpinLock<FileDescriptorTable>,
-    //@FIXME: INDEXTYPE(children); PID/group scans and ordered removal are O(n); add a PID hash side index for expected O(1) targeted lookup if needed.
     children: IrqSpinLock<Vec<ChildProcessRecord>>,
     filesystem: IrqSpinLock<FilesystemContext>,
 }
@@ -1422,7 +1395,6 @@ impl Process {
         if self.active_threads.fetch_sub(1, Ordering::AcqRel) == 1
             && !self.exit_notified.swap(true, Ordering::AcqRel)
         {
-            #[cfg(not(test))]
             crate::kernel::runtime::runtime_libc::filesystem::cleanup_process_descriptors_for_process(
                 self.pid,
             );
@@ -1987,16 +1959,19 @@ impl Process {
     }
 
     pub(crate) fn current_directory(&self) -> Result<Vec<u8>, Error> {
-        let directory = self.filesystem.lock().current_directory.clone();
-        directory.path()
+        self.filesystem.lock().try_clone().map(|context| context.current_directory)
     }
 
-    pub(crate) fn set_current_directory(&self, directory: DirectoryHandle) -> Result<(), Error> {
-        let previous = {
-            let mut filesystem = self.filesystem.lock();
-            core::mem::replace(&mut filesystem.current_directory, directory)
-        };
-        drop(previous);
+    pub(crate) fn set_current_directory(&self, path: &[u8]) -> Result<(), Error> {
+        if path.first() != Some(&b'/') || path.contains(&0) {
+            return Err(Error::Inval);
+        }
+        let mut current_directory = Vec::new();
+        current_directory
+            .try_reserve_exact(path.len())
+            .map_err(|_| Error::NoMem)?;
+        current_directory.extend_from_slice(path);
+        self.filesystem.lock().current_directory = current_directory;
         Ok(())
     }
 
@@ -2340,9 +2315,7 @@ impl Process {
 
 pub(crate) struct ProcessMessage {
     opcode: u32,
-    //@FIXME: INDEXTYPE(payload); owned message byte buffer; Vec indexing is O(1) and append amortized O(1), keep Vec.
     payload: Vec<u8>,
-    //@FIXME: INDEXTYPE(capabilities); ordered indexed handle list; remove(index) is O(n). Sqrt-decomposed blocks give O(sqrt n) removal but require replacing the contiguous capabilities() slice API; swap_remove is O(1) only if reordering is acceptable.
     capabilities: Vec<CapabilityHandle>,
     reply: Option<ReplyCapability>,
 }

@@ -23,11 +23,13 @@ use crate::arch::traits::{
     TimerArchitecture as _,
 };
 use crate::kernel::event::{EventFlagsApi, EventLoopApi as _};
+use crate::kernel::block::BlockClientApi as _;
 #[cfg(feature = "virtualization")]
 use crate::arch::traits::VirtualizationArchitecture as _;
 
 pub(crate) mod arch;
 pub(crate) mod block;
+pub(crate) mod credentials;
 pub(crate) mod debug;
 pub(crate) mod driver;
 pub(crate) mod dl;
@@ -64,14 +66,14 @@ pub(crate) mod vfs;
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
     #[allow(unused_imports)]
-    pub(crate) use crate::{arch, beam, block, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, namespace, process, runtime, scheduler, script, signal, syscall, tty, vfs};
+    pub(crate) use crate::{arch, beam, block, credentials, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, namespace, process, runtime, scheduler, script, signal, syscall, tty, vfs};
     #[cfg(feature = "virtualization")]
     pub(crate) use crate::vm;
 }
 
 pub(crate) struct KernelContext<'a> {
     pub(crate) events: &'a mut event::EventLoop<16>,
-    pub(crate) block_device: Option<&'a mut block::service::BlockClient>,
+    pub(crate) block_device: Option<&'a mut block::BlockClient>,
     pub(crate) network_stack: Option<&'a mut net::stack::NetStack>,
     pub(crate) network_registration: Option<event::EventSourceToken>,
 }

@@ -7,49 +7,45 @@
 
 //@READONLY
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-mod user;
 mod group;
+mod registry;
+mod user;
 
-pub(crate) struct UserId {
-    id: usize,
+pub(crate) use group::Group;
+#[allow(unused_imports)]
+pub(crate) use registry::{user_group_registry, UserGroupRegistry};
+pub(crate) use user::User;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct UserId(u32);
+
+impl UserId {
+    pub(crate) const ROOT: Self = Self(0);
+
+    pub(crate) const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
 }
 
-pub(crate) struct IUser {
-    id: UserId,
-    username: Arc<String>,
-    password: String,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct GroupId(u32);
+
+impl GroupId {
+    pub(crate) const ROOT: Self = Self(0);
+
+    pub(crate) const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
 }
 
-type User = Arc<IUser>;
-
-pub(crate) struct UserIndex {
-    users: HashMap<usize, User>,
-    users_by_name: HashMap<Arc<String>, User>,
-}
-
-pub(crate) struct GroupId {
-    id: u32,
-}
-
-pub(crate) struct IGroup {
-    id: GroupId,
-    name: String,
-    members: HashMap<UserId, User>,
-}
-
-trait TGroup {
-    fn init() -> Option<Self>;
-    fn new() -> Option<Arc<Self>>;
-    fn id(&self) -> GroupId;
-    fn name(&self) -> &str;
-}
-
-type Group = Arc<IGroup>;
-
-pub(crate) struct GroupIndex {
-    groups: HashMap<usize, Group>,
-    groups_by_name: HashMap<Arc<String>, Group>,
-}
+#[cfg(test)]
+#[path = "../../tests/kernel/credentials.rs"]
+mod tests;

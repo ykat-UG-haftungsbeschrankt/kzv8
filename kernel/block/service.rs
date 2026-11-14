@@ -11,8 +11,6 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
-use crate::kernel::block::device::BlockDevice;
-use crate::kernel::block::request::Request;
 use crate::kernel::error::Error;
 use crate::kernel::ipc::{
     CallTicket, CallTicketApi as _, Capability, CapabilityRights, CapabilityRightsApi as _,
@@ -22,6 +20,10 @@ use crate::kernel::ipc::{
 use crate::kernel::process::{CapabilityHandle, Process};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::scheduler::thread::{ThreadManager, ThreadState};
+use super::{
+    BlockClientApi, BlockDevice, BlockDeviceApi as _, BlockServiceApi, Request,
+    RequestApi as _,
+};
 
 const BLOCK_QUEUE_CAPACITY: usize = 8;
 const BLOCK_SERVER_STACK_SIZE: usize = 32 * 1024;
@@ -34,6 +36,10 @@ const BLOCK_TIMEOUT_NS: u64 = 5_000_000_000;
 const BLOCK_WAIT_ITERATIONS: usize = 10_000_000;
 
 pub(crate) struct BlockClient {
+    state: BlockClientState,
+}
+
+struct BlockClientState {
     process: Arc<Process>,
     endpoint: CapabilityHandle,
     shared_memory: CapabilityHandle,
@@ -42,13 +48,13 @@ pub(crate) struct BlockClient {
     pending_reply: IrqSpinLock<Option<CallTicket>>,
 }
 
-impl BlockClient {
-    pub(crate) fn capacity_sectors(&self) -> u64 {
-        self.capacity_sectors
+impl BlockClientApi for BlockClient {
+    fn capacity_sectors(&self) -> u64 {
+        self.state.capacity_sectors
     }
 
-    pub(crate) fn smoke(&self) -> Result<(), Error> {
-        if self.capacity_sectors == 0 {
+    fn smoke(&self) -> Result<(), Error> {
+        if self.state.capacity_sectors == 0 {
             return Err(Error::NoDev);
         }
         let mut first = [0; 512];
@@ -61,7 +67,7 @@ impl BlockClient {
         Ok(())
     }
 
-    pub(crate) fn read(&self, sector: u64, output: &mut [u8]) -> Result<(), Error> {
+    fn read(&self, sector: u64, output: &mut [u8]) -> Result<(), Error> {
         let mut active = self.begin_request()?;
         let grant = self.shared_grant()?;
         let response = self.transact(BLOCK_READ, sector, output.len(), &mut active)?;
@@ -71,7 +77,7 @@ impl BlockClient {
         grant.read(0, output)
     }
 
-    pub(crate) fn write(&self, sector: u64, input: &[u8]) -> Result<(), Error> {
+    fn write(&self, sector: u64, input: &[u8]) -> Result<(), Error> {
         let mut active = self.begin_request()?;
         let grant = self.shared_grant()?;
         grant.write(0, input)?;
@@ -81,20 +87,22 @@ impl BlockClient {
         }
         Ok(())
     }
+}
 
+impl BlockClient {
     fn begin_request(&self) -> Result<BlockRequestGuard<'_>, Error> {
         self.reap_completed_request()?;
-        self.request_active
+        self.state.request_active
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| Error::Busy)?;
         Ok(BlockRequestGuard {
-            request_active: &self.request_active,
+            request_active: &self.state.request_active,
             release_on_drop: true,
         })
     }
 
     fn reap_completed_request(&self) -> Result<(), Error> {
-        let mut pending_reply = self.pending_reply.lock();
+        let mut pending_reply = self.state.pending_reply.lock();
         let Some(ticket) = pending_reply.as_ref() else {
             return Ok(());
         };
@@ -104,7 +112,7 @@ impl BlockClient {
                 let completed_ticket = pending_reply.take();
                 drop(pending_reply);
                 drop(completed_ticket);
-                self.request_active.store(false, Ordering::Release);
+                self.state.request_active.store(false, Ordering::Release);
                 Ok(())
             }
         }
@@ -115,7 +123,7 @@ impl BlockClient {
         ticket: CallTicket,
         active: &mut BlockRequestGuard<'_>,
     ) {
-        let mut pending_reply = self.pending_reply.lock();
+        let mut pending_reply = self.state.pending_reply.lock();
         if pending_reply.is_some() {
             crate::kernel::arch::CpuArchitecture::halt();
         }
@@ -124,7 +132,7 @@ impl BlockClient {
     }
 
     fn shared_grant(&self) -> Result<crate::kernel::ipc::SharedMemoryGrant, Error> {
-        match self.process.capability(self.shared_memory)? {
+        match self.state.process.capability(self.state.shared_memory)? {
             Capability::SharedMemory(grant) => Ok(grant),
             Capability::Endpoint(_) => Err(Error::Badf),
         }
@@ -142,7 +150,7 @@ impl BlockClient {
             || length % 512 != 0
             || sector
                 .checked_add((length / 512) as u64)
-                .is_none_or(|end| end > self.capacity_sectors)
+                .is_none_or(|end| end > self.state.capacity_sectors)
         {
             return Err(Error::Inval);
         }
@@ -158,9 +166,10 @@ impl BlockClient {
             BLOCK_WRITE => CapabilityRights::READ.union(CapabilityRights::TRANSFER),
             _ => return Err(Error::Inval),
         };
-        self.process
-            .attach_capability(&mut body, self.shared_memory, rights)?;
-        let ticket = self.process.call_now(self.endpoint, body)?;
+        self.state
+            .process
+            .attach_capability(&mut body, self.state.shared_memory, rights)?;
+        let ticket = self.state.process.call_now(self.state.endpoint, body)?;
         let started = block_time_ns();
         for _ in 0..BLOCK_WAIT_ITERATIONS {
             if let Some(response) = ticket.try_reply()? {
@@ -206,8 +215,8 @@ struct BlockWorker {
 
 pub(crate) struct BlockService;
 
-impl BlockService {
-    pub(crate) fn start(device: BlockDevice) -> Option<BlockClient> {
+impl BlockServiceApi for BlockService {
+    fn start(device: BlockDevice) -> Option<BlockClient> {
         let process = ThreadManager::current_process().ok()?;
         let server_process = Process::new().ok()?;
         let (sender, receiver) = Endpoint::channel(BLOCK_QUEUE_CAPACITY).ok()?;
@@ -252,16 +261,18 @@ impl BlockService {
             return None;
         }
         Some(BlockClient {
-            process,
-            endpoint: client_endpoint,
-            shared_memory: shared_memory_handle,
-            capacity_sectors,
-            request_active: AtomicBool::new(false),
-            pending_reply: IrqSpinLock::new(None),
+            state: BlockClientState {
+                process,
+                endpoint: client_endpoint,
+                shared_memory: shared_memory_handle,
+                capacity_sectors,
+                request_active: AtomicBool::new(false),
+                pending_reply: IrqSpinLock::new(None),
+            },
         })
     }
 
-    pub(crate) fn ready_marker(client: &Option<BlockClient>) -> &'static str {
+    fn ready_marker(client: &Option<BlockClient>) -> &'static str {
         if client.is_some() {
             "kz: block IPC service ready\n"
         } else {

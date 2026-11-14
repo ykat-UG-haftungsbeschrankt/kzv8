@@ -7,67 +7,87 @@
 
 //@READONLY
 
-pub(crate) impl IUser {
-    pub(crate) fn new() -> Option<Arc<Self>> {
-        Some(Arc::new(Self {
-            id: UserId {
-                id: 0,
-            },
-            username: Arc::new(String::new()),
-            password: String::new(),
-        }))
+use alloc::string::String;
+
+use crate::kernel::error::Error;
+use crate::kernel::lib::hashmap::HashMap;
+
+use super::registry::copy_name;
+use super::UserId;
+
+pub(crate) struct User {
+    id: UserId,
+    username: String,
+}
+
+impl User {
+    pub(super) fn new(id: UserId, username: String) -> Self {
+        Self { id, username }
     }
-    pub(crate) fn id(&self) -> UserId {
+
+    pub(crate) const fn id(&self) -> UserId {
         self.id
     }
-    pub(crate) fn username(&self) -> Arc<String> {
-        self.username.clone()
+
+    pub(crate) fn username(&self) -> &str {
+        &self.username
     }
 }
 
-pub(crate) impl UserIndex {
-    pub(crate) fn new() -> Option<Self> {
-        Some(Self {
+pub(super) struct UserIndex {
+    users: HashMap<u32, User>,
+    users_by_name: HashMap<String, u32>,
+}
+
+impl UserIndex {
+    pub(super) const fn new() -> Self {
+        Self {
             users: HashMap::new(),
             users_by_name: HashMap::new(),
-        })
-    }
-    pub(crate) fn add(&mut self, user: User) -> bool {
-        let id_exists = self.users.contains_key(user.id.id);
-        let name_exists = self.users_by_name.contains_key(&user.username);
-        if id_exists || name_exists {
-            return false;
-        }
-        self.users.insert(user.id.id, user);
-        let user_ref = self.users.get(user.id.id).unwrap().clone();
-        self.users_by_name.insert(user_ref.username.clone(), user_ref);
-        true
-    }
-    pub(crate) fn get(&self, id: UserId) -> Option<&User> {
-        self.users.get(id.id)
-    }
-    pub(crate) fn contains_id(&self, id: UserId) -> bool {
-        self.users.contains_key(id.id)
-    }
-    pub(crate) fn contains(&self, user: User) -> bool {
-        self.users.contains_key(user.id.id)
-    }
-    pub(crate) fn remove(&mut self, id: UserId) {
-        if let Some(user) = self.users.remove(id.id) {
-            self.users_by_name.remove(&user.username);
         }
     }
-    pub(crate) fn count(&self) -> usize {
+
+    pub(super) fn insert(&mut self, user: User) -> Result<(), Error> {
+        let id = user.id().raw();
+        if self.users.contains_key(&id) || self.users_by_name.contains_key(user.username()) {
+            return Err(Error::Exist);
+        }
+        let username = copy_name(user.username())?;
+        match self.users.insert(id, user) {
+            Ok(core::option::Option::None) => {}
+            Ok(core::option::Option::Some(_)) => return Err(Error::Exist),
+            Err(_) => return Err(Error::NoMem),
+        }
+        match self.users_by_name.insert(username, id) {
+            Ok(core::option::Option::None) => Ok(()),
+            Ok(core::option::Option::Some(_)) => {
+                self.users.remove(&id);
+                Err(Error::Exist)
+            }
+            Err(_) => {
+                self.users.remove(&id);
+                Err(Error::NoMem)
+            }
+        }
+    }
+
+    pub(super) fn get(&self, id: UserId) -> Option<&User> {
+        self.users.get(&id.raw())
+    }
+
+    pub(super) fn get_by_name(&self, username: &str) -> Option<&User> {
+        self.users_by_name
+            .get(username)
+            .and_then(|id| self.users.get(id))
+    }
+
+    pub(super) fn remove(&mut self, id: UserId) -> Option<User> {
+        let user = self.users.remove(&id.raw())?;
+        self.users_by_name.remove(user.username());
+        Some(user)
+    }
+
+    pub(super) fn len(&self) -> usize {
         self.users.len()
-    }
-    pub(crate) fn is_empty(&self) -> bool {
-        self.users.is_empty()
-    }
-    pub(crate) fn clear(&mut self) {
-        self.users.clear();
-        self.users_by_name.clear();
-    }
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &User> {
-        self.users.values()
     }
 }

@@ -17,7 +17,8 @@ use crate::kernel::arch::traits::CpuArchitecture as _;
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::immutable_byte_buffer::ImmutableByteBuffer;
-use crate::kernel::process::{Credentials, GroupId, UserId};
+use crate::kernel::credentials::{GroupId, UserId};
+use crate::kernel::process::Credentials;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::scheduler::thread::{ThreadManager, ThreadState};
 
@@ -604,10 +605,10 @@ impl VfsApi for Vfs {
     }
 }
 
-pub(crate) fn mount_virtio_devices(virtio_fs_root: Option<Node>) -> usize {
-    let (root, device_count) = super::plugin::build_virtio_tree(virtio_fs_root);
+pub(crate) fn mount_virtio_devices(virtio_fs_root: Option<Node>) -> Result<usize, Error> {
+    let (root, device_count) = super::plugin::build_virtio_tree(virtio_fs_root)?;
     *MOUNTED_VFS.lock() = Some(Vfs::new(root));
-    device_count
+    Ok(device_count)
 }
 
 pub(crate) fn mounted() -> Option<Vfs> {

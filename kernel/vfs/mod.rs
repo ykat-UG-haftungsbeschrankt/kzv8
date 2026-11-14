@@ -14,7 +14,8 @@ use core::future::Future;
 use core::pin::Pin;
 
 use crate::kernel::error::Error;
-use crate::kernel::process::{Credentials, GroupId, UserId};
+use crate::kernel::credentials::{GroupId, UserId};
+use crate::kernel::process::Credentials;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 pub(crate) mod plugin;

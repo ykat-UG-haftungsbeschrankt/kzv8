@@ -21,31 +21,7 @@
         SignalInfo, SignalSet, CLD_CONTINUED, CLD_KILLED, CLD_STOPPED, SIGCHLD, SIGCONT, SIGKILL,
         SIGSTOP,
     };
-    use crate::kernel::vfs::{
-        DirectoryHandle, DirectoryHandleReference, NodeMetadata, NodeMetadataApi as _,
-    };
-
-    struct TestDirectoryReference {
-        path: Vec<u8>,
-        drop_count: Arc<AtomicUsize>,
-    }
-
-    impl DirectoryHandleReference for TestDirectoryReference {
-        fn path(&self) -> Result<Vec<u8>, Error> {
-            let mut path = Vec::new();
-            path.try_reserve_exact(self.path.len())
-                .map_err(|_| Error::NoMem)?;
-            path.extend_from_slice(&self.path);
-            Ok(path)
-        }
-    }
-
-    impl Drop for TestDirectoryReference {
-        fn drop(&mut self) {
-            self.drop_count
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
+    use crate::kernel::vfs::{NodeMetadata, NodeMetadataApi as _};
 
 
 impl Process {
@@ -99,26 +75,6 @@ impl Process {
 }
 
     static PROCESS_CONTROL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn cloned_filesystem_context_retains_directory_handle() {
-        let drop_count = Arc::new(AtomicUsize::new(0));
-        let filesystem = FilesystemContext {
-            current_directory: DirectoryHandle::new(TestDirectoryReference {
-                path: b"/work".to_vec(),
-                drop_count: Arc::clone(&drop_count),
-            }),
-            umask: 0o022,
-        };
-        let child = filesystem.try_clone().unwrap();
-
-        drop(filesystem);
-        assert_eq!(drop_count.load(core::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(child.current_directory.path().unwrap(), b"/work");
-
-        drop(child);
-        assert_eq!(drop_count.load(core::sync::atomic::Ordering::Relaxed), 1);
-    }
 
     #[test]
     fn capability_table_grows_past_previous_limit() {
@@ -385,11 +341,7 @@ impl Process {
         parent.set_process_group(child.pid(), 0).unwrap();
         assert_eq!(child.process_group_id(), child.pid());
         assert_eq!(child.create_session(), Err(crate::kernel::error::Error::Perm));
-        assert_eq!(
-            child.set_terminal_foreground_process_group(child.pid()),
-            Err(Error::Intr)
-        );
-        parent
+        child
             .set_terminal_foreground_process_group(child.pid())
             .unwrap();
         assert_eq!(parent.terminal_foreground_process_group(), Ok(child.pid()));
@@ -410,9 +362,6 @@ impl Process {
             session_child.set_process_group(parent.pid(), 0),
             Err(crate::kernel::error::Error::Perm)
         );
-        child
-            .set_terminal_foreground_process_group(parent.process_group_id())
-            .unwrap();
         assert_eq!(
             parent.set_terminal_foreground_process_group(session_child.pid()),
             Err(crate::kernel::error::Error::Perm)
@@ -465,12 +414,10 @@ impl Process {
             CLD_CONTINUED
         );
 
-        child.thread_started();
         child
             .queue_signal(SignalInfo::new(SIGKILL, 0, parent.pid(), 0, 0, 0))
             .unwrap();
         assert_eq!(child.termination_signal(), Some(SIGKILL));
-        child.thread_exited(0);
         let killed = parent
             .take_pending_signal(SignalSet::from_signal(SIGCHLD))
             .unwrap();

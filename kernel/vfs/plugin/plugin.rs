@@ -13,6 +13,8 @@ use alloc::vec::Vec;
 
 use crate::kernel::driver::virtio::transport::{self, VirtioDeviceInfo, VirtioTransport};
 use crate::kernel::error::Error;
+use crate::kernel::lib::hashmap::HashMap;
+use crate::kernel::scheduler::sync::IrqSpinLock;
 
 use super::tun;
 use super::super::{
@@ -20,32 +22,38 @@ use super::super::{
 };
 
 struct Directory {
-    //@FIXME: INDEXTYPE(entries); insertion-ordered directory list; lookup scans O(n), add a hash side index for expected O(1) lookup if directories grow.
-    entries: Vec<DirectoryEntry>,
+    //@FIXME: INDEXTYPE(entries); hash-indexed child names provide expected O(1) lookup.
+    entries: IrqSpinLock<HashMap<String, Node, 8>>,
 }
 
 impl DirectoryPlugin for Directory {
     fn lookup<'a>(&'a self, name: &'a str) -> VfsFuture<'a, VfsResult<Node>> {
-        Box::pin(async move {
-            self.entries
-                .iter()
-                .find(|entry| entry.name.as_str() == name)
-                .map(|entry| entry.node.clone())
-                .ok_or(Error::NoEnt)
-        })
+        let result = self.entries.lock().get(name).cloned().ok_or(Error::NoEnt);
+        Box::pin(async move { result })
     }
 
     fn read_dir(&self) -> VfsFuture<'_, VfsResult<Vec<DirectoryEntry>>> {
-        Box::pin(async move {
-            Ok(self
-                .entries
-                .iter()
-                .map(|entry| DirectoryEntry {
-                    name: entry.name.clone(),
-                    node: entry.node.clone(),
-                })
-                .collect())
-        })
+        let result = (|| {
+            let mut entries = Vec::new();
+            let directory = self.entries.lock();
+            entries
+                .try_reserve_exact(directory.len())
+                .map_err(|_| Error::NoMem)?;
+            directory.try_for_each(|name, node| {
+                let mut name_copy = String::new();
+                name_copy
+                    .try_reserve_exact(name.len())
+                    .map_err(|_| Error::NoMem)?;
+                name_copy.push_str(name);
+                entries.push(DirectoryEntry {
+                    name: name_copy,
+                    node: node.clone(),
+                });
+                Ok::<(), Error>(())
+            })?;
+            Ok(entries)
+        })();
+        Box::pin(async move { result })
     }
 }
 
@@ -85,11 +93,21 @@ impl FilePlugin for DeviceMetadataFile {
     }
 }
 
-fn directory(entries: Vec<DirectoryEntry>) -> Node {
-    Node::directory(Directory { entries })
+fn directory(entries: Vec<DirectoryEntry>) -> Result<Node, Error> {
+    let mut directory = HashMap::new();
+    for entry in entries {
+        match directory.insert(entry.name, entry.node) {
+            Ok(None) => {}
+            Ok(Some(_previous)) => return Err(Error::Exist),
+            Err((_name, _node)) => return Err(Error::NoMem),
+        }
+    }
+    Ok(Node::directory(Directory {
+        entries: IrqSpinLock::new(directory),
+    }))
 }
 
-fn named_directory(entries: Vec<(&'static str, Node)>) -> Node {
+fn named_directory(entries: Vec<(&'static str, Node)>) -> Result<Node, Error> {
     directory(
         entries
             .into_iter()
@@ -101,7 +119,7 @@ fn named_directory(entries: Vec<(&'static str, Node)>) -> Node {
     )
 }
 
-pub(crate) fn build_virtio_tree(virtio_fs_root: Option<Node>) -> (Node, usize) {
+pub(crate) fn build_virtio_tree(virtio_fs_root: Option<Node>) -> Result<(Node, usize), Error> {
     let mut block_devices = Vec::new();
     let mut network_devices = Vec::new();
     let mut console_devices = Vec::new();
@@ -131,14 +149,18 @@ pub(crate) fn build_virtio_tree(virtio_fs_root: Option<Node>) -> (Node, usize) {
         node: Node::file(tun::TunDevicePlugin),
     });
     let devices = named_directory(vec![
-        ("console", directory(console_devices)),
-        ("net", directory(network_devices)),
-        ("block", directory(block_devices)),
-        ("fs", directory(file_system_devices)),
-    ]);
+        ("console", directory(console_devices)?),
+        ("net", directory(network_devices)?),
+        ("block", directory(block_devices)?),
+        ("fs", directory(file_system_devices)?),
+    ])?;
     let mut root_entries = vec![("dev", devices)];
     if let Some(filesystem) = virtio_fs_root {
         root_entries.push(("fs", filesystem));
     }
-    (named_directory(root_entries), device_count)
+    Ok((named_directory(root_entries)?, device_count))
 }
+
+#[cfg(test)]
+#[path = "../../../tests/kernel/vfs/plugin/plugin.rs"]
+mod tests;

@@ -12,9 +12,6 @@ use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::signal::{SIGINT, SIGQUIT, SIGTSTP};
 
-mod pty;
-pub(crate) use pty::Pty;
-
 const CONTROL_CHARACTER_COUNT: usize = 32;
 const COOKED_INPUT_CAPACITY: usize = 16 * 1024;
 const CANONICAL_LINE_CAPACITY: usize = 4096;

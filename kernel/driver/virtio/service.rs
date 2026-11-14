@@ -5,8 +5,9 @@
  * free of charge, without warranty of any kind.
  */
 
-use crate::kernel::block::device::BlockDevice;
-use crate::kernel::block::service::{BlockClient, BlockService};
+use crate::kernel::block::{
+    BlockClient, BlockDevice, BlockDeviceApi as _, BlockService, BlockServiceApi as _,
+};
 use crate::kernel::net::stack::NetStack;
 
 pub(crate) struct KernelVirtioServices {

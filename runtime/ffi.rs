@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::kernel::arch::traits::{CpuArchitecture as _, TimerArchitecture as _};
 use crate::kernel::block::service::BlockClient;
+use crate::kernel::block::BlockClientApi as _;
 use crate::kernel::error::Error;
 use crate::kernel::event::{
     Completion, Event, EventFlags, EventFlagsApi, EventLoop, EventLoopApi as _, EventSourceId,

@@ -6,7 +6,6 @@
  */
 
 use alloc::vec::Vec;
-use crate::kernel::lib::sorted_vector::SortedVector;
 
 use super::{
     AddressSpace, Error, FileSource, LoadedObject, ObjectKind, Permissions, PermissionsApi,
@@ -341,9 +340,7 @@ struct ScopedDependency<'a> {
 }
 
 pub(super) struct SymbolScopeState<'a> {
-    //@FIXME: INDEXTYPE(symbols); SortedVector preserves name/strength/order sorting with O(log n) lower-bound lookup.
-    symbols: SortedVector<ScopedSymbol<'a>>,
-    //@FIXME: INDEXTYPE(dependencies); ordered first-match lookup scans O(n); add a hash side index for expected O(1) lookup if dependency counts grow.
+    symbols: Vec<ScopedSymbol<'a>>,
     dependencies: Vec<ScopedDependency<'a>>,
 }
 
@@ -400,7 +397,7 @@ impl<'a> SymbolScope<'a> {
                 order += 1;
             });
         }
-        let symbols = SortedVector::from_vec_by(symbols, |left, right| {
+        symbols.sort_unstable_by(|left, right| {
             left.name
                 .cmp(right.name)
                 .then(left.weak.cmp(&right.weak))
