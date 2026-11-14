@@ -5,6 +5,7 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -15,7 +16,7 @@ use crate::kernel::scheduler::thread::vm::UserAddressSpace;
 
 mod ipc;
 
-use ipc::{EndpointCore, Message, ReplySlot, SharedMemoryCore};
+use ipc::{EndpointCore, Message, ReplySlot, SendWaiter, SharedMemoryCore};
 
 pub(crate) use ipc::{process_capability_smoke, shared_mapping_smoke, smoke};
 
@@ -103,7 +104,7 @@ pub(crate) trait EndpointApi: Sized {
 pub(crate) struct SendFuture {
     endpoint: Endpoint,
     message: Option<Message>,
-    waiter: Option<core::task::Waker>,
+    waiter: Option<Box<SendWaiter>>,
 }
 
 pub(crate) struct ReceiveFuture {

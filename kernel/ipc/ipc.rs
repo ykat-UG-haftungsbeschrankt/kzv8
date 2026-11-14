@@ -5,14 +5,17 @@
  * free of charge, without warranty of any kind.
  */
 
+use alloc::alloc::alloc;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::task::Wake;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::future::Future;
 use core::ops::Range;
 use core::pin::Pin;
+use core::ptr::NonNull;
 use core::task::{Context, Poll, Waker};
 
 use super::{
@@ -178,11 +181,141 @@ impl ReceivedMessageApi for ReceivedMessage {
 
 struct EndpointState {
 	queue: VecDeque<Message>,
-	//@FIXME: INDEXTYPE(send_waiters); deduplicated waiter list scans and retain removal are O(n); keep Vec unless waiter handles enable O(1) unlink.
-	send_waiters: Vec<Waker>,
+	send_ready: SendWaiterList,
+	send_waiting: SendWaiterList,
 	//@FIXME: INDEXTYPE(receive_waiters); deduplicated waiter list scans and retain removal are O(n); keep Vec unless waiter handles enable O(1) unlink.
 	receive_waiters: Vec<Waker>,
 	closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendWaiterQueue {
+	Ready,
+	Waiting,
+}
+
+pub(super) struct SendWaiter {
+	waker: Option<Waker>,
+	previous: Option<NonNull<SendWaiter>>,
+	next: Option<NonNull<SendWaiter>>,
+	queue: Option<SendWaiterQueue>,
+}
+
+// SAFETY: waiter links point to stable Box allocations owned by SendFuture, and all link and
+// Waker access is serialized by the associated EndpointCore state lock.
+unsafe impl Send for SendWaiter {}
+
+struct SendWaiterList {
+	kind: SendWaiterQueue,
+	head: Option<NonNull<SendWaiter>>,
+	tail: Option<NonNull<SendWaiter>>,
+}
+
+// SAFETY: links are only dereferenced while the owning EndpointState lock is held.
+unsafe impl Send for SendWaiterList {}
+
+impl SendWaiterList {
+	const fn new(kind: SendWaiterQueue) -> Self {
+		Self {
+			kind,
+			head: None,
+			tail: None,
+		}
+	}
+
+	fn push_back(&mut self, mut waiter: NonNull<SendWaiter>) {
+		// SAFETY: callers hold the EndpointState lock and the waiter remains owned by its future.
+		unsafe {
+			let waiter_ref = waiter.as_mut();
+			debug_assert!(waiter_ref.queue.is_none());
+			debug_assert!(waiter_ref.previous.is_none() && waiter_ref.next.is_none());
+			waiter_ref.queue = Some(self.kind);
+			waiter_ref.previous = self.tail;
+			if let Some(mut tail) = self.tail {
+				tail.as_mut().next = Some(waiter);
+			} else {
+				self.head = Some(waiter);
+			}
+			self.tail = Some(waiter);
+		}
+	}
+
+	fn pop_front(&mut self) -> Option<NonNull<SendWaiter>> {
+		let waiter = self.head?;
+		let removed = self.remove(waiter);
+		debug_assert!(removed);
+		Some(waiter)
+	}
+
+	fn remove(&mut self, mut waiter: NonNull<SendWaiter>) -> bool {
+		// SAFETY: callers hold the EndpointState lock and the waiter remains owned by its future.
+		unsafe {
+			let waiter_ref = waiter.as_ref();
+			if waiter_ref.queue != Some(self.kind) {
+				return false;
+			}
+			let previous = waiter_ref.previous;
+			let next = waiter_ref.next;
+			if let Some(mut previous) = previous {
+				previous.as_mut().next = next;
+			} else {
+				self.head = next;
+			}
+			if let Some(mut next) = next {
+				next.as_mut().previous = previous;
+			} else {
+				self.tail = previous;
+			}
+			let waiter_ref = waiter.as_mut();
+			waiter_ref.previous = None;
+			waiter_ref.next = None;
+			waiter_ref.queue = None;
+		}
+		true
+	}
+}
+
+struct SendWaiterRegistration<'a> {
+	waiter: &'a mut Option<Box<SendWaiter>>,
+	waker: &'a Waker,
+}
+
+fn try_box_send_waiter(waker: &Waker) -> Result<Box<SendWaiter>, Error> {
+	let stored_waker = waker.clone();
+	let layout = Layout::new::<SendWaiter>();
+	// SAFETY: SendWaiter has a nonzero, valid layout.
+	let allocation = unsafe { alloc(layout) }.cast::<SendWaiter>();
+	let Some(allocation) = NonNull::new(allocation) else {
+		return Err(Error::NoMem);
+	};
+	// SAFETY: allocation is aligned storage for one SendWaiter and is initialized once here.
+	unsafe {
+		allocation.as_ptr().write(SendWaiter {
+			waker: Some(stored_waker),
+			previous: None,
+			next: None,
+			queue: None,
+		});
+		Ok(Box::from_raw(allocation.as_ptr()))
+	}
+}
+
+fn unlink_send_waiter(
+	state: &mut EndpointState,
+	waiter: &mut Option<Box<SendWaiter>>,
+) -> Option<Waker> {
+	let waiter = waiter.as_mut()?;
+	let mut pointer = NonNull::from(waiter.as_mut());
+	// SAFETY: the future owns this Box and the EndpointState lock is held by the caller.
+	let queue = unsafe { pointer.as_ref().queue };
+	let removed = match queue {
+		Some(SendWaiterQueue::Ready) => state.send_ready.remove(pointer),
+		Some(SendWaiterQueue::Waiting) => state.send_waiting.remove(pointer),
+		None => false,
+	};
+	debug_assert!(queue.is_none() || removed);
+	// SAFETY: the pointer still refers to the future-owned waiter while the state lock is held.
+	unsafe { pointer.as_mut().waker.take() }
 }
 
 pub(super) struct EndpointCore {
@@ -202,7 +335,8 @@ impl EndpointCore {
 			capacity,
 			state: IrqSpinLock::new(EndpointState {
 				queue,
-				send_waiters: Vec::new(),
+				send_ready: SendWaiterList::new(SendWaiterQueue::Ready),
+				send_waiting: SendWaiterList::new(SendWaiterQueue::Waiting),
 				receive_waiters: Vec::new(),
 				closed: false,
 			}),
@@ -228,7 +362,16 @@ impl EndpointCore {
 		self.receive_signal.set_readiness(receive_readiness);
 	}
 
-	fn enqueue(&self, message: Message, waiter: Option<&Waker>) -> Result<(), (Error, Message)> {
+	fn enqueue(
+		&self,
+		message: Message,
+		mut waiter: Option<SendWaiterRegistration<'_>>,
+	) -> Result<(), (Error, Message)> {
+		let mut retired_waker = None;
+		let mut state = self.state.lock();
+		if let Some(registration) = waiter.as_mut() {
+			retired_waker = unlink_send_waiter(&mut *state, registration.waiter);
+		}
 		if !message
 			.body
 			.capabilities
@@ -237,16 +380,22 @@ impl EndpointCore {
 		{
 			return Err((Error::Acces, message));
 		}
-
-		let mut state = self.state.lock();
 		if state.closed {
 			return Err((Error::ConnReset, message));
 		}
 		if state.queue.len() == self.capacity {
-			if let Some(waiter) = waiter {
-				if let Err(error) = register_waker(&mut state.send_waiters, waiter) {
-					return Err((error, message));
+			if let Some(registration) = waiter {
+				if registration.waiter.is_none() {
+					let waiter_node = match try_box_send_waiter(registration.waker) {
+						Ok(waiter) => waiter,
+						Err(error) => return Err((error, message)),
+					};
+					*registration.waiter = Some(waiter_node);
+				} else if let Some(waiter) = registration.waiter.as_deref_mut() {
+					waiter.waker = Some(registration.waker.clone());
 				}
+				let waiter = registration.waiter.as_deref_mut().expect("waiter inserted");
+				state.send_waiting.push_back(NonNull::from(waiter));
 			}
 			return Err((Error::Again, message));
 		}
@@ -254,13 +403,11 @@ impl EndpointCore {
 			return Err((Error::NoMem, message));
 		}
 		state.queue.push_back(message);
-		if let Some(waiter) = waiter {
-			remove_waker(&mut state.send_waiters, waiter);
-		}
-		let waiters = core::mem::take(&mut state.receive_waiters);
-		self.update_signal(&state);
+		let receive_waiters = core::mem::take(&mut state.receive_waiters);
+		self.update_signal(&*state);
 		drop(state);
-		wake_all(waiters);
+		drop(retired_waker);
+		wake_all(receive_waiters);
 		Ok(())
 	}
 
@@ -270,10 +417,11 @@ impl EndpointCore {
 			if let Some(waiter) = waiter {
 				remove_waker(&mut state.receive_waiters, waiter);
 			}
-			let waiters = core::mem::take(&mut state.send_waiters);
-			self.update_signal(&state);
+			let receive_waiters = core::mem::take(&mut state.receive_waiters);
+			self.update_signal(&*state);
 			drop(state);
-			wake_all(waiters);
+			wake_all(receive_waiters);
+			self.wake_waiting_senders();
 			return Ok(message);
 		}
 		if state.closed {
@@ -286,18 +434,40 @@ impl EndpointCore {
 	}
 
 	fn close(&self) {
-		let mut state = self.state.lock();
-		state.closed = true;
-		let send_waiters = core::mem::take(&mut state.send_waiters);
-		let receive_waiters = core::mem::take(&mut state.receive_waiters);
-		self.update_signal(&state);
-		drop(state);
-		wake_all(send_waiters);
+		let receive_waiters = {
+			let mut state = self.state.lock();
+			state.closed = true;
+			let receive_waiters = core::mem::take(&mut state.receive_waiters);
+			self.update_signal(&*state);
+			receive_waiters
+		};
 		wake_all(receive_waiters);
+		self.wake_waiting_senders();
 	}
 
-	fn remove_send_waiter(&self, waiter: &Waker) {
-		remove_waker(&mut self.state.lock().send_waiters, waiter);
+	fn remove_send_waiter(&self, waiter: &mut Option<Box<SendWaiter>>) {
+		let retired_waker = {
+			let mut state = self.state.lock();
+			unlink_send_waiter(&mut *state, waiter)
+		};
+		drop(retired_waker);
+	}
+
+	fn wake_waiting_senders(&self) {
+		loop {
+			let waiter = {
+				let mut state = self.state.lock();
+				let Some(mut waiter) = state.send_waiting.pop_front() else {
+					return;
+				};
+				state.send_ready.push_back(waiter);
+				// SAFETY: the future owns the stable waiter Box, and the endpoint lock is held.
+				unsafe { waiter.as_mut().waker.take() }
+			};
+			if let Some(waiter) = waiter {
+				waiter.wake();
+			}
+		}
 	}
 
 	fn remove_receive_waiter(&self, waiter: &Waker) {
@@ -459,32 +629,34 @@ impl Future for SendFuture {
 		if !this.endpoint.rights.contains(CapabilityRights::SEND) {
 			return Poll::Ready(Err(Error::Acces));
 		}
-		if let Some(waiter) = this.waiter.take() {
-			this.endpoint.core.remove_send_waiter(&waiter);
-		}
 		let Some(message) = this.message.take() else {
 			return Poll::Ready(Err(Error::Inval));
 		};
-		match this.endpoint.core.enqueue(message, Some(context.waker())) {
+		let registration = SendWaiterRegistration {
+			waiter: &mut this.waiter,
+			waker: context.waker(),
+		};
+		match this.endpoint.core.enqueue(message, Some(registration)) {
 			Ok(()) => {
+				this.waiter = None;
 				record_message_sent();
 				Poll::Ready(Ok(()))
 			}
 			Err((Error::Again, message)) => {
 				this.message = Some(message);
-				this.waiter = Some(context.waker().clone());
 				Poll::Pending
 			}
-			Err((error, _message)) => Poll::Ready(Err(error)),
+			Err((error, _message)) => {
+				this.waiter = None;
+				Poll::Ready(Err(error))
+			}
 		}
 	}
 }
 
 impl Drop for SendFuture {
 	fn drop(&mut self) {
-		if let Some(waiter) = self.waiter.take() {
-			self.endpoint.core.remove_send_waiter(&waiter);
-		}
+		self.endpoint.core.remove_send_waiter(&mut self.waiter);
 	}
 }
 
