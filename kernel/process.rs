@@ -19,7 +19,8 @@ use crate::kernel::ipc::{
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::namespace::NamespaceSet;
 use crate::kernel::scheduler::sync::IrqSpinLock;
-use crate::kernel::vfs::FileHandle;
+use crate::kernel::lib::stack::Stack;
+use crate::kernel::vfs::{DirectoryHandle, FileHandle};
 use crate::kernel::scheduler::thread::{vm::UserAddressSpace, ThreadManager};
 use crate::kernel::signal::{
     SignalAction, SignalInfo, SignalSet, SignalState, CLD_CONTINUED, CLD_EXITED, CLD_KILLED,
@@ -286,30 +287,21 @@ struct ChildProcessRecord {
 }
 
 struct FilesystemContext {
-    //@FIXME: INDEXTYPE(current_directory); owned path-byte buffer; Vec provides O(1) indexing and amortized O(1) append, keep Vec.
-    current_directory: Vec<u8>,
+	current_directory: DirectoryHandle,
     umask: u32,
 }
 
 impl FilesystemContext {
     fn root() -> Result<Self, Error> {
-        let mut current_directory = Vec::new();
-        current_directory.try_reserve_exact(1).map_err(|_| Error::NoMem)?;
-        current_directory.push(b'/');
         Ok(Self {
-            current_directory,
+            current_directory: DirectoryHandle::root(),
             umask: 0o022,
         })
     }
 
     fn try_clone(&self) -> Result<Self, Error> {
-        let mut current_directory = Vec::new();
-        current_directory
-            .try_reserve_exact(self.current_directory.len())
-            .map_err(|_| Error::NoMem)?;
-        current_directory.extend_from_slice(&self.current_directory);
         Ok(Self {
-            current_directory,
+            current_directory: self.current_directory.clone(),
             umask: self.umask,
         })
     }
@@ -668,8 +660,8 @@ impl CapabilitySlot {
 struct CapabilityTable {
     //@FIXME: INDEXTYPE(slots); generation-checked direct-index capability table; Vec access is O(1), keep Vec.
     slots: Vec<CapabilitySlot>,
-    //@FIXME: INDEXTYPE(free_slots); LIFO free-index stack; Vec push/pop are amortized O(1), keep Vec.
-    free_slots: Vec<usize>,
+    //@FIXME: INDEXTYPE(free_slots); LIFO free-index stack; Stack makes the allocation order explicit.
+    free_slots: Stack<usize>,
 }
 
 impl CapabilityTable {
@@ -679,21 +671,19 @@ impl CapabilityTable {
             .try_reserve_exact(INITIAL_CAPABILITY_SLOTS)
             .map_err(|_| Error::NoMem)?;
         slots.resize_with(INITIAL_CAPABILITY_SLOTS, CapabilitySlot::empty);
-        let mut free_slots = Vec::new();
-        free_slots
-            .try_reserve_exact(INITIAL_CAPABILITY_SLOTS)
-            .map_err(|_| Error::NoMem)?;
-        free_slots.extend((0..INITIAL_CAPABILITY_SLOTS).rev());
+        let mut free_slots = Stack::new();
+        for index in (0..INITIAL_CAPABILITY_SLOTS).rev() {
+            free_slots.try_push(index).map_err(|_| Error::NoMem)?;
+        }
         Ok(Self { slots, free_slots })
     }
 
     fn insert(&mut self, capability: Capability) -> Result<CapabilityHandle, Error> {
         if self.free_slots.is_empty() {
             self.slots.try_reserve(1).map_err(|_| Error::NoMem)?;
-            self.free_slots.try_reserve(1).map_err(|_| Error::NoMem)?;
             let index = self.slots.len();
+            self.free_slots.try_push(index).map_err(|_| Error::NoMem)?;
             self.slots.push(CapabilitySlot::empty());
-            self.free_slots.push(index);
         }
         let index = self.free_slots.pop().ok_or(Error::Proto)?;
         let slot = &mut self.slots[index];
@@ -715,13 +705,13 @@ impl CapabilityTable {
 
     fn remove(&mut self, handle: CapabilityHandle) -> Result<Capability, Error> {
         let (index, generation) = handle.parts();
-        let slot = self.slots.get_mut(index).ok_or(Error::Badf)?;
-        if slot.generation != generation {
+        let slot = self.slots.get(index).ok_or(Error::Badf)?;
+        if slot.generation != generation || slot.capability.is_none() {
             return Err(Error::Badf);
         }
-        self.free_slots.try_reserve(1).map_err(|_| Error::NoMem)?;
+        self.free_slots.try_push(index).map_err(|_| Error::NoMem)?;
+        let slot = self.slots.get_mut(index).ok_or(Error::Badf)?;
         let capability = slot.capability.take().ok_or(Error::Badf)?;
-        self.free_slots.push(index);
         Ok(capability)
     }
 }
@@ -1997,19 +1987,16 @@ impl Process {
     }
 
     pub(crate) fn current_directory(&self) -> Result<Vec<u8>, Error> {
-        self.filesystem.lock().try_clone().map(|context| context.current_directory)
+        let directory = self.filesystem.lock().current_directory.clone();
+        directory.path()
     }
 
-    pub(crate) fn set_current_directory(&self, path: &[u8]) -> Result<(), Error> {
-        if path.first() != Some(&b'/') || path.contains(&0) {
-            return Err(Error::Inval);
-        }
-        let mut current_directory = Vec::new();
-        current_directory
-            .try_reserve_exact(path.len())
-            .map_err(|_| Error::NoMem)?;
-        current_directory.extend_from_slice(path);
-        self.filesystem.lock().current_directory = current_directory;
+    pub(crate) fn set_current_directory(&self, directory: DirectoryHandle) -> Result<(), Error> {
+        let previous = {
+            let mut filesystem = self.filesystem.lock();
+            core::mem::replace(&mut filesystem.current_directory, directory)
+        };
+        drop(previous);
         Ok(())
     }
 

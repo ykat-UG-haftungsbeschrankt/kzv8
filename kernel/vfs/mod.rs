@@ -9,6 +9,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use crate::kernel::lib::immutable_byte_buffer::ImmutableByteBuffer;
 use core::future::Future;
 use core::pin::Pin;
 
@@ -67,8 +68,8 @@ pub(crate) trait NodeMetadataApi: Sized {
     fn update_from_filesystem(&self, owner: UserId, group: GroupId, mode: u16) -> VfsResult<()>;
     fn flags(&self) -> u32;
     fn set_flags(&self, credentials: &Credentials, flags: u32) -> VfsResult<()>;
-    fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>>;
-    fn list_xattrs(&self) -> VfsResult<Vec<Vec<u8>>>;
+    fn get_xattr(&self, name: &[u8]) -> VfsResult<Arc<ImmutableByteBuffer>>;
+    fn list_xattrs(&self) -> VfsResult<Vec<Arc<ImmutableByteBuffer>>>;
     fn set_xattr(
         &self,
         credentials: &Credentials,
@@ -131,6 +132,44 @@ pub(crate) enum Node {
         plugin: Arc<dyn FilePlugin>,
         metadata: NodeMetadata,
     },
+}
+
+pub(crate) trait DirectoryHandleReference: Send + Sync {
+    fn path(&self) -> VfsResult<Vec<u8>>;
+}
+
+#[derive(Clone)]
+pub(crate) struct DirectoryHandle {
+    reference: Arc<dyn DirectoryHandleReference>,
+}
+
+struct RootDirectoryHandleReference;
+
+impl DirectoryHandleReference for RootDirectoryHandleReference {
+    fn path(&self) -> VfsResult<Vec<u8>> {
+        let mut path = Vec::new();
+        path.try_reserve_exact(1).map_err(|_| Error::NoMem)?;
+        path.push(b'/');
+        Ok(path)
+    }
+}
+
+impl DirectoryHandle {
+    pub(crate) fn root() -> Self {
+        Self {
+            reference: Arc::new(RootDirectoryHandleReference),
+        }
+    }
+
+    pub(crate) fn new(reference: impl DirectoryHandleReference + 'static) -> Self {
+        Self {
+            reference: Arc::new(reference),
+        }
+    }
+
+    pub(crate) fn path(&self) -> VfsResult<Vec<u8>> {
+        self.reference.path()
+    }
 }
 
 pub(crate) trait NodeApi: Sized {

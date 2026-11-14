@@ -9,10 +9,14 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::task::Wake;
 use alloc::vec::Vec;
+use core::borrow::Borrow;
+use core::hash::{Hash, Hasher};
 use core::task::{Context, Poll, Waker};
 
 use crate::kernel::arch::traits::CpuArchitecture as _;
 use crate::kernel::error::Error;
+use crate::kernel::lib::hashmap::HashMap;
+use crate::kernel::lib::immutable_byte_buffer::ImmutableByteBuffer;
 use crate::kernel::process::{Credentials, GroupId, UserId};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::scheduler::thread::{ThreadManager, ThreadState};
@@ -39,20 +43,46 @@ const ACCESS_EXECUTE: u16 = 0o1;
 const ACCESS_WRITE: u16 = 0o2;
 const ACCESS_READ: u16 = 0o4;
 
+#[derive(Clone)]
+struct XattrName(Arc<ImmutableByteBuffer>);
+
+impl XattrName {
+    fn try_from_slice(name: &[u8]) -> VfsResult<Self> {
+        Ok(Self(Arc::new(ImmutableByteBuffer::try_from_slice(name)?)))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl Borrow<[u8]> for XattrName {
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl PartialEq for XattrName {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for XattrName {}
+
+impl Hash for XattrName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
 pub(super) struct NodeMetadataState {
     owner: UserId,
     group: GroupId,
     mode: u16,
     flags: u32,
-    //@FIXME: INDEXTYPE(xattrs); ordered name/value list has O(n) keyed operations; add a hash side index for expected O(1) lookup while retaining ordered iteration.
-    xattrs: Vec<Xattr>,
-}
-
-struct Xattr {
-    //@FIXME: INDEXTYPE(name); owned attribute-name bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
-    name: Vec<u8>,
-    //@FIXME: INDEXTYPE(value); owned attribute-value bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
-    value: Vec<u8>,
+    //@FIXME: INDEXTYPE(xattrs); hash-indexed immutable byte keys provide expected O(1) lookup.
+    xattrs: HashMap<XattrName, Arc<ImmutableByteBuffer>, 1>,
 }
 
 static MOUNTED_VFS: IrqSpinLock<Option<Vfs>> = IrqSpinLock::new(None);
@@ -69,7 +99,7 @@ impl NodeMetadata {
                 group,
                 mode,
                 flags: 0,
-                xattrs: Vec::new(),
+                xattrs: HashMap::new(),
             })),
         }
     }
@@ -184,34 +214,26 @@ impl NodeMetadataApi for NodeMetadata {
         Ok(())
     }
 
-    fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>> {
+    fn get_xattr(&self, name: &[u8]) -> VfsResult<Arc<ImmutableByteBuffer>> {
         validate_xattr_name(name)?;
         let state = self.state.lock();
-        let value = state
+        state
             .xattrs
-            .iter()
-            .find(|attribute| attribute.name == name)
-            .map(|attribute| attribute.value.as_slice())
-            .ok_or(Error::NoData)?;
-        let mut copy = Vec::new();
-        copy.try_reserve_exact(value.len()).map_err(|_| Error::NoMem)?;
-        copy.extend_from_slice(value);
-        Ok(copy)
+            .get(name)
+            .cloned()
+            .ok_or(Error::NoData)
     }
 
-    fn list_xattrs(&self) -> VfsResult<Vec<Vec<u8>>> {
+    fn list_xattrs(&self) -> VfsResult<Vec<Arc<ImmutableByteBuffer>>> {
         let state = self.state.lock();
         let mut names = Vec::new();
         names
             .try_reserve_exact(state.xattrs.len())
             .map_err(|_| Error::NoMem)?;
-        for attribute in &state.xattrs {
-            let mut name = Vec::new();
-            name.try_reserve_exact(attribute.name.len())
-                .map_err(|_| Error::NoMem)?;
-            name.extend_from_slice(&attribute.name);
-            names.push(name);
-        }
+        state.xattrs.try_for_each(|attribute_name, _attribute_value| {
+            names.push(Arc::clone(&attribute_name.0));
+            Ok::<(), Error>(())
+        })?;
         Ok(names)
     }
 
@@ -232,16 +254,8 @@ impl NodeMetadataApi for NodeMetadata {
             return Err(Error::Inval);
         }
 
-        let mut owned_name = Vec::new();
-        owned_name
-            .try_reserve_exact(name.len())
-            .map_err(|_| Error::NoMem)?;
-        owned_name.extend_from_slice(name);
-        let mut owned_value = Vec::new();
-        owned_value
-            .try_reserve_exact(value.len())
-            .map_err(|_| Error::NoMem)?;
-        owned_value.extend_from_slice(value);
+        let owned_name = XattrName::try_from_slice(name)?;
+        let owned_value = Arc::new(ImmutableByteBuffer::try_from_slice(value)?);
 
         let mut state = self.state.lock();
         if !credentials.is_root() && credentials.effective_user() != state.owner {
@@ -253,25 +267,17 @@ impl NodeMetadataApi for NodeMetadata {
         if state.flags & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
             return Err(Error::Perm);
         }
-        if let Some(index) = state
-            .xattrs
-            .iter()
-            .position(|attribute| attribute.name == name)
-        {
-            if flags & XATTR_CREATE != 0 {
-                return Err(Error::Exist);
-            }
-            state.xattrs[index].value = owned_value;
-            return Ok(());
+        let already_exists = state.xattrs.contains_key(name);
+        if already_exists && flags & XATTR_CREATE != 0 {
+            return Err(Error::Exist);
         }
-        if flags & XATTR_REPLACE != 0 {
+        if !already_exists && flags & XATTR_REPLACE != 0 {
             return Err(Error::NoData);
         }
-        state.xattrs.try_reserve(1).map_err(|_| Error::NoMem)?;
-        state.xattrs.push(Xattr {
-            name: owned_name,
-            value: owned_value,
-        });
+        let _previous = state
+            .xattrs
+            .insert(owned_name, owned_value)
+            .map_err(|(_name, _value)| Error::NoMem)?;
         Ok(())
     }
 
@@ -287,12 +293,7 @@ impl NodeMetadataApi for NodeMetadata {
         if state.flags & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
             return Err(Error::Perm);
         }
-        let index = state
-            .xattrs
-            .iter()
-            .position(|attribute| attribute.name == name)
-            .ok_or(Error::NoData)?;
-        state.xattrs.remove(index);
+        state.xattrs.remove(name).ok_or(Error::NoData)?;
         Ok(())
     }
 }
@@ -634,3 +635,7 @@ fn run_vfs_future<T>(mut future: VfsFuture<'_, VfsResult<T>>) -> VfsResult<T> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/kernel/vfs/vfs.rs"]
+mod tests;

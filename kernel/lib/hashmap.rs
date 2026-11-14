@@ -6,6 +6,7 @@
  */
 
 use alloc::boxed::Box;
+use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
@@ -72,6 +73,18 @@ impl<K, V, const INITIAL_CAPACITY: usize> HashMap<K, V, INITIAL_CAPACITY> {
 		}
 	}
 
+	pub(crate) fn try_for_each<E>(
+		&self,
+		mut visit: impl FnMut(&K, &V) -> Result<(), E>,
+	) -> Result<(), E> {
+		for index in 0..self.capacity {
+			for entry in self.bucket(index).iter() {
+				visit(&entry.key, &entry.value)?;
+			}
+		}
+		Ok(())
+	}
+
 	fn allocate_buckets(capacity: usize) -> Option<(usize, usize)> {
 		let allocation_length = capacity.checked_mul(size_of::<Bucket<K, V>>())?;
 		let address = crate::kernel::memory::r#virtual::reserve(
@@ -123,7 +136,7 @@ impl<K, V, const INITIAL_CAPACITY: usize> HashMap<K, V, INITIAL_CAPACITY> {
 }
 
 impl<K: Eq + Hash, V, const INITIAL_CAPACITY: usize> HashMap<K, V, INITIAL_CAPACITY> {
-	fn bucket_index(key: &K, capacity: usize) -> usize {
+	fn bucket_index<Q: ?Sized + Hash>(key: &Q, capacity: usize) -> usize {
 		let mut hasher = FnvHasher::new();
 		key.hash(&mut hasher);
 		(hasher.finish() as usize) & (capacity - 1)
@@ -239,42 +252,60 @@ impl<K: Eq + Hash, V, const INITIAL_CAPACITY: usize> HashMap<K, V, INITIAL_CAPAC
 		Ok(None)
 	}
 
-	pub(crate) fn get(&self, key: &K) -> Option<&V> {
+	pub(crate) fn get<Q: ?Sized>(&self, key: &Q) -> Option<&V>
+	where
+		K: Borrow<Q>,
+		Q: Eq + Hash,
+	{
 		if self.capacity == 0 {
 			return None;
 		}
 		let index = Self::bucket_index(key, self.capacity);
 		for entry in self.bucket(index).iter() {
-			if entry.key == *key {
+			if <K as Borrow<Q>>::borrow(&entry.key) == key {
 				return Some(&entry.value);
 			}
 		}
 		None
 	}
 
-	pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+	pub(crate) fn get_mut<Q: ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+	where
+		K: Borrow<Q>,
+		Q: Eq + Hash,
+	{
 		if self.capacity == 0 {
 			return None;
 		}
 		let index = Self::bucket_index(key, self.capacity);
 		for entry in self.bucket_mut(index).iter_mut() {
-			if entry.key == *key {
+			if <K as Borrow<Q>>::borrow(&entry.key) == key {
 				return Some(&mut entry.value);
 			}
 		}
 		None
 	}
 
-	pub(crate) fn contains_key(&self, key: &K) -> bool {
+	pub(crate) fn contains_key<Q: ?Sized>(&self, key: &Q) -> bool
+	where
+		K: Borrow<Q>,
+		Q: Eq + Hash,
+	{
 		self.get(key).is_some()
 	}
 
-	pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+	pub(crate) fn remove<Q: ?Sized>(&mut self, key: &Q) -> Option<V>
+	where
+		K: Borrow<Q>,
+		Q: Eq + Hash,
+	{
 		if self.capacity == 0 {
 			return None;
 		}
 		let index = Self::bucket_index(key, self.capacity);
-		let node = self.bucket(index).find(|entry| entry.key == *key)?;
+		let node = self
+			.bucket(index)
+			.find(|entry| <K as Borrow<Q>>::borrow(&entry.key) == key)?;
 		// SAFETY: node was found in this bucket and has not been unlinked.
 		let entry = unsafe { ListNode::remove(self.bucket_mut(index), node) }?.into_value();
 		self.length -= 1;
@@ -288,3 +319,7 @@ impl<K, V, const INITIAL_CAPACITY: usize> Drop for HashMap<K, V, INITIAL_CAPACIT
 		self.release_buckets();
 	}
 }
+
+#[cfg(test)]
+#[path = "../../tests/kernel/lib/hashmap.rs"]
+mod tests;

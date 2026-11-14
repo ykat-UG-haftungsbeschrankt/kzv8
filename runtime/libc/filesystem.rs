@@ -15,10 +15,12 @@ use crate::kernel::dl::AddressSpace;
 use crate::kernel::arch::traits::CpuArchitecture as _;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::error::Error as KernelError;
+use crate::kernel::lib::immutable_byte_buffer::ImmutableByteBuffer;
 use crate::kernel::process::{Credentials, GroupId, UserId};
 use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::vfs::{
-    NodeMetadata, NodeMetadataApi as _, INODE_FLAG_APPEND, INODE_FLAG_IMMUTABLE,
+    DirectoryHandle, DirectoryHandleReference, NodeMetadata, NodeMetadataApi as _,
+    INODE_FLAG_APPEND, INODE_FLAG_IMMUTABLE,
 };
 
 use super::errno::{
@@ -129,6 +131,7 @@ struct Node {
     fifo_pipe_id: Option<usize>,
     data: Vec<u8>,
     open_count: usize,
+    cwd_count: usize,
     inode: u64,
     special_device: u64,
     mode: u32,
@@ -226,6 +229,52 @@ struct FileSystem {
     root_modified: Timespec,
     root_changed: Timespec,
     next_inode: u64,
+}
+
+struct DirectoryNodeReference {
+    node_index: usize,
+    inode: u64,
+}
+
+impl DirectoryHandleReference for DirectoryNodeReference {
+    fn path(&self) -> Result<Vec<u8>, KernelError> {
+        let filesystem = FILESYSTEM.lock();
+        let node = filesystem
+            .nodes
+            .get(self.node_index)
+            .and_then(Option::as_ref)
+            .filter(|node| node.inode == self.inode && node.linked)
+            .ok_or(KernelError::NoEnt)?;
+        if node.mode & S_IFMT != S_IFDIR {
+            return Err(KernelError::NotDir);
+        }
+        let path = node.path.as_deref().ok_or(KernelError::NoEnt)?;
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(path.len())
+            .map_err(|_| KernelError::NoMem)?;
+        copy.extend_from_slice(path);
+        Ok(copy)
+    }
+}
+
+impl Drop for DirectoryNodeReference {
+    fn drop(&mut self) {
+        let mut filesystem = FILESYSTEM.lock();
+        let Some(node) = filesystem
+            .nodes
+            .get_mut(self.node_index)
+            .and_then(Option::as_mut)
+        else {
+            return;
+        };
+        if node.inode != self.inode {
+            return;
+        }
+        node.cwd_count = node.cwd_count.saturating_sub(1);
+        if !node.linked && node.open_count == 0 && node.cwd_count == 0 {
+            filesystem.nodes[self.node_index] = None;
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -428,17 +477,11 @@ impl FileSystem {
         self.directory_path_for_process(process_id, file_descriptor)
     }
 
-    fn directory_path_for_process(
-        &self,
-        process_id: i32,
-        file_descriptor: i32,
-    ) -> Result<Vec<u8>, i32> {
-        let slot = self.descriptor_slot_for_process(process_id, file_descriptor)?;
-        let descriptor = self.descriptors[slot].ok_or(EBADF)?;
-        if self.node_mode(descriptor.node).ok_or(EBADF)? & S_IFMT != S_IFDIR {
+    fn directory_path_for_node(&self, node_index: usize) -> Result<Vec<u8>, i32> {
+        if self.node_mode(node_index).ok_or(EBADF)? & S_IFMT != S_IFDIR {
             return Err(ENOTDIR);
         }
-        if descriptor.node == ROOT_NODE {
+        if node_index == ROOT_NODE {
             let mut path = Vec::new();
             path.try_reserve_exact(1).map_err(|_| ENOMEM)?;
             path.push(b'/');
@@ -446,7 +489,7 @@ impl FileSystem {
         }
         let path = self
             .nodes
-            .get(descriptor.node)
+            .get(node_index)
             .and_then(Option::as_ref)
             .and_then(|node| node.path.as_deref())
             .ok_or(EBADF)?;
@@ -454,6 +497,74 @@ impl FileSystem {
         copy.try_reserve_exact(path.len()).map_err(|_| ENOMEM)?;
         copy.extend_from_slice(path);
         Ok(copy)
+    }
+
+    fn directory_handle_for_node(
+        &mut self,
+        node_index: usize,
+    ) -> Result<DirectoryHandle, i32> {
+        if node_index == ROOT_NODE {
+            return Ok(DirectoryHandle::root());
+        }
+        let node = self
+            .nodes
+            .get_mut(node_index)
+            .and_then(Option::as_mut)
+            .ok_or(ENOENT)?;
+        if node.mode & S_IFMT != S_IFDIR {
+            return Err(ENOTDIR);
+        }
+        node.cwd_count = node.cwd_count.checked_add(1).ok_or(EMFILE)?;
+        Ok(DirectoryHandle::new(DirectoryNodeReference {
+            node_index,
+            inode: node.inode,
+        }))
+    }
+
+    fn directory_handle_for_path(
+        &mut self,
+        path: &[u8],
+        credentials: &Credentials,
+    ) -> Result<DirectoryHandle, i32> {
+        self.check_search_permissions(path, credentials)?;
+        let node_index = self.find_node(path).ok_or(ENOENT)?;
+        if self.node_mode(node_index).ok_or(ENOENT)? & S_IFMT != S_IFDIR {
+            return Err(ENOTDIR);
+        }
+        self.node_metadata(node_index)?
+            .check_access(credentials, 0o1, true)
+            .map_err(metadata_errno)?;
+        self.directory_handle_for_node(node_index)
+    }
+
+    fn directory_handle_for_descriptor(
+        &mut self,
+        process_id: i32,
+        file_descriptor: i32,
+        credentials: &Credentials,
+    ) -> Result<DirectoryHandle, i32> {
+        let slot = self.descriptor_slot_for_process(process_id, file_descriptor)?;
+        let descriptor = self.descriptors[slot].ok_or(EBADF)?;
+        if self.node_mode(descriptor.node).ok_or(EBADF)? & S_IFMT != S_IFDIR {
+            return Err(ENOTDIR);
+        }
+        let path = self.directory_path_for_node(descriptor.node)?;
+        self.check_search_permissions(&path, credentials)?;
+        self.node_metadata(descriptor.node)?
+            .check_access(credentials, 0o1, true)
+            .map_err(metadata_errno)?;
+        let node_index = descriptor.node;
+        self.directory_handle_for_node(node_index)
+    }
+
+    fn directory_path_for_process(
+        &self,
+        process_id: i32,
+        file_descriptor: i32,
+    ) -> Result<Vec<u8>, i32> {
+        let slot = self.descriptor_slot_for_process(process_id, file_descriptor)?;
+        let descriptor = self.descriptors[slot].ok_or(EBADF)?;
+        self.directory_path_for_node(descriptor.node)
     }
 
     fn set_directory_position(
@@ -676,6 +787,7 @@ impl FileSystem {
             fifo_pipe_id: None,
             data: Vec::new(),
             open_count: 0,
+            cwd_count: 0,
             inode: self.next_inode,
             special_device: 0,
             mode,
@@ -1659,7 +1771,7 @@ impl FileSystem {
             if descriptor.node != PIPE_NODE {
                 let node = self.nodes.get_mut(descriptor.node).and_then(Option::as_mut).ok_or(EBADF)?;
                 node.open_count = node.open_count.saturating_sub(1);
-                if !node.linked && node.open_count == 0 {
+                if !node.linked && node.open_count == 0 && node.cwd_count == 0 {
                     self.nodes[descriptor.node] = None;
                     if empty {
                         self.pipes[pipe_id] = None;
@@ -1684,7 +1796,7 @@ impl FileSystem {
                 .retain(|lock| lock.inode != inode || lock.process_id != process_id);
             let node = self.nodes[descriptor.node].as_mut().ok_or(EBADF)?;
             node.open_count -= 1;
-            if !node.linked && node.open_count == 0 {
+            if !node.linked && node.open_count == 0 && node.cwd_count == 0 {
                 self.nodes[descriptor.node] = None;
             }
         }
@@ -2431,6 +2543,16 @@ impl FileSystem {
         if self.node_metadata(index)?.flags() & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
             return Err(EPERM);
         }
+        if self
+            .nodes
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(ENOENT)?
+            .cwd_count
+            != 0
+        {
+            return Err(EBUSY);
+        }
         for candidate in self.nodes.iter().flatten() {
             if !candidate.linked {
                 continue;
@@ -2443,7 +2565,7 @@ impl FileSystem {
         }
         let node = self.nodes[index].as_mut().ok_or(ENOENT)?;
         node.linked = false;
-        if node.open_count == 0 {
+        if node.open_count == 0 && node.cwd_count == 0 {
             self.nodes[index] = None;
         }
         Ok(())
@@ -4144,20 +4266,11 @@ fn change_current_directory(path: Vec<u8>) -> Result<(), i32> {
 fn change_current_directory_for_process(process_id: i32, path: &[u8]) -> Result<(), i32> {
     let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
     let credentials = process.credentials().map_err(metadata_errno)?;
-    {
-        let mut filesystem = FILESYSTEM.lock();
-        filesystem.check_search_permissions(path, &credentials)?;
-        let index = filesystem.find_node(path).ok_or(ENOENT)?;
-        if filesystem.node_mode(index).ok_or(ENOENT)? & S_IFMT != S_IFDIR {
-            return Err(ENOTDIR);
-        }
-        filesystem
-            .node_metadata(index)?
-            .check_access(&credentials, 0o1, true)
-            .map_err(metadata_errno)?;
-    }
+    let directory = FILESYSTEM
+        .lock()
+        .directory_handle_for_path(path, &credentials)?;
     process
-        .set_current_directory(path)
+        .set_current_directory(directory)
         .map_err(|error| -(error as i32))
 }
 
@@ -4167,8 +4280,16 @@ pub(crate) fn chdir_for_process(process_id: i32, path: &[u8]) -> Result<(), i32>
 }
 
 pub(crate) fn fchdir_for_process(process_id: i32, file_descriptor: i32) -> Result<(), i32> {
-    let path = directory_path_for_process(process_id, file_descriptor)?;
-    change_current_directory_for_process(process_id, &path)
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let credentials = process.credentials().map_err(metadata_errno)?;
+    let directory = FILESYSTEM.lock().directory_handle_for_descriptor(
+        process_id,
+        file_descriptor,
+        &credentials,
+    )?;
+    process
+        .set_current_directory(directory)
+        .map_err(|error| -(error as i32))
 }
 
 #[no_mangle]
@@ -5616,16 +5737,20 @@ fn copy_xattr_value(value: &[u8], output: *mut c_void, size: usize) -> Result<us
     Ok(value.len())
 }
 
-fn copy_xattr_names(names: &[Vec<u8>], output: *mut c_char, size: usize) -> Result<usize, i32> {
+fn copy_xattr_names(
+    names: &[Arc<ImmutableByteBuffer>],
+    output: *mut c_char,
+    size: usize,
+) -> Result<usize, i32> {
     let length = names.iter().try_fold(0usize, |length, name| {
         length
-            .checked_add(name.len())
+            .checked_add(name.as_bytes().len())
             .and_then(|length| length.checked_add(1))
-                .ok_or(E2BIG)
+            .ok_or(E2BIG)
     })?;
-            if length > XATTR_SIZE_MAX {
-            return Err(E2BIG);
-            }
+    if length > XATTR_SIZE_MAX {
+        return Err(E2BIG);
+    }
     if size == 0 {
         return Ok(length);
     }
@@ -5637,8 +5762,8 @@ fn copy_xattr_names(names: &[Vec<u8>], output: *mut c_char, size: usize) -> Resu
     }
     let mut offset = 0;
     for name in names {
-        for byte in name {
-            unsafe { write_volatile(output.cast::<u8>().add(offset), *byte) };
+        for byte in name.as_bytes().iter().copied() {
+            unsafe { write_volatile(output.cast::<u8>().add(offset), byte) };
             offset += 1;
         }
         unsafe { write_volatile(output.cast::<u8>().add(offset), 0) };
@@ -5676,7 +5801,7 @@ fn get_xattr_path(
     let metadata = metadata_for_path(path)?;
     let name = unsafe { xattr_name(name) }?;
     let value = metadata.get_xattr(&name).map_err(metadata_errno)?;
-    copy_xattr_value(&value, output, size)
+    copy_xattr_value(value.as_bytes(), output, size)
 }
 
 fn get_xattr_fd(
@@ -5688,7 +5813,7 @@ fn get_xattr_fd(
     let metadata = metadata_for_fd(file_descriptor)?;
     let name = unsafe { xattr_name(name) }?;
     let value = metadata.get_xattr(&name).map_err(metadata_errno)?;
-    copy_xattr_value(&value, output, size)
+    copy_xattr_value(value.as_bytes(), output, size)
 }
 
 fn list_xattrs_path(path: *const c_char, output: *mut c_char, size: usize) -> Result<usize, i32> {

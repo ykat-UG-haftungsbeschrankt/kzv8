@@ -21,6 +21,7 @@ pub(crate) mod btree;
 pub(crate) mod hash;
 #[allow(dead_code)]
 pub(crate) mod hashmap;
+pub(crate) mod immutable_byte_buffer;
 #[allow(dead_code)]
 pub(crate) mod interval;
 #[allow(dead_code)]

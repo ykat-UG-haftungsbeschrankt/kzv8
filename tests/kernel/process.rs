@@ -21,7 +21,31 @@
         SignalInfo, SignalSet, CLD_CONTINUED, CLD_KILLED, CLD_STOPPED, SIGCHLD, SIGCONT, SIGKILL,
         SIGSTOP,
     };
-    use crate::kernel::vfs::{NodeMetadata, NodeMetadataApi as _};
+    use crate::kernel::vfs::{
+        DirectoryHandle, DirectoryHandleReference, NodeMetadata, NodeMetadataApi as _,
+    };
+
+    struct TestDirectoryReference {
+        path: Vec<u8>,
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    impl DirectoryHandleReference for TestDirectoryReference {
+        fn path(&self) -> Result<Vec<u8>, Error> {
+            let mut path = Vec::new();
+            path.try_reserve_exact(self.path.len())
+                .map_err(|_| Error::NoMem)?;
+            path.extend_from_slice(&self.path);
+            Ok(path)
+        }
+    }
+
+    impl Drop for TestDirectoryReference {
+        fn drop(&mut self) {
+            self.drop_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
 
 impl Process {
@@ -75,6 +99,26 @@ impl Process {
 }
 
     static PROCESS_CONTROL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn cloned_filesystem_context_retains_directory_handle() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let filesystem = FilesystemContext {
+            current_directory: DirectoryHandle::new(TestDirectoryReference {
+                path: b"/work".to_vec(),
+                drop_count: Arc::clone(&drop_count),
+            }),
+            umask: 0o022,
+        };
+        let child = filesystem.try_clone().unwrap();
+
+        drop(filesystem);
+        assert_eq!(drop_count.load(core::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(child.current_directory.path().unwrap(), b"/work");
+
+        drop(child);
+        assert_eq!(drop_count.load(core::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn capability_table_grows_past_previous_limit() {
