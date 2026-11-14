@@ -16,6 +16,7 @@ pub(crate) enum DescriptorKind {
     Socket,
     Packet,
     Pty,
+    Vfs,
 }
 
 #[derive(Clone, Copy)]
@@ -24,6 +25,8 @@ pub(crate) struct DescriptorAlias {
     pub(crate) backing: i32,
     pub(crate) kind: DescriptorKind,
     pub(crate) close_on_exec: bool,
+    pub(crate) nonblocking: bool,
+    pub(crate) access_mode: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -303,5 +306,22 @@ pub(crate) fn set_close_on_exec_for_process(
         .find(|entry| entry.process_id == process_id && entry.alias.target == target)
         .ok_or(Error::Badf)?;
     entry.alias.close_on_exec = enabled;
+    Ok(())
+}
+
+pub(crate) fn set_nonblocking_for_process(
+    process_id: i32,
+    target: i32,
+    enabled: bool,
+) -> Result<(), Error> {
+    let mut aliases = ALIASES.lock();
+    let entry = aliases
+        .iter_mut()
+        .find(|entry| entry.process_id == process_id && entry.alias.target == target)
+        .ok_or(Error::Badf)?;
+    if entry.alias.kind != DescriptorKind::Vfs {
+        return Err(Error::Badf);
+    }
+    entry.alias.nonblocking = enabled;
     Ok(())
 }

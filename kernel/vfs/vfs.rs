@@ -12,6 +12,7 @@ use alloc::task::Wake;
 use alloc::vec::Vec;
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use crate::kernel::arch::traits::CpuArchitecture as _;
@@ -27,7 +28,7 @@ use super::{
     AppendResult, DirectoryEntry, DirectoryPlugin, FileHandle, FileHandleApi, FilePlugin,
     INODE_FLAG_APPEND, INODE_FLAG_DIRSYNC, INODE_FLAG_IMMUTABLE, INODE_FLAG_NODUMP,
     INODE_FLAG_NOATIME, INODE_FLAG_TOPDIR, Node, NodeApi, NodeMetadata, NodeMetadataApi, OpenMode,
-    SeekFrom, VfsApi, VfsFuture, VfsResult,
+    FileSystem, MountOptions, SeekFrom, VfsApi, VfsFuture, VfsResult,
 };
 
 const SUPPORTED_INODE_FLAGS: u32 = INODE_FLAG_IMMUTABLE
@@ -94,12 +95,50 @@ const MAX_SYMLINK_FOLLOWS: usize = 40;
 #[derive(Clone)]
 pub(crate) struct Vfs {
     root: Node,
+    root_filesystem: Arc<dyn FileSystem>,
     mounts: Arc<IrqSpinLock<Vec<MountEntry>>>,
+    filesystem_operation: Arc<AtomicBool>,
 }
 
 struct MountEntry {
     path: String,
     root: Node,
+    filesystem: Arc<dyn FileSystem>,
+    unmounting: bool,
+}
+
+struct NodeFileSystem(Node);
+
+struct FileSystemOperation(Arc<AtomicBool>);
+
+impl Drop for FileSystemOperation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct MountDetachment {
+    mounts: Arc<IrqSpinLock<Vec<MountEntry>>>,
+    path: String,
+}
+
+impl Drop for MountDetachment {
+    fn drop(&mut self) {
+        if let Some(mount) = self
+            .mounts
+            .lock()
+            .iter_mut()
+            .find(|mount| mount.path == self.path)
+        {
+            mount.unmounting = false;
+        }
+    }
+}
+
+impl FileSystem for NodeFileSystem {
+    fn root(&self) -> VfsResult<Node> {
+        Ok(self.0.clone())
+    }
 }
 
 enum ResolveStep {
@@ -108,12 +147,35 @@ enum ResolveStep {
 }
 
 impl Vfs {
-    fn mount_root_at(&self, path: &str) -> Option<Node> {
-        self.mounts
-            .lock()
-            .iter()
-            .find(|mount| mount.path == path)
-            .map(|mount| mount.root.clone())
+    pub(crate) fn with_filesystem(filesystem: Arc<dyn FileSystem>) -> VfsResult<Self> {
+        let root = filesystem.root()?;
+        if !matches!(&root, Node::Directory { .. }) {
+            return Err(Error::NotDir);
+        }
+        Ok(Self {
+            root,
+            root_filesystem: filesystem,
+            mounts: Arc::new(IrqSpinLock::new(Vec::new())),
+            filesystem_operation: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn begin_filesystem_operation(&self) -> VfsResult<FileSystemOperation> {
+        self.filesystem_operation
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| Error::Busy)?;
+        Ok(FileSystemOperation(Arc::clone(&self.filesystem_operation)))
+    }
+
+    fn mount_root_at(&self, path: &str) -> VfsResult<Option<Node>> {
+        let mounts = self.mounts.lock();
+        let Some(mount) = mounts.iter().find(|mount| mount.path == path) else {
+            return Ok(None);
+        };
+        if mount.unmounting {
+            return Err(Error::Busy);
+        }
+        Ok(Some(mount.root.clone()))
     }
 
     fn mount_path_for<'a>(mounts: &'a [MountEntry], path: &str) -> Option<&'a str> {
@@ -180,7 +242,7 @@ impl Vfs {
                     parent.check_access(credentials, ACCESS_EXECUTE)?;
                     let mut child = parent.lookup(component).await?;
                     let child_path = absolute_path_with(&path_stack, component)?;
-                    if let Some(mounted_root) = self.mount_root_at(&child_path) {
+                    if let Some(mounted_root) = self.mount_root_at(&child_path)? {
                         child = mounted_root;
                     }
 
@@ -234,6 +296,31 @@ impl Vfs {
     fn is_mountpoint(&self, path: &str) -> bool {
         self.mounts.lock().iter().any(|mount| mount.path == path)
     }
+
+    fn check_mount_available(
+        &self,
+        mount_path: &str,
+        filesystem: &Arc<dyn FileSystem>,
+    ) -> VfsResult<()> {
+        let mut mounts = self.mounts.lock();
+        let backend_is_already_mounted = Arc::ptr_eq(&self.root_filesystem, filesystem)
+            || mounts
+                .iter()
+                .any(|mount| Arc::ptr_eq(&mount.filesystem, filesystem));
+        let overlaps_detaching_mount = mounts.iter().any(|mount| {
+            mount.unmounting
+                && (path_is_within(mount_path, &mount.path)
+                    || path_is_within(&mount.path, mount_path))
+        });
+        let mount_conflicts = mounts.iter().any(|mount| {
+            mount.path == mount_path || path_is_within(&mount.path, mount_path)
+        });
+        if backend_is_already_mounted || overlaps_detaching_mount || mount_conflicts {
+            return Err(Error::Busy);
+        }
+        mounts.try_reserve(1).map_err(|_| Error::NoMem)
+    }
+
 }
 
 fn copy_string(value: &str) -> VfsResult<String> {
@@ -426,6 +513,10 @@ impl NodeMetadataApi for NodeMetadata {
 
     fn link_count(&self) -> u32 {
         self.state.lock().link_count
+    }
+
+    fn identity(&self) -> u64 {
+        Arc::as_ptr(&self.state) as usize as u64
     }
 
     fn check_access(
@@ -763,6 +854,49 @@ impl NodeApi for Node {
 }
 
 impl FileHandleApi for FileHandle {
+    fn metadata(&self) -> NodeMetadata {
+        self.node.metadata()
+    }
+
+    fn size_blocking(&self) -> VfsResult<u64> {
+        match self.opened_plugin.as_ref() {
+            Some(plugin) => run_vfs_future(plugin.size()),
+            None => run_vfs_future(self.node.size()),
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        match (&self.node, &self.opened_plugin) {
+            (_, Some(plugin)) => plugin.is_terminal(),
+            (Node::File { plugin, .. }, None) => plugin.is_terminal(),
+            (Node::Directory { .. } | Node::Symlink { .. }, None) => false,
+        }
+    }
+
+    fn ioctl<'a>(
+        &'a mut self,
+        request: u64,
+        argument: &'a mut [u8],
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<i64>> {
+        match (&self.opened_plugin, &self.node) {
+            (Some(plugin), _) => plugin.ioctl(request, argument, credentials),
+            (None, Node::File { plugin, .. }) => plugin.ioctl(request, argument, credentials),
+            (None, Node::Directory { .. } | Node::Symlink { .. }) => {
+                Box::pin(async { Err(Error::NotTty) })
+            }
+        }
+    }
+
+    fn ioctl_blocking(
+        &mut self,
+        request: u64,
+        argument: &mut [u8],
+        credentials: &Credentials,
+    ) -> VfsResult<i64> {
+        run_vfs_future(self.ioctl(request, argument, credentials))
+    }
+
     fn read_blocking(&mut self, buffer: &mut [u8]) -> VfsResult<usize> {
         run_vfs_future(self.read(buffer))
     }
@@ -824,6 +958,13 @@ impl FileHandleApi for FileHandle {
     }
 
     fn seek(&mut self, from: SeekFrom) -> VfsResult<u64> {
+        let plugin = self.opened_plugin.as_ref().cloned().or_else(|| match &self.node {
+            Node::File { plugin, .. } => Some(Arc::clone(plugin)),
+            Node::Directory { .. } | Node::Symlink { .. } => None,
+        });
+        if plugin.as_ref().is_some_and(|plugin| !plugin.seekable()) {
+            return Err(Error::Spipe);
+        }
         let offset = match from {
             SeekFrom::Start(offset) => offset,
             SeekFrom::Current(delta) if delta >= 0 => {
@@ -833,6 +974,20 @@ impl FileHandleApi for FileHandle {
                 .offset
                 .checked_sub(delta.unsigned_abs())
                 .ok_or(Error::Inval)?,
+            SeekFrom::End(delta) if delta >= 0 => {
+                let size = match self.opened_plugin.as_ref() {
+                    Some(plugin) => run_vfs_future(plugin.size())?,
+                    None => run_vfs_future(self.node.size())?,
+                };
+                size.checked_add(delta as u64).ok_or(Error::Inval)?
+            }
+            SeekFrom::End(delta) => {
+                let size = match self.opened_plugin.as_ref() {
+                    Some(plugin) => run_vfs_future(plugin.size())?,
+                    None => run_vfs_future(self.node.size())?,
+                };
+                size.checked_sub(delta.unsigned_abs()).ok_or(Error::Inval)?
+            }
         };
         self.offset = offset;
         Ok(offset)
@@ -849,9 +1004,12 @@ impl FileHandleApi for FileHandle {
 
 impl VfsApi for Vfs {
     fn new(root: Node) -> Self {
+        let root_filesystem: Arc<dyn FileSystem> = Arc::new(NodeFileSystem(root.clone()));
         Self {
             root,
+            root_filesystem,
             mounts: Arc::new(IrqSpinLock::new(Vec::new())),
+            filesystem_operation: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1013,15 +1171,14 @@ impl VfsApi for Vfs {
     fn mount<'a>(
         &'a self,
         path: &'a str,
-        filesystem_root: Node,
+        filesystem: Arc<dyn FileSystem>,
+        options: MountOptions<'a>,
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<()>> {
         Box::pin(async move {
+            let _operation = self.begin_filesystem_operation()?;
             if !credentials.is_root() {
                 return Err(Error::Perm);
-            }
-            if !matches!(&filesystem_root, Node::Directory { .. }) {
-                return Err(Error::NotDir);
             }
             let (mountpoint, mount_path) = self.resolve_internal(path, credentials, true).await?;
             if !matches!(&mountpoint, Node::Directory { .. }) {
@@ -1031,16 +1188,20 @@ impl VfsApi for Vfs {
                 return Err(Error::Busy);
             }
 
-            let mut mounts = self.mounts.lock();
-            if mounts.iter().any(|mount| {
-                mount.path == mount_path || path_is_within(&mount.path, &mount_path)
-            }) {
-                return Err(Error::Busy);
+            self.check_mount_available(&mount_path, &filesystem)?;
+
+            let filesystem_root = filesystem.mount_root(options).await?;
+            if !matches!(&filesystem_root, Node::Directory { .. }) {
+                let _cleanup = filesystem.unmount().await;
+                return Err(Error::NotDir);
             }
-            mounts.try_reserve(1).map_err(|_| Error::NoMem)?;
+
+            let mut mounts = self.mounts.lock();
             mounts.push(MountEntry {
                 path: mount_path,
                 root: filesystem_root,
+                filesystem,
+                unmounting: false,
             });
             Ok(())
         })
@@ -1052,6 +1213,7 @@ impl VfsApi for Vfs {
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<()>> {
         Box::pin(async move {
+            let _operation = self.begin_filesystem_operation()?;
             if !credentials.is_root() {
                 return Err(Error::Perm);
             }
@@ -1060,18 +1222,62 @@ impl VfsApi for Vfs {
                 return Err(Error::Busy);
             }
 
+            let detach_path = copy_string(&mount_path)?;
+            let filesystem = {
+                let mut mounts = self.mounts.lock();
+                let index = mounts
+                    .iter()
+                    .position(|mount| mount.path == mount_path)
+                    .ok_or(Error::NoEnt)?;
+                if mounts[index].unmounting
+                    || mounts.iter().any(|mount| {
+                        mount.path != mount_path && path_is_within(&mount.path, &mount_path)
+                    })
+                {
+                    return Err(Error::Busy);
+                }
+                mounts[index].unmounting = true;
+                Arc::clone(&mounts[index].filesystem)
+            };
+            let _detachment = MountDetachment {
+                mounts: Arc::clone(&self.mounts),
+                path: detach_path,
+            };
+
+            filesystem.sync().await?;
+            filesystem.unmount().await?;
+
             let mut mounts = self.mounts.lock();
             let index = mounts
                 .iter()
-                .position(|mount| mount.path == mount_path)
+                .position(|mount| mount.path == mount_path && mount.unmounting)
                 .ok_or(Error::NoEnt)?;
-            if mounts
-                .iter()
-                .any(|mount| mount.path != mount_path && path_is_within(&mount.path, &mount_path))
-            {
-                return Err(Error::Busy);
-            }
             mounts.remove(index);
+            Ok(())
+        })
+    }
+
+    fn sync_filesystems(&self) -> VfsFuture<'_, VfsResult<()>> {
+        Box::pin(async move {
+            let _operation = self.begin_filesystem_operation()?;
+            let filesystems = {
+                let mounts = self.mounts.lock();
+                let mut filesystems = Vec::new();
+                filesystems
+                    .try_reserve_exact(mounts.len().saturating_add(1))
+                    .map_err(|_| Error::NoMem)?;
+                filesystems.push(Arc::clone(&self.root_filesystem));
+                for mount in mounts.iter() {
+                    if mount.unmounting {
+                        return Err(Error::Busy);
+                    }
+                    filesystems.push(Arc::clone(&mount.filesystem));
+                }
+                filesystems
+            };
+            for filesystem in filesystems {
+                filesystem.sync().await?;
+            }
             Ok(())
         })
     }

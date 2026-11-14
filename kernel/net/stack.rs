@@ -341,7 +341,7 @@ impl NetStack {
         let local_address = INITIAL_LOCAL_ADDRESS;
         let local_prefix_length = INITIAL_PREFIX_LENGTH;
         #[cfg(feature = "virtualization")]
-        crate::kernel::vm::device::virtio::net::register_host_interface(mac_address.0);
+        crate::kernel::vfs::filesystem::vm::device::virtio::net::register_host_interface(mac_address.0);
         let mut neighbors = Vec::new();
         neighbors.try_reserve_exact(INITIAL_PENDING_CAPACITY).ok()?;
         let mut tunnel_peers = Vec::new();
@@ -387,7 +387,7 @@ impl NetStack {
         source: EventSourceToken,
     ) -> bool {
         #[cfg(feature = "virtualization")]
-        crate::kernel::vm::device::virtio::net::poll_tap_devices();
+        crate::kernel::vfs::filesystem::vm::device::virtio::net::poll_tap_devices();
         let mut changed = false;
         let Some(mut input) = allocate_zeroed(self.frame_size) else {
             return false;
@@ -404,12 +404,12 @@ impl NetStack {
             };
             input[..length].copy_from_slice(frame);
             #[cfg(feature = "virtualization")]
-            crate::kernel::vm::device::virtio::net::host_ingress_frame(&input[..length]);
+            crate::kernel::vfs::filesystem::vm::device::virtio::net::host_ingress_frame(&input[..length]);
             changed |= self.process_frame(&input[..length], now_ns);
         }
         #[cfg(feature = "virtualization")]
         for _ in 0..self.receive_budget {
-            let Some(length) = crate::kernel::vm::device::virtio::net::receive_host_stack_frame(
+            let Some(length) = crate::kernel::vfs::filesystem::vm::device::virtio::net::receive_host_stack_frame(
                 &mut input,
             ) else {
                 break;
@@ -1147,7 +1147,7 @@ impl NetStack {
         }
         frame[ETHERNET_HEADER_LENGTH..].copy_from_slice(packet);
         #[cfg(feature = "virtualization")]
-        crate::kernel::vm::device::virtio::net::host_transmit_frame(&frame);
+        crate::kernel::vfs::filesystem::vm::device::virtio::net::host_transmit_frame(&frame);
         #[cfg(not(feature = "virtualization"))]
         self.device.transmit_frame(&frame)?;
         Ok(())
@@ -1272,7 +1272,7 @@ impl NetStack {
         }
         #[cfg(feature = "virtualization")]
         {
-            crate::kernel::vm::device::virtio::net::host_transmit_frame(&frame);
+            crate::kernel::vfs::filesystem::vm::device::virtio::net::host_transmit_frame(&frame);
             true
         }
         #[cfg(not(feature = "virtualization"))]
@@ -1427,7 +1427,7 @@ impl NetStack {
         };
         for _ in 0..self.receive_budget {
             let Some(length) =
-                crate::kernel::vm::device::virtio::net::peek_host_transmit_frame(&mut frame)
+                crate::kernel::vfs::filesystem::vm::device::virtio::net::peek_host_transmit_frame(&mut frame)
             else {
                 break;
             };
@@ -1437,12 +1437,12 @@ impl NetStack {
             match self.device.transmit_frame(&frame[..length]) {
                 Ok(()) => {
                     let _consumed =
-                        crate::kernel::vm::device::virtio::net::consume_host_transmit_frame(length);
+                        crate::kernel::vfs::filesystem::vm::device::virtio::net::consume_host_transmit_frame(length);
                 }
                 Err(Error::Busy) => break,
                 Err(_) => {
                     let _dropped =
-                        crate::kernel::vm::device::virtio::net::drop_host_transmit_frame(length);
+                        crate::kernel::vfs::filesystem::vm::device::virtio::net::drop_host_transmit_frame(length);
                 }
             }
         }

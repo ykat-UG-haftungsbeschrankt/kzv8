@@ -6,6 +6,7 @@
  */
 
 use crate::kernel::error::Error;
+use crate::kernel::lib::lookup::LookupTable;
 
 pub(crate) const MAX_SIGNAL_NUMBER: u8 = 63;
 pub(crate) const REALTIME_SIGNAL_MIN: u8 = 34;
@@ -224,7 +225,7 @@ impl SignalQueue {
 
 #[derive(Clone, Copy)]
 pub(crate) struct SignalState {
-    actions: [SignalAction; MAX_SIGNAL_NUMBER as usize + 1],
+    actions: LookupTable<SignalAction, { MAX_SIGNAL_NUMBER as usize + 1 }>,
     pub(crate) pending: SignalQueue,
     alarm_deadline_ns: Option<u64>,
     terminated_by_signal: Option<u8>,
@@ -234,7 +235,7 @@ pub(crate) struct SignalState {
 impl SignalState {
     pub(crate) const fn new() -> Self {
         Self {
-            actions: [SignalAction::DEFAULT; MAX_SIGNAL_NUMBER as usize + 1],
+            actions: LookupTable::new([SignalAction::DEFAULT; MAX_SIGNAL_NUMBER as usize + 1]),
             pending: SignalQueue::new(),
             alarm_deadline_ns: None,
             terminated_by_signal: None,
@@ -265,8 +266,10 @@ impl SignalState {
     }
 
     pub(crate) fn action(&self, signal_number: u8) -> Option<SignalAction> {
-        (signal_number != 0 && signal_number <= MAX_SIGNAL_NUMBER)
-            .then(|| self.actions[signal_number as usize])
+        if signal_number == 0 || signal_number > MAX_SIGNAL_NUMBER {
+            return None;
+        }
+        self.actions.get(signal_number as usize).copied()
     }
 
     pub(crate) fn set_action(
@@ -281,7 +284,9 @@ impl SignalState {
         {
             return Err(Error::Inval);
         }
-        let slot = &mut self.actions[signal_number as usize];
+        let Some(slot) = self.actions.get_mut(signal_number as usize) else {
+            return Err(Error::Inval);
+        };
         let previous = *slot;
         *slot = action;
         if action.is_ignored() {

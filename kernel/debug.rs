@@ -22,11 +22,11 @@ pub(crate) fn debug_fmt(arguments: fmt::Arguments<'_>) {
 }
 
 pub(crate) fn write_virtio_devices() {
-    crate::kernel::driver::virtio::transport::for_each_device(|device| {
+    crate::kernel::vfs::filesystem::virtio::transport::for_each_device(|device| {
         debug_fmt(format_args!(
             "kz: virtio device_id={} type={}\n",
             device.device_id,
-            crate::kernel::driver::virtio::transport::VirtioTransport::device_type_name(
+            crate::kernel::vfs::filesystem::virtio::transport::VirtioTransport::device_type_name(
                 device.device_id,
             )
         ));

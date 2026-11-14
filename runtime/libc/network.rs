@@ -1145,7 +1145,7 @@ pub(crate) fn write_packet_fd(
         }
         TunTapMode::Tap => {
             #[cfg(feature = "virtualization")]
-            crate::kernel::vm::device::virtio::net::poll_tap_devices();
+            crate::kernel::vfs::filesystem::vm::device::virtio::net::poll_tap_devices();
         }
     }
     Ok(length)
@@ -1154,7 +1154,7 @@ pub(crate) fn write_packet_fd(
 pub(crate) fn pump_packet_network() {
     let _progress = with_active_tcp_context(TcpContext::poll_network);
     #[cfg(feature = "virtualization")]
-    crate::kernel::vm::device::virtio::net::poll_tap_devices();
+    crate::kernel::vfs::filesystem::vm::device::virtio::net::poll_tap_devices();
 }
 
 pub(crate) fn close_packet_fd(file_descriptor: i32) -> Result<(), Error> {

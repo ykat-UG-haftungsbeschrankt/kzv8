@@ -11,11 +11,9 @@ use core::ptr::{copy_nonoverlapping, write_bytes, write_volatile};
 
 use crate::kernel::arch::traits::{InterruptArchitecture as _, MemoryArchitecture as _};
 use crate::kernel::arch::{
-    GuestRegisters, MemoryArchitecture, VirtualMachineExit, VirtualMachineExitReason,
-    VirtualizationError,
+    GuestMemoryView, GuestMmioHandler, GuestRegisters, MemoryArchitecture, VirtualMachineExit,
+    VirtualMachineExitReason, VirtualizationError,
 };
-use crate::kernel::vm::device::virtio::GuestVirtioDevices;
-use crate::kernel::vm::device::GuestMemory;
 use super::FpuContext;
 use crate::kernel::memory::physical::PhysicalAllocator;
 
@@ -635,7 +633,6 @@ pub(crate) struct GuestContext {
     owner_apic_id: u32,
     registers: GuestRegisters,
     fpu_context: FpuContext,
-    devices: GuestVirtioDevices,
     launched: bool,
 }
 
@@ -666,7 +663,6 @@ impl GuestContext {
             owner_apic_id: super::interrupts::current_apic_id(),
             registers: GuestRegisters::default(),
             fpu_context: FpuContext::INITIAL,
-            devices: GuestVirtioDevices::new()?,
             launched: false,
         })
     }
@@ -785,6 +781,7 @@ impl GuestContext {
     /// The caller must trust the guest image and resume this context on its owning CPU.
     pub(crate) unsafe fn restore(
         &mut self,
+        devices: &mut dyn GuestMmioHandler,
     ) -> Result<VirtualMachineExit, VirtualizationError> {
         if self.owner_apic_id != super::interrupts::current_apic_id() {
             return Err(VirtualizationError::HostSetupFailed);
@@ -837,7 +834,7 @@ impl GuestContext {
                     Some(Some(next_rip))
                 }
                 VirtualMachineExitReason::EptViolation => {
-                    let Some(next_rip) = self.emulate_guest_mmio(&exit) else {
+                    let Some(next_rip) = self.emulate_guest_mmio(&exit, devices) else {
                         return Ok(exit);
                     };
                     Some(Some(next_rip))
@@ -894,9 +891,13 @@ impl GuestContext {
         Ok(session)
     }
 
-    fn emulate_guest_mmio(&mut self, exit: &VirtualMachineExit) -> Option<u64> {
+    fn emulate_guest_mmio(
+        &mut self,
+        exit: &VirtualMachineExit,
+        devices: &mut dyn GuestMmioHandler,
+    ) -> Option<u64> {
         let address = exit.guest_physical_address?;
-        if !GuestVirtioDevices::contains(address) {
+        if !devices.contains(address) {
             return None;
         }
         let access = exit.qualification & 0x7;
@@ -937,8 +938,8 @@ impl GuestContext {
         let guest_bytes = unsafe {
             core::slice::from_raw_parts_mut(self.guest_memory.pointer(), GUEST_MEMORY_SIZE)
         };
-        let mut memory = GuestMemory::new(guest_bytes);
-        let value = self.devices.access(
+        let mut memory = GuestMemoryView::new(guest_bytes);
+        let value = devices.access(
             &mut memory,
             address,
             decoded.width as u8,
@@ -1198,9 +1199,10 @@ fn read_guest_register_full(registers: &GuestRegisters, index: usize) -> Option<
 /// The caller must trust the ring-0 guest image; firmware and full OS device models are absent.
 pub(crate) unsafe fn run_guest(
     image: &[u8],
+    devices: &mut dyn GuestMmioHandler,
 ) -> Result<VirtualMachineExit, VirtualizationError> {
     let mut context = GuestContext::load(image)?;
-    unsafe { context.restore() }
+    unsafe { context.restore(devices) }
 }
 
 fn read_guest_exit(

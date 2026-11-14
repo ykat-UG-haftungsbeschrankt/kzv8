@@ -6,7 +6,7 @@
  */
 
 use alloc::vec::Vec;
-use crate::kernel::driver::virtio::net::VirtioNet;
+use crate::kernel::vfs::filesystem::virtio::net::VirtioNet;
 use crate::kernel::error::Error;
 
 pub(crate) struct EthernetDevice {

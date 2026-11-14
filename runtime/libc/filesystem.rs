@@ -18,7 +18,8 @@ use crate::kernel::error::Error as KernelError;
 use crate::kernel::process::{Credentials, GroupId, UserId};
 use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::vfs::{
-    NodeMetadata, NodeMetadataApi as _, INODE_FLAG_APPEND, INODE_FLAG_IMMUTABLE,
+    FileHandleApi as _, NodeMetadata, NodeMetadataApi as _, OpenMode, VfsApi as _,
+    SeekFrom, INODE_FLAG_APPEND, INODE_FLAG_IMMUTABLE,
 };
 
 use super::errno::{
@@ -43,8 +44,15 @@ const O_LARGEFILE: i32 = 0o100000;
 const O_DIRECTORY: i32 = 0o200000;
 const O_NOFOLLOW: i32 = 0o400000;
 const O_CLOEXEC: i32 = 0o2000000;
-const TIOCGWINSZ: usize = 0x5413;
-const TIOCSWINSZ: usize = 0x5414;
+const TIOCGWINSZ: usize = crate::kernel::vfs::filesystem::tty::TIOCGWINSZ as usize;
+const TIOCSWINSZ: usize = crate::kernel::vfs::filesystem::tty::TIOCSWINSZ as usize;
+const TCGETS: usize = crate::kernel::vfs::filesystem::tty::TCGETS as usize;
+const TCSETS: usize = crate::kernel::vfs::filesystem::tty::TCSETS as usize;
+const TCSETSW: usize = crate::kernel::vfs::filesystem::tty::TCSETSW as usize;
+const TCSETSF: usize = crate::kernel::vfs::filesystem::tty::TCSETSF as usize;
+const TCXONC: usize = crate::kernel::vfs::filesystem::tty::TCXONC as usize;
+const TCFLSH: usize = crate::kernel::vfs::filesystem::tty::TCFLSH as usize;
+const TCSBRK: usize = crate::kernel::vfs::filesystem::tty::TCSBRK as usize;
 const O_SUPPORTED: i32 = O_ACCMODE
     | O_CREAT
     | O_EXCL
@@ -2763,20 +2771,63 @@ pub(crate) fn duplicate_to(
 }
 
 pub(crate) fn descriptor_flags(file_descriptor: i32) -> Result<i32, i32> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            return Ok(i32::from(alias.close_on_exec));
+        }
+    }
     FILESYSTEM.lock().descriptor_flags(file_descriptor)
 }
 
 pub(crate) fn set_descriptor_flags(file_descriptor: i32, flags: i32) -> Result<(), i32> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            if flags & !1 != 0 {
+                return Err(EINVAL);
+            }
+            let process_id = ThreadManager::current_process()
+                .map_err(metadata_errno)?
+                .pid();
+            return crate::kernel::runtime::runtime_libc::fd_alias::set_close_on_exec_for_process(
+                process_id,
+                file_descriptor,
+                flags & 1 != 0,
+            )
+            .map_err(metadata_errno);
+        }
+    }
     FILESYSTEM
         .lock()
         .set_descriptor_flags(file_descriptor, flags)
 }
 
 pub(crate) fn status_flags(file_descriptor: i32) -> Result<i32, i32> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            let nonblocking = if alias.nonblocking { O_NONBLOCK } else { 0 };
+            return Ok(alias.access_mode | nonblocking);
+        }
+    }
     FILESYSTEM.lock().status_flags(file_descriptor)
 }
 
 pub(crate) fn set_status_flags(file_descriptor: i32, flags: i32) -> Result<(), i32> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            if flags & !(O_ACCMODE | O_NONBLOCK) != 0 {
+                return Err(EINVAL);
+            }
+            let process_id = ThreadManager::current_process()
+                .map_err(metadata_errno)?
+                .pid();
+            return crate::kernel::runtime::runtime_libc::fd_alias::set_nonblocking_for_process(
+                process_id,
+                file_descriptor,
+                flags & O_NONBLOCK != 0,
+            )
+            .map_err(metadata_errno);
+        }
+    }
     FILESYSTEM.lock().set_status_flags(file_descriptor, flags)
 }
 
@@ -3514,6 +3565,9 @@ pub unsafe extern "C" fn kz_rust_open(path: *const c_char, flags: i32, mode: u32
         let credentials = current_credentials()?;
         let process = crate::kernel::scheduler::thread::ThreadManager::current_process()
             .map_err(|error| -(error as i32))?;
+        if let Some(descriptor) = open_vfs_descriptor(&path, flags, process.pid())? {
+            return Ok(descriptor);
+        }
         FILESYSTEM
             .lock()
             .open(path, flags, mode & !process.umask(), &credentials, process.pid())
@@ -3591,10 +3645,75 @@ pub(crate) fn open_for_process(
         .map_err(|error| -(error as i32));
     }
     let credentials = process.credentials().map_err(metadata_errno)?;
+    if let Some(descriptor) = open_vfs_descriptor(&path, flags, process_id)? {
+        return Ok((
+            descriptor,
+            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs,
+        ));
+    }
     FILESYSTEM
         .lock()
         .open(path, flags, mode & !process.umask(), &credentials, process_id)
         .map(|descriptor| (descriptor, DescriptorKind::File))
+}
+
+fn open_vfs_descriptor(path: &[u8], flags: i32, process_id: i32) -> Result<Option<i32>, i32> {
+    if flags & (O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_DIRECTORY | O_NOFOLLOW) != 0 {
+        return Ok(None);
+    }
+    let Ok(path) = core::str::from_utf8(path) else {
+        return Ok(None);
+    };
+    let Some(vfs) = crate::kernel::vfs::mounted() else {
+        return Ok(None);
+    };
+    let open_mode = match flags & O_ACCMODE {
+        O_RDONLY => OpenMode::ReadOnly,
+        O_WRONLY => OpenMode::WriteOnly,
+        O_RDWR => OpenMode::ReadWrite,
+        _ => return Err(EINVAL),
+    };
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let file = match vfs.open_blocking(path, open_mode, process.credentials().map_err(metadata_errno)?) {
+        Ok(file) => file,
+        Err(KernelError::NoEnt | KernelError::NotDir) => return Ok(None),
+        Err(error) => return Err(metadata_errno(error)),
+    };
+    let backing = process.insert_file_descriptor(file).map_err(metadata_errno)?;
+    let backing_number = match i32::try_from(backing) {
+        Ok(backing) => backing,
+        Err(_) => {
+            let _ = process.close_file_descriptor(backing);
+            return Err(EMFILE);
+        }
+    };
+    let target = (|| {
+        let filesystem = FILESYSTEM.lock();
+        let slot = filesystem
+            .available_descriptor_slot_for_process(process_id, FIRST_DESCRIPTOR)
+            .ok_or(EMFILE)?;
+        let target = FIRST_DESCRIPTOR + slot as i32;
+        crate::kernel::runtime::runtime_libc::fd_alias::install_for_process(
+            process_id,
+            crate::kernel::runtime::runtime_libc::fd_alias::DescriptorAlias {
+                target,
+                backing: backing_number,
+                kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs,
+                close_on_exec: flags & O_CLOEXEC != 0,
+                nonblocking: flags & O_NONBLOCK != 0,
+                access_mode: flags & O_ACCMODE,
+            },
+        )
+        .map_err(metadata_errno)?;
+        Ok::<i32, i32>(target)
+    })();
+    match target {
+        Ok(target) => Ok(Some(target)),
+        Err(error) => {
+            let _ = process.close_file_descriptor(backing);
+            Err(error)
+        }
+    }
 }
 
 #[no_mangle]
@@ -4189,8 +4308,38 @@ pub extern "C" fn kz_rust_fchdir(file_descriptor: i32) -> i32 {
 }
 
 pub(crate) fn is_terminal_descriptor(file_descriptor: i32) -> Result<bool, i32> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            let process_id = ThreadManager::current_process()
+                .map_err(metadata_errno)?
+                .pid();
+            let descriptor = u32::try_from(alias.backing).map_err(|_| EBADF)?;
+            let process = crate::kernel::process::Process::lookup(process_id)
+                .map_err(metadata_errno)?;
+            let object = process.file_descriptor(descriptor).map_err(metadata_errno)?;
+            let file = object.take_file().map_err(metadata_errno)?;
+            let is_terminal = file.is_terminal();
+            object.restore_file(file).map_err(metadata_errno)?;
+            return Ok(is_terminal);
+        }
+    }
     if pty::has_fd(file_descriptor) {
         return Ok(true);
+    }
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            let process_id = ThreadManager::current_process()
+                .map_err(metadata_errno)?
+                .pid();
+            let descriptor = u32::try_from(alias.backing).map_err(|_| EBADF)?;
+            let process = crate::kernel::process::Process::lookup(process_id)
+                .map_err(metadata_errno)?;
+            let object = process.file_descriptor(descriptor).map_err(metadata_errno)?;
+            let file = object.take_file().map_err(metadata_errno)?;
+            let is_terminal = file.is_terminal();
+            object.restore_file(file).map_err(metadata_errno)?;
+            return Ok(is_terminal);
+        }
     }
     FILESYSTEM.lock().is_terminal_descriptor(file_descriptor)
 }
@@ -4353,6 +4502,13 @@ fn close_descriptor_backing_for_process(
             backing,
         )
         .map_err(|error| -(error as i32)),
+        DescriptorKind::Vfs => {
+            let descriptor = u32::try_from(backing).map_err(|_| EBADF)?;
+            crate::kernel::process::Process::lookup(process_id)
+                .map_err(metadata_errno)?
+                .close_file_descriptor(descriptor)
+                .map_err(metadata_errno)
+        }
     }
 }
 
@@ -4388,6 +4544,16 @@ fn duplicate_descriptor_backing_for_process(
             target_process_id,
         )
         .map_err(|error| -(error as i32)),
+        DescriptorKind::Vfs => {
+            let descriptor = u32::try_from(source).map_err(|_| EBADF)?;
+            crate::kernel::process::Process::duplicate_file_descriptor_to_process(
+                source_process_id,
+                descriptor,
+                target_process_id,
+            )
+            .and_then(|descriptor| i32::try_from(descriptor).map_err(|_| KernelError::Mfile))
+            .map_err(metadata_errno)
+        }
     }
 }
 
@@ -4398,6 +4564,8 @@ fn clone_descriptor_alias_for_process(
     target: i32,
     kind: crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind,
     close_on_exec: bool,
+    nonblocking: bool,
+    access_mode: i32,
 ) -> Result<(), i32> {
     prepare_alias_target_for_process(target_process_id, target)?;
     let backing = duplicate_descriptor_backing_for_process(
@@ -4411,6 +4579,8 @@ fn clone_descriptor_alias_for_process(
         backing,
         kind,
         close_on_exec,
+        nonblocking,
+        access_mode,
     };
     if let Err(error) = crate::kernel::runtime::runtime_libc::fd_alias::install_for_process(
         target_process_id,
@@ -4533,6 +4703,8 @@ pub(crate) fn inherit_descriptors_for_process(
                 alias.target,
                 alias.kind,
                 alias.close_on_exec,
+                alias.nonblocking,
+                alias.access_mode,
             )?;
         }
 
@@ -4545,6 +4717,8 @@ pub(crate) fn inherit_descriptors_for_process(
                     target,
                     crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::File,
                     close_on_exec,
+                    false,
+                    O_RDONLY,
                 )?;
             }
         }
@@ -4558,6 +4732,8 @@ pub(crate) fn inherit_descriptors_for_process(
                     target,
                     kind,
                     close_on_exec,
+                    false,
+                    O_RDONLY,
                 )?;
             }
         }
@@ -4571,6 +4747,8 @@ pub(crate) fn inherit_descriptors_for_process(
                     target,
                     crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Pty,
                     close_on_exec,
+                    false,
+                    O_RDWR,
                 )?;
             }
         }
@@ -4679,6 +4857,10 @@ fn descriptor_backing_is_open_for_process(
             process_id,
             backing,
         ),
+        DescriptorKind::Vfs => u32::try_from(backing)
+            .ok()
+            .and_then(|descriptor| crate::kernel::process::Process::lookup(process_id).ok()?.file_descriptor(descriptor).ok())
+            .is_some(),
     }
 }
 
@@ -4710,6 +4892,16 @@ pub(crate) fn duplicate_descriptor_to_process(
         target,
         kind,
         close_on_exec,
+        crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+            source_process_id,
+            source,
+        )
+        .is_some_and(|alias| alias.nonblocking),
+        crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+            source_process_id,
+            source,
+        )
+        .map_or(O_RDONLY, |alias| alias.access_mode),
     )?;
     Ok(target)
 }
@@ -4727,6 +4919,8 @@ pub(crate) fn install_open_descriptor_for_process(
         backing,
         kind,
         close_on_exec,
+        nonblocking: false,
+        access_mode: O_RDONLY,
     };
     if let Err(error) = crate::kernel::runtime::runtime_libc::fd_alias::install_for_process(
         process_id,
@@ -4822,9 +5016,113 @@ fn wait_for_blocking_pipe(file_descriptor: i32) -> bool {
     matches!(pipe_nonblocking(file_descriptor), Ok(Some(false)))
 }
 
+fn read_vfs_for_process(
+    process_id: i32,
+    backing_descriptor: i32,
+    buffer_address: usize,
+    length: usize,
+    nonblocking: bool,
+) -> Result<usize, i32> {
+    let descriptor = u32::try_from(backing_descriptor).map_err(|_| EBADF)?;
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let mut address_space = process.address_space();
+    if !address_space.user_range_accessible(buffer_address, length, true) {
+        return Err(EFAULT);
+    }
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(length).map_err(|_| ENOMEM)?;
+    buffer.resize(length, 0);
+    let object = process.file_descriptor(descriptor).map_err(metadata_errno)?;
+    let mut file = object.take_file().map_err(metadata_errno)?;
+    let result = loop {
+        ThreadManager::cancel_current_if_requested();
+        match file.read_blocking(&mut buffer) {
+            Err(KernelError::Again) if nonblocking => break Err(KernelError::Again),
+            Err(KernelError::Again) => {
+                if ThreadManager::current_signal_wake_pending() && !restart_interrupted_io() {
+                    break Err(KernelError::Intr);
+                }
+                crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+            }
+            result => break result,
+        }
+    };
+    object.restore_file(file).map_err(metadata_errno)?;
+    let amount = result.map_err(metadata_errno)?;
+    if amount > buffer.len() {
+        return Err(metadata_errno(KernelError::Io));
+    }
+    if amount != 0 {
+        address_space
+            .write(buffer_address, &buffer[..amount])
+            .map_err(|_| EFAULT)?;
+        record_file_blocks(amount, true);
+    }
+    Ok(amount)
+}
+
+fn write_vfs_for_process(
+    process_id: i32,
+    backing_descriptor: i32,
+    buffer_address: usize,
+    length: usize,
+    nonblocking: bool,
+) -> Result<usize, i32> {
+    let descriptor = u32::try_from(backing_descriptor).map_err(|_| EBADF)?;
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let address_space = process.address_space();
+    if !address_space.user_range_accessible(buffer_address, length, false) {
+        return Err(EFAULT);
+    }
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(length).map_err(|_| ENOMEM)?;
+    buffer.resize(length, 0);
+    address_space
+        .read(buffer_address, &mut buffer)
+        .map_err(|_| EFAULT)?;
+    let object = process.file_descriptor(descriptor).map_err(metadata_errno)?;
+    let mut file = object.take_file().map_err(metadata_errno)?;
+    let result = (|| {
+        let mut written = 0;
+        while written < buffer.len() {
+            ThreadManager::cancel_current_if_requested();
+            match file.write_blocking(&buffer[written..]) {
+                Ok(0) => break,
+                Ok(amount) if amount <= buffer.len() - written => {
+                    written += amount;
+                }
+                Ok(_) => return Err(metadata_errno(KernelError::Io)),
+                Err(KernelError::Again) if nonblocking => {
+                    if written == 0 {
+                        return Err(metadata_errno(KernelError::Again));
+                    }
+                    break;
+                }
+                Err(KernelError::Again) => {
+                    if ThreadManager::current_signal_wake_pending() && !restart_interrupted_io() {
+                        if written == 0 {
+                            return Err(metadata_errno(KernelError::Intr));
+                        }
+                        break;
+                    }
+                    crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
+                }
+                Err(_) if written != 0 => break,
+                Err(error) => return Err(metadata_errno(error)),
+            }
+        }
+        Ok(written)
+    })();
+    object.restore_file(file).map_err(metadata_errno)?;
+    let written = result?;
+    record_file_blocks(written, false);
+    Ok(written)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length: usize) -> isize {
-    let has_alias = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor).is_some();
+    let alias = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor);
+    let has_alias = alias.is_some();
     if !has_alias
         && crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor)
         && (file_descriptor != 0 || !standard_descriptor_is_open(file_descriptor).unwrap_or(false))
@@ -4842,6 +5140,30 @@ pub unsafe extern "C" fn read(file_descriptor: i32, buffer: *mut c_void, length:
     }
     if length == 0 {
         return 0;
+    }
+    if let Some(alias) = alias.filter(|alias| {
+        alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs
+    }) {
+        let process_id = match ThreadManager::current_process() {
+            Ok(process) => process.pid(),
+            Err(error) => {
+                set_errno(metadata_errno(error));
+                return -1;
+            }
+        };
+        return match read_vfs_for_process(
+            process_id,
+            alias.backing,
+            buffer as usize,
+            length,
+            alias.nonblocking,
+        ) {
+            Ok(amount) => amount as isize,
+            Err(error) => {
+                set_errno(error);
+                -1
+            }
+        };
     }
     ThreadManager::cancel_current_if_requested();
     if !has_alias && file_descriptor == 0 {
@@ -5023,7 +5345,8 @@ pub unsafe extern "C" fn write(
     buffer: *const c_void,
     length: usize,
 ) -> isize {
-    let has_alias = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor).is_some();
+    let alias = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor);
+    let has_alias = alias.is_some();
     if !has_alias
         && crate::kernel::tty::is_standard_terminal_descriptor(file_descriptor)
         && (file_descriptor == 0 || !standard_descriptor_is_open(file_descriptor).unwrap_or(false))
@@ -5041,6 +5364,30 @@ pub unsafe extern "C" fn write(
     }
     if length == 0 {
         return 0;
+    }
+    if let Some(alias) = alias.filter(|alias| {
+        alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs
+    }) {
+        let process_id = match ThreadManager::current_process() {
+            Ok(process) => process.pid(),
+            Err(error) => {
+                set_errno(metadata_errno(error));
+                return -1;
+            }
+        };
+        return match write_vfs_for_process(
+            process_id,
+            alias.backing,
+            buffer as usize,
+            length,
+            alias.nonblocking,
+        ) {
+            Ok(amount) => amount as isize,
+            Err(error) => {
+                set_errno(error);
+                -1
+            }
+        };
     }
     ThreadManager::cancel_current_if_requested();
     if !has_alias && (file_descriptor == 1 || file_descriptor == 2) {
@@ -5199,6 +5546,29 @@ pub extern "C" fn close(file_descriptor: i32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn lseek(file_descriptor: i32, offset: i64, origin: i32) -> i64 {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            let process_id = match ThreadManager::current_process() {
+                Ok(process) => process.pid(),
+                Err(error) => {
+                    set_errno(metadata_errno(error));
+                    return -1;
+                }
+            };
+            return match seek_vfs_for_process(
+                process_id,
+                alias.backing,
+                offset,
+                origin,
+            ) {
+                Ok(position) => position,
+                Err(error) => {
+                    set_errno(error);
+                    -1
+                }
+            };
+        }
+    }
     if network::is_socket_fd(file_descriptor) || network::is_packet_fd(file_descriptor) {
         if network::has_socket_fd(file_descriptor) || network::has_packet_fd(file_descriptor) {
             set_errno(-(KernelError::Spipe as i32));
@@ -5214,6 +5584,29 @@ pub extern "C" fn lseek(file_descriptor: i32, offset: i64, origin: i32) -> i64 {
             -1
         }
     }
+}
+
+fn seek_vfs_for_process(
+    process_id: i32,
+    backing_descriptor: i32,
+    offset: i64,
+    origin: i32,
+) -> Result<i64, i32> {
+    let from = match origin {
+        0 if offset >= 0 => SeekFrom::Start(u64::try_from(offset).map_err(|_| EINVAL)?),
+        0 => return Err(EINVAL),
+        1 => SeekFrom::Current(offset),
+        2 => SeekFrom::End(offset),
+        _ => return Err(EINVAL),
+    };
+    let descriptor = u32::try_from(backing_descriptor).map_err(|_| EBADF)?;
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let object = process.file_descriptor(descriptor).map_err(metadata_errno)?;
+    let mut file = object.take_file().map_err(metadata_errno)?;
+    let result = file.seek(from);
+    object.restore_file(file).map_err(metadata_errno)?;
+    let position = result.map_err(metadata_errno)?;
+    i64::try_from(position).map_err(|_| EOVERFLOW)
 }
 
 #[no_mangle]
@@ -5286,10 +5679,62 @@ fn pty_status(file_descriptor: i32) -> Result<CStat, i32> {
     })
 }
 
+fn vfs_status_for_process(process_id: i32, backing_descriptor: i32) -> Result<CStat, i32> {
+    let descriptor = u32::try_from(backing_descriptor).map_err(|_| EBADF)?;
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let object = process.file_descriptor(descriptor).map_err(metadata_errno)?;
+    let file = object.take_file().map_err(metadata_errno)?;
+    let metadata = file.metadata();
+    let is_terminal = file.is_terminal();
+    let file_size = if is_terminal {
+        0
+    } else {
+        match file.size_blocking() {
+            Ok(size) => size,
+            Err(error) => {
+                let _ = object.restore_file(file);
+                return Err(metadata_errno(error));
+            }
+        }
+    };
+    object.restore_file(file).map_err(metadata_errno)?;
+    let size = i64::try_from(file_size).map_err(|_| EOVERFLOW)?;
+    Ok(CStat {
+        device: 1,
+        inode: metadata.identity(),
+        links: u64::from(metadata.link_count()),
+        mode: (if is_terminal { S_IFCHR } else { S_IFREG }) | u32::from(metadata.mode()),
+        user: metadata.owner().raw(),
+        group: metadata.group().raw(),
+        pad: 0,
+        special_device: 0,
+        size,
+        block_size: 4096,
+        blocks: size.saturating_add(511) / 512,
+        accessed: Timespec { seconds: 0, nanoseconds: 0 },
+        modified: Timespec { seconds: 0, nanoseconds: 0 },
+        changed: Timespec { seconds: 0, nanoseconds: 0 },
+        reserved: [0; 3],
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn fstat(file_descriptor: i32, output: *mut c_void) -> i32 {
     if output.is_null() {
         return fail(EFAULT);
+    }
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            let process_id = match ThreadManager::current_process() {
+                Ok(process) => process.pid(),
+                Err(error) => return fail(metadata_errno(error)),
+            };
+            return vfs_status_for_process(process_id, alias.backing)
+                .map_or_else(fail, |status| {
+                    fill_status(output, status);
+                    0
+                });
+        }
     }
     let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     let status = if network::has_socket_fd(file_descriptor) {
@@ -5508,6 +5953,14 @@ pub(super) fn fd_access(
 }
 
 pub(super) fn status_for_fd(file_descriptor: i32) -> Result<CStat, i32> {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            let process_id = ThreadManager::current_process()
+                .map_err(metadata_errno)?
+                .pid();
+            return vfs_status_for_process(process_id, alias.backing);
+        }
+    }
     let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if pty::has_fd(file_descriptor) {
         return pty_status(file_descriptor);
@@ -5872,12 +6325,110 @@ const fn file_ioctl(direction: usize, number: usize) -> usize {
 pub(crate) const FS_IOC_GETFLAGS: usize = file_ioctl(2, 1);
 pub(crate) const FS_IOC_SETFLAGS: usize = file_ioctl(1, 2);
 
+fn ioctl_vfs_buffer(
+    process_id: i32,
+    backing_descriptor: i32,
+    request: usize,
+    argument: &mut [u8],
+) -> Result<i64, i32> {
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let descriptor = u32::try_from(backing_descriptor).map_err(|_| EBADF)?;
+    let object = process.file_descriptor(descriptor).map_err(metadata_errno)?;
+    let mut file = object.take_file().map_err(metadata_errno)?;
+    let credentials = process.credentials().map_err(metadata_errno)?;
+    let result = file.ioctl_blocking(request as u64, argument, &credentials);
+    object.restore_file(file).map_err(metadata_errno)?;
+    result.map_err(|error| {
+        if error == KernelError::NoSys {
+            ENOTTY
+        } else {
+            metadata_errno(error)
+        }
+    })
+}
+
+pub(crate) fn is_vfs_descriptor(file_descriptor: i32) -> bool {
+    crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor)
+        .is_some_and(|alias| alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs)
+}
+
+pub(crate) fn ioctl_vfs_descriptor_buffer(
+    file_descriptor: i32,
+    request: usize,
+    argument: &mut [u8],
+) -> Result<i64, i32> {
+    let process_id = ThreadManager::current_process()
+        .map_err(metadata_errno)?
+        .pid();
+    let alias = crate::kernel::runtime::runtime_libc::fd_alias::get_for_process(
+        process_id,
+        file_descriptor,
+    )
+    .filter(|alias| alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs)
+    .ok_or(EBADF)?;
+    ioctl_vfs_buffer(process_id, alias.backing, request, argument)
+}
+
+fn ioctl_vfs_descriptor(
+    process_id: i32,
+    backing_descriptor: i32,
+    request: usize,
+    argument: *mut c_void,
+) -> Result<i32, i32> {
+    let (argument_size, writes_argument) = match request {
+        TIOCGWINSZ => (size_of::<CWindowSize>(), true),
+        TIOCSWINSZ => (size_of::<CWindowSize>(), false),
+        TCGETS => (56, true),
+        TCSETS | TCSETSW | TCSETSF => (56, false),
+        TCXONC | TCFLSH | TCSBRK => (4, false),
+        _ => return Err(ENOTTY),
+    };
+    let process = crate::kernel::process::Process::lookup(process_id).map_err(metadata_errno)?;
+    let mut address_space = process.address_space();
+    let argument_value = argument as usize;
+    let mut buffer = [0; 56];
+    let argument_buffer = &mut buffer[..argument_size];
+    if matches!(request, TCFLSH | TCXONC | TCSBRK) {
+        argument_buffer[..4].copy_from_slice(&(argument_value as i32).to_ne_bytes());
+    } else {
+        if argument.is_null() {
+            return Err(EFAULT);
+        }
+        if writes_argument {
+            if !address_space.user_range_accessible(argument_value, argument_size, true) {
+                return Err(EFAULT);
+            }
+        } else {
+            address_space
+                .read(argument_value, argument_buffer)
+                .map_err(|_| EFAULT)?;
+        }
+    }
+    let result = ioctl_vfs_buffer(process_id, backing_descriptor, request, argument_buffer)?;
+    if writes_argument {
+        address_space
+            .write(argument_value, argument_buffer)
+            .map_err(|_| EFAULT)?;
+    }
+    i32::try_from(result).map_err(|_| EOVERFLOW)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn kz_rust_ioctl(
     file_descriptor: i32,
     request: usize,
     argument: *mut c_void,
 ) -> i32 {
+    if let Some(alias) = crate::kernel::runtime::runtime_libc::fd_alias::get(file_descriptor) {
+        if alias.kind == crate::kernel::runtime::runtime_libc::fd_alias::DescriptorKind::Vfs {
+            let process_id = match ThreadManager::current_process() {
+                Ok(process) => process.pid(),
+                Err(error) => return fail(metadata_errno(error)),
+            };
+            return ioctl_vfs_descriptor(process_id, alias.backing, request, argument)
+                .map_or_else(fail, |result| result);
+        }
+    }
     let file_descriptor = crate::kernel::runtime::runtime_libc::fd_alias::resolve_any(file_descriptor);
     if network::ioctl_requires_admin(request) {
         match current_credentials() {

@@ -11,7 +11,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::kernel::driver::virtio::transport::{self, VirtioDeviceInfo, VirtioTransport};
+use crate::kernel::vfs::filesystem::virtio::transport::{self, VirtioDeviceInfo, VirtioTransport};
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::scheduler::sync::IrqSpinLock;

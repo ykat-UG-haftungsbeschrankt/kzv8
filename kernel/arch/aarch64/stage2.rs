@@ -8,10 +8,8 @@
 use core::ptr::{copy_nonoverlapping, write_bytes, write_volatile};
 
 use crate::kernel::arch::traits::{InterruptArchitecture as _, MemoryArchitecture as _};
-use crate::kernel::arch::MemoryArchitecture;
+use crate::kernel::arch::{GuestMemoryView, GuestMmioHandler, MemoryArchitecture};
 use crate::kernel::memory::physical::PhysicalAllocator;
-use crate::kernel::vm::device::virtio::GuestVirtioDevices;
-use crate::kernel::vm::device::GuestMemory as GuestMemoryView;
 
 const PAGE_SIZE: usize = 4096;
 const GUEST_MEMORY_SIZE: usize = 2 * 1024 * 1024;
@@ -411,7 +409,6 @@ pub(crate) struct GuestContext {
     owner_cpu: usize,
     guest: GuestState,
     exit: crate::kernel::arch::VirtualMachineExit,
-    devices: GuestVirtioDevices,
 }
 
 unsafe extern "C" {
@@ -443,7 +440,6 @@ impl GuestContext {
                 fpsr: 0,
             },
             exit: empty_guest_exit(),
-            devices: GuestVirtioDevices::new()?,
         })
     }
 
@@ -507,6 +503,7 @@ impl GuestContext {
     /// Only trusted guest images may be executed.
     pub(crate) unsafe fn restore(
         &mut self,
+        devices: &mut dyn GuestMmioHandler,
     ) -> Result<crate::kernel::arch::VirtualMachineExit, crate::kernel::arch::VirtualizationError> {
         if self.owner_cpu != current_cpu_slot()
             .ok_or(crate::kernel::arch::VirtualizationError::Unsupported)?
@@ -534,7 +531,7 @@ impl GuestContext {
             self.guest = state.guest;
             self.exit = state.exit;
             if self.exit.reason == crate::kernel::arch::VirtualMachineExitReason::EptViolation
-                && self.emulate_guest_mmio()
+                && self.emulate_guest_mmio(devices)
             {
                 let Some(next_pc) = self.guest.pc.checked_add(4) else {
                     crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
@@ -563,11 +560,11 @@ impl GuestContext {
         Ok(self.exit)
     }
 
-    fn emulate_guest_mmio(&mut self) -> bool {
+    fn emulate_guest_mmio(&mut self, devices: &mut dyn GuestMmioHandler) -> bool {
         let Some(address) = self.exit.guest_physical_address else {
             return false;
         };
-        if !GuestVirtioDevices::contains(address)
+        if !devices.contains(address)
             || self.exit.qualification & (1 << 24) == 0
         {
             return false;
@@ -592,9 +589,7 @@ impl GuestContext {
             core::slice::from_raw_parts_mut(self._memory.physical as *mut u8, GUEST_MEMORY_SIZE)
         };
         let mut memory = GuestMemoryView::new(bytes);
-        let Some(value) = self
-            .devices
-            .access(&mut memory, address, width, write, value)
+        let Some(value) = devices.access(&mut memory, address, width, write, value)
         else {
             return false;
         };

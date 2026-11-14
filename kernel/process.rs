@@ -757,6 +757,21 @@ impl KernelObjectTable {
         }
     }
 
+    fn insert_shared(&mut self, object: Arc<KernelObject>) -> Result<(KernelObjectRef, bool), Error> {
+        let reference = KernelObjectRef::from_arc(&object);
+        if self.objects.contains_key(&reference) {
+            return Ok((reference, false));
+        }
+        match self.objects.insert(reference, object) {
+            Ok(None) => Ok((reference, true)),
+            Ok(Some(previous)) => {
+                let _ = self.objects.insert(reference, previous);
+                Err(Error::Exist)
+            }
+            Err((_reference, _object)) => Err(Error::NoMem),
+        }
+    }
+
     fn get(&self, reference: KernelObjectRef) -> Result<Arc<KernelObject>, Error> {
         self.objects.get(&reference).cloned().ok_or(Error::Badf)
     }
@@ -805,6 +820,10 @@ impl FileDescriptorTable {
             .copied()
             .flatten()
             .ok_or(Error::Badf)
+    }
+
+    fn contains_object(&self, object: KernelObjectRef) -> bool {
+        self.entries.iter().any(|entry| *entry == Some(object))
     }
 
     fn remove(&mut self, descriptor: u32) -> Result<KernelObjectRef, Error> {
@@ -2131,8 +2150,42 @@ impl Process {
     }
 
     pub(crate) fn close_file_descriptor(&self, descriptor: u32) -> Result<(), Error> {
-        let object_ref = self.file_descriptors.lock().remove(descriptor)?;
+        let object_ref = {
+            let mut descriptors = self.file_descriptors.lock();
+            let object_ref = descriptors.remove(descriptor)?;
+            if descriptors.contains_object(object_ref) {
+                return Ok(());
+            }
+            object_ref
+        };
         self.close_kernel_object(object_ref)
+    }
+
+    pub(crate) fn duplicate_file_descriptor_to_process(
+        source_process_id: i32,
+        source_descriptor: u32,
+        target_process_id: i32,
+    ) -> Result<u32, Error> {
+        let source_process = Self::lookup(source_process_id)?;
+        let object = source_process.file_descriptor(source_descriptor)?;
+        let target_process = Self::lookup(target_process_id)?;
+        let (object_ref, inserted) = target_process
+            .kernel_objects
+            .lock()
+            .insert_shared(object)?;
+        let insertion = {
+            let mut descriptors = target_process.file_descriptors.lock();
+            descriptors.insert(object_ref)
+        };
+        match insertion {
+            Ok(descriptor) => Ok(descriptor),
+            Err(error) => {
+                if inserted {
+                    let _ = target_process.close_kernel_object(object_ref);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn kernel_object(

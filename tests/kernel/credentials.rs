@@ -55,6 +55,9 @@ fn membership_is_validated_and_group_results_are_ordered() {
     assert_eq!(registry.add_member(user_id, first_group), Ok(false));
     assert_eq!(registry.add_member(user_id, second_group), Ok(true));
     assert!(registry.is_member(user_id, first_group));
+    let first_group_record = registry.group_by_id(first_group).unwrap();
+    assert_eq!(first_group_record.member_by_id(user_id).unwrap().username(), "alice");
+    assert_eq!(first_group_record.member_by_name("alice").unwrap().id(), user_id);
     assert_eq!(registry.groups_for_user(user_id).unwrap(), [second_group, first_group]);
 
     assert_eq!(registry.remove_member(user_id, first_group), Ok(true));

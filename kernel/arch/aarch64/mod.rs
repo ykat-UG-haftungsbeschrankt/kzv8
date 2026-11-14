@@ -596,10 +596,11 @@ impl crate::kernel::arch::traits::VirtualizationArchitecture for super::Virtuali
 
     unsafe fn restore_guest_context(
         context: &mut Self::GuestContext,
+        devices: &mut dyn super::GuestMmioHandler,
     ) -> Result<super::VirtualMachineExit, super::VirtualizationError> {
         #[cfg(feature = "aarch64-stage2")]
         {
-            unsafe { context.restore() }
+            unsafe { context.restore(devices) }
         }
         #[cfg(not(feature = "aarch64-stage2"))]
         {
@@ -621,11 +622,12 @@ impl crate::kernel::arch::traits::VirtualizationArchitecture for super::Virtuali
 
     unsafe fn run_guest(
         image: &[u8],
+        devices: &mut dyn super::GuestMmioHandler,
     ) -> Result<super::VirtualMachineExit, super::VirtualizationError> {
         #[cfg(feature = "aarch64-stage2")]
         {
             let mut context = stage2::GuestContext::load(image)?;
-            unsafe { context.restore() }
+            unsafe { context.restore(devices) }
         }
         #[cfg(not(feature = "aarch64-stage2"))]
         {

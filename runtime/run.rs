@@ -18,7 +18,7 @@ mod runtime_v8;
 use crate::kernel::arch::traits::MemoryArchitecture as _;
 use crate::kernel::arch::MemoryArchitecture;
 #[allow(unused_imports)]
-use crate::kernel::driver::virtio::console::Console;
+use crate::kernel::vfs::filesystem::virtio::console::Console;
 #[allow(unused_imports)]
 use crate::kernel::event::{EventLoop, EventSourceToken};
 use crate::kernel::memory::physical::PhysicalAllocator;

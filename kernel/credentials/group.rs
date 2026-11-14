@@ -8,18 +8,20 @@
 //@READONLY
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 
 use super::registry::copy_name;
+use super::user::{User, UserIndex};
 use super::{GroupId, UserId};
 
 pub(crate) struct Group {
     id: GroupId,
     name: String,
-    members: HashMap<u32, ()>,
+    members: UserIndex,
 }
 
 impl Group {
@@ -27,7 +29,7 @@ impl Group {
         Self {
             id,
             name,
-            members: HashMap::new(),
+            members: UserIndex::new(),
         }
     }
 
@@ -40,26 +42,32 @@ impl Group {
     }
 
     pub(crate) fn is_member(&self, user_id: UserId) -> bool {
-        self.members.contains_key(&user_id.raw())
+        self.members.get(user_id).is_some()
     }
 
     pub(crate) fn member_count(&self) -> usize {
         self.members.len()
     }
 
-    fn add_member(&mut self, user_id: UserId) -> Result<bool, Error> {
+    pub(crate) fn member_by_id(&self, user_id: UserId) -> Option<&User> {
+        self.members.get(user_id)
+    }
+
+    pub(crate) fn member_by_name(&self, username: &str) -> Option<&User> {
+        self.members.get_by_name(username)
+    }
+
+    fn add_member(&mut self, user: Arc<User>) -> Result<bool, Error> {
+        let user_id = user.id();
         if self.is_member(user_id) {
             return Ok(false);
         }
-        match self.members.insert(user_id.raw(), ()) {
-            Ok(core::option::Option::None) => Ok(true),
-            Ok(core::option::Option::Some(())) => Ok(false),
-            Err(_) => Err(Error::NoMem),
-        }
+        self.members.insert_shared(user)?;
+        Ok(true)
     }
 
     fn remove_member(&mut self, user_id: UserId) -> bool {
-        self.members.remove(&user_id.raw()).is_some()
+        self.members.remove(user_id).is_some()
     }
 }
 
@@ -122,13 +130,13 @@ impl GroupIndex {
 
     pub(super) fn add_member(
         &mut self,
-        user_id: UserId,
+        user: Arc<User>,
         group_id: GroupId,
     ) -> Result<bool, Error> {
         self.groups
             .get_mut(&group_id.raw())
             .ok_or(Error::NoEnt)?
-            .add_member(user_id)
+            .add_member(user)
     }
 
     pub(super) fn remove_member(

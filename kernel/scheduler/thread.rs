@@ -1101,7 +1101,7 @@ impl ThreadManager {
     pub(crate) fn create_vm_thread_with_pci_function(
         stack_size: usize,
         image: &[u8],
-        function: crate::kernel::vm::device::passthru::PciFunction,
+        function: crate::kernel::vfs::filesystem::vm::device::passthru::PciFunction,
         detached: bool,
     ) -> Result<usize, crate::kernel::arch::VirtualizationError> {
         Self::create_vm_thread_with_pci_function_and_control(
@@ -1117,7 +1117,7 @@ impl ThreadManager {
     pub(crate) fn create_vm_thread_with_pci_function_and_control(
         stack_size: usize,
         image: &[u8],
-        function: crate::kernel::vm::device::passthru::PciFunction,
+        function: crate::kernel::vfs::filesystem::vm::device::passthru::PciFunction,
         detached: bool,
     ) -> Result<(usize, vm::PassthroughControlHandle), crate::kernel::arch::VirtualizationError> {
         let process = Self::current_process().map_err(|error| match error {

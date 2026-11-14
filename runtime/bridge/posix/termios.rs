@@ -17,6 +17,15 @@ const TCSAFLUSH: c_int = 2;
 const TCIFLUSH: c_int = 0;
 const TCOFLUSH: c_int = 1;
 const TCIOFLUSH: c_int = 2;
+const TIOCGWINSZ: usize = crate::kernel::vfs::filesystem::tty::TIOCGWINSZ as usize;
+const TIOCSWINSZ: usize = crate::kernel::vfs::filesystem::tty::TIOCSWINSZ as usize;
+const TCGETS: usize = crate::kernel::vfs::filesystem::tty::TCGETS as usize;
+const TCSETS: usize = crate::kernel::vfs::filesystem::tty::TCSETS as usize;
+const TCSETSW: usize = crate::kernel::vfs::filesystem::tty::TCSETSW as usize;
+const TCSETSF: usize = crate::kernel::vfs::filesystem::tty::TCSETSF as usize;
+const TCXONC: usize = crate::kernel::vfs::filesystem::tty::TCXONC as usize;
+const TCFLSH: usize = crate::kernel::vfs::filesystem::tty::TCFLSH as usize;
+const TCSBRK: usize = crate::kernel::vfs::filesystem::tty::TCSBRK as usize;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -102,11 +111,39 @@ fn kernel_result(result: Result<(), crate::kernel::error::Error>) -> c_int {
     }
 }
 
+unsafe fn vfs_ioctl_pointer(file_descriptor: c_int, request: usize, argument: *mut c_void) -> c_int {
+    unsafe {
+        crate::kernel::runtime::runtime_libc::filesystem::kz_rust_ioctl(
+            file_descriptor,
+            request,
+            argument,
+        )
+    }
+}
+
+fn vfs_ioctl_value(file_descriptor: c_int, request: usize, value: c_int) -> c_int {
+    let mut argument = value.to_ne_bytes();
+    match crate::kernel::runtime::runtime_libc::filesystem::ioctl_vfs_descriptor_buffer(
+        file_descriptor,
+        request,
+        &mut argument,
+    ) {
+        Ok(_) => 0,
+        Err(error) => {
+            set_errno(error);
+            -1
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn tcdrain(file_descriptor: c_int) -> c_int {
     if let Err(error) = validate_terminal(file_descriptor) {
         set_errno(error);
         return -1;
+    }
+    if crate::kernel::runtime::runtime_libc::filesystem::is_vfs_descriptor(file_descriptor) {
+        return vfs_ioctl_value(file_descriptor, TCSBRK, 0);
     }
     if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
         return 0;
@@ -119,6 +156,9 @@ pub unsafe extern "C" fn tcflow(file_descriptor: c_int, action: c_int) -> c_int 
     if let Err(error) = validate_terminal(file_descriptor) {
         set_errno(error);
         return -1;
+    }
+    if crate::kernel::runtime::runtime_libc::filesystem::is_vfs_descriptor(file_descriptor) {
+        return vfs_ioctl_value(file_descriptor, TCXONC, action);
     }
     if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
         return match crate::kernel::runtime::runtime_libc::pty::flow(file_descriptor, action) {
@@ -134,6 +174,13 @@ pub unsafe extern "C" fn tcflush(file_descriptor: c_int, queue_selector: c_int) 
     if let Err(error) = validate_terminal(file_descriptor) {
         set_errno(error);
         return -1;
+    }
+    if crate::kernel::runtime::runtime_libc::filesystem::is_vfs_descriptor(file_descriptor) {
+        if !matches!(queue_selector, TCIFLUSH | TCOFLUSH | TCIOFLUSH) {
+            set_errno(EINVAL);
+            return -1;
+        }
+        return vfs_ioctl_value(file_descriptor, TCFLSH, queue_selector);
     }
     let is_pty = crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor);
     match queue_selector {
@@ -181,6 +228,9 @@ pub unsafe extern "C" fn tcgetattr(file_descriptor: c_int, attributes: *mut Term
     if let Err(error) = validate_terminal(file_descriptor) {
         set_errno(error);
         return -1;
+    }
+    if crate::kernel::runtime::runtime_libc::filesystem::is_vfs_descriptor(file_descriptor) {
+        return unsafe { vfs_ioctl_pointer(file_descriptor, TCGETS, attributes.cast()) };
     }
     let attributes_value = if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
         match crate::kernel::runtime::runtime_libc::pty::attributes(file_descriptor) {
@@ -253,6 +303,9 @@ pub unsafe extern "C" fn tcgetwinsize(file_descriptor: c_int, size: *mut c_void)
         set_errno(error);
         return -1;
     }
+    if crate::kernel::runtime::runtime_libc::filesystem::is_vfs_descriptor(file_descriptor) {
+        return unsafe { vfs_ioctl_pointer(file_descriptor, TIOCGWINSZ, size) };
+    }
     let window = if crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor) {
         match crate::kernel::runtime::runtime_libc::pty::window_size(file_descriptor) {
             Ok(window) => window,
@@ -285,6 +338,9 @@ pub unsafe extern "C" fn tcsendbreak(file_descriptor: c_int, duration: c_int) ->
         set_errno(error);
         return -1;
     }
+    if crate::kernel::runtime::runtime_libc::filesystem::is_vfs_descriptor(file_descriptor) {
+        return vfs_ioctl_value(file_descriptor, TCSBRK, duration);
+    }
     kernel_result(crate::kernel::tty::drain_output())
 }
 
@@ -305,6 +361,17 @@ pub unsafe extern "C" fn tcsetattr(
     if !matches!(actions, TCSANOW | TCSADRAIN | TCSAFLUSH) {
         set_errno(EINVAL);
         return -1;
+    }
+    if crate::kernel::runtime::runtime_libc::filesystem::is_vfs_descriptor(file_descriptor) {
+        let request = match actions {
+            TCSANOW => TCSETS,
+            TCSADRAIN => TCSETSW,
+            TCSAFLUSH => TCSETSF,
+            _ => return -1,
+        };
+        return unsafe {
+            vfs_ioctl_pointer(file_descriptor, request, attributes as *mut c_void)
+        };
     }
     let is_pty = crate::kernel::runtime::runtime_libc::pty::is_fd(file_descriptor);
     if actions != TCSANOW && !is_pty {
@@ -351,6 +418,9 @@ pub unsafe extern "C" fn tcsetwinsize(file_descriptor: c_int, size: *const c_voi
     if let Err(error) = validate_terminal(file_descriptor) {
         set_errno(error);
         return -1;
+    }
+    if crate::kernel::runtime::runtime_libc::filesystem::is_vfs_descriptor(file_descriptor) {
+        return unsafe { vfs_ioctl_pointer(file_descriptor, TIOCSWINSZ, size as *mut c_void) };
     }
     let size = unsafe { core::ptr::read_volatile(size.cast::<WindowSize>()) };
     crate::kernel::tty::set_window_size(crate::kernel::tty::WindowSize {

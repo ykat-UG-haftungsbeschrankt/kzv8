@@ -21,12 +21,15 @@ use crate::kernel::lib::alignment::align_up;
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 #[cfg(feature = "virtualization")]
-use crate::kernel::vm::device::passthru::{PassthroughDevice, PciFunction};
+use crate::kernel::vfs::filesystem::vm::device::passthru::{PassthroughDevice, PciFunction};
+#[cfg(feature = "virtualization")]
+use crate::kernel::vfs::filesystem::vm::device::virtio::GuestVirtioDevices;
 
 #[cfg(feature = "virtualization")]
 pub(crate) struct VcpuContext {
 	kernel: super::kernel::Context,
 	passthrough: Vec<PassthroughDevice>,
+	devices: GuestVirtioDevices,
 	guest: <crate::kernel::arch::VirtualizationArchitecture as crate::kernel::arch::traits::VirtualizationArchitecture>::GuestContext,
 }
 
@@ -38,10 +41,12 @@ impl VcpuContext {
 		image: &[u8],
 	) -> Result<Self, crate::kernel::arch::VirtualizationError> {
 		let guest = crate::kernel::arch::VirtualizationArchitecture::load_guest_context(image)?;
+		let devices = GuestVirtioDevices::new()?;
 		let kernel = super::kernel::Context::load(kernel_stack, kernel_entry);
 		Ok(Self {
 			kernel,
 			passthrough: Vec::new(),
+			devices,
 			guest,
 		})
 	}
@@ -80,7 +85,10 @@ impl VcpuContext {
 	{
 		// SAFETY: the context was created by the architecture backend from this guest image.
 		unsafe {
-			crate::kernel::arch::VirtualizationArchitecture::restore_guest_context(&mut self.guest)
+			crate::kernel::arch::VirtualizationArchitecture::restore_guest_context(
+				&mut self.guest,
+				&mut self.devices,
+			)
 		}
 	}
 

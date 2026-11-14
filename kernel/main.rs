@@ -23,12 +23,12 @@ use crate::arch::traits::{
     TimerArchitecture as _,
 };
 use crate::kernel::event::{EventFlagsApi, EventLoopApi as _};
-use crate::kernel::block::BlockClientApi as _;
+use crate::kernel::vfs::filesystem::block::BlockClientApi as _;
 #[cfg(feature = "virtualization")]
 use crate::arch::traits::VirtualizationArchitecture as _;
 
 pub(crate) mod arch;
-pub(crate) mod block;
+pub(crate) use vfs::filesystem::block as block;
 pub(crate) mod credentials;
 pub(crate) mod debug;
 pub(crate) mod driver;
@@ -49,7 +49,7 @@ pub(crate) mod process;
 pub(crate) mod random;
 pub(crate) mod signal;
 pub(crate) mod syscall;
-pub(crate) mod tty;
+pub(crate) use vfs::filesystem::tty as tty;
 #[cfg(not(test))]
 #[path = "../runtime/run.rs"]
 pub(crate) mod runtime;
@@ -59,7 +59,7 @@ pub(crate) mod runtime {
 }
 pub(crate) mod scheduler;
 #[cfg(feature = "virtualization")]
-pub(crate) mod vm;
+pub(crate) use vfs::filesystem::vm as vm;
 #[allow(dead_code)]
 pub(crate) mod vfs;
 
@@ -68,6 +68,7 @@ pub(crate) mod kernel {
     #[allow(unused_imports)]
     pub(crate) use crate::{arch, beam, block, credentials, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, namespace, process, runtime, scheduler, script, signal, syscall, tty, vfs};
     #[cfg(feature = "virtualization")]
+    #[allow(unused_imports)]
     pub(crate) use crate::vm;
 }
 
@@ -82,9 +83,9 @@ struct Kernel;
 
 impl Kernel {
     fn interrupt() {
-        let pending = driver::virtio::transport::dispatch_interrupts();
+        let pending = vfs::filesystem::virtio::transport::dispatch_interrupts();
         event::EventLoop::<16>::record_device_interrupts(pending);
-        driver::virtio::console::Console::handle_interrupt(pending);
+        vfs::filesystem::virtio::console::Console::handle_interrupt(pending);
     }
 
     fn main(boot_info: usize, boot_magic: usize) -> ! {
@@ -141,8 +142,8 @@ impl Kernel {
         );
         arch::TimerArchitecture::initialize_timer();
 
-        let console_ready = driver::virtio::console::Console::initialize();
-        let mut virtio_services = driver::virtio::service::KernelVirtioServices::initialize();
+        let console_ready = vfs::filesystem::virtio::console::Console::initialize();
+        let mut virtio_services = vfs::filesystem::virtio::service::KernelVirtioServices::initialize();
         let mut events = event::EventLoop::<16>::new();
         let network_registration = events
             .register(
@@ -162,7 +163,7 @@ impl Kernel {
 
         debug::write(arch::BootArchitecture::BOOT_MESSAGE);
         arch::InterruptArchitecture::enable_interrupts();
-        if console_ready && driver::virtio::console::Console::write(b"kz: virtio-console transmit OK\n") {
+        if console_ready && vfs::filesystem::virtio::console::Console::write(b"kz: virtio-console transmit OK\n") {
             debug::write_virtio_devices();
             if scheduler::thread::smoke::thread_smoke() {
                 debug::debug("kz: kernel thread smoke OK\n");

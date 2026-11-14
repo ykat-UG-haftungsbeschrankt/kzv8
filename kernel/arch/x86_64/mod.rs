@@ -602,10 +602,11 @@ impl crate::kernel::arch::traits::VirtualizationArchitecture for super::Virtuali
 
     unsafe fn restore_guest_context(
         context: &mut Self::GuestContext,
+        devices: &mut dyn super::GuestMmioHandler,
     ) -> Result<super::VirtualMachineExit, super::VirtualizationError> {
         #[cfg(feature = "intel-vtx")]
         {
-            unsafe { context.restore() }
+            unsafe { context.restore(devices) }
         }
         #[cfg(not(feature = "intel-vtx"))]
         {
@@ -633,10 +634,11 @@ impl crate::kernel::arch::traits::VirtualizationArchitecture for super::Virtuali
 
     unsafe fn run_guest(
         image: &[u8],
+        devices: &mut dyn super::GuestMmioHandler,
     ) -> Result<super::VirtualMachineExit, super::VirtualizationError> {
         #[cfg(feature = "intel-vtx")]
         {
-            unsafe { vmx::run_guest(image) }
+            unsafe { vmx::run_guest(image, devices) }
         }
         #[cfg(not(feature = "intel-vtx"))]
         {

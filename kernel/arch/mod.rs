@@ -311,6 +311,7 @@ pub(crate) mod traits {
         /// Guest execution must be allowed by the caller; only trusted guest images may run.
         unsafe fn restore_guest_context(
             context: &mut Self::GuestContext,
+            devices: &mut dyn super::GuestMmioHandler,
         ) -> Result<super::VirtualMachineExit, super::VirtualizationError>;
 
         /// Run a single-vCPU, 2 MiB raw image for at most 100 ms.
@@ -333,6 +334,7 @@ pub(crate) mod traits {
         /// The image executes with guest ring-0 privileges. Only trusted images may be run.
         unsafe fn run_guest(
             image: &[u8],
+            devices: &mut dyn super::GuestMmioHandler,
         ) -> Result<super::VirtualMachineExit, super::VirtualizationError>;
     }
 
@@ -379,6 +381,11 @@ pub(crate) mod traits {
         const MPROTECT: u64;
     }
 }
+
+#[cfg(feature = "virtualization")]
+mod virtualization;
+#[cfg(feature = "virtualization")]
+pub(crate) use virtualization::{GuestMemoryView, GuestMmioHandler};
 
 #[cfg(target_arch = "aarch64")]
 #[path = "aarch64/mod.rs"]

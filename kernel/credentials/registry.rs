@@ -6,6 +6,7 @@
  */
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::kernel::error::Error;
@@ -32,7 +33,7 @@ impl UserGroupRegistry {
         self.users.insert(User::new(id, copy_name(username)?))
     }
 
-    pub(crate) fn unregister_user(&mut self, id: UserId) -> Option<User> {
+    pub(crate) fn unregister_user(&mut self, id: UserId) -> Option<Arc<User>> {
         let user = self.users.remove(id)?;
         self.groups.remove_member_from_all(id);
         Some(user)
@@ -75,10 +76,8 @@ impl UserGroupRegistry {
         user_id: UserId,
         group_id: GroupId,
     ) -> Result<bool, Error> {
-        if self.users.get(user_id).is_none() {
-            return Err(Error::NoEnt);
-        }
-        self.groups.add_member(user_id, group_id)
+        let user = self.users.get_shared(user_id).ok_or(Error::NoEnt)?;
+        self.groups.add_member(user, group_id)
     }
 
     pub(crate) fn remove_member(

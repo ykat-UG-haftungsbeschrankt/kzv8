@@ -9,6 +9,7 @@ use crate::kernel::error::Error;
 use crate::kernel::process::Credentials;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::scheduler::sync::IrqSpinLock;
+use crate::kernel::vfs::filesystem::test::test_filesystem;
 use crate::kernel::vfs::{
     DirectoryPlugin, FilePlugin, Node, NodeApi as _, NodeMetadata, NodeMetadataApi as _, Vfs,
     VfsApi as _, VfsFuture,
@@ -19,6 +20,7 @@ use alloc::sync::Arc;
 use alloc::task::Wake;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 use core::task::{Context, Poll, Waker};
 
 struct TestDirectory {
@@ -220,17 +222,38 @@ fn mounts_are_shared_and_nested_mounts_must_be_removed_first() {
         ("inside", Node::file(EmptyFile)),
         ("nested", directory(Vec::new())),
     ]);
-    let vfs = Vfs::new(root);
+    let (root_filesystem, root_sync_count, _, _) = test_filesystem(root);
+    let vfs = Vfs::with_filesystem(root_filesystem).unwrap();
     let clone = vfs.clone();
+    let (
+        mounted_filesystem,
+        mounted_sync_count,
+        mounted_unmount_count,
+        mounted_options,
+    ) = test_filesystem(mounted_root);
+    let options = [("mode", "ro"), ("cache", "none")];
 
-    ready(vfs.mount("/mnt", mounted_root, &credentials)).unwrap();
+    ready(vfs.mount("/mnt", mounted_filesystem, &options, &credentials)).unwrap();
+    let received_options = mounted_options.lock();
+    assert_eq!(received_options.len(), 2);
+    assert_eq!(received_options[0], (String::from("mode"), String::from("ro")));
+    assert_eq!(
+        received_options[1],
+        (String::from("cache"), String::from("none"))
+    );
+    drop(received_options);
     assert!(ready(clone.resolve("/mnt/inside", &credentials)).is_ok());
     assert_eq!(
         ready(clone.resolve("/mnt/covered", &credentials)).map(|_| ()),
         Err(Error::NoEnt)
     );
     assert_eq!(
-        ready(vfs.mount("/mnt", directory(Vec::new()), &credentials)),
+        ready(vfs.mount(
+            "/mnt",
+            test_filesystem(directory(Vec::new())).0,
+            &[],
+            &credentials
+        )),
         Err(Error::Busy)
     );
     assert_eq!(
@@ -238,13 +261,22 @@ fn mounts_are_shared_and_nested_mounts_must_be_removed_first() {
         Err(Error::Xdev)
     );
 
-    ready(vfs.mount("/mnt/nested", directory(Vec::new()), &credentials)).unwrap();
+    let (nested_filesystem, nested_sync_count, nested_unmount_count, _) =
+        test_filesystem(directory(Vec::new()));
+    ready(vfs.mount("/mnt/nested", nested_filesystem, &[], &credentials)).unwrap();
     assert_eq!(ready(vfs.unmount("/mnt", &credentials)), Err(Error::Busy));
     ready(vfs.umount("/mnt/nested", &credentials)).unwrap();
+    assert_eq!(nested_sync_count.load(Ordering::SeqCst), 1);
+    assert_eq!(nested_unmount_count.load(Ordering::SeqCst), 1);
     ready(vfs.unmount("/mnt", &credentials)).unwrap();
+    assert_eq!(mounted_sync_count.load(Ordering::SeqCst), 1);
+    assert_eq!(mounted_unmount_count.load(Ordering::SeqCst), 1);
     assert!(ready(vfs.resolve("/mnt/covered", &credentials)).is_ok());
     assert_eq!(
         ready(vfs.resolve("/mnt/inside", &credentials)).map(|_| ()),
         Err(Error::NoEnt)
     );
+
+    ready(vfs.sync_filesystems()).unwrap();
+    assert_eq!(root_sync_count.load(Ordering::SeqCst), 1);
 }

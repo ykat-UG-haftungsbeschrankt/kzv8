@@ -19,6 +19,7 @@ use crate::kernel::process::Credentials;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 pub(crate) mod plugin;
+pub(crate) mod filesystem;
 mod vfs;
 
 pub(crate) use vfs::mounted;
@@ -29,6 +30,7 @@ pub(crate) use vfs::mount_virtio_devices;
 
 pub(crate) type VfsResult<T> = Result<T, Error>;
 pub(crate) type VfsFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type MountOptions<'a> = &'a [(&'a str, &'a str)];
 
 /// Result of an atomic append, including the resulting file offset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +58,7 @@ pub(crate) trait NodeMetadataApi: Sized {
     fn group(&self) -> GroupId;
     fn mode(&self) -> u16;
     fn link_count(&self) -> u32;
+    fn identity(&self) -> u64;
     fn check_access(
         &self,
         credentials: &Credentials,
@@ -95,6 +98,7 @@ pub(crate) enum OpenMode {
 pub(crate) enum SeekFrom {
     Start(u64),
     Current(i64),
+    End(i64),
 }
 
 pub(crate) trait DirectoryPlugin: Send + Sync {
@@ -118,6 +122,23 @@ pub(crate) trait FilePlugin: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    fn is_terminal(&self) -> bool {
+        false
+    }
+
+    fn seekable(&self) -> bool {
+        true
+    }
+
+    fn ioctl<'a>(
+        &'a self,
+        _request: u64,
+        _argument: &'a mut [u8],
+        _credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<i64>> {
+        Box::pin(async { Err(Error::NoSys) })
+    }
+
     fn read_at<'a>(&'a self, offset: u64, buffer: &'a mut [u8]) -> VfsFuture<'a, VfsResult<usize>>;
 
     fn size(&self) -> VfsFuture<'_, VfsResult<u64>> {
@@ -131,6 +152,28 @@ pub(crate) trait FilePlugin: Send + Sync {
     /// Appends at EOF atomically with other writes to this file.
     fn append<'a>(&'a self, _buffer: &'a [u8]) -> VfsFuture<'a, VfsResult<AppendResult>> {
         Box::pin(async { Err(Error::NoSys) })
+    }
+}
+
+pub(crate) trait FileSystem: Send + Sync {
+    fn root(&self) -> VfsResult<Node>;
+
+    fn mount_root<'a>(&'a self, options: MountOptions<'a>) -> VfsFuture<'a, VfsResult<Node>> {
+        Box::pin(async move {
+            if options.is_empty() {
+                self.root()
+            } else {
+                Err(Error::Inval)
+            }
+        })
+    }
+
+    fn sync(&self) -> VfsFuture<'_, VfsResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn unmount(&self) -> VfsFuture<'_, VfsResult<()>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -226,6 +269,21 @@ pub(crate) struct FileHandle {
 }
 
 pub(crate) trait FileHandleApi: Sized {
+    fn ioctl<'a>(
+        &'a mut self,
+        request: u64,
+        argument: &'a mut [u8],
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<i64>>;
+    fn ioctl_blocking(
+        &mut self,
+        request: u64,
+        argument: &mut [u8],
+        credentials: &Credentials,
+    ) -> VfsResult<i64>;
+    fn is_terminal(&self) -> bool;
+    fn metadata(&self) -> NodeMetadata;
+    fn size_blocking(&self) -> VfsResult<u64>;
     fn read_blocking(&mut self, buffer: &mut [u8]) -> VfsResult<usize>;
     fn read<'a>(&'a mut self, buffer: &'a mut [u8]) -> VfsFuture<'a, VfsResult<usize>>;
     fn write_blocking(&mut self, buffer: &[u8]) -> VfsResult<usize>;
@@ -285,7 +343,8 @@ pub(crate) trait VfsApi: Sized {
     fn mount<'a>(
         &'a self,
         path: &'a str,
-        filesystem_root: Node,
+        filesystem: Arc<dyn FileSystem>,
+        options: MountOptions<'a>,
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<()>>;
     fn unmount<'a>(
@@ -293,6 +352,7 @@ pub(crate) trait VfsApi: Sized {
         path: &'a str,
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<()>>;
+    fn sync_filesystems(&self) -> VfsFuture<'_, VfsResult<()>>;
     fn umount<'a>(
         &'a self,
         path: &'a str,
