@@ -23,6 +23,7 @@ struct Descriptor {
 
 pub(crate) struct GuestChain {
     head: u16,
+    //@FIXME: INDEXTYPE(descriptors); variable-length descriptor chain traversed in order; Vec gives O(1) indexing and amortized O(1) append, keep Vec.
     descriptors: Vec<Descriptor>,
     length: usize,
 }

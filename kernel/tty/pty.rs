@@ -19,6 +19,7 @@ const POLLERR: i16 = 0x0008;
 const POLLHUP: i16 = 0x0010;
 
 struct ByteQueue {
+    //@FIXME: INDEXTYPE(bytes); ring-buffer backing array; Vec provides O(1) indexed access, keep Vec.
     bytes: Vec<u8>,
     head: usize,
     length: usize,

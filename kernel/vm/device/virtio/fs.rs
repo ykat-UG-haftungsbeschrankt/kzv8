@@ -43,7 +43,9 @@ const MAX_WRITE: u32 = 16 * 1024;
 
 pub(crate) struct VirtioFs {
     mmio: VirtioMmio,
+    //@FIXME: INDEXTYPE(request); fixed-capacity request scratch buffer; replace Vec with Box<[u8]> to express fixed size while retaining O(1) indexing.
     request: Vec<u8>,
+    //@FIXME: INDEXTYPE(response); fixed-capacity response scratch buffer; replace Vec with Box<[u8]> to express fixed size while retaining O(1) indexing.
     response: Vec<u8>,
 }
 

@@ -60,6 +60,7 @@ struct TcpFlowKey {
 
 struct TcpFlowBucket {
     key: TcpFlowKey,
+    //@FIXME: INDEXTYPE(handles); per-flow handle list uses O(n) membership/search; add a hash side index for expected O(1) lookup if fan-out grows.
     handles: Vec<TcpSocketHandle>,
 }
 
@@ -70,6 +71,7 @@ struct TcpListener {
 
 struct TcpListenerBucket {
     port: u16,
+    //@FIXME: INDEXTYPE(listeners); per-port exact/wildcard listener list is scanned in O(n); keep Vec for typically small fan-out or add an address index if hot.
     listeners: Vec<TcpListener>,
 }
 
@@ -77,11 +79,13 @@ struct OutstandingSegment {
     sequence_number: u32,
     end_sequence_number: u32,
     flags: u8,
+    //@FIXME: INDEXTYPE(payload); contiguous segment bytes; Vec indexing is O(1), keep Vec.
     payload: Vec<u8>,
 }
 
 struct ReassemblySegment {
     sequence_number: u32,
+    //@FIXME: INDEXTYPE(payload); contiguous reassembly bytes; Vec indexing is O(1), keep Vec.
     payload: Vec<u8>,
     fin: bool,
 }
@@ -98,6 +102,7 @@ struct TcpSocket {
     peer_window: u16,
     send_buffer: VecDeque<u8>,
     receive_buffer: VecDeque<u8>,
+    //@FIXME: INDEXTYPE(out_of_order); sequence-ordered reassembly list capped at 64; O(n) scans/removal are bounded, keep Vec.
     out_of_order: Vec<ReassemblySegment>,
     out_of_order_bytes: usize,
     maximum_segment_size: usize,
@@ -132,13 +137,18 @@ pub(crate) struct TcpTransmission {
     pub(crate) acknowledgment_number: u32,
     pub(crate) flags: u8,
     pub(crate) window: u16,
+    //@FIXME: INDEXTYPE(payload); owned transmission byte buffer; Vec indexing is O(1) and append amortized O(1), keep Vec.
     pub(crate) payload: Vec<u8>,
 }
 
 pub(crate) struct TcpSocketTable {
+    //@FIXME: INDEXTYPE(slots); generation-checked direct-index socket table; Vec access is O(1), add a free-slot stack if vacant-slot scans become costly.
     slots: Vec<SocketSlot>,
+    //@FIXME: INDEXTYPE(flows); sorted key index has O(log n) lookup but O(n) updates; use a balanced tree/map for O(log n) updates if iteration requirements permit.
     flows: Vec<TcpFlowBucket>,
+    //@FIXME: INDEXTYPE(listeners); port-sorted index has O(log n) lookup but O(n) updates; use a balanced tree/map for O(log n) updates if iteration requirements permit.
     listeners: Vec<TcpListenerBucket>,
+    //@FIXME: INDEXTYPE(removed_indexes); reserved deferred-removal batch, appended then drained; keep Vec.
     removed_indexes: Vec<(TcpSocketHandle, Option<TcpFlowKey>, Option<u16>)>,
     maximum_segment_size: usize,
     queued_send_bytes: usize,

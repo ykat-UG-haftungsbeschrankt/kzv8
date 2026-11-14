@@ -166,11 +166,16 @@ struct Export {
 }
 
 pub(crate) struct BeamModule {
+    //@FIXME: INDEXTYPE(atoms); atom-ID-indexed dynamic table of byte strings; Vec access is O(1), keep Vec.
     atoms: Vec<Vec<u8>>,
+    //@FIXME: INDEXTYPE(exports); ordered first-match name/arity scan is O(n); keep Vec unless a semantics-preserving hash side index is warranted.
     exports: Vec<Export>,
+    //@FIXME: INDEXTYPE(instructions); dense program-counter-indexed bytecode array; Vec access is O(1), keep Vec.
     instructions: Vec<Instruction>,
+    //@FIXME: INDEXTYPE(labels); label-ID-indexed table; Vec access is O(1), keep Vec.
     labels: Vec<Option<usize>>,
     #[cfg(all(feature = "beam-jit", target_arch = "x86_64"))]
+    //@FIXME: INDEXTYPE(jit_cache); linear lookup is bounded to 16 entries; keep Vec.
     jit_cache: IrqSpinLock<Vec<CachedJitFunction>>,
 }
 

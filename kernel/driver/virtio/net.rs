@@ -19,11 +19,15 @@ pub(crate) struct VirtioNet {
     transport: VirtioTransport,
     receive_queue: DmaQueue<{Self::QUEUE_SIZE}>,
     transmit_queue: DmaQueue<{ Self::QUEUE_SIZE }>,
+    //@FIXME: INDEXTYPE(receive_buffers); queue-indexed DMA buffer pool; Vec indexing is O(1), keep Vec.
     receive_buffers: Vec<ReceiveBuffer>,
+    //@FIXME: INDEXTYPE(free_receive_buffers); LIFO free-index stack; Vec push/pop are amortized O(1), keep Vec.
     free_receive_buffers: Vec<usize>,
     completed_receive_buffers: VecDeque<usize>,
     receive_buffer_by_head: [Option<usize>; Self::QUEUE_SIZE],
+    //@FIXME: INDEXTYPE(transmit_buffers); queue-indexed DMA buffer pool; Vec indexing is O(1), keep Vec.
     transmit_buffers: Vec<TransmitBuffer>,
+    //@FIXME: INDEXTYPE(free_transmit_buffers); LIFO free-index stack; Vec push/pop are amortized O(1), keep Vec.
     free_transmit_buffers: Vec<usize>,
     transmit_buffer_by_head: [Option<usize>; Self::QUEUE_SIZE],
     mtu: usize,

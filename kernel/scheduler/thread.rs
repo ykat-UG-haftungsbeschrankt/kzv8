@@ -287,6 +287,7 @@ pub(crate) struct Thread {
     resource_usage: ThreadResourceUsage,
     in_kernel: bool,
     running_since_ns: Option<u64>,
+    //@FIXME: INDEXTYPE(cleanup_handlers); LIFO cleanup stack; Vec push/pop are amortized O(1), keep Vec.
     cleanup_handlers: Vec<CleanupHandler>,
     pub(crate) tls: [usize; ThreadManager::MAX_TLS_KEYS],
     signal_mask: SignalSet,
@@ -302,6 +303,7 @@ pub(crate) struct Thread {
     stack: Option<ThreadStack>,
     external_stack_address: usize,
     external_stack_size: usize,
+    //@FIXME: INDEXTYPE(retired_stacks); LIFO stack pool; Vec push/pop are amortized O(1), keep Vec.
     retired_stacks: Vec<ThreadStack>,
 }
 
@@ -528,6 +530,7 @@ impl Thread {
 }
 
 pub(crate) struct ThreadStack {
+    //@FIXME: INDEXTYPE(bytes); fixed stack backing storage; replace Vec with Box<[u8]> to express fixed capacity while retaining O(1) indexing.
     bytes: Vec<u8>,
 }
 

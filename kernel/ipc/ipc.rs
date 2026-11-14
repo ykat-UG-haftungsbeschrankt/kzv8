@@ -178,7 +178,9 @@ impl ReceivedMessageApi for ReceivedMessage {
 
 struct EndpointState {
 	queue: VecDeque<Message>,
+	//@FIXME: INDEXTYPE(send_waiters); deduplicated waiter list scans and retain removal are O(n); keep Vec unless waiter handles enable O(1) unlink.
 	send_waiters: Vec<Waker>,
+	//@FIXME: INDEXTYPE(receive_waiters); deduplicated waiter list scans and retain removal are O(n); keep Vec unless waiter handles enable O(1) unlink.
 	receive_waiters: Vec<Waker>,
 	closed: bool,
 }

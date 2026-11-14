@@ -91,6 +91,7 @@ pub(crate) struct HostSegmentState {
     pub(crate) tss_selector: u16,
 }
 
+//@FIXME: INDEXTYPE(HOST_SEGMENTS); stable boxed slots with linear APIC-ID lookup; add a HashMap side index for expected O(1) lookup if this grows.
 static HOST_SEGMENTS: IrqSpinLock<Vec<Box<HostSegmentSlot>>> =
     IrqSpinLock::new(Vec::new());
 

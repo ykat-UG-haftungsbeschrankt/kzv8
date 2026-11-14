@@ -58,11 +58,13 @@ impl<T> IntervalNode<T> {
 }
 
 pub(crate) struct IntervalTreeStorage<T> {
+	//@FIXME: INDEXTYPE(nodes); indexed AVL-node arena; direct Vec access is O(1), keep Vec.
 	nodes: Vec<IntervalNode<T>>,
 }
 
 struct NodeStorage<T, const N: usize> {
 	inline_nodes: [IntervalNode<T>; INLINE_NODE_CAPACITY],
+	//@FIXME: INDEXTYPE(heap_nodes); optional fixed-capacity indexed node arena; direct Vec access is O(1), keep Vec.
 	heap_nodes: Option<Vec<IntervalNode<T>>>,
 }
 

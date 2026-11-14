@@ -44,11 +44,14 @@ pub(super) struct NodeMetadataState {
     group: GroupId,
     mode: u16,
     flags: u32,
+    //@FIXME: INDEXTYPE(xattrs); ordered name/value list has O(n) keyed operations; add a hash side index for expected O(1) lookup while retaining ordered iteration.
     xattrs: Vec<Xattr>,
 }
 
 struct Xattr {
+    //@FIXME: INDEXTYPE(name); owned attribute-name bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
     name: Vec<u8>,
+    //@FIXME: INDEXTYPE(value); owned attribute-value bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
     value: Vec<u8>,
 }
 

@@ -33,6 +33,7 @@ static NETWORK_SWITCH: IrqSpinLock<NetworkSwitch> = IrqSpinLock::new(NetworkSwit
 struct Peer {
     active: bool,
     mac: [u8; 6],
+    //@FIXME: INDEXTYPE(frames); FIFO VecDeque of packet Vec byte buffers; queue ends are O(1), keep VecDeque and Vec payloads.
     frames: VecDeque<Vec<u8>>,
     queued_bytes: usize,
 }
@@ -49,11 +50,14 @@ impl Peer {
 }
 
 struct NetworkSwitch {
+    //@FIXME: INDEXTYPE(peers); peer-ID-indexed slots use O(1) Vec access; retain Vec for flooding, with a MAC hash side index only if unicast scans become hot.
     peers: Vec<Peer>,
     host_active: bool,
     host_mac: [u8; 6],
+    //@FIXME: INDEXTYPE(host_stack_frames); FIFO VecDeque of packet Vec byte buffers; queue ends are O(1), keep VecDeque and Vec payloads.
     host_stack_frames: VecDeque<Vec<u8>>,
     host_stack_bytes: usize,
+    //@FIXME: INDEXTYPE(host_transmit_frames); FIFO VecDeque of packet Vec byte buffers; queue ends are O(1), keep VecDeque and Vec payloads.
     host_transmit_frames: VecDeque<Vec<u8>>,
     host_transmit_bytes: usize,
     queued_frame_bytes: usize,

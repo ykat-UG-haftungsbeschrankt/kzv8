@@ -136,7 +136,9 @@ struct VtdManager {
     capability: u64,
     extended_capability: u64,
     root_table: VtdPage,
+    //@FIXME: INDEXTYPE(context_tables); bus-keyed list currently bounded to one entry; keep Vec.
     context_tables: Vec<ContextTable>,
+    //@FIXME: INDEXTYPE(active_contexts); bounded set-like list uses O(n) lookup and O(1) swap removal; use a hash index only if it grows.
     active_contexts: Vec<ActiveContext>,
     next_domain_id: u32,
     poisoned: bool,

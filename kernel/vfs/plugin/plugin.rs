@@ -20,6 +20,7 @@ use super::super::{
 };
 
 struct Directory {
+    //@FIXME: INDEXTYPE(entries); insertion-ordered directory list; lookup scans O(n), add a hash side index for expected O(1) lookup if directories grow.
     entries: Vec<DirectoryEntry>,
 }
 

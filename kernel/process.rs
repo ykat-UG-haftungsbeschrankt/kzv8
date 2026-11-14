@@ -32,6 +32,7 @@ const FIRST_FILE_DESCRIPTOR: u32 = 3;
 const CHILD_EVENT_CAPACITY: usize = 8;
 pub(crate) const MAX_SUPPLEMENTARY_GROUPS: usize = 64;
 static NEXT_PROCESS_ID: AtomicU32 = AtomicU32::new(1);
+//@FIXME: INDEXTYPE(PROCESS_REGISTRY); PID-sorted search is O(log n), but stale-entry sweeps and ordered updates are O(n); add a HashMap<i32, Weak<Process>> side index for expected O(1) PID lookup while retaining Vec iteration.
 static PROCESS_REGISTRY: IrqSpinLock<Vec<ProcessRegistryEntry>> = IrqSpinLock::new(Vec::new());
 
 struct ProcessRegistryEntry {
@@ -280,10 +281,12 @@ pub(crate) struct ChildExitStatus {
 struct ChildProcessRecord {
     process_id: i32,
     process_group_id: i32,
+    //@FIXME: INDEXTYPE(events); matching and ordered remove(index) are O(n); a sqrt-decomposed block sequence makes indexed removal O(sqrt n), but matching still scans O(n).
     events: Vec<ChildExitStatus>,
 }
 
 struct FilesystemContext {
+    //@FIXME: INDEXTYPE(current_directory); owned path-byte buffer; Vec provides O(1) indexing and amortized O(1) append, keep Vec.
     current_directory: Vec<u8>,
     umask: u32,
 }
@@ -349,6 +352,7 @@ pub(crate) struct Credentials {
     real_group: GroupId,
     effective_group: GroupId,
     saved_group: GroupId,
+    //@FIXME: INDEXTYPE(supplementary_groups); sparse group IDs and slice API favor Vec; process setter caps at 64, but Credentials::new does not enforce that limit.
     supplementary_groups: Vec<GroupId>,
 }
 
@@ -662,7 +666,9 @@ impl CapabilitySlot {
 }
 
 struct CapabilityTable {
+    //@FIXME: INDEXTYPE(slots); generation-checked direct-index capability table; Vec access is O(1), keep Vec.
     slots: Vec<CapabilitySlot>,
+    //@FIXME: INDEXTYPE(free_slots); LIFO free-index stack; Vec push/pop are amortized O(1), keep Vec.
     free_slots: Vec<usize>,
 }
 
@@ -796,6 +802,7 @@ impl KernelObjectTable {
 }
 
 struct FileDescriptorTable {
+    //@FIXME: INDEXTYPE(entries); direct descriptor-indexed array; lookup/removal are O(1), add a free-index stack for O(1) hole allocation if needed.
     entries: Vec<Option<KernelObjectRef>>,
 }
 
@@ -861,6 +868,7 @@ pub(crate) struct Process {
     capabilities: IrqSpinLock<CapabilityTable>,
     kernel_objects: IrqSpinLock<KernelObjectTable>,
     file_descriptors: IrqSpinLock<FileDescriptorTable>,
+    //@FIXME: INDEXTYPE(children); PID/group scans and ordered removal are O(n); add a PID hash side index for expected O(1) targeted lookup if needed.
     children: IrqSpinLock<Vec<ChildProcessRecord>>,
     filesystem: IrqSpinLock<FilesystemContext>,
 }
@@ -2345,7 +2353,9 @@ impl Process {
 
 pub(crate) struct ProcessMessage {
     opcode: u32,
+    //@FIXME: INDEXTYPE(payload); owned message byte buffer; Vec indexing is O(1) and append amortized O(1), keep Vec.
     payload: Vec<u8>,
+    //@FIXME: INDEXTYPE(capabilities); ordered indexed handle list; remove(index) is O(n). Sqrt-decomposed blocks give O(sqrt n) removal but require replacing the contiguous capabilities() slice API; swap_remove is O(1) only if reordering is acceptable.
     capabilities: Vec<CapabilityHandle>,
     reply: Option<ReplyCapability>,
 }

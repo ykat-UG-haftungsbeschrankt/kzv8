@@ -11,6 +11,7 @@ use crate::kernel::error::Error;
 
 pub(crate) struct EthernetDevice {
     device: VirtioNet,
+    //@FIXME: INDEXTYPE(receive_frame); fixed-capacity reusable frame buffer; replace Vec with Box<[u8]> to express fixed size while retaining O(1) indexing.
     receive_frame: Vec<u8>,
 }
 

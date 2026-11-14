@@ -340,7 +340,9 @@ struct ScopedDependency<'a> {
 }
 
 pub(super) struct SymbolScopeState<'a> {
+    //@FIXME: INDEXTYPE(symbols); name-sorted array uses O(log n) partition_point lookup; keep Vec.
     symbols: Vec<ScopedSymbol<'a>>,
+    //@FIXME: INDEXTYPE(dependencies); ordered first-match lookup scans O(n); add a hash side index for expected O(1) lookup if dependency counts grow.
     dependencies: Vec<ScopedDependency<'a>>,
 }
 

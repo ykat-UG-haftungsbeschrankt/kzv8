@@ -139,6 +139,7 @@ enum ExportAddress {
 }
 
 struct ParsedExport {
+    //@FIXME: INDEXTYPE(name); owned export-name bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
     name: Vec<u8>,
     address: ExportAddress,
     weak: bool,
@@ -146,6 +147,7 @@ struct ParsedExport {
 
 struct Binding {
     virtual_address: u64,
+    //@FIXME: INDEXTYPE(name); owned binding-name bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
     name: Vec<u8>,
     library_ordinal: i32,
     addend: i64,
@@ -153,6 +155,7 @@ struct Binding {
 }
 
 struct LoadedExport {
+    //@FIXME: INDEXTYPE(name); owned export-name bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
     name: Vec<u8>,
     address: usize,
     weak: bool,
@@ -164,13 +167,20 @@ struct ParsedMachO<'a, F> {
     minimum_page: usize,
     mapping_length: usize,
     fixed_address: bool,
+    //@FIXME: INDEXTYPE(segments); parse-order segment array traversed during loading; keep Vec.
     segments: Vec<Segment>,
     entry_virtual_address: Option<u64>,
+    //@FIXME: INDEXTYPE(bindings); append-then-iterate relocation records; keep Vec.
     bindings: Vec<Binding>,
+    //@FIXME: INDEXTYPE(rebases); append-then-iterate relocation offsets; keep Vec.
     rebases: Vec<u64>,
+    //@FIXME: INDEXTYPE(exports); name lookup scans O(n); add a hash side index for expected O(1) lookup if exports are numerous.
     exports: Vec<ParsedExport>,
+    //@FIXME: INDEXTYPE(needed); dependency-order byte strings with O(1) ordinal access; keep Vec.
     needed: Vec<Vec<u8>>,
+    //@FIXME: INDEXTYPE(needed_weak); parallel dependency flags with O(1) indexing; keep Vec.
     needed_weak: Vec<bool>,
+    //@FIXME: INDEXTYPE(rpaths); ordered search-path list; keep Vec.
     rpaths: Vec<Vec<u8>>,
 }
 
@@ -180,12 +190,19 @@ pub(super) struct MachOLoadedObject {
     mapping_length: usize,
     load_bias: i128,
     entry: Option<usize>,
+    //@FIXME: INDEXTYPE(segments); parse-order segment array traversed during loading; keep Vec.
     segments: Vec<Segment>,
+    //@FIXME: INDEXTYPE(bindings); append-then-iterate relocation records; keep Vec.
     bindings: Vec<Binding>,
+    //@FIXME: INDEXTYPE(rebases); append-then-iterate relocation offsets; keep Vec.
     rebases: Vec<u64>,
+    //@FIXME: INDEXTYPE(exports); name lookup scans O(n); add a hash side index for expected O(1) lookup if exports are numerous.
     exports: Vec<LoadedExport>,
+    //@FIXME: INDEXTYPE(needed); dependency-order byte strings with O(1) ordinal access; keep Vec.
     needed: Vec<Vec<u8>>,
+    //@FIXME: INDEXTYPE(needed_weak); parallel dependency flags with O(1) indexing; keep Vec.
     needed_weak: Vec<bool>,
+    //@FIXME: INDEXTYPE(rpaths); ordered search-path list; keep Vec.
     rpaths: Vec<Vec<u8>>,
     state: ObjectState,
 }

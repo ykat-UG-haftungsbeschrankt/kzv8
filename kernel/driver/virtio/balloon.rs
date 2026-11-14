@@ -31,6 +31,7 @@ impl Operation {
 struct PendingOperation {
     operation: Operation,
     head: u16,
+    //@FIXME: INDEXTYPE(frames); bounded operation batch iterated at completion; keep Vec.
     frames: Vec<Frame>,
 }
 
@@ -39,6 +40,7 @@ pub(crate) struct VirtioBalloon {
     inflate_queue: DmaQueue<{ Self::QUEUE_SIZE }>,
     deflate_queue: DmaQueue<{ Self::QUEUE_SIZE }>,
     page_list: DmaBuffer,
+    //@FIXME: INDEXTYPE(ballooned_pages); tail-grown page pool, deflated with truncate; bulk append/truncate cost O(k) for k frames, bounded by the 16-frame queue batch, keep Vec.
     ballooned_pages: Vec<Frame>,
     pending: Option<PendingOperation>,
 }

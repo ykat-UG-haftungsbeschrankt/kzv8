@@ -26,6 +26,7 @@ use crate::kernel::vm::device::passthru::{PassthroughDevice, PciFunction};
 #[cfg(feature = "virtualization")]
 pub(crate) struct VcpuContext {
 	kernel: super::kernel::Context,
+	//@FIXME: INDEXTYPE(passthrough); tiny attached-device list (currently 0-1); keep Vec.
 	passthrough: Vec<PassthroughDevice>,
 	guest: <crate::kernel::arch::VirtualizationArchitecture as crate::kernel::arch::traits::VirtualizationArchitecture>::GuestContext,
 }
@@ -148,10 +149,12 @@ const VM_BORROWED: u16 = 1 << 9;
 
 struct UserArea {
 	range: Range<usize>,
+	//@FIXME: INDEXTYPE(page_states); direct per-page state array; Vec indexing is O(1), keep Vec.
 	page_states: Vec<AtomicU16>,
 }
 
 struct UserAreas {
+	//@FIXME: INDEXTYPE(areas); address-sorted interval list with O(log n) lookup and O(n) updates; use an interval tree if updates become costly.
 	areas: Vec<UserArea>,
 }
 

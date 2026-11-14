@@ -131,7 +131,9 @@ mod x86_64 {
     }
 
     struct Emitter {
+        //@FIXME: INDEXTYPE(bytes); emitted machine-code buffer patched by byte offset; Vec indexing is O(1), keep Vec.
         bytes: Vec<u8>,
+        //@FIXME: INDEXTYPE(fixups); append-then-iterate relocation patch list; keep Vec.
         fixups: Vec<Fixup>,
     }
 
@@ -444,7 +446,9 @@ mod aarch64 {
     }
 
     struct Emitter {
+        //@FIXME: INDEXTYPE(bytes); emitted machine-code buffer patched by byte offset; Vec indexing is O(1), keep Vec.
         bytes: Vec<u8>,
+        //@FIXME: INDEXTYPE(fixups); append-then-iterate relocation patch list; keep Vec.
         fixups: Vec<Fixup>,
     }
 

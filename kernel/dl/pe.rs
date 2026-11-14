@@ -77,6 +77,7 @@ struct Import {
 }
 
 enum ImportSymbol {
+    //@FIXME: INDEXTYPE(Name); owned import-name bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
     Name(Vec<u8>),
     Ordinal(u32),
 }
@@ -84,6 +85,7 @@ enum ImportSymbol {
 struct Export {
     function_rva: u32,
     ordinal: u32,
+    //@FIXME: INDEXTYPE(name); optional owned export-name bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
     name: Option<Vec<u8>>,
 }
 
@@ -95,16 +97,22 @@ struct ParsedPe<'a, F> {
     mapping_length: usize,
     headers_size: u32,
     entry_rva: u32,
+    //@FIXME: INDEXTYPE(sections); already sorted by virtual address; read_rva scans O(n), use partition_point/binary search on this Vec for O(log n) section selection.
     sections: Vec<Section>,
     directories: [DataDirectory; DIRECTORY_COUNT],
+    //@FIXME: INDEXTYPE(imports); parse-order imports traversed by dependency index; keep Vec.
     imports: Vec<Import>,
+    //@FIXME: INDEXTYPE(exports); name/ordinal lookup scans O(n); add hash side indexes for expected O(1) lookup if exports are numerous.
     exports: Vec<Export>,
+    //@FIXME: INDEXTYPE(base_relocations); sorted relocation batch iterated in order; keep Vec.
     base_relocations: Vec<u32>,
+    //@FIXME: INDEXTYPE(needed); dependency-order byte strings with O(1) ordinal access; keep Vec.
     needed: Vec<Vec<u8>>,
 }
 
 struct LoadedExport {
     ordinal: u32,
+    //@FIXME: INDEXTYPE(name); optional owned export-name bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
     name: Option<Vec<u8>>,
     address: usize,
 }
@@ -117,10 +125,15 @@ pub(super) struct PeLoadedObject {
     entry: Option<usize>,
     image_base: u64,
     headers_size: u32,
+    //@FIXME: INDEXTYPE(sections); loaded sections are iterated for permission checks; keep Vec unless replacing those scans with binary search is worthwhile.
     sections: Vec<Section>,
+    //@FIXME: INDEXTYPE(imports); parse-order imports traversed by dependency index; keep Vec.
     imports: Vec<Import>,
+    //@FIXME: INDEXTYPE(base_relocations); sorted relocation batch iterated in order; keep Vec.
     base_relocations: Vec<u32>,
+    //@FIXME: INDEXTYPE(needed); dependency-order byte strings with O(1) ordinal access; keep Vec.
     needed: Vec<Vec<u8>>,
+    //@FIXME: INDEXTYPE(exports); name/ordinal lookup scans O(n); add hash side indexes for expected O(1) lookup if exports are numerous.
     exports: Vec<LoadedExport>,
     state: ObjectState,
 }

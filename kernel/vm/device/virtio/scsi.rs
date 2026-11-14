@@ -33,8 +33,11 @@ const CDB_WRITE_10: u8 = 0x2a;
 
 pub(crate) struct VirtioScsi {
     mmio: VirtioMmio,
+    //@FIXME: INDEXTYPE(disk); fixed-size byte-addressed backing store; replace Vec with Box<[u8]> to express fixed capacity while retaining O(1) indexing.
     disk: Vec<u8>,
+    //@FIXME: INDEXTYPE(request); fixed-capacity request scratch buffer; replace Vec with Box<[u8]> to express fixed size while retaining O(1) indexing.
     request: Vec<u8>,
+    //@FIXME: INDEXTYPE(response); fixed-capacity response scratch buffer; replace Vec with Box<[u8]> to express fixed size while retaining O(1) indexing.
     response: Vec<u8>,
 }
 

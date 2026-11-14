@@ -29,7 +29,9 @@ pub(crate) enum TunTapMode {
 }
 
 struct PacketQueues {
+    //@FIXME: INDEXTYPE(to_userspace); FIFO VecDeque of packet Vec byte buffers; queue ends are O(1), keep VecDeque and Vec payloads.
     to_userspace: VecDeque<Vec<u8>>,
+    //@FIXME: INDEXTYPE(to_kernel); FIFO VecDeque of packet Vec byte buffers; queue ends are O(1), keep VecDeque and Vec payloads.
     to_kernel: VecDeque<Vec<u8>>,
     mode: TunTapMode,
     configured: bool,
@@ -43,6 +45,7 @@ pub(crate) struct TunDevice {
     mac_address: [u8; 6],
 }
 
+//@FIXME: INDEXTYPE(OPEN_TUN_DEVICES); weak registry is appended, swept, and enumerated; keep Vec.
 static OPEN_TUN_DEVICES: IrqSpinLock<Vec<Weak<TunDevice>>> =
     IrqSpinLock::new(Vec::new());
 

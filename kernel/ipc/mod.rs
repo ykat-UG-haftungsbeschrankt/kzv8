@@ -37,7 +37,9 @@ pub(crate) trait CapabilityRightsApi: Sized {
 
 pub(crate) struct MessageBody {
     opcode: u32,
+    //@FIXME: INDEXTYPE(payload); dynamic byte array with O(1) indexing and amortized O(1) append; keep as a contiguous message buffer.
     payload: Vec<u8>,
+    //@FIXME: INDEXTYPE(capabilities); ordered indexed list; Vec::remove(index) shifts the suffix in O(n). A sqrt-decomposed BlockVec gives O(sqrt n) removal but requires replacing the contiguous capabilities() slice API; swap-remove is O(1) only if reordering is acceptable.
     capabilities: Vec<Capability>,
 }
 

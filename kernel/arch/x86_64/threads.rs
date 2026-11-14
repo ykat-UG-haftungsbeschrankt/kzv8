@@ -46,6 +46,7 @@ impl FpuContext {
 
 const TLS_BLOCK_SIZE: usize = 4096;
 
+//@FIXME: INDEXTYPE(TLS_BLOCKS); CPU-ID-indexed TLS block table; Vec access is O(1), keep Vec.
 static TLS_BLOCKS: IrqSpinLock<Vec<Option<alloc::boxed::Box<[u8]>>>> =
     IrqSpinLock::new(Vec::new());
 

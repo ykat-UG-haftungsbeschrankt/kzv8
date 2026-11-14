@@ -49,7 +49,9 @@ struct ApBootRecord {
     stack: u64,
 }
 
+//@FIXME: INDEXTYPE(CPU_SLOTS); CPU-ID-indexed table with stable boxed slots; Vec lookup is O(1), keep Vec.
 static CPU_SLOTS: IrqSpinLock<Vec<Box<CpuSlot>>> = IrqSpinLock::new(Vec::new());
+//@FIXME: INDEXTYPE(AP_BOOT_RECORDS); contiguous boot-record array rebuilt for the trampoline; keep Vec for O(1) indexing.
 static AP_BOOT_RECORDS: IrqSpinLock<Vec<ApBootRecord>> = IrqSpinLock::new(Vec::new());
 static CPU_SLOT_HEAD: AtomicPtr<CpuSlot> = AtomicPtr::new(core::ptr::null_mut());
 

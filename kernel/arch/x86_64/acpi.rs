@@ -17,7 +17,9 @@ pub(crate) struct DmarInfo {
     pub(crate) host_address_width: u8,
     pub(crate) interrupt_remapping: bool,
     pub(crate) x2apic_opt_out: bool,
+    //@FIXME: INDEXTYPE(units); parsed firmware descriptor list; Vec append and iteration are appropriate, keep Vec.
     pub(crate) units: Vec<DmarUnit>,
+    //@FIXME: INDEXTYPE(reserved_regions); parsed firmware descriptor list; keep Vec unless keyed lookup becomes hot.
     pub(crate) reserved_regions: Vec<DmarReservedRegion>,
 }
 
@@ -26,6 +28,7 @@ pub(crate) struct DmarUnit {
     pub(crate) segment: u16,
     pub(crate) register_base: u64,
     pub(crate) include_all: bool,
+    //@FIXME: INDEXTYPE(device_scopes); parsed ordered descriptor list; keep Vec.
     pub(crate) device_scopes: Vec<DmarDeviceScope>,
 }
 
@@ -34,6 +37,7 @@ pub(crate) struct DmarReservedRegion {
     pub(crate) segment: u16,
     pub(crate) base: u64,
     pub(crate) limit: u64,
+    //@FIXME: INDEXTYPE(device_scopes); parsed ordered descriptor list; keep Vec.
     pub(crate) device_scopes: Vec<DmarDeviceScope>,
 }
 
@@ -42,6 +46,7 @@ pub(crate) struct DmarDeviceScope {
     pub(crate) scope_type: u8,
     pub(crate) enumeration_id: u8,
     pub(crate) start_bus: u8,
+    //@FIXME: INDEXTYPE(path); short ordered PCI path; Vec indexing and append are O(1) amortized, keep Vec.
     pub(crate) path: Vec<DmarPathEntry>,
 }
 

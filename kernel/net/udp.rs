@@ -98,12 +98,14 @@ pub(crate) struct UdpTransmission {
     pub(crate) destination_address: Ipv4Address,
     pub(crate) source_port: u16,
     pub(crate) destination_port: u16,
+    //@FIXME: INDEXTYPE(payload); owned datagram byte buffer; Vec indexing is O(1) and append amortized O(1), keep Vec.
     pub(crate) payload: Vec<u8>,
 }
 
 struct ReceivedDatagram {
     source_address: Ipv4Address,
     source_port: u16,
+    //@FIXME: INDEXTYPE(payload); owned datagram byte buffer; Vec indexing is O(1), keep Vec.
     payload: Vec<u8>,
 }
 
@@ -129,12 +131,16 @@ struct UdpFlowKey {
 
 struct UdpFlowBucket {
     key: UdpFlowKey,
+    //@FIXME: INDEXTYPE(slots); per-flow socket fan-out list; keep Vec for ordered iteration and O(n) updates unless fan-out requires a hash side index.
     slots: Vec<usize>,
 }
 
 pub(crate) struct UdpSocketTable {
+    //@FIXME: INDEXTYPE(slots); generation-checked direct-index socket table; Vec access is O(1), keep Vec.
     slots: Vec<UdpSocketSlot>,
+    //@FIXME: INDEXTYPE(free_slots); LIFO free-index stack; Vec push/pop are amortized O(1), keep Vec.
     free_slots: Vec<usize>,
+    //@FIXME: INDEXTYPE(flows); sorted key index has O(log n) lookup but O(n) updates; use a balanced tree/map for O(log n) updates if iteration requirements permit.
     flows: Vec<UdpFlowBucket>,
     queued_datagrams: usize,
     queued_bytes: usize,

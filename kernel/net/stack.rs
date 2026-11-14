@@ -96,6 +96,7 @@ struct Ipv4Route {
 }
 
 struct Ipv4RouteTable {
+    //@FIXME: INDEXTYPE(by_prefix); 33-way direct prefix array with sorted inner Vecs; lookup is O(log r), updates O(r); use BTreeMap per prefix for O(log r) updates if needed.
     by_prefix: Vec<Vec<Ipv4Route>>,
 }
 
@@ -283,6 +284,7 @@ impl Ipv4RouteTable {
 struct PendingIpv4Transmission {
     next_hop: Ipv4Address,
     destination: Ipv4Address,
+    //@FIXME: INDEXTYPE(packet); owned encoded packet buffer; Vec indexing is O(1), keep Vec.
     packet: Vec<u8>,
 }
 
@@ -318,8 +320,11 @@ pub(crate) struct NetStack {
     default_ttl: u8,
     receive_budget: usize,
     fragment_reassembler: Ipv4FragmentReassembler,
+    //@FIXME: INDEXTYPE(neighbors); bounded address list (max 256) with expiry/oldest scans; keep Vec.
     neighbors: Vec<NeighborEntry>,
+    //@FIXME: INDEXTYPE(tunnel_peers); bounded address list (max 256) with expiry/oldest scans; keep Vec.
     tunnel_peers: Vec<TunnelPeer>,
+    //@FIXME: INDEXTYPE(arp_requests); bounded deduplicated retry list with ordered scans/removal; keep Vec.
     arp_requests: Vec<PendingArpRequest>,
     routes: Ipv4RouteTable,
     ipv4_forwarding_enabled: bool,

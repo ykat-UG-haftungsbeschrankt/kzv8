@@ -26,6 +26,7 @@ struct SvmHostCpu {
     _host_save_physical: usize,
 }
 
+//@FIXME: INDEXTYPE(HOST_CPUS); initialization-time CPU list with linear APIC-ID dedup; use the kernel HashMap<u32, ()> as a side index for expected O(1) membership if it grows.
 static HOST_CPUS: IrqSpinLock<Vec<SvmHostCpu>> = IrqSpinLock::new(Vec::new());
 
 pub(crate) fn initialize_host() -> Result<(), super::super::VirtualizationError> {

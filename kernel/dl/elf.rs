@@ -85,11 +85,14 @@ pub(super) fn matches(magic: &[u8; 4]) -> bool {
 }
 
 struct DynamicInfo {
+    //@FIXME: INDEXTYPE(tags); tag-value lookup and duplicate checks scan O(n); add a tag side index for expected O(1) lookup while preserving repeated tags.
     tags: Vec<(i64, u64)>,
+    //@FIXME: INDEXTYPE(needed_offsets); dependency-order offset list; Vec indexing is O(1), keep Vec.
     needed_offsets: Vec<u64>,
 }
 
 struct DynamicSymbol {
+    //@FIXME: INDEXTYPE(name); owned symbol-name bytes; Vec is an O(1)-indexed byte buffer, keep Vec.
     name: Vec<u8>,
     address: Option<usize>,
     size: u64,
@@ -143,8 +146,11 @@ struct ParsedElf<'a, F> {
     kind: ObjectKind,
     fixed_address: bool,
     entry: u64,
+    //@FIXME: INDEXTYPE(program_headers); source-order header array iterated after parsing; keep Vec.
     program_headers: Vec<ProgramHeader>,
+    //@FIXME: INDEXTYPE(load_ranges); sorted range array uses O(log n) binary search; keep Vec for O(1) indexing and compact iteration.
     load_ranges: Vec<LoadRange>,
+    //@FIXME: INDEXTYPE(file_ranges); sorted range array uses O(log n) binary search; keep Vec for O(1) indexing and compact iteration.
     file_ranges: Vec<FileRange>,
     minimum_page: usize,
     mapping_length: usize,
@@ -157,10 +163,15 @@ pub(super) struct ElfLoadedObject {
     mapping_length: usize,
     load_bias: usize,
     entry: Option<usize>,
+    //@FIXME: INDEXTYPE(load_ranges); sorted range array uses O(log n) binary search; keep Vec.
     load_ranges: Vec<LoadRange>,
+    //@FIXME: INDEXTYPE(relro_segments); parse-order protection list traversed at load time; keep Vec.
     relro_segments: Vec<ProgramHeader>,
+    //@FIXME: INDEXTYPE(needed); dependency-order byte strings with O(1) ordinal access; keep Vec.
     needed: Vec<Vec<u8>>,
+    //@FIXME: INDEXTYPE(symbols); name lookup scans O(n), but relocation indexing and enumeration use this order; add a hash side index if lookups are hot.
     symbols: Vec<DynamicSymbol>,
+    //@FIXME: INDEXTYPE(relocations); offset-sorted batch iterated during relocation; keep Vec.
     relocations: Vec<Relocation>,
     state: ObjectState,
 }

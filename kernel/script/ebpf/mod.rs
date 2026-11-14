@@ -90,6 +90,7 @@ impl Instruction {
 }
 
 pub(crate) struct Program {
+    //@FIXME: INDEXTYPE(instructions); dense program-counter-indexed bytecode array; Vec access is O(1), keep Vec.
     instructions: Vec<Instruction>,
     #[cfg(feature = "ebpf-jit")]
     jit: Option<jit::Code>,

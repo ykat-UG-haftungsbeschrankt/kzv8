@@ -21,7 +21,9 @@ pub(crate) struct BlockDevice {
 
 struct BlockState {
     queue: DmaQueue<{ BlockDevice::QUEUE_SIZE }>,
+    //@FIXME: INDEXTYPE(requests); small direct-index request pool; Vec lookup is O(1), keep Vec.
     requests: Vec<BlockRequest>,
+    //@FIXME: INDEXTYPE(free_requests); LIFO free-index stack; Vec push/pop are amortized O(1), keep Vec.
     free_requests: Vec<usize>,
     request_by_head: [Option<usize>; BlockDevice::QUEUE_SIZE],
 }

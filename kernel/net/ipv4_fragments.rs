@@ -26,19 +26,23 @@ struct FragmentKey {
 
 struct FragmentPiece {
     offset: usize,
+    //@FIXME: INDEXTYPE(bytes); contiguous fragment payload; Vec indexing is O(1), keep Vec.
     bytes: Vec<u8>,
 }
 
 struct DatagramFragments {
     key: FragmentKey,
     expires_at_ns: u64,
+    //@FIXME: INDEXTYPE(header); optional contiguous header bytes; Vec indexing is O(1), keep Vec.
     header: Option<Vec<u8>>,
+    //@FIXME: INDEXTYPE(pieces); offset-ordered fragment list capped at 64; O(n) scans are bounded, keep Vec.
     pieces: Vec<FragmentPiece>,
     final_length: Option<usize>,
     buffered_bytes: usize,
 }
 
 pub(crate) struct Ipv4FragmentReassembler {
+    //@FIXME: INDEXTYPE(datagrams); key-searched reassembly list capped at 16; O(n) lookup/removal are bounded, keep Vec.
     datagrams: Vec<DatagramFragments>,
     buffered_bytes: usize,
 }

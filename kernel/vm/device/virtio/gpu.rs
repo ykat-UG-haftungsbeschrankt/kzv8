@@ -41,8 +41,11 @@ const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 
 pub(crate) struct VirtioGpu {
     mmio: VirtioMmio,
+    //@FIXME: INDEXTYPE(request); fixed-capacity request scratch buffer; replace Vec with Box<[u8]> to express fixed size while retaining O(1) indexing.
     request: Vec<u8>,
+    //@FIXME: INDEXTYPE(response); fixed-capacity response scratch buffer; replace Vec with Box<[u8]> to express fixed size while retaining O(1) indexing.
     response: Vec<u8>,
+    //@FIXME: INDEXTYPE(framebuffer); fixed pixel backing buffer; replace Vec with Box<[u8]> to express fixed size while retaining O(1) indexing.
     framebuffer: Vec<u8>,
     width: usize,
     height: usize,
