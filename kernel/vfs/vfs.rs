@@ -7,6 +7,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::string::String;
 use alloc::task::Wake;
 use alloc::vec::Vec;
 use core::borrow::Borrow;
@@ -26,7 +27,7 @@ use super::{
     AppendResult, DirectoryEntry, DirectoryPlugin, FileHandle, FileHandleApi, FilePlugin,
     INODE_FLAG_APPEND, INODE_FLAG_DIRSYNC, INODE_FLAG_IMMUTABLE, INODE_FLAG_NODUMP,
     INODE_FLAG_NOATIME, INODE_FLAG_TOPDIR, Node, NodeApi, NodeMetadata, NodeMetadataApi, OpenMode,
-    SeekFrom, Vfs, VfsApi, VfsFuture, VfsResult,
+    SeekFrom, VfsApi, VfsFuture, VfsResult,
 };
 
 const SUPPORTED_INODE_FLAGS: u32 = INODE_FLAG_IMMUTABLE
@@ -81,11 +82,292 @@ pub(super) struct NodeMetadataState {
     owner: UserId,
     group: GroupId,
     mode: u16,
+    link_count: u32,
     flags: u32,
     xattrs: HashMap<XattrName, Arc<ImmutableByteBuffer>, 1>,
 }
 
 static MOUNTED_VFS: IrqSpinLock<Option<Vfs>> = IrqSpinLock::new(None);
+
+const MAX_SYMLINK_FOLLOWS: usize = 40;
+
+#[derive(Clone)]
+pub(crate) struct Vfs {
+    root: Node,
+    mounts: Arc<IrqSpinLock<Vec<MountEntry>>>,
+}
+
+struct MountEntry {
+    path: String,
+    root: Node,
+}
+
+enum ResolveStep {
+    Restart(String),
+    Resolved(Node, String),
+}
+
+impl Vfs {
+    fn mount_root_at(&self, path: &str) -> Option<Node> {
+        self.mounts
+            .lock()
+            .iter()
+            .find(|mount| mount.path == path)
+            .map(|mount| mount.root.clone())
+    }
+
+    fn mount_path_for<'a>(mounts: &'a [MountEntry], path: &str) -> Option<&'a str> {
+        mounts
+            .iter()
+            .filter(|mount| path_is_within(path, &mount.path))
+            .max_by_key(|mount| mount.path.len())
+            .map(|mount| mount.path.as_str())
+    }
+
+    async fn resolve_internal(
+        &self,
+        path: &str,
+        credentials: &Credentials,
+        follow_final_symlink: bool,
+    ) -> VfsResult<(Node, String)> {
+        if path.contains('\0') {
+            return Err(Error::Inval);
+        }
+        let mut pending_path = copy_string(path)?;
+        let mut followed_symlinks = 0;
+        loop {
+            let step = {
+                let mut components = Vec::new();
+                components
+                    .try_reserve_exact(pending_path.split('/').count())
+                    .map_err(|_| Error::NoMem)?;
+                components.extend(pending_path.split('/').filter(|part| !part.is_empty()));
+
+                let mut node_stack = Vec::new();
+                node_stack
+                    .try_reserve_exact(components.len().saturating_add(1))
+                    .map_err(|_| Error::NoMem)?;
+                node_stack.push(self.root.clone());
+
+                let mut path_stack: Vec<&str> = Vec::new();
+                path_stack
+                    .try_reserve_exact(components.len())
+                    .map_err(|_| Error::NoMem)?;
+
+                let mut restart = None;
+                for (index, component) in components.iter().enumerate() {
+                    let component = *component;
+                    match component {
+                        "." | ".." => {
+                            let current = node_stack.last().ok_or(Error::Proto)?;
+                            if !matches!(current, Node::Directory { .. }) {
+                                return Err(Error::NotDir);
+                            }
+                            current.check_access(credentials, ACCESS_EXECUTE)?;
+                            if component == ".." && node_stack.len() > 1 {
+                                node_stack.pop();
+                                path_stack.pop();
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    let parent = node_stack.last().cloned().ok_or(Error::Proto)?;
+                    if !matches!(&parent, Node::Directory { .. }) {
+                        return Err(Error::NotDir);
+                    }
+                    parent.check_access(credentials, ACCESS_EXECUTE)?;
+                    let mut child = parent.lookup(component).await?;
+                    let child_path = absolute_path_with(&path_stack, component)?;
+                    if let Some(mounted_root) = self.mount_root_at(&child_path) {
+                        child = mounted_root;
+                    }
+
+                    let is_final = index + 1 == components.len();
+                    if let Node::Symlink { target, .. } = &child {
+                        if !is_final || follow_final_symlink || pending_path.ends_with('/') {
+                            followed_symlinks += 1;
+                            if followed_symlinks > MAX_SYMLINK_FOLLOWS {
+                                return Err(Error::Loop);
+                            }
+                            restart = Some(expand_symlink_path(
+                                &path_stack,
+                                target,
+                                &components[index + 1..],
+                                pending_path.ends_with('/'),
+                            )?);
+                            break;
+                        }
+                    }
+
+                    path_stack.push(component);
+                    node_stack.push(child);
+                }
+
+                match restart {
+                    Some(path) => ResolveStep::Restart(path),
+                    None => {
+                        let node = node_stack.pop().ok_or(Error::Proto)?;
+                        if pending_path.ends_with('/')
+                            && !matches!(&node, Node::Directory { .. })
+                        {
+                            return Err(Error::NotDir);
+                        }
+                        ResolveStep::Resolved(node, absolute_path(&path_stack)?)
+                    }
+                }
+            };
+
+            match step {
+                ResolveStep::Restart(path) => pending_path = path,
+                ResolveStep::Resolved(node, path) => return Ok((node, path)),
+            }
+        }
+    }
+
+    fn same_filesystem(&self, first: &str, second: &str) -> bool {
+        let mounts = self.mounts.lock();
+        Self::mount_path_for(&mounts, first) == Self::mount_path_for(&mounts, second)
+    }
+
+    fn is_mountpoint(&self, path: &str) -> bool {
+        self.mounts.lock().iter().any(|mount| mount.path == path)
+    }
+}
+
+fn copy_string(value: &str) -> VfsResult<String> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| Error::NoMem)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+fn absolute_path(components: &[&str]) -> VfsResult<String> {
+    let mut path = String::new();
+    path.try_reserve_exact(1)
+        .map_err(|_| Error::NoMem)?;
+    path.push('/');
+    for component in components {
+        push_path_component(&mut path, component)?;
+    }
+    Ok(path)
+}
+
+fn absolute_path_with(components: &[&str], component: &str) -> VfsResult<String> {
+    let mut path = absolute_path(components)?;
+    push_path_component(&mut path, component)?;
+    Ok(path)
+}
+
+fn push_path_component(path: &mut String, component: &str) -> VfsResult<()> {
+    if path.len() > 1 {
+        path.try_reserve(1).map_err(|_| Error::NoMem)?;
+        path.push('/');
+    }
+    path.try_reserve(component.len()).map_err(|_| Error::NoMem)?;
+    path.push_str(component);
+    Ok(())
+}
+
+fn expand_symlink_path(
+    parent: &[&str],
+    target: &str,
+    remaining: &[&str],
+    trailing_slash: bool,
+) -> VfsResult<String> {
+    let mut expanded = if target.starts_with('/') {
+        copy_string(target)?
+    } else {
+        let mut path = absolute_path(parent)?;
+        if path != "/" {
+            path.try_reserve(1).map_err(|_| Error::NoMem)?;
+            path.push('/');
+        }
+        path.try_reserve(target.len()).map_err(|_| Error::NoMem)?;
+        path.push_str(target);
+        path
+    };
+    for component in remaining {
+        if !expanded.ends_with('/') {
+            expanded.try_reserve(1).map_err(|_| Error::NoMem)?;
+            expanded.push('/');
+        }
+        expanded
+            .try_reserve(component.len())
+            .map_err(|_| Error::NoMem)?;
+        expanded.push_str(component);
+    }
+    if trailing_slash && !expanded.ends_with('/') {
+        expanded.try_reserve(1).map_err(|_| Error::NoMem)?;
+        expanded.push('/');
+    }
+    Ok(expanded)
+}
+
+fn path_is_within(path: &str, mount_path: &str) -> bool {
+    path == mount_path
+        || (path.starts_with(mount_path)
+            && path.as_bytes().get(mount_path.len()) == Some(&b'/'))
+}
+
+fn split_parent_path(path: &str) -> VfsResult<(&str, &str)> {
+    if path.contains('\0') {
+        return Err(Error::Inval);
+    }
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return Err(Error::Busy);
+    }
+    let Some(separator) = path.rfind('/') else {
+        return validate_entry_name(path).map(|()| ("", path));
+    };
+    let parent = if separator == 0 {
+        "/"
+    } else {
+        &path[..separator]
+    };
+    let name = &path[separator + 1..];
+    validate_entry_name(name)?;
+    Ok((parent, name))
+}
+
+fn validate_entry_name(name: &str) -> VfsResult<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+        Err(Error::Inval)
+    } else {
+        Ok(())
+    }
+}
+
+fn child_absolute_path(parent: &str, name: &str) -> VfsResult<String> {
+    let mut path = copy_string(parent)?;
+    if path != "/" {
+        path.try_reserve(1).map_err(|_| Error::NoMem)?;
+        path.push('/');
+    }
+    path.try_reserve(name.len()).map_err(|_| Error::NoMem)?;
+    path.push_str(name);
+    Ok(path)
+}
+
+fn check_directory_mutation(
+    node: &Node,
+    credentials: &Credentials,
+    removes_entry: bool,
+) -> VfsResult<()> {
+    let Node::Directory { metadata, .. } = node else {
+        return Err(Error::NotDir);
+    };
+    metadata.check_access(credentials, ACCESS_WRITE | ACCESS_EXECUTE, true)?;
+    let flags = metadata.flags();
+    if flags & INODE_FLAG_IMMUTABLE != 0 || removes_entry && flags & INODE_FLAG_APPEND != 0 {
+        return Err(Error::Perm);
+    }
+    Ok(())
+}
 
 impl NodeMetadata {
     fn new_directory() -> Self {
@@ -98,10 +380,23 @@ impl NodeMetadata {
                 owner,
                 group,
                 mode,
+                link_count: 1,
                 flags: 0,
                 xattrs: HashMap::new(),
             })),
         }
+    }
+
+    fn add_link(&self) -> VfsResult<()> {
+        let mut state = self.state.lock();
+        state.link_count = state.link_count.checked_add(1).ok_or(Error::Mlink)?;
+        Ok(())
+    }
+
+    fn remove_link(&self) -> VfsResult<()> {
+        let mut state = self.state.lock();
+        state.link_count = state.link_count.checked_sub(1).ok_or(Error::Proto)?;
+        Ok(())
     }
 }
 
@@ -127,6 +422,10 @@ impl NodeMetadataApi for NodeMetadata {
 
     fn mode(&self) -> u16 {
         self.state.lock().mode
+    }
+
+    fn link_count(&self) -> u32 {
+        self.state.lock().link_count
     }
 
     fn check_access(
@@ -329,6 +628,21 @@ impl Node {
         match self {
             Self::Directory { metadata, .. } => metadata.check_access(credentials, requested, true),
             Self::File { metadata, .. } => metadata.check_access(credentials, requested, false),
+            Self::Symlink { .. } => Err(Error::Inval),
+        }
+    }
+
+    fn insert_entry(&self, name: &str, node: Node) -> VfsResult<()> {
+        match self {
+            Self::Directory { plugin, .. } => plugin.insert_entry(name, node),
+            Self::File { .. } | Self::Symlink { .. } => Err(Error::NotDir),
+        }
+    }
+
+    fn remove_file_entry(&self, name: &str) -> VfsResult<Node> {
+        match self {
+            Self::Directory { plugin, .. } => plugin.remove_file_entry(name),
+            Self::File { .. } | Self::Symlink { .. } => Err(Error::NotDir),
         }
     }
 }
@@ -361,7 +675,9 @@ impl NodeApi for Node {
 
     fn metadata(&self) -> NodeMetadata {
         match self {
-            Self::Directory { metadata, .. } | Self::File { metadata, .. } => metadata.clone(),
+            Self::Directory { metadata, .. }
+            | Self::File { metadata, .. }
+            | Self::Symlink { metadata, .. } => metadata.clone(),
         }
     }
 
@@ -372,14 +688,14 @@ impl NodeApi for Node {
     fn lookup<'a>(&'a self, name: &'a str) -> VfsFuture<'a, VfsResult<Node>> {
         match self {
             Self::Directory { plugin, .. } => plugin.lookup(name),
-            Self::File { .. } => Box::pin(async { Err(Error::NotDir) }),
+            Self::File { .. } | Self::Symlink { .. } => Box::pin(async { Err(Error::NotDir) }),
         }
     }
 
     fn read_dir(&self) -> VfsFuture<'_, VfsResult<Vec<DirectoryEntry>>> {
         match self {
             Self::Directory { plugin, .. } => plugin.read_dir(),
-            Self::File { .. } => Box::pin(async { Err(Error::NotDir) }),
+            Self::File { .. } | Self::Symlink { .. } => Box::pin(async { Err(Error::NotDir) }),
         }
     }
 
@@ -391,6 +707,7 @@ impl NodeApi for Node {
         match self {
             Self::File { plugin, .. } => plugin.read_at(offset, buffer),
             Self::Directory { .. } => Box::pin(async { Err(Error::IsDir) }),
+            Self::Symlink { .. } => Box::pin(async { Err(Error::Inval) }),
         }
     }
 
@@ -398,6 +715,7 @@ impl NodeApi for Node {
         match self {
             Self::File { plugin, .. } => plugin.size(),
             Self::Directory { .. } => Box::pin(async { Err(Error::IsDir) }),
+            Self::Symlink { .. } => Box::pin(async { Err(Error::Inval) }),
         }
     }
 
@@ -418,6 +736,7 @@ impl NodeApi for Node {
                 })
             }
             Self::Directory { .. } => Box::pin(async { Err(Error::IsDir) }),
+            Self::Symlink { .. } => Box::pin(async { Err(Error::Inval) }),
         }
     }
 
@@ -438,6 +757,7 @@ impl NodeApi for Node {
                 })
             }
             Self::Directory { .. } => Box::pin(async { Err(Error::IsDir) }),
+            Self::Symlink { .. } => Box::pin(async { Err(Error::Inval) }),
         }
     }
 }
@@ -529,7 +849,10 @@ impl FileHandleApi for FileHandle {
 
 impl VfsApi for Vfs {
     fn new(root: Node) -> Self {
-        Self { root }
+        Self {
+            root,
+            mounts: Arc::new(IrqSpinLock::new(Vec::new())),
+        }
     }
 
     fn root(&self) -> Node {
@@ -550,6 +873,7 @@ impl VfsApi for Vfs {
                     plugin.open(mode).await?
                 }
                 Node::Directory { .. } => return Err(Error::IsDir),
+                Node::Symlink { .. } => return Err(Error::Inval),
             };
             Ok(FileHandle {
                 node,
@@ -575,20 +899,180 @@ impl VfsApi for Vfs {
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<Node>> {
         Box::pin(async move {
-            let mut node = self.root.clone();
-            for component in path.split('/') {
-                match component {
-                    "" | "." => continue,
-                    ".." => return Err(Error::Inval),
-                    name => {
-                        if matches!(node, Node::Directory { .. }) {
-                            node.check_access(credentials, ACCESS_EXECUTE)?;
-                        }
-                        node = node.lookup(name).await?;
-                    }
-                }
+            self.resolve_internal(path, credentials, true)
+                .await
+                .map(|(node, _path)| node)
+        })
+    }
+
+    fn hard_link<'a>(
+        &'a self,
+        source_path: &'a str,
+        link_path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>> {
+        Box::pin(async move {
+            let (source, source_canonical_path) = self
+                .resolve_internal(source_path, credentials, false)
+                .await?;
+            if matches!(&source, Node::Directory { .. }) {
+                return Err(Error::Perm);
             }
-            Ok(node)
+            if source.flags() & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
+                return Err(Error::Perm);
+            }
+            let (parent_path, name) = split_parent_path(link_path)?;
+            let (parent, parent_canonical_path) = self
+                .resolve_internal(parent_path, credentials, true)
+                .await?;
+            check_directory_mutation(&parent, credentials, false)?;
+            if !self.same_filesystem(&source_canonical_path, &parent_canonical_path) {
+                return Err(Error::Xdev);
+            }
+
+            let metadata = source.metadata();
+            metadata.add_link()?;
+            if let Err(error) = parent.insert_entry(name, source) {
+                let _rollback = metadata.remove_link();
+                return Err(error);
+            }
+            Ok(())
+        })
+    }
+
+    fn symlink<'a>(
+        &'a self,
+        target: &'a str,
+        link_path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>> {
+        Box::pin(async move {
+            if target.is_empty() {
+                return Err(Error::NoEnt);
+            }
+            if target.contains('\0') {
+                return Err(Error::Inval);
+            }
+            let (parent_path, name) = split_parent_path(link_path)?;
+            let (parent, _) = self
+                .resolve_internal(parent_path, credentials, true)
+                .await?;
+            check_directory_mutation(&parent, credentials, false)?;
+
+            let metadata = NodeMetadata::with_owner_and_mode(
+                credentials.effective_user(),
+                credentials.effective_group(),
+                0o777,
+            )?;
+            let node = Node::Symlink {
+                target: Arc::new(copy_string(target)?),
+                metadata,
+            };
+            parent.insert_entry(name, node)
+        })
+    }
+
+    fn read_link<'a>(
+        &'a self,
+        path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<String>> {
+        Box::pin(async move {
+            let (node, _) = self.resolve_internal(path, credentials, false).await?;
+            match node {
+                Node::Symlink { target, .. } => copy_string(target.as_str()),
+                _ => Err(Error::Inval),
+            }
+        })
+    }
+
+    fn unlink<'a>(
+        &'a self,
+        path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>> {
+        Box::pin(async move {
+            let (parent_path, name) = split_parent_path(path)?;
+            let (parent, parent_canonical_path) = self
+                .resolve_internal(parent_path, credentials, true)
+                .await?;
+            check_directory_mutation(&parent, credentials, true)?;
+            let link_path = child_absolute_path(&parent_canonical_path, name)?;
+            if self.is_mountpoint(&link_path) {
+                return Err(Error::Busy);
+            }
+            let existing = parent.lookup(name).await?;
+            if existing.flags() & (INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND) != 0 {
+                return Err(Error::Perm);
+            }
+            let node = parent.remove_file_entry(name)?;
+            node.metadata().remove_link()
+        })
+    }
+
+    fn mount<'a>(
+        &'a self,
+        path: &'a str,
+        filesystem_root: Node,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>> {
+        Box::pin(async move {
+            if !credentials.is_root() {
+                return Err(Error::Perm);
+            }
+            if !matches!(&filesystem_root, Node::Directory { .. }) {
+                return Err(Error::NotDir);
+            }
+            let (mountpoint, mount_path) = self.resolve_internal(path, credentials, true).await?;
+            if !matches!(&mountpoint, Node::Directory { .. }) {
+                return Err(Error::NotDir);
+            }
+            if mount_path == "/" {
+                return Err(Error::Busy);
+            }
+
+            let mut mounts = self.mounts.lock();
+            if mounts.iter().any(|mount| {
+                mount.path == mount_path || path_is_within(&mount.path, &mount_path)
+            }) {
+                return Err(Error::Busy);
+            }
+            mounts.try_reserve(1).map_err(|_| Error::NoMem)?;
+            mounts.push(MountEntry {
+                path: mount_path,
+                root: filesystem_root,
+            });
+            Ok(())
+        })
+    }
+
+    fn unmount<'a>(
+        &'a self,
+        path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>> {
+        Box::pin(async move {
+            if !credentials.is_root() {
+                return Err(Error::Perm);
+            }
+            let (_mountpoint, mount_path) = self.resolve_internal(path, credentials, true).await?;
+            if mount_path == "/" {
+                return Err(Error::Busy);
+            }
+
+            let mut mounts = self.mounts.lock();
+            let index = mounts
+                .iter()
+                .position(|mount| mount.path == mount_path)
+                .ok_or(Error::NoEnt)?;
+            if mounts
+                .iter()
+                .any(|mount| mount.path != mount_path && path_is_within(&mount.path, &mount_path))
+            {
+                return Err(Error::Busy);
+            }
+            mounts.remove(index);
+            Ok(())
         })
     }
 

@@ -23,6 +23,8 @@ mod vfs;
 
 pub(crate) use vfs::mounted;
 #[allow(unused_imports)]
+pub(crate) use vfs::Vfs;
+#[allow(unused_imports)]
 pub(crate) use vfs::mount_virtio_devices;
 
 pub(crate) type VfsResult<T> = Result<T, Error>;
@@ -53,6 +55,7 @@ pub(crate) trait NodeMetadataApi: Sized {
     fn owner(&self) -> UserId;
     fn group(&self) -> GroupId;
     fn mode(&self) -> u16;
+    fn link_count(&self) -> u32;
     fn check_access(
         &self,
         credentials: &Credentials,
@@ -97,6 +100,14 @@ pub(crate) enum SeekFrom {
 pub(crate) trait DirectoryPlugin: Send + Sync {
     fn lookup<'a>(&'a self, name: &'a str) -> VfsFuture<'a, VfsResult<Node>>;
 
+    fn insert_entry(&self, _name: &str, _node: Node) -> VfsResult<()> {
+        Err(Error::Rofs)
+    }
+
+    fn remove_file_entry(&self, _name: &str) -> VfsResult<Node> {
+        Err(Error::Rofs)
+    }
+
     fn read_dir(&self) -> VfsFuture<'_, VfsResult<Vec<DirectoryEntry>>> {
         Box::pin(async { Err(Error::NoSys) })
     }
@@ -131,6 +142,10 @@ pub(crate) enum Node {
     },
     File {
         plugin: Arc<dyn FilePlugin>,
+        metadata: NodeMetadata,
+    },
+    Symlink {
+        target: Arc<String>,
         metadata: NodeMetadata,
     },
 }
@@ -225,11 +240,6 @@ pub(crate) struct DirectoryEntry {
     pub(crate) node: Node,
 }
 
-#[derive(Clone)]
-pub(crate) struct Vfs {
-    root: Node,
-}
-
 pub(crate) trait VfsApi: Sized {
     fn new(root: Node) -> Self;
     fn root(&self) -> Node;
@@ -250,6 +260,46 @@ pub(crate) trait VfsApi: Sized {
         path: &'a str,
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<Node>>;
+    fn hard_link<'a>(
+        &'a self,
+        source_path: &'a str,
+        link_path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>>;
+    fn symlink<'a>(
+        &'a self,
+        target: &'a str,
+        link_path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>>;
+    fn read_link<'a>(
+        &'a self,
+        path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<String>>;
+    fn unlink<'a>(
+        &'a self,
+        path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>>;
+    fn mount<'a>(
+        &'a self,
+        path: &'a str,
+        filesystem_root: Node,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>>;
+    fn unmount<'a>(
+        &'a self,
+        path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>>;
+    fn umount<'a>(
+        &'a self,
+        path: &'a str,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>> {
+        self.unmount(path, credentials)
+    }
     fn read_dir<'a>(
         &'a self,
         path: &'a str,

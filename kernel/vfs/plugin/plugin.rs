@@ -32,6 +32,33 @@ impl DirectoryPlugin for Directory {
         Box::pin(async move { result })
     }
 
+    fn insert_entry(&self, name: &str, node: Node) -> VfsResult<()> {
+        validate_entry_name(name)?;
+        let mut owned_name = String::new();
+        owned_name
+            .try_reserve_exact(name.len())
+            .map_err(|_| Error::NoMem)?;
+        owned_name.push_str(name);
+
+        let mut entries = self.entries.lock();
+        if entries.contains_key(name) {
+            return Err(Error::Exist);
+        }
+        entries
+            .insert(owned_name, node)
+            .map_err(|(_name, _node)| Error::NoMem)?;
+        Ok(())
+    }
+
+    fn remove_file_entry(&self, name: &str) -> VfsResult<Node> {
+        let mut entries = self.entries.lock();
+        let node = entries.get(name).ok_or(Error::NoEnt)?;
+        if matches!(node, Node::Directory { .. }) {
+            return Err(Error::IsDir);
+        }
+        entries.remove(name).ok_or(Error::NoEnt)
+    }
+
     fn read_dir(&self) -> VfsFuture<'_, VfsResult<Vec<DirectoryEntry>>> {
         let result = (|| {
             let mut entries = Vec::new();
@@ -54,6 +81,14 @@ impl DirectoryPlugin for Directory {
             Ok(entries)
         })();
         Box::pin(async move { result })
+    }
+}
+
+fn validate_entry_name(name: &str) -> VfsResult<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+        Err(Error::Inval)
+    } else {
+        Ok(())
     }
 }
 
