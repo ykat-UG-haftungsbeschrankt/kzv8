@@ -556,6 +556,23 @@ impl crate::kernel::arch::traits::VirtualizationArchitecture for super::Virtuali
         }
     }
 
+    fn unmap_guest_mmio(
+        context: &mut Self::GuestContext,
+        guest_address: u64,
+        host_address: u64,
+        length: usize,
+    ) -> Result<(), super::VirtualizationError> {
+        #[cfg(feature = "intel-vtx")]
+        {
+            context.unmap_guest_mmio(guest_address, host_address, length)
+        }
+        #[cfg(not(feature = "intel-vtx"))]
+        {
+            let _ = (context, guest_address, host_address, length);
+            Err(super::VirtualizationError::Unsupported)
+        }
+    }
+
     fn write_guest_memory(
         context: &mut Self::GuestContext,
         guest_address: u64,

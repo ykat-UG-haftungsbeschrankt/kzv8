@@ -1104,6 +1104,22 @@ impl ThreadManager {
         function: crate::kernel::vm::device::passthru::PciFunction,
         detached: bool,
     ) -> Result<usize, crate::kernel::arch::VirtualizationError> {
+        Self::create_vm_thread_with_pci_function_and_control(
+            stack_size,
+            image,
+            function,
+            detached,
+        )
+        .map(|(thread_id, _control)| thread_id)
+    }
+
+    #[cfg(feature = "virtualization")]
+    pub(crate) fn create_vm_thread_with_pci_function_and_control(
+        stack_size: usize,
+        image: &[u8],
+        function: crate::kernel::vm::device::passthru::PciFunction,
+        detached: bool,
+    ) -> Result<(usize, vm::PassthroughControlHandle), crate::kernel::arch::VirtualizationError> {
         let process = Self::current_process().map_err(|error| match error {
             Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
             _ => crate::kernel::arch::VirtualizationError::HostSetupFailed,
@@ -1118,13 +1134,15 @@ impl ThreadManager {
             image,
             function,
         )?;
+        let control = context.passthrough_control_handle();
         let thread = Box::new(ListNode::new(Thread::new_vm(
             stack, context, process, detached,
         )));
-        Self::enqueue_thread(thread).map_err(|error| match error {
+        let thread_id = Self::enqueue_thread(thread).map_err(|error| match error {
             Error::NoMem => crate::kernel::arch::VirtualizationError::ResourceExhausted,
             _ => crate::kernel::arch::VirtualizationError::HostSetupFailed,
-        })
+        })?;
+        Ok((thread_id, control))
     }
 
     fn enqueue_thread(mut thread: Box<ListNode<Thread>>) -> Result<usize, Error> {

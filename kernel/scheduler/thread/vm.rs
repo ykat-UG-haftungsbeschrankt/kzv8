@@ -5,6 +5,8 @@
  * free of charge, without warranty of any kind.
  */
 
+#[cfg(feature = "virtualization")]
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -18,6 +20,8 @@ use crate::kernel::arch::traits::{
 	ThreadArchitecture as _,
 };
 use crate::kernel::lib::alignment::align_up;
+#[cfg(feature = "virtualization")]
+use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::interval::IntervalTree;
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::scheduler::sync::IrqSpinLock;
@@ -25,10 +29,103 @@ use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::vm::device::passthru::{PassthroughDevice, PciFunction};
 
 #[cfg(feature = "virtualization")]
+struct PendingPassthroughUnplug {
+	function: PciFunction,
+	result: IrqSpinLock<Option<Result<(), crate::kernel::arch::VirtualizationError>>>,
+}
+
+#[cfg(feature = "virtualization")]
+struct PassthroughControlState {
+	requests: VecDeque<Arc<PendingPassthroughUnplug>>,
+	closed: bool,
+}
+
+#[cfg(feature = "virtualization")]
+struct PassthroughControl {
+	state: IrqSpinLock<PassthroughControlState>,
+}
+
+#[cfg(feature = "virtualization")]
+pub(crate) struct PassthroughUnplugTicket {
+	request: Arc<PendingPassthroughUnplug>,
+}
+
+#[cfg(feature = "virtualization")]
+#[derive(Clone)]
+pub(crate) struct PassthroughControlHandle {
+	control: Arc<PassthroughControl>,
+}
+
+#[cfg(feature = "virtualization")]
+impl PassthroughUnplugTicket {
+	/// Returns the unplug result once the vCPU reaches its next safe point.
+	pub(crate) fn try_result(
+		&self,
+	) -> Option<Result<(), crate::kernel::arch::VirtualizationError>> {
+		*self.request.result.lock()
+	}
+}
+
+#[cfg(feature = "virtualization")]
+impl PassthroughControlHandle {
+	/// Queues a forced unplug; poll the returned ticket for completion.
+	pub(crate) fn request_unplug(
+		&self,
+		function: PciFunction,
+	) -> Result<PassthroughUnplugTicket, crate::kernel::arch::VirtualizationError> {
+		self.control.request(function)
+	}
+}
+
+#[cfg(feature = "virtualization")]
+impl PassthroughControl {
+	fn new() -> Self {
+		Self {
+			state: IrqSpinLock::new(PassthroughControlState {
+				requests: VecDeque::new(),
+				closed: false,
+			}),
+		}
+	}
+
+	fn request(
+		&self,
+		function: PciFunction,
+	) -> Result<PassthroughUnplugTicket, crate::kernel::arch::VirtualizationError> {
+		let mut state = self.state.lock();
+		if state.closed || state.requests.iter().any(|request| request.function == function) {
+			return Err(crate::kernel::arch::VirtualizationError::Unsupported);
+		}
+		state
+			.requests
+			.try_reserve(1)
+			.map_err(|_| crate::kernel::arch::VirtualizationError::ResourceExhausted)?;
+		let request = Arc::new(PendingPassthroughUnplug {
+			function,
+			result: IrqSpinLock::new(None),
+		});
+		state.requests.push_back(Arc::clone(&request));
+		Ok(PassthroughUnplugTicket { request })
+	}
+
+	fn take_request(&self) -> Option<Arc<PendingPassthroughUnplug>> {
+		self.state.lock().requests.pop_front()
+	}
+
+	fn close(&self, error: crate::kernel::arch::VirtualizationError) {
+		let mut state = self.state.lock();
+		state.closed = true;
+		while let Some(request) = state.requests.pop_front() {
+			*request.result.lock() = Some(Err(error));
+		}
+	}
+}
+
+#[cfg(feature = "virtualization")]
 pub(crate) struct VcpuContext {
 	kernel: super::kernel::Context,
-	//@FIXME: INDEXTYPE(passthrough); tiny attached-device list (currently 0-1); keep Vec.
-	passthrough: Vec<PassthroughDevice>,
+	passthrough: HashMap<PciFunction, PassthroughDevice>,
+	passthrough_control: Arc<PassthroughControl>,
 	guest: <crate::kernel::arch::VirtualizationArchitecture as crate::kernel::arch::traits::VirtualizationArchitecture>::GuestContext,
 }
 
@@ -43,7 +140,8 @@ impl VcpuContext {
 		let kernel = super::kernel::Context::load(kernel_stack, kernel_entry);
 		Ok(Self {
 			kernel,
-			passthrough: Vec::new(),
+			passthrough: HashMap::new(),
+			passthrough_control: Arc::new(PassthroughControl::new()),
 			guest,
 		})
 	}
@@ -55,13 +153,101 @@ impl VcpuContext {
 		function: PciFunction,
 	) -> Result<Self, crate::kernel::arch::VirtualizationError> {
 		let mut context = Self::load(kernel_stack, kernel_entry, image)?;
-		context
-			.passthrough
-			.try_reserve(1)
-			.map_err(|_| crate::kernel::arch::VirtualizationError::ResourceExhausted)?;
 		let device = PassthroughDevice::attach(&mut context.guest, function)?;
-		context.passthrough.push(device);
+		if let Err((_function, mut device)) = context.passthrough.insert(function, device) {
+			if !device.detach() {
+				crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
+					&mut context.guest,
+				);
+			}
+			return Err(crate::kernel::arch::VirtualizationError::ResourceExhausted);
+		}
 		Ok(context)
+	}
+
+	pub(crate) fn passthrough_control_handle(&self) -> PassthroughControlHandle {
+		PassthroughControlHandle {
+			control: Arc::clone(&self.passthrough_control),
+		}
+	}
+
+	fn unplug_passthrough(
+		&mut self,
+		function: PciFunction,
+	) -> (Result<(), crate::kernel::arch::VirtualizationError>, bool) {
+		let Some(mapping) = self
+			.passthrough
+			.get(&function)
+			.map(PassthroughDevice::guest_mmio_mapping)
+		else {
+			return (Err(crate::kernel::arch::VirtualizationError::Unsupported), false);
+		};
+		let Some(device) = self.passthrough.get_mut(&function) else {
+			return (Err(crate::kernel::arch::VirtualizationError::Unsupported), false);
+		};
+		if !device.detach() {
+			crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
+				&mut self.guest,
+			);
+			return (
+				Err(crate::kernel::arch::VirtualizationError::HostSetupFailed),
+				true,
+			);
+		}
+		let (guest_address, host_address, length) = mapping;
+		if let Err(error) = crate::kernel::arch::VirtualizationArchitecture::unmap_guest_mmio(
+			&mut self.guest,
+			guest_address,
+			host_address,
+			length,
+		) {
+			crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
+				&mut self.guest,
+			);
+			return (Err(error), true);
+		}
+		if let Err(error) = crate::kernel::arch::VirtualizationArchitecture::write_guest_memory(
+			&mut self.guest,
+			crate::kernel::vm::device::passthru::GUEST_INFO_ADDRESS,
+			&[0; crate::kernel::vm::device::passthru::GUEST_INFO_SIZE],
+		) {
+			crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
+				&mut self.guest,
+			);
+			return (Err(error), true);
+		}
+		let _removed = self.passthrough.remove(&function);
+		(Ok(()), false)
+	}
+
+	fn process_passthrough_requests(&mut self) -> bool {
+		while let Some(request) = self.passthrough_control.take_request() {
+			let (result, must_stop) = self.unplug_passthrough(request.function);
+			*request.result.lock() = Some(result);
+			if must_stop {
+				self.passthrough_control
+					.close(crate::kernel::arch::VirtualizationError::HostSetupFailed);
+				return true;
+			}
+		}
+		loop {
+			let mut missing_function = None;
+			self.passthrough.for_each_mut(|function, device| {
+				if missing_function.is_none() && device.is_missing() {
+					missing_function = Some(*function);
+				}
+			});
+			let Some(function) = missing_function else {
+				break;
+			};
+			let (_result, must_stop) = self.unplug_passthrough(function);
+			if must_stop {
+				self.passthrough_control
+					.close(crate::kernel::arch::VirtualizationError::HostSetupFailed);
+				return true;
+			}
+		}
+		false
 	}
 
 	pub(super) fn kernel(&self) -> &super::kernel::Context {
@@ -96,7 +282,18 @@ impl VcpuContext {
 	/// The pointer must refer to the current running thread's stable, boxed context.
 	pub(crate) unsafe fn run(context: core::ptr::NonNull<Self>) -> ! {
 		loop {
-			let exit = unsafe { (&mut *context.as_ptr()).restore() };
+			let exit = unsafe {
+				let context = &mut *context.as_ptr();
+				let exit = context.restore();
+				match &exit {
+					Ok(_) if context.process_passthrough_requests() => {
+						super::ThreadManager::exit_current(core::ptr::null_mut());
+					}
+					Err(error) => context.passthrough_control.close(*error),
+					_ => {}
+				}
+				exit
+			};
 			match exit {
 				#[cfg(target_arch = "x86_64")]
 				Ok(exit)
@@ -127,12 +324,14 @@ impl VcpuContext {
 #[cfg(feature = "virtualization")]
 impl Drop for VcpuContext {
 	fn drop(&mut self) {
+		self.passthrough_control
+			.close(crate::kernel::arch::VirtualizationError::HostSetupFailed);
 		let mut retain_guest_memory = false;
-		for device in &mut self.passthrough {
+		self.passthrough.for_each_mut(|_, device| {
 			if !device.detach() {
 				retain_guest_memory = true;
 			}
-		}
+		});
 		if retain_guest_memory {
 			crate::kernel::arch::VirtualizationArchitecture::retain_guest_memory(
 				&mut self.guest,
@@ -154,7 +353,6 @@ struct UserArea {
 }
 
 struct UserAreas {
-	//@FIXME: INDEXTYPE(areas); augmented red-black interval tree with O(log n) insertion, removal, and point lookup.
 	areas: IntervalTree<UserArea>,
 }
 

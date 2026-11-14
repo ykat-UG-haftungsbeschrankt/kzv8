@@ -732,6 +732,53 @@ impl GuestContext {
         Ok(())
     }
 
+    pub(crate) fn unmap_guest_mmio(
+        &mut self,
+        guest_address: u64,
+        host_address: u64,
+        length: usize,
+    ) -> Result<(), VirtualizationError> {
+        if self.owner_apic_id != super::interrupts::current_apic_id()
+            || guest_address != GUEST_DEVICE_APERTURE
+            || length == 0
+            || length > GUEST_MEMORY_SIZE
+            || length % PAGE_SIZE != 0
+            || host_address as usize % PAGE_SIZE != 0
+        {
+            return Err(VirtualizationError::Unsupported);
+        }
+        let host_end = host_address
+            .checked_add(length as u64)
+            .ok_or(VirtualizationError::Unsupported)?;
+        if host_end > self.controls.physical_address_limit {
+            return Err(VirtualizationError::Unsupported);
+        }
+
+        let _interrupt_guard = InterruptGuard::disable();
+        let _cr4_guard = Cr4Guard::enable_vmx()?;
+        let _session = self.begin_vmx(&self.control_memory, false)?;
+        let level2 = self.control_memory.pointer_at(EPT_PD_OFFSET).cast::<u64>();
+        let page_table = self.control_memory.pointer_at(EPT_DEVICE_PT_OFFSET).cast::<u64>();
+        let expected_table = (self.control_memory.address + EPT_DEVICE_PT_OFFSET) as u64 | 0x7;
+        // SAFETY: these entries are inside this vCPU's owned, identity-mapped EPT tables.
+        if unsafe { core::ptr::read_volatile(level2.add(1)) } != expected_table {
+            return Err(VirtualizationError::Unsupported);
+        }
+        for page in 0..length / PAGE_SIZE {
+            let entry = unsafe { page_table.add(page) };
+            let expected = host_address + (page * PAGE_SIZE) as u64;
+            // SAFETY: page is bounded by the validated MMIO aperture length.
+            if unsafe { core::ptr::read_volatile(entry) } & !0xfff != expected {
+                return Err(VirtualizationError::Unsupported);
+            }
+        }
+        for page in 0..length / PAGE_SIZE {
+            // SAFETY: the vCPU is stopped and page is bounded by the validated MMIO aperture.
+            unsafe { write_volatile(page_table.add(page), 0) };
+        }
+        Ok(())
+    }
+
     /// Resume this vCPU until a VM exit should be returned to its scheduler thread.
     ///
     /// # Safety

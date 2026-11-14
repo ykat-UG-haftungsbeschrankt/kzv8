@@ -68,6 +68,14 @@ pub(crate) fn read_config(address: PciAddress, offset: u8) -> Option<u32> {
     Some(read_config_unlocked(address, offset))
 }
 
+fn identity_is_present(identity: u32) -> bool {
+    !matches!(identity as u16, 0 | u16::MAX)
+}
+
+pub(crate) fn function_is_present(address: PciAddress) -> Option<bool> {
+    read_config(address, 0).map(identity_is_present)
+}
+
 pub(crate) fn read_config_u16(address: PciAddress, offset: u8) -> Option<u16> {
     if offset & 1 != 0 {
         return None;
@@ -672,3 +680,7 @@ pub(crate) fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {
     }
     None
 }
+
+#[cfg(test)]
+#[path = "../../../tests/kernel/arch/x86_64/pci.rs"]
+mod tests;

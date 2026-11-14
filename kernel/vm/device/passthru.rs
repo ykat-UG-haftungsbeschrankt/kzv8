@@ -13,7 +13,7 @@ const MAX_ASSIGNED_FUNCTIONS: usize = 64;
 static ASSIGNED_FUNCTIONS: IrqSpinLock<[Option<PciFunction>; MAX_ASSIGNED_FUNCTIONS]> =
     IrqSpinLock::new([None; MAX_ASSIGNED_FUNCTIONS]);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PciFunction {
     pub(crate) segment: u16,
     pub(crate) bus: u8,
@@ -78,6 +78,9 @@ pub(crate) const GUEST_MMIO_APERTURE: u64 = 0x20_0000;
 const GUEST_MMIO_MAX_LENGTH: u64 = 2 * 1024 * 1024;
 
 pub(crate) struct PassthroughDevice {
+    guest_mmio_address: u64,
+    guest_mmio_host_address: u64,
+    guest_mmio_length: usize,
     #[cfg(all(target_arch = "x86_64", feature = "intel-vtd"))]
     _dma: crate::kernel::arch::x86_64::vtd::VtdDmaAssignment,
     _claim: ExclusivePciClaim,
@@ -105,6 +108,8 @@ impl PassthroughDevice {
                 .ok_or(crate::kernel::arch::VirtualizationError::Unsupported)?;
             let bar = pci::find_guest_mmio_bar(address, GUEST_MMIO_MAX_LENGTH)
                 .ok_or(crate::kernel::arch::VirtualizationError::Unsupported)?;
+            let guest_mmio_length = usize::try_from(bar.length)
+                .map_err(|_| crate::kernel::arch::VirtualizationError::Unsupported)?;
             let (guest_memory, guest_memory_length) =
                 crate::kernel::arch::VirtualizationArchitecture::guest_memory_region(context)
                     .ok_or(crate::kernel::arch::VirtualizationError::Unsupported)?;
@@ -118,8 +123,7 @@ impl PassthroughDevice {
                     context,
                     GUEST_MMIO_APERTURE,
                     bar.address,
-                    usize::try_from(bar.length)
-                        .map_err(|_| crate::kernel::arch::VirtualizationError::Unsupported)?,
+                    guest_mmio_length,
                 )?;
 
                 let identity = pci::read_config(address, 0)
@@ -155,6 +159,9 @@ impl PassthroughDevice {
                 return Err(error);
             }
             Ok(Self {
+                guest_mmio_address: GUEST_MMIO_APERTURE,
+                guest_mmio_host_address: bar.address,
+                guest_mmio_length,
                 _dma: dma,
                 _claim: claim,
             })
@@ -170,12 +177,43 @@ impl PassthroughDevice {
     pub(crate) fn detach(&mut self) -> bool {
         #[cfg(all(target_arch = "x86_64", feature = "intel-vtd"))]
         {
-            if !self._dma.detach() {
+            let detached = if self.is_missing() {
+                self._dma.detach_after_removal()
+            } else {
+                self._dma.detach()
+            };
+            if !detached {
                 self._claim.retain();
                 return false;
             }
         }
         true
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "intel-vtd"))]
+    pub(crate) fn is_missing(&self) -> bool {
+        use crate::kernel::arch::x86_64::pci::{self, PciAddress};
+
+        let function = self._claim.address();
+        pci::function_is_present(PciAddress {
+            segment: function.segment,
+            bus: function.bus,
+            device: function.device,
+            function: function.function,
+        }) == Some(false)
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", feature = "intel-vtd")))]
+    pub(crate) fn is_missing(&self) -> bool {
+        false
+    }
+
+    pub(crate) const fn guest_mmio_mapping(&self) -> (u64, u64, usize) {
+        (
+            self.guest_mmio_address,
+            self.guest_mmio_host_address,
+            self.guest_mmio_length,
+        )
     }
 }
 

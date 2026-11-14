@@ -488,6 +488,19 @@ impl GuestContext {
         self.tables.map_guest_mmio(guest_address, host_address, length)
     }
 
+    pub(crate) fn unmap_guest_mmio(
+        &mut self,
+        guest_address: u64,
+        host_address: u64,
+        length: usize,
+    ) -> Result<(), crate::kernel::arch::VirtualizationError> {
+        if self.owner_cpu != current_cpu_slot() {
+            return Err(crate::kernel::arch::VirtualizationError::HostSetupFailed);
+        }
+        self.tables
+            .unmap_guest_mmio(guest_address, host_address, length)
+    }
+
     /// Resume this vCPU until a VM exit should be returned to its scheduler thread.
     ///
     /// # Safety
@@ -1069,8 +1082,10 @@ impl Stage2Tables {
         }
         let level2 = (self.tables_physical + LEVEL2_OFFSET) as *mut u64;
         let device_table = (self.tables_physical + DEVICE_TABLE_OFFSET) as *mut u64;
+        let expected_table = device_table as u64 | TABLE_DESCRIPTOR;
         // SAFETY: both entries point into the context-owned, identity-mapped stage-2 table run.
-        if unsafe { core::ptr::read_volatile(level2.add(1)) } != 0 {
+        let level2_entry = unsafe { core::ptr::read_volatile(level2.add(1)) };
+        if level2_entry != 0 && level2_entry != expected_table {
             return Err(crate::kernel::arch::VirtualizationError::Unsupported);
         }
         for page in 0..length / PAGE_SIZE {
@@ -1090,8 +1105,50 @@ impl Stage2Tables {
             unsafe { write_volatile(device_table.add(page), entry) };
         }
         fence(Ordering::SeqCst);
-        // SAFETY: all leaves are initialized before publishing the table descriptor.
-        unsafe { write_volatile(level2.add(1), (device_table as u64) | TABLE_DESCRIPTOR) };
+        if level2_entry == 0 {
+            // SAFETY: all leaves are initialized before publishing the table descriptor.
+            unsafe { write_volatile(level2.add(1), expected_table) };
+        }
+        Ok(())
+    }
+
+    fn unmap_guest_mmio(
+        &mut self,
+        guest_address: u64,
+        host_address: u64,
+        length: usize,
+    ) -> Result<(), crate::kernel::arch::VirtualizationError> {
+        if guest_address != GUEST_DEVICE_APERTURE
+            || length == 0
+            || length > GUEST_MEMORY_SIZE
+            || length % PAGE_SIZE != 0
+            || host_address as usize % PAGE_SIZE != 0
+            || host_address
+                .checked_add(length as u64)
+                .is_none_or(|end| end > MemoryArchitecture::physical_address_limit())
+        {
+            return Err(crate::kernel::arch::VirtualizationError::Unsupported);
+        }
+        let level2 = (self.tables_physical + LEVEL2_OFFSET) as *mut u64;
+        let device_table = (self.tables_physical + DEVICE_TABLE_OFFSET) as *mut u64;
+        let expected_table = device_table as u64 | TABLE_DESCRIPTOR;
+        // SAFETY: these entries are inside this guest's owned, identity-mapped stage-2 tables.
+        if unsafe { core::ptr::read_volatile(level2.add(1)) } != expected_table {
+            return Err(crate::kernel::arch::VirtualizationError::Unsupported);
+        }
+        for page in 0..length / PAGE_SIZE {
+            // SAFETY: page is bounded by the validated MMIO aperture length.
+            let entry = unsafe { core::ptr::read_volatile(device_table.add(page)) };
+            let expected = host_address + (page * PAGE_SIZE) as u64;
+            if entry & !(PAGE_SIZE as u64 - 1) != expected {
+                return Err(crate::kernel::arch::VirtualizationError::Unsupported);
+            }
+        }
+        for page in 0..length / PAGE_SIZE {
+            // SAFETY: the vCPU is stopped and page is bounded by the validated MMIO aperture.
+            unsafe { write_volatile(device_table.add(page), 0) };
+        }
+        fence(Ordering::Release);
         Ok(())
     }
 

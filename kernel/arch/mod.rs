@@ -292,6 +292,13 @@ pub(crate) mod traits {
             length: usize,
         ) -> Result<(), super::VirtualizationError>;
 
+        fn unmap_guest_mmio(
+            context: &mut Self::GuestContext,
+            guest_address: u64,
+            host_address: u64,
+            length: usize,
+        ) -> Result<(), super::VirtualizationError>;
+
         fn write_guest_memory(
             context: &mut Self::GuestContext,
             guest_address: u64,
@@ -316,7 +323,11 @@ pub(crate) mod traits {
         /// balloon PFN tracking. The network has no host uplink, GPU has no display sink, and balloon
         /// does not reclaim host pages.
         /// An assigned PCI BAR is exposed at `0x200000`; its `KZPC` v1 descriptor is at `0x6000`.
-        /// PCI discovery, interrupt injection, and firmware are absent; assigned devices poll.
+        /// A host unplug request or detected PCI-function removal clears that descriptor and revokes
+        /// the BAR mapping at a vCPU exit; guests must poll the descriptor and stop using the BAR
+        /// after it is cleared. No ACK is required. On x86_64 with Intel VT-d, assigned functions are
+        /// checked at VM exits and their DMA contexts are revoked even if config space is gone.
+        /// Guest PCI discovery, interrupt injection, and firmware are absent; assigned devices poll.
         ///
         /// # Safety
         /// The image executes with guest ring-0 privileges. Only trusted images may be run.

@@ -64,6 +64,14 @@ impl<K, V, const INITIAL_CAPACITY: usize> HashMap<K, V, INITIAL_CAPACITY> {
 		self.length = 0;
 	}
 
+	pub(crate) fn for_each_mut(&mut self, mut visit: impl FnMut(&K, &mut V)) {
+		for index in 0..self.capacity {
+			for entry in self.bucket_mut(index).iter_mut() {
+				visit(&entry.key, &mut entry.value);
+			}
+		}
+	}
+
 	fn allocate_buckets(capacity: usize) -> Option<(usize, usize)> {
 		let allocation_length = capacity.checked_mul(size_of::<Bucket<K, V>>())?;
 		let address = crate::kernel::memory::r#virtual::reserve(

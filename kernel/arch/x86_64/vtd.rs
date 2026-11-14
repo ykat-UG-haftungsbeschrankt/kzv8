@@ -575,12 +575,25 @@ impl VtdDmaAssignment {
     }
 
     pub(crate) fn detach(&mut self) -> bool {
+        self.detach_with_presence(false)
+    }
+
+    pub(crate) fn detach_after_removal(&mut self) -> bool {
+        self.detach_with_presence(true)
+    }
+
+    fn detach_with_presence(&mut self, device_removed: bool) -> bool {
         if self.detach_attempted {
             return self.detached;
         }
         self.detach_attempted = true;
         let address = self.prepared.address();
-        if super::pci::quiesce_for_detach(address).is_none() {
+        let still_missing = device_removed
+            && super::pci::function_is_present(address) == Some(false);
+        if !still_missing
+            && super::pci::quiesce_for_detach(address).is_none()
+            && super::pci::function_is_present(address) != Some(false)
+        {
             if let Some(page) = self.second_level.take() {
                 forget(page);
             }
