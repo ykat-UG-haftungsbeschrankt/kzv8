@@ -18,6 +18,7 @@ use crate::kernel::arch::traits::{
 	ThreadArchitecture as _,
 };
 use crate::kernel::lib::alignment::align_up;
+use crate::kernel::lib::interval::IntervalTree;
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 #[cfg(feature = "virtualization")]
@@ -148,27 +149,20 @@ const VM_OWNED: u16 = 1 << 8;
 const VM_BORROWED: u16 = 1 << 9;
 
 struct UserArea {
-	range: Range<usize>,
 	//@FIXME: INDEXTYPE(page_states); direct per-page state array; Vec indexing is O(1), keep Vec.
 	page_states: Vec<AtomicU16>,
 }
 
 struct UserAreas {
-	//@FIXME: INDEXTYPE(areas); address-sorted interval list with O(log n) lookup and O(n) updates; use an interval tree if updates become costly.
-	areas: Vec<UserArea>,
+	//@FIXME: INDEXTYPE(areas); augmented red-black interval tree with O(log n) insertion, removal, and point lookup.
+	areas: IntervalTree<UserArea>,
 }
 
 impl UserAreas {
 	const fn new() -> Self {
-		Self { areas: Vec::new() }
-	}
-
-	fn area_index(&self, address: usize) -> Option<usize> {
-		let index = self
-			.areas
-			.partition_point(|area| area.range.start <= address)
-			.checked_sub(1)?;
-		(self.areas[index].range.end > address).then_some(index)
+		Self {
+			areas: IntervalTree::new(),
+		}
 	}
 
 	fn reserve(
@@ -190,41 +184,15 @@ impl UserAreas {
 		let alignment = alignment.max(USER_VM_PAGE_SIZE);
 		let range = if let Some(address) = hint {
 			let end = address.checked_add(length)?;
-			let insertion = self
-				.areas
-				.partition_point(|area| area.range.start < address);
 			if address < bounds.start || address % alignment != 0 || end > bounds.end {
 				return None;
 			}
-			if insertion > 0 && self.areas[insertion - 1].range.end > address {
-				return None;
-			}
-			if insertion < self.areas.len() && self.areas[insertion].range.start < end {
+			if self.areas.find_overlap(address..end).is_some() {
 				return None;
 			}
 			address..end
 		} else {
-			let mut cursor = bounds.start;
-			let mut fit = None;
-			for area in &self.areas {
-				let start = align_up(cursor, alignment)?;
-				let end = start.checked_add(length)?;
-				if end <= area.range.start {
-					fit = Some(start..end);
-					break;
-				}
-				cursor = cursor.max(area.range.end);
-			}
-			if let Some(fit) = fit {
-				fit
-			} else {
-				let start = align_up(cursor, alignment)?;
-				let end = start.checked_add(length)?;
-				if end > bounds.end {
-					return None;
-				}
-				start..end
-			}
+			self.areas.first_fit(bounds, length, alignment)?
 		};
 
 		let page_count = length / USER_VM_PAGE_SIZE;
@@ -237,17 +205,9 @@ impl UserAreas {
 		let mut page_states = Vec::new();
 		page_states.try_reserve_exact(page_count).ok()?;
 		page_states.resize_with(page_count, || AtomicU16::new(state));
-		self.areas.try_reserve(1).ok()?;
-		let insertion = self
-			.areas
-			.partition_point(|area| area.range.start < range.start);
-		self.areas.insert(
-			insertion,
-			UserArea {
-				range: range.clone(),
-				page_states,
-			},
-		);
+		self.areas
+			.insert(range.clone(), UserArea { page_states })
+			.ok()?;
 		Some(range.start)
 	}
 
@@ -255,14 +215,13 @@ impl UserAreas {
 		if range.start == range.end {
 			return true;
 		}
-		let Some(area_index) = self.area_index(range.start) else {
+		let Some((area_range, area)) = self.areas.find_point(range.start) else {
 			return false;
 		};
-		let area = &self.areas[area_index];
-		if range.end > area.range.end {
+		if range.end > area_range.end {
 			return false;
 		}
-		let first_page = (range.start - area.range.start) / USER_VM_PAGE_SIZE;
+		let first_page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
 		let page_count = (range.end - range.start) / USER_VM_PAGE_SIZE;
 		(first_page..first_page + page_count).all(|page| {
 			area.page_states.get(page).is_some_and(|state| {
@@ -301,9 +260,9 @@ impl Drop for UserAddressSpaceInner {
 		}
 		{
 			let areas = self.areas.lock();
-			for area in &areas.areas {
+			areas.areas.visit_all(|range, area| {
 				for (page, state) in area.page_states.iter().enumerate() {
-					let address = area.range.start + page * USER_VM_PAGE_SIZE;
+					let address = range.start + page * USER_VM_PAGE_SIZE;
 					if let Some(physical_address) =
 						crate::kernel::arch::MemoryArchitecture::unmap_page(address)
 					{
@@ -317,7 +276,7 @@ impl Drop for UserAddressSpaceInner {
 						}
 					}
 				}
-			}
+			});
 		}
 		if !crate::kernel::arch::MemoryArchitecture::activate_address_space(previous_root)
 			|| !crate::kernel::arch::MemoryArchitecture::destroy_address_space(
@@ -365,17 +324,25 @@ impl UserAddressSpace {
 			areas
 				.try_reserve_exact(source_areas.areas.len())
 				.map_err(|_| Error::NoMem)?;
-			for area in &source_areas.areas {
+			let mut allocation_failed = false;
+			source_areas.areas.visit_all(|range, area| {
+				if allocation_failed {
+					return;
+				}
 				let mut page_states = Vec::new();
-				page_states
-					.try_reserve_exact(area.page_states.len())
-					.map_err(|_| Error::NoMem)?;
+				if page_states.try_reserve_exact(area.page_states.len()).is_err() {
+					allocation_failed = true;
+					return;
+				}
 				page_states.extend(
 					area.page_states
 						.iter()
 						.map(|state| state.load(Ordering::Acquire)),
 				);
-				areas.push((area.range.clone(), page_states));
+				areas.push((range.clone(), page_states));
+			});
+			if allocation_failed {
+				return Err(Error::NoMem);
 			}
 			areas
 		};
@@ -529,8 +496,9 @@ impl UserAddressSpace {
 		}
 		let rounded_length = align_up(length, USER_VM_PAGE_SIZE)?;
 		let mut areas = self.inner.areas.lock();
-		let reserved = areas.areas.iter().fold(0usize, |total, area| {
-			total.saturating_add(area.range.end - area.range.start)
+		let mut reserved = 0usize;
+		areas.areas.visit_all(|range, _| {
+			reserved = reserved.saturating_add(range.end - range.start);
 		});
 		let requested = u64::try_from(rounded_length).ok()?;
 		if u64::try_from(reserved).ok()?.saturating_add(requested) > limit {
@@ -617,40 +585,66 @@ impl UserAddressSpace {
 		};
 		self.activate(|| {
 			let mut areas = self.inner.areas.lock();
-			let Some(area_index) = areas.area_index(range.start) else {
-			return None;
+			let Some((area_range, area)) = areas.areas.find_point(range.start) else {
+				return None;
 			};
-			let (area_range, first_page, end_page, prefix_pages, suffix_pages) = {
-				let area = &areas.areas[area_index];
-				let area_range = area.range.clone();
-				if range.end > area_range.end || (exact && range != area_range) {
-					return None;
-				}
-				let first_page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
-				let end_page = (range.end - area_range.start) / USER_VM_PAGE_SIZE;
-				if (first_page..end_page).any(|page| {
-					area.page_states[page].load(Ordering::Acquire) & (VM_RESERVED | VM_USER)
-						!= (VM_RESERVED | VM_USER)
-				}) {
-					return None;
-				}
-				(
-					area_range,
-					first_page,
-					end_page,
-					first_page,
-					area.page_states.len() - end_page,
-				)
-			};
-			if prefix_pages != 0
-				&& suffix_pages != 0
-				&& areas.areas.try_reserve(1).is_err()
-			{
+			let area_range = area_range.clone();
+			if range.end > area_range.end || (exact && range != area_range) {
 				return None;
 			}
-			let mut area = areas.areas.remove(area_index);
+			let first_page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
+			let end_page = (range.end - area_range.start) / USER_VM_PAGE_SIZE;
+			if (first_page..end_page).any(|page| {
+				area.page_states[page].load(Ordering::Acquire) & (VM_RESERVED | VM_USER)
+					!= (VM_RESERVED | VM_USER)
+			}) {
+				return None;
+			}
+			let prefix_range = (first_page != 0).then(|| area_range.start..range.start);
+			let suffix_range = (end_page != area.page_states.len())
+				.then(|| range.end..area_range.end);
+			// Stage replacement keys first so allocation failure leaves the original interval intact.
+			if let Some(prefix) = &prefix_range {
+				if areas
+					.areas
+					.insert(prefix.clone(), UserArea { page_states: Vec::new() })
+					.is_err()
+				{
+					return None;
+				}
+			}
+			if let Some(suffix) = &suffix_range {
+				if areas
+					.areas
+					.insert(suffix.clone(), UserArea { page_states: Vec::new() })
+					.is_err()
+				{
+					if let Some(prefix) = &prefix_range {
+						let _removed = areas.areas.remove(prefix);
+					}
+					return None;
+				}
+			}
+			let mut area = areas
+				.areas
+				.remove(&area_range)
+				.expect("original user-area interval must remain while staging split");
 			let suffix_states = area.page_states.split_off(end_page);
 			let released_states = area.page_states.split_off(first_page);
+			if let Some(prefix) = &prefix_range {
+				let prefix_area = areas
+					.areas
+					.get_mut(prefix)
+					.expect("staged user-area prefix must exist");
+				prefix_area.page_states = core::mem::take(&mut area.page_states);
+			}
+			if let Some(suffix) = &suffix_range {
+				let suffix_area = areas
+					.areas
+					.get_mut(suffix)
+					.expect("staged user-area suffix must exist");
+				suffix_area.page_states = suffix_states;
+			}
 			let resident_bytes = released_states
 				.iter()
 				.filter(|state| state.load(Ordering::Acquire) & VM_OWNED != 0)
@@ -673,33 +667,6 @@ impl UserAddressSpace {
 					}
 				}
 			}
-			match (prefix_pages != 0, suffix_pages != 0) {
-				(true, true) => {
-					area.range = area_range.start..range.start;
-					areas.areas.insert(area_index, area);
-					areas.areas.insert(
-						area_index + 1,
-						UserArea {
-							range: range.end..area_range.end,
-							page_states: suffix_states,
-						},
-					);
-				}
-				(true, false) => {
-					area.range = area_range.start..range.start;
-					areas.areas.insert(area_index, area);
-				}
-				(false, true) => {
-					areas.areas.insert(
-						area_index,
-						UserArea {
-							range: range.end..area_range.end,
-							page_states: suffix_states,
-						},
-					);
-				}
-				(false, false) => {}
-			}
 			Some((range.end.saturating_sub(range.start) as u64, resident_bytes, released))
 		})
 		.flatten()
@@ -713,16 +680,19 @@ impl UserAddressSpace {
 			return false;
 		};
 		self.activate(|| {
-			let areas = self.inner.areas.lock();
-			let Some(area_index) = areas.area_index(range.start) else {
+			let mut areas = self.inner.areas.lock();
+			let Some((area_range, _)) = areas.areas.find_point(range.start) else {
 				return false;
 			};
-			let area = &areas.areas[area_index];
-			if range.end > area.range.end {
+			let area_range = area_range.clone();
+			let Some(area) = areas.areas.get_mut(&area_range) else {
+				return false;
+			};
+			if range.end > area_range.end {
 				return false;
 			}
-			let first_page = (range.start - area.range.start) / USER_VM_PAGE_SIZE;
-			let end_page = (range.end - area.range.start) / USER_VM_PAGE_SIZE;
+			let first_page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
+			let end_page = (range.end - area_range.start) / USER_VM_PAGE_SIZE;
 			if (first_page..end_page).any(|page| {
 				area.page_states[page].load(Ordering::Acquire) & (VM_RESERVED | VM_USER)
 					!= (VM_RESERVED | VM_USER)
@@ -778,12 +748,15 @@ impl UserAddressSpace {
 			return false;
 		};
 		self.activate(|| {
-			let areas = self.inner.areas.lock();
-			let Some(area_index) = areas.area_index(range.start) else {
+			let mut areas = self.inner.areas.lock();
+			let Some((area_range, _)) = areas.areas.find_point(range.start) else {
 				return false;
 			};
-			let area = &areas.areas[area_index];
-			let page = (range.start - area.range.start) / USER_VM_PAGE_SIZE;
+			let area_range = area_range.clone();
+			let Some(area) = areas.areas.get_mut(&area_range) else {
+				return false;
+			};
+			let page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
 			let Some(state) = area
 				.page_states
 				.get(page)
@@ -828,12 +801,15 @@ impl UserAddressSpace {
 			return (false, false);
 		};
 		self.activate(|| {
-			let areas = self.inner.areas.lock();
-			let Some(area_index) = areas.area_index(range.start) else {
+			let mut areas = self.inner.areas.lock();
+			let Some((area_range, _)) = areas.areas.find_point(range.start) else {
 				return (false, false);
 			};
-			let area = &areas.areas[area_index];
-			let page = (range.start - area.range.start) / USER_VM_PAGE_SIZE;
+			let area_range = area_range.clone();
+			let Some(area) = areas.areas.get_mut(&area_range) else {
+				return (false, false);
+			};
+			let page = (range.start - area_range.start) / USER_VM_PAGE_SIZE;
 			let Some(state) = area
 				.page_states
 				.get(page)
