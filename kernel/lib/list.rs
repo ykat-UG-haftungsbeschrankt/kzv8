@@ -15,7 +15,9 @@
  *       +-----------------------------+
  */
 
+use alloc::alloc::alloc;
 use alloc::boxed::Box;
+use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
@@ -162,6 +164,20 @@ impl<T> LinkedList<T> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.head.is_none()
+    }
+
+    pub(crate) fn try_push_front(&mut self, value: T) -> Result<(), T> {
+        let layout = Layout::new::<ListNode<T>>();
+        // SAFETY: Layout is valid and nonzero for the sized ListNode<T>.
+        let Some(pointer) = NonNull::new(unsafe { alloc(layout).cast::<ListNode<T>>() }) else {
+            return Err(value);
+        };
+        // SAFETY: pointer is aligned storage for one ListNode<T> allocated above.
+        unsafe { pointer.as_ptr().write(ListNode::new(value)) };
+        // SAFETY: the allocation now contains an initialized node from the global allocator.
+        let node = unsafe { Box::from_raw(pointer.as_ptr()) };
+        self.push_front(node);
+        Ok(())
     }
 
     pub(crate) fn push_back(&mut self, mut node: Box<ListNode<T>>) {

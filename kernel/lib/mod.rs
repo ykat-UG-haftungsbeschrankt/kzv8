@@ -8,11 +8,12 @@
 /*
  * Kernel data-structure toolbox:
  *
- * [addresses] [arrays] [bitfields] [trees] [hashing] [lists]
+ * [addresses] [arrays] [bitfields] [trees] [hashing] [lists] [stacks]
  */
 
 pub(crate) mod address;
 pub(crate) mod alignment;
+pub(crate) mod byte_queue;
 pub(crate) mod bitfield;
 pub(crate) mod endian;
 #[allow(dead_code)]
@@ -24,6 +25,8 @@ pub(crate) mod hashmap;
 pub(crate) mod interval;
 #[allow(dead_code)]
 pub(crate) mod list;
+pub(crate) mod stack;
+pub(crate) mod sorted_vector;
 #[allow(dead_code)]
 pub(crate) mod array;
 pub(crate) mod tls;

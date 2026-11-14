@@ -19,6 +19,7 @@ use crate::kernel::arch::traits::{
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::lib::list::{LinkedList, ListNode};
+use crate::kernel::lib::stack::Stack;
 use crate::kernel::process::{
     Process, ResourceUsageSnapshot, SchedulingParameters, SporadicParameters,
 };
@@ -287,8 +288,7 @@ pub(crate) struct Thread {
     resource_usage: ThreadResourceUsage,
     in_kernel: bool,
     running_since_ns: Option<u64>,
-    //@FIXME: INDEXTYPE(cleanup_handlers); LIFO cleanup stack; Vec push/pop are amortized O(1), keep Vec.
-    cleanup_handlers: Vec<CleanupHandler>,
+    cleanup_handlers: Stack<CleanupHandler>,
     pub(crate) tls: [usize; ThreadManager::MAX_TLS_KEYS],
     signal_mask: SignalSet,
     pending_signals: SignalQueue,
@@ -303,8 +303,7 @@ pub(crate) struct Thread {
     stack: Option<ThreadStack>,
     external_stack_address: usize,
     external_stack_size: usize,
-    //@FIXME: INDEXTYPE(retired_stacks); LIFO stack pool; Vec push/pop are amortized O(1), keep Vec.
-    retired_stacks: Vec<ThreadStack>,
+    retired_stack: Option<ThreadStack>,
 }
 
 #[derive(Clone, Copy)]
@@ -372,7 +371,7 @@ impl Thread {
             resource_usage: ThreadResourceUsage::default(),
             in_kernel: false,
             running_since_ns: None,
-            cleanup_handlers: Vec::new(),
+            cleanup_handlers: Stack::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
             signal_mask: SignalSet::EMPTY,
             pending_signals: SignalQueue::new(),
@@ -387,7 +386,7 @@ impl Thread {
             stack: None,
             external_stack_address: stack_address,
             external_stack_size: stack_size,
-            retired_stacks: Vec::new(),
+            retired_stack: None,
         }
     }
 
@@ -416,7 +415,7 @@ impl Thread {
             resource_usage: ThreadResourceUsage::default(),
             in_kernel: false,
             running_since_ns: None,
-            cleanup_handlers: Vec::new(),
+            cleanup_handlers: Stack::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
             signal_mask: SignalSet::EMPTY,
             pending_signals: SignalQueue::new(),
@@ -431,7 +430,7 @@ impl Thread {
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
-            retired_stacks: Vec::new(),
+            retired_stack: None,
         }
     }
 
@@ -458,7 +457,7 @@ impl Thread {
             resource_usage: ThreadResourceUsage::default(),
             in_kernel: false,
             running_since_ns: None,
-            cleanup_handlers: Vec::new(),
+            cleanup_handlers: Stack::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
             signal_mask: SignalSet::EMPTY,
             pending_signals: SignalQueue::new(),
@@ -473,7 +472,7 @@ impl Thread {
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
-            retired_stacks: Vec::new(),
+            retired_stack: None,
         }
     }
 
@@ -501,7 +500,7 @@ impl Thread {
             resource_usage: ThreadResourceUsage::default(),
             in_kernel: false,
             running_since_ns: None,
-            cleanup_handlers: Vec::new(),
+            cleanup_handlers: Stack::new(),
             tls: [0; ThreadManager::MAX_TLS_KEYS],
             signal_mask: SignalSet::EMPTY,
             pending_signals: SignalQueue::new(),
@@ -516,7 +515,7 @@ impl Thread {
             stack: Some(stack),
             external_stack_address: 0,
             external_stack_size: 0,
-            retired_stacks: Vec::new(),
+            retired_stack: None,
         }
     }
 
@@ -530,8 +529,7 @@ impl Thread {
 }
 
 pub(crate) struct ThreadStack {
-    //@FIXME: INDEXTYPE(bytes); fixed stack backing storage; replace Vec with Box<[u8]> to express fixed capacity while retaining O(1) indexing.
-    bytes: Vec<u8>,
+    bytes: Box<[u8]>,
 }
 
 impl ThreadStack {
@@ -547,7 +545,9 @@ impl ThreadStack {
             .try_reserve_exact(size)
             .map_err(|_| Error::NoMem)?;
         bytes.resize(size, 0);
-        Ok(Self { bytes })
+        Ok(Self {
+            bytes: bytes.into_boxed_slice(),
+        })
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -1023,16 +1023,8 @@ impl ThreadManager {
             if current.process.pid() != process.pid() {
                 crate::kernel::arch::CpuArchitecture::halt();
             }
-            if current.retired_stacks.try_reserve(1).is_err() {
-                let _ = crate::kernel::arch::MemoryArchitecture::activate_address_space(
-                    old_address_space.root(),
-                );
-                crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
-                return Err(Error::NoMem);
-            }
-            if let Some(old_stack) = current.stack.take() {
-                current.retired_stacks.push(old_stack);
-            }
+            // This call is running on the active stack, not the previously retired one.
+            current.retired_stack = current.stack.take();
             current.context = ExecutionContext::Userspace(user_context);
             current.stack = Some(kernel_stack);
             current.cancellation_requested = false;
@@ -1783,11 +1775,13 @@ impl ThreadManager {
     ) -> Result<(), Error> {
         let mut manager = THREAD_MANAGER.lock();
         let thread = manager.busy.front_mut().ok_or(Error::Srch)?;
-        thread.cleanup_handlers.try_reserve(1).map_err(|_| Error::NoMem)?;
-        thread.cleanup_handlers.push(CleanupHandler {
-            routine,
-            argument: argument as usize,
-        });
+        thread
+            .cleanup_handlers
+            .try_push(CleanupHandler {
+                routine,
+                argument: argument as usize,
+            })
+            .map_err(|_| Error::NoMem)?;
         Ok(())
     }
 

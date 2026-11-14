@@ -6,9 +6,9 @@
  */
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use crate::kernel::error::Error;
+use crate::kernel::lib::byte_queue::ByteQueue;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::signal::{SIGINT, SIGQUIT, SIGTSTP, SIGWINCH};
 
@@ -17,72 +17,6 @@ const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
 const POLLERR: i16 = 0x0008;
 const POLLHUP: i16 = 0x0010;
-
-struct ByteQueue {
-    //@FIXME: INDEXTYPE(bytes); ring-buffer backing array; Vec provides O(1) indexed access, keep Vec.
-    bytes: Vec<u8>,
-    head: usize,
-    length: usize,
-}
-
-impl ByteQueue {
-    fn new(capacity: usize) -> Result<Self, Error> {
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(capacity).map_err(|_| Error::NoMem)?;
-        bytes.resize(capacity, 0);
-        Ok(Self {
-            bytes,
-            head: 0,
-            length: 0,
-        })
-    }
-
-    fn available(&self) -> usize {
-        self.bytes.len() - self.length
-    }
-
-    fn is_empty(&self) -> bool {
-        self.length == 0
-    }
-
-    fn push(&mut self, byte: u8) -> bool {
-        if self.length == self.bytes.len() {
-            return false;
-        }
-        let tail = (self.head + self.length) % self.bytes.len();
-        self.bytes[tail] = byte;
-        self.length += 1;
-        true
-    }
-
-    fn push_slice(&mut self, bytes: &[u8]) -> bool {
-        if bytes.len() > self.available() {
-            return false;
-        }
-        for byte in bytes {
-            let _ = self.push(*byte);
-        }
-        true
-    }
-
-    fn pop_into(&mut self, output: &mut [u8]) -> usize {
-        let count = output.len().min(self.length);
-        for byte in &mut output[..count] {
-            *byte = self.bytes[self.head];
-            self.head = (self.head + 1) % self.bytes.len();
-        }
-        self.length -= count;
-        if self.length == 0 {
-            self.head = 0;
-        }
-        count
-    }
-
-    fn clear(&mut self) {
-        self.head = 0;
-        self.length = 0;
-    }
-}
 
 struct PtyState {
     master_open: bool,
