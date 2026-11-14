@@ -81,7 +81,6 @@ pub(super) struct NodeMetadataState {
     group: GroupId,
     mode: u16,
     flags: u32,
-    //@FIXME: INDEXTYPE(xattrs); hash-indexed immutable byte keys provide expected O(1) lookup.
     xattrs: HashMap<XattrName, Arc<ImmutableByteBuffer>, 1>,
 }
 
