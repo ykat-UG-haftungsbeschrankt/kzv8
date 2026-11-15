@@ -5,40 +5,22 @@
  * free of charge, without warranty of any kind.
  */
 
-#[path = "fn/mod.rs"]
-mod r#fn;
+#[allow(dead_code)]
+pub(crate) mod darwin;
+pub(crate) mod linux;
+#[allow(dead_code)]
+pub(crate) mod windows;
 
-use crate::kernel::error::Error;
-use crate::kernel::scheduler::thread::ThreadManager;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SyscallFrame {
-    pub(crate) number: u64,
-    pub(crate) arguments: [u64; 6],
-    pub(crate) result: i64,
-}
+pub(crate) use linux::SyscallFrame;
 
 pub(crate) fn dispatch(frame: &mut SyscallFrame) {
-    ThreadManager::begin_syscall_accounting();
-    let result = match frame.number {
-        r#fn::exit::Exit::ID => r#fn::exit::Exit::handle(*frame),
-        r#fn::exit_group::ExitGroup::ID => r#fn::exit_group::ExitGroup::handle(*frame),
-        r#fn::getpid::GetPid::ID => r#fn::getpid::GetPid::handle(*frame),
-        r#fn::gettid::GetTid::ID => r#fn::gettid::GetTid::handle(*frame),
-        r#fn::sched_yield::SchedYield::ID => r#fn::sched_yield::SchedYield::handle(*frame),
-        r#fn::read::Read::ID => r#fn::read::Read::handle(*frame),
-        r#fn::write::Write::ID => r#fn::write::Write::handle(*frame),
-        r#fn::close::Close::ID => r#fn::close::Close::handle(*frame),
-        r#fn::openat::OpenAt::ID => r#fn::openat::OpenAt::handle(*frame),
-        r#fn::clock_gettime::ClockGetTime::ID => {
-            r#fn::clock_gettime::ClockGetTime::handle(*frame)
-        }
-        r#fn::mmap::Mmap::ID => r#fn::mmap::Mmap::handle(*frame),
-        r#fn::munmap::Munmap::ID => r#fn::munmap::Munmap::handle(*frame),
-        r#fn::mprotect::Mprotect::ID => r#fn::mprotect::Mprotect::handle(*frame),
-        _ => Err(Error::NoSys),
-    };
-    frame.result = result.unwrap_or_else(|error| error as i64);
-    ThreadManager::end_syscall_accounting();
+	if crate::kernel::scheduler::thread::ThreadManager::current_process()
+		.is_ok_and(|process| process.syscall_abi() == crate::kernel::process::SyscallAbi::WindowsNt)
+	{
+		windows::dispatch(frame);
+	} else if darwin::has_syscall_class(frame.number) {
+		darwin::dispatch(frame);
+	} else {
+		linux::dispatch(frame);
+	}
 }

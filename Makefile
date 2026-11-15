@@ -14,6 +14,11 @@ V8_PLATFORM_OUT ?= runtime/v8/src/out.gn/x64.platform
 V8_AARCH64_PLATFORM_OUT ?= runtime/v8/src/out.gn/arm64.platform
 V8_CXX ?= runtime/v8/src/third_party/llvm-build/Release+Asserts/bin/clang++
 QEMU_GDB_PORT ?= 1234
+VIRTIOFS_SOCKET ?= $(CURDIR)/build/virtiofs.sock
+VIRTIOFS_ROOT ?= $(CURDIR)/build/virtiofs-root
+VIRTIOFS_BUSYBOX ?= libraries/linux/x86_64/busybox-pie
+VIRTIOFS_TAG ?= hostfs
+VIRTIOFS_RAM ?= 512M
 KERNEL_X86_RUSTFLAGS ?= -C relocation-model=static -C link-arg=-no-pie -C link-arg=--error-limit=0
 V8_RUST_LIBS ?= $(shell find "$(V8_PLATFORM_OUT)/obj/third_party/rust" -type f -name '*.rlib' -print) $(wildcard $(V8_PLATFORM_OUT)/local_rustc_sysroot/lib/rustlib/x86_64-unknown-linux-gnu/lib/*.rlib)
 V8_RUST_ALLOCATOR_LIBS ?= $(wildcard $(V8_PLATFORM_OUT)/obj/build/rust/allocator/*.rlib)
@@ -52,7 +57,7 @@ else
 $(error AARCH64_FPU_STATE must be on or off)
 endif
 
-.PHONY: all test app-build doc run-x86_64 run-aarch64 debug-x86_64 debug-aarch64 v8-host-test v8-platform-test clean force
+.PHONY: all test app-build doc run-x86_64 run-x86_64-virtiofs run-aarch64 debug-x86_64 debug-aarch64 v8-host-test v8-platform-test clean force
 all: $(RUNTIME_V8_BUILD_DEPENDENCY) build/x86_64/kernel.elf build/aarch64/kernel.bin
 
 force:
@@ -132,6 +137,12 @@ v8-platform-test:
 
 run-x86_64: build/x86_64/kernel.elf
 	qemu-system-x86_64 -machine microvm,acpi=off -accel tcg -m 5G -smp 2 -display none -serial file:build/x86_64/early-debug.log -monitor none -no-reboot -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev stdio,id=console,signal=off -device virtconsole,chardev=console
+
+run-x86_64-virtiofs: build/x86_64/kernel.elf
+	@test -d "$(VIRTIOFS_ROOT)" || { echo "VirtIO-FS root directory does not exist: $(VIRTIOFS_ROOT)"; exit 1; }
+	@test -S "$(VIRTIOFS_SOCKET)" || { echo "VirtIO-FS socket not found: $(VIRTIOFS_SOCKET)"; echo "Start virtiofsd with --socket-path=$(VIRTIOFS_SOCKET) --shared-dir=$(VIRTIOFS_ROOT)"; exit 1; }
+	install -m 0755 "$(VIRTIOFS_BUSYBOX)" "$(VIRTIOFS_ROOT)/busybox"
+	qemu-system-x86_64 -object memory-backend-memfd,id=mem,size=$(VIRTIOFS_RAM),share=on -machine microvm,acpi=off,memory-backend=mem -accel tcg -cpu qemu64,+rdrand -smp 2 -display none -serial file:build/x86_64/early-debug.log -monitor none -no-reboot -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev stdio,id=console,signal=off -device virtconsole,chardev=console -chardev socket,id=virtiofs,path=$(VIRTIOFS_SOCKET) -device vhost-user-fs-device,chardev=virtiofs,tag=$(VIRTIOFS_TAG)
 
 run-aarch64: build/aarch64/kernel.bin
 	qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a72 -accel tcg -m 128M -smp 2 -display none -serial file:build/aarch64/early-debug.log -monitor none -no-reboot -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev stdio,id=console,signal=off -device virtconsole,chardev=console

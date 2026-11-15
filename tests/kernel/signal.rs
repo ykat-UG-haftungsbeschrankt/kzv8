@@ -53,6 +53,8 @@
         assert!(!set.contains(9));
         assert!(!set.contains(19));
         assert!(set.contains(63));
+        assert!(set.contains(64));
+        assert!(SignalSet::from_signal(64).contains(64));
     }
 
     #[test]

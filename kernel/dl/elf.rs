@@ -162,6 +162,8 @@ pub(super) struct ElfLoadedObject {
     needed: Vec<Vec<u8>>,
     symbols: Vec<DynamicSymbol>,
     relocations: Vec<Relocation>,
+    position_independent: bool,
+    self_relocation_prepared: bool,
     state: ObjectState,
 }
 
@@ -313,6 +315,37 @@ impl ElfLoadedObject {
         result
     }
 
+    pub(crate) fn prepare_for_self_relocation(&mut self) -> Result<(), Error> {
+        if !self.position_independent
+            || self.kind != ObjectKind::Executable
+            || !self.needed.is_empty()
+        {
+            return Err(Error::OpNotSupp);
+        }
+        let expected_state = if self.relocations.is_empty() {
+            ObjectState::ReadyToSeal
+        } else {
+            ObjectState::RelocationPending
+        };
+        if self.state != expected_state {
+            return Err(Error::Inval);
+        }
+        for relocation in &self.relocations {
+            if relocation.kind != relative_relocation_type()
+                || relocation.symbol_index != 0
+                || relocation.addend.is_none()
+            {
+                return Err(Error::OpNotSupp);
+            }
+            if !self.writable_target(relocation.offset, 8)? {
+                return Err(Error::Libbad);
+            }
+        }
+        self.self_relocation_prepared = true;
+        self.state = ObjectState::ReadyToSeal;
+        Ok(())
+    }
+
     pub(crate) fn seal<A: AddressSpace>(
         &mut self,
         address_space: &mut A,
@@ -365,6 +398,13 @@ impl ElfLoadedObject {
             let end_index = self.page_index(end_page)?;
             for page in &mut page_permissions[start_index..end_index] {
                 *page &= !Permissions::WRITE.bits();
+            }
+        }
+        if self.self_relocation_prepared {
+            for relocation in &self.relocations {
+                let target_page = relocation.offset & !((PAGE_SIZE as u64) - 1);
+                let page = self.page_index(target_page)?;
+                page_permissions[page] |= Permissions::WRITE.bits();
             }
         }
 
@@ -588,6 +628,8 @@ impl ElfLoadedObject {
                 ObjectState::RelocationPending
             },
             relocations,
+            position_independent: !parsed.fixed_address,
+            self_relocation_prepared: false,
         })
     }
 }
@@ -728,7 +770,7 @@ impl<'a, F: FileSource> ParsedElf<'a, F> {
                     has_executable_entry = true;
                 }
             }
-            if matches!(header.kind, PT_INTERP | PT_TLS) {
+            if header.kind == PT_INTERP {
                 return Err(Error::OpNotSupp);
             }
             program_headers.push(header);
@@ -1566,6 +1608,10 @@ fn validate_page_permissions(ranges: &[LoadRange]) -> Result<(), Error> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../tests/kernel/dl/elf.rs"]
+mod tests;
 
 #[cfg(target_arch = "x86_64")]
 const fn native_machine() -> u16 {

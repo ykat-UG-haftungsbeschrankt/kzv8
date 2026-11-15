@@ -11,8 +11,8 @@ use crate::kernel::lib::hashmap::HashMap;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::vfs::filesystem::test::test_filesystem;
 use crate::kernel::vfs::{
-    DirectoryPlugin, FilePlugin, Node, NodeApi as _, NodeMetadata, NodeMetadataApi as _, Vfs,
-    VfsApi as _, VfsFuture,
+    DirectoryPlugin, FileHandleApi as _, FilePlugin, Node, NodeApi as _, NodeMetadata,
+    NodeMetadataApi as _, OpenMode, Vfs, VfsApi as _, VfsFuture,
 };
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -102,6 +102,34 @@ fn directory(entries: Vec<(&str, Node)>) -> Node {
         plugin.insert_entry(name, node).unwrap();
     }
     directory
+}
+
+#[test]
+fn read_only_directory_can_be_opened_as_a_handle() {
+    let vfs = Vfs::new(directory(vec![("file", Node::file(EmptyFile))]));
+    let mut handle = vfs
+        .open_blocking("/", OpenMode::ReadOnly, Credentials::root())
+        .unwrap();
+
+    assert!(handle.is_directory());
+    assert_eq!(handle.read_blocking(&mut [0; 1]), Err(Error::IsDir));
+}
+
+#[test]
+fn blocking_path_resolution_returns_canonical_absolute_path() {
+    let credentials = Credentials::root();
+    let vfs = Vfs::new(directory(vec![("dir", directory(Vec::new()))]));
+    ready(vfs.symlink("dir", "/dir-link", &credentials)).unwrap();
+
+    let (_, dot_path) = vfs
+        .resolve_with_path_blocking("/dir/../dir", &credentials)
+        .unwrap();
+    let (_, symlink_path) = vfs
+        .resolve_with_path_blocking("/dir-link", &credentials)
+        .unwrap();
+
+    assert_eq!(dot_path, "/dir");
+    assert_eq!(symlink_path, "/dir");
 }
 
 #[test]

@@ -9,9 +9,12 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::task::Wake;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::future::Future;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use crate::kernel::vfs::filesystem::virtio::queue::{Descriptor, DmaQueue};
 use crate::kernel::vfs::filesystem::virtio::transport::VirtioTransport;
@@ -65,6 +68,12 @@ struct InFlightRequest<'a> {
 
 struct FileWriteGuard<'a>(&'a AtomicBool);
 
+struct InitializationWake;
+
+impl Wake for InitializationWake {
+    fn wake(self: Arc<Self>) {}
+}
+
 impl Drop for FileWriteGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
@@ -97,7 +106,7 @@ impl VirtioFs {
     const DEVICE_ID: u32 = 26;
     const QUEUE_SIZE: usize = 8;
     const HIPRIO_QUEUE: u32 = 0;
-    const REQUEST_QUEUE: u32 = 2;
+    const REQUEST_QUEUE: u32 = 1;
     const TAG_SIZE: usize = 36;
     const CONFIG_REQUEST_QUEUE_COUNT_OFFSET: usize = 36;
     const MAX_REQUEST_SIZE: usize = 32 * 1024;
@@ -188,6 +197,18 @@ impl VirtioFs {
         filesystem.initialize_fuse().await.ok()?;
         filesystem.refresh_metadata(Self::FUSE_ROOT_ID).await.ok()?;
         Some(Arc::new(filesystem))
+    }
+
+    pub(crate) fn initialize_blocking() -> Option<Arc<Self>> {
+        let mut future = Box::pin(Self::initialize());
+        let waker = Waker::from(Arc::new(InitializationWake));
+        let mut context = Context::from_waker(&waker);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(filesystem) => return filesystem,
+                Poll::Pending => core::hint::spin_loop(),
+            }
+        }
     }
 
     pub(crate) fn tag(&self) -> &str {
@@ -346,7 +367,6 @@ impl VirtioFs {
                 if length - cursor < Self::FUSE_DIRENT_HEADER_SIZE {
                     return Err(Error::Proto);
                 }
-                let inode = Self::read_u64(&response, cursor)?;
                 let next_offset = Self::read_u64(&response, cursor + 8)?;
                 let name_length = Self::read_u32(&response, cursor + 16)? as usize;
                 let file_type = Self::read_u32(&response, cursor + 20)?;
@@ -363,31 +383,10 @@ impl VirtioFs {
                 if name_bytes != b"." && name_bytes != b".." {
                     let name =
                         String::from(core::str::from_utf8(name_bytes).map_err(|_| Error::Ilseq)?);
-                    let metadata = match file_type {
-                        Self::DIRECTORY_TYPE | Self::REGULAR_FILE_TYPE => {
-                            self.refresh_metadata(inode).await?
-                        }
-                        _ => {
-                            cursor += record_length;
-                            offset = next_offset;
-                            continue;
-                        }
-                    };
                     let node = match file_type {
-                        Self::DIRECTORY_TYPE => Node::directory_with_metadata(
-                            FuseDirectory {
-                                filesystem: self.clone(),
-                                node_id: inode,
-                            },
-                            metadata,
-                        ),
-                        Self::REGULAR_FILE_TYPE => Node::file_with_metadata(
-                            FuseFile {
-                                filesystem: self.clone(),
-                                node_id: inode,
-                            },
-                            metadata,
-                        ),
+                        Self::DIRECTORY_TYPE | Self::REGULAR_FILE_TYPE => {
+                            self.lookup_node(node_id, &name).await?
+                        }
                         _ => {
                             cursor += record_length;
                             offset = next_offset;
@@ -624,6 +623,10 @@ impl VirtioFs {
                     return Err(Error::Proto);
                 }
                 if error != 0 {
+                    crate::kernel::debug::debug_fmt(format_args!(
+                        "kz: FUSE opcode={} node={} errno={}\n",
+                        opcode, node_id, error,
+                    ));
                     return Err(Self::map_fuse_error(error));
                 }
                 let body_length = response_length - Self::FUSE_OUT_HEADER_SIZE;
@@ -684,6 +687,31 @@ impl VirtioFs {
         }
     }
 
+    async fn lookup_node(self: &Arc<Self>, parent: u64, name: &str) -> VfsResult<Node> {
+        if name.is_empty() || name.contains('/') || name.as_bytes().contains(&0) {
+            return Err(Error::Inval);
+        }
+        let payload_length = name.len().checked_add(1).ok_or(Error::NameTooLong)?;
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(payload_length)
+            .map_err(|_| Error::NoMem)?;
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        let mut response = [0; Self::FUSE_ENTRY_OUT_SIZE];
+        let length = self
+            .transact(Self::FUSE_LOOKUP, parent, &payload, &mut response)
+            .await?;
+        if length < Self::FUSE_ENTRY_OUT_SIZE {
+            return Err(Error::Proto);
+        }
+        let node_id = Self::read_u64(&response, 0)?;
+        let mode = Self::read_u32(&response, Self::FUSE_ENTRY_MODE_OFFSET)?;
+        let owner = Self::read_u32(&response, Self::FUSE_ENTRY_UID_OFFSET)?;
+        let group = Self::read_u32(&response, Self::FUSE_ENTRY_GID_OFFSET)?;
+        self.node_from_type(node_id, mode, owner, group)
+    }
+
     fn align_dirent(length: usize) -> usize {
         (length + 7) & !7
     }
@@ -720,26 +748,7 @@ impl DirectoryPlugin for FuseDirectory {
         let filesystem = self.filesystem.clone();
         let parent = self.node_id;
         let name = String::from(name);
-        Box::pin(async move {
-            if name.is_empty() || name.contains('/') || name.as_bytes().contains(&0) {
-                return Err(Error::Inval);
-            }
-            let mut payload = Vec::with_capacity(name.len() + 1);
-            payload.extend_from_slice(name.as_bytes());
-            payload.push(0);
-            let mut response = [0; VirtioFs::FUSE_ENTRY_OUT_SIZE];
-            let length = filesystem
-                .transact(VirtioFs::FUSE_LOOKUP, parent, &payload, &mut response)
-                .await?;
-            if length < VirtioFs::FUSE_ENTRY_OUT_SIZE {
-                return Err(Error::Proto);
-            }
-            let node_id = VirtioFs::read_u64(&response, 0)?;
-            let mode = VirtioFs::read_u32(&response, VirtioFs::FUSE_ENTRY_MODE_OFFSET)?;
-            let owner = VirtioFs::read_u32(&response, VirtioFs::FUSE_ENTRY_UID_OFFSET)?;
-            let group = VirtioFs::read_u32(&response, VirtioFs::FUSE_ENTRY_GID_OFFSET)?;
-            filesystem.node_from_type(node_id, mode, owner, group)
-        })
+        Box::pin(async move { filesystem.lookup_node(parent, &name).await })
     }
 
     fn read_dir(&self) -> VfsFuture<'_, VfsResult<Vec<DirectoryEntry>>> {

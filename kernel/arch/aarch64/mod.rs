@@ -13,6 +13,7 @@ mod paging;
 #[cfg(feature = "virtualization")]
 mod stage2;
 mod ram_map;
+#[path = "syscall/linux/syscall.rs"]
 mod syscall;
 pub(crate) mod smp;
 mod threads;
@@ -201,8 +202,8 @@ pub(crate) fn random_u32() -> Option<u32> {
 }
 
 impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitecture {
-    const VM_ARENA_SIZE: usize = 64 << 30;
-    const VM_BASE: usize = 448usize << 30;
+    const VM_ARENA_SIZE: usize = (64 << 30) - 2 * 4096;
+    const VM_BASE: usize = (448usize << 30) + 2 * 4096;
 
     fn physical_address_limit() -> u64 {
         1u64 << 48

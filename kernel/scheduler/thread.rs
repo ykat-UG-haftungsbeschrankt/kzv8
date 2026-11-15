@@ -38,6 +38,8 @@ pub(crate) const MAX_SPORADIC_REPLENISHMENTS: u32 = 64;
 pub(crate) mod kernel;
 #[path = "thread/userspace.rs"]
 pub(crate) mod userspace;
+#[path = "thread/boot.rs"]
+pub(crate) mod boot;
 #[path = "thread/vm.rs"]
 pub(crate) mod vm;
 #[path = "thread/smoke.rs"]
@@ -705,8 +707,15 @@ impl ThreadManager {
     }
 
     pub(crate) fn initialize() -> bool {
-        let Ok(process) = Process::new() else {
-            return false;
+        let process = match Process::new() {
+            Ok(process) => process,
+            Err(error) => {
+                crate::kernel::debug::debug_fmt(format_args!(
+                    "kz: initial process creation failed: {:?}\n",
+                    error
+                ));
+                return false;
+            }
         };
         process.thread_started();
         let process_root = process.address_space().root();
@@ -1061,6 +1070,7 @@ impl ThreadManager {
         for _ in 0..terminated_siblings {
             process.thread_exited(usize::MAX);
         }
+        process.close_on_exec_file_descriptors();
         if !crate::kernel::arch::ThreadArchitecture::set_user_kernel_stack(new_kernel_stack_pointer) {
             crate::kernel::arch::CpuArchitecture::halt();
         }
@@ -1649,6 +1659,25 @@ impl ThreadManager {
                     .map_or(0, |started_ns| now_ns.saturating_sub(started_ns)),
             )
         })
+    }
+
+    pub(crate) fn current_thread_resource_usage_snapshot() -> Option<ResourceUsageSnapshot> {
+        let manager = THREAD_MANAGER.lock();
+        let thread = manager.busy.front()?;
+        let mut usage = ResourceUsageSnapshot {
+            user_cpu_time_ns: thread.resource_usage.user_cpu_time_ns,
+            system_cpu_time_ns: thread.resource_usage.system_cpu_time_ns,
+            ..ResourceUsageSnapshot::default()
+        };
+        if let Some(started_ns) = thread.running_since_ns {
+            let elapsed_ns = scheduler_time_ns().saturating_sub(started_ns);
+            if thread.in_kernel {
+                usage.system_cpu_time_ns = usage.system_cpu_time_ns.saturating_add(elapsed_ns);
+            } else {
+                usage.user_cpu_time_ns = usage.user_cpu_time_ns.saturating_add(elapsed_ns);
+            }
+        }
+        Some(usage)
     }
 
     pub(crate) fn current_process_cpu_time_ns() -> u64 {

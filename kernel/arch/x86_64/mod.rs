@@ -17,6 +17,7 @@ mod paging;
 pub(crate) mod pci;
 mod ram_map;
 mod segments;
+#[path = "syscall/linux/syscall.rs"]
 mod syscall;
 #[cfg(feature = "intel-vtd")]
 pub(crate) mod vtd;
@@ -137,6 +138,14 @@ pub(crate) fn switch_thread(
     unsafe { threads::switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
 }
 
+pub(crate) fn set_user_fs_base(value: u64) {
+    syscall::set_user_fs_base(value);
+}
+
+pub(crate) fn user_fs_base() -> u64 {
+    syscall::user_fs_base()
+}
+
 pub(crate) unsafe fn enter_user(entry: usize, stack_pointer: usize) -> ! {
     unsafe { syscall::enter_user(entry, stack_pointer) }
 }
@@ -189,8 +198,8 @@ pub(crate) fn wait_for_interrupt() {
 }
 
 impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitecture {
-    const VM_ARENA_SIZE: usize = 1 << 36;
-    const VM_BASE: usize = 0x10_0000_0000;
+    const VM_ARENA_SIZE: usize = (1 << 36) - 2 * 4096;
+    const VM_BASE: usize = 0x10_0000_0000 + 2 * 4096;
 
     fn physical_address_limit() -> u64 {
         let maximum_leaf = core::arch::x86_64::__cpuid(0x8000_0000).eax;

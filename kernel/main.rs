@@ -99,6 +99,7 @@ impl Kernel {
             "{}",
             arch::BootArchitecture::BOOT_INFO_ERROR
         );
+        debug::debug("kz: boot info ready\n");
         let memory_map_needs_growth = memory::memblock::MemBlock::needs_growth();
         memory::r#virtual::initialize();
         memory::memblock::MemBlock::enable_growth();
@@ -120,30 +121,51 @@ impl Kernel {
             );
             memory::r#virtual::refresh_memory_map();
         }
-        assert!(
-            memory::physical::PhysicalAllocator::initialize(),
-            "unable to initialize physical memory"
-        );
+        debug::debug("kz: memory map ready\n");
+        if !memory::physical::PhysicalAllocator::initialize() {
+            debug::debug("kz: physical allocator initialization failed\n");
+            Kernel::halt();
+        }
+        debug::debug("kz: physical allocator ready\n");
         memory::heap::Heap::initialize();
+        debug::debug("kz: heap ready\n");
         #[cfg(feature = "virtualization")]
         let _host_virtualization = arch::VirtualizationArchitecture::initialize_host();
         assert!(
             scheduler::thread::ThreadManager::initialize(),
             "unable to initialize the thread scheduler"
         );
+        debug::debug("kz: scheduler ready\n");
         assert!(
             arch::ThreadArchitecture::initialize_thread_local_storage(0),
             "unable to initialize thread-local storage"
         );
+        debug::debug("kz: kernel TLS ready\n");
         memory::dma::DmaArena::initialize();
         assert!(
             arch::InterruptArchitecture::initialize_interrupt_controller(),
             "unable to initialize the interrupt controller"
         );
+        debug::debug("kz: interrupt controller ready\n");
         arch::TimerArchitecture::initialize_timer();
 
         let console_ready = vfs::filesystem::virtio::console::Console::initialize();
+        debug::debug("kz: virtio console initialized\n");
         let mut virtio_services = vfs::filesystem::virtio::service::KernelVirtioServices::initialize();
+        debug::debug("kz: virtio block/network initialized\n");
+        debug::debug("kz: initializing host VirtIO-FS\n");
+        let host_virtio_fs = vfs::filesystem::virtio::fs::VirtioFs::initialize_blocking();
+        debug::debug("kz: host VirtIO-FS initialization returned\n");
+        let virtio_fs_root = host_virtio_fs
+            .as_ref()
+            .map(|filesystem| filesystem.root());
+        match vfs::mount_virtio_devices(virtio_fs_root) {
+            Ok(_) if host_virtio_fs.is_some() => {
+                debug::debug("kz: host VirtIO-FS mounted at /fs\n");
+            }
+            Ok(_) => debug::debug("kz: VFS initialized without host VirtIO-FS\n"),
+            Err(_) => debug::debug("kz: VFS initialization failed\n"),
+        }
         let mut events = event::EventLoop::<16>::new();
         let network_registration = events
             .register(
@@ -165,6 +187,15 @@ impl Kernel {
         arch::InterruptArchitecture::enable_interrupts();
         if console_ready && vfs::filesystem::virtio::console::Console::write(b"kz: virtio-console transmit OK\n") {
             debug::write_virtio_devices();
+            if host_virtio_fs.is_some() {
+                match scheduler::thread::boot::launch_busybox() {
+                    Ok(()) => debug::debug("kz: BusyBox launch returned unexpectedly\n"),
+                    Err(error) => debug::debug_fmt(format_args!(
+                        "kz: BusyBox launch failed: {:?}\n",
+                        error
+                    )),
+                }
+            }
             if scheduler::thread::smoke::thread_smoke() {
                 debug::debug("kz: kernel thread smoke OK\n");
             } else {

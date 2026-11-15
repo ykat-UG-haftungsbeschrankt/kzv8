@@ -321,8 +321,18 @@ extern "C" fn aarch64_syscall_dispatch(registers: *mut Aarch64SyscallRegisters) 
         crate::kernel::scheduler::thread::ThreadManager::exit_current(core::ptr::null_mut());
     }
     let registers = unsafe { &mut *registers };
+    let syscall_trap = exception_syndrome & 0xffff;
+    if !matches!(syscall_trap, 0 | 0x80) {
+        registers.x[0] = crate::kernel::error::Error::NoSys as i64 as u64;
+        return;
+    }
+    let is_darwin = syscall_trap == 0x80;
     let mut frame = crate::kernel::syscall::SyscallFrame {
-        number: registers.x[8],
+        number: if is_darwin {
+            crate::kernel::syscall::darwin::with_unix_class(registers.x[16])
+        } else {
+            registers.x[8]
+        },
         arguments: [
             registers.x[0],
             registers.x[1],
@@ -331,12 +341,18 @@ extern "C" fn aarch64_syscall_dispatch(registers: *mut Aarch64SyscallRegisters) 
             registers.x[4],
             registers.x[5],
         ],
+        windows_arguments: [0; 4],
         result: 0,
+        errno: 0,
     };
-    if exception_syndrome & 0xffff == 0 {
-        crate::kernel::syscall::dispatch(&mut frame);
-    } else {
-        frame.result = crate::kernel::error::Error::NoSys as i64;
+    crate::kernel::syscall::dispatch(&mut frame);
+    if is_darwin {
+        const SPSR_CARRY: u64 = 1 << 29;
+        if frame.errno != 0 {
+            registers.spsr |= SPSR_CARRY;
+        } else {
+            registers.spsr &= !SPSR_CARRY;
+        }
     }
     registers.x[0] = frame.result as u64;
 }

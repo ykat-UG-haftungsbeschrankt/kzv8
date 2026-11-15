@@ -65,6 +65,10 @@ impl LoadedObject {
         }
     }
 
+    pub(crate) fn is_pe(&self) -> bool {
+        matches!(&self.state, LoadedObjectState::Pe(_))
+    }
+
     pub(crate) const fn mapping_base(&self) -> usize {
         match &self.state {
             LoadedObjectState::Elf(object) => object.mapping_base(),
@@ -171,6 +175,13 @@ impl LoadedObject {
             LoadedObjectState::Elf(object) => object.relocate(address_space, resolver),
             LoadedObjectState::Pe(object) => object.relocate(address_space, resolver),
             LoadedObjectState::MachO(object) => object.relocate(address_space, resolver),
+        }
+    }
+
+    pub(crate) fn prepare_for_self_relocation(&mut self) -> Result<(), Error> {
+        match &mut self.state {
+            LoadedObjectState::Elf(object) => object.prepare_for_self_relocation(),
+            LoadedObjectState::Pe(_) | LoadedObjectState::MachO(_) => Err(Error::OpNotSupp),
         }
     }
 

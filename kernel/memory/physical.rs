@@ -824,11 +824,10 @@ impl PhysicalAllocator {
             PAGE_TABLE_ALLOCATOR_READY.store(true, Ordering::Release);
             return true;
         }
-        let Some(range_window) = crate::kernel::memory::r#virtual::reserve(
-            2 * PAGE_SIZE,
-            PAGE_SIZE,
-            2,
-        ) else {
+        let Some(range_window) = crate::kernel::memory::r#virtual::allocator_base()
+            .checked_sub(2 * PAGE_SIZE)
+        else {
+            crate::kernel::debug::debug("kz: physical allocator scratch reservation failed\n");
             return false;
         };
         let Some(chunk_window) = range_window.checked_add(PAGE_SIZE) else {
@@ -894,6 +893,11 @@ impl PhysicalAllocator {
                             range_end - cursor,
                         )
                     } {
+                        crate::kernel::debug::debug_fmt(format_args!(
+                            "kz: physical range rejected base={:#x} length={:#x}\n",
+                            cursor,
+                            range_end - cursor,
+                        ));
                         return false;
                     }
                 }
@@ -907,6 +911,9 @@ impl PhysicalAllocator {
             state.initialized
         };
         PAGE_TABLE_ALLOCATOR_READY.store(initialized, Ordering::Release);
+        if !initialized {
+            crate::kernel::debug::debug("kz: physical allocator found no usable frames\n");
+        }
         initialized
     }
 
@@ -994,12 +1001,23 @@ impl PhysicalAllocator {
 impl PhysicalAllocatorState {
     unsafe fn add_memory_range(&mut self, base: PhysAddr, length: usize) -> bool {
         let Some(memory) = PhysicalMemory::new(base, length, self.chunk_window) else {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: invalid physical range base={:#x} length={:#x}\n",
+                base.as_usize(),
+                length,
+            ));
             return false;
         };
         if self.range_overlaps(base, length) != Some(false) {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: overlapping physical range base={:#x} length={:#x}\n",
+                base.as_usize(),
+                length,
+            ));
             return false;
         }
         let Some(frame_count) = memory.usable_frame_count() else {
+            crate::kernel::debug::debug("kz: invalid physical frame count\n");
             return false;
         };
         let Some(memory_bytes) = frame_count.checked_mul(PAGE_SIZE) else {
@@ -1020,9 +1038,14 @@ impl PhysicalAllocatorState {
             // SAFETY: add_memory_range reserves and maps this physical header page.
             unsafe { (mapped_address as *mut PhysicalMemory).write(memory) };
         }) else {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: failed to map physical range header at {:#x}\n",
+                base.as_usize(),
+            ));
             return false;
         };
         if !self.insert_range(range_address) {
+            crate::kernel::debug::debug("kz: failed to link physical range header\n");
             return false;
         }
         self.frame_count = new_frame_count;

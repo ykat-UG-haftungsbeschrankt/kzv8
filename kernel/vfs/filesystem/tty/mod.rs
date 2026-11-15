@@ -13,6 +13,8 @@ use crate::kernel::vfs::{FileSystem, Node, VfsFuture, VfsResult};
 
 pub(crate) const TIOCGWINSZ: u64 = 0x5413;
 pub(crate) const TIOCSWINSZ: u64 = 0x5414;
+pub(crate) const TIOCGPGRP: u64 = 0x540f;
+pub(crate) const TIOCSPGRP: u64 = 0x5410;
 pub(crate) const TCGETS: u64 = 0x5401;
 pub(crate) const TCSETS: u64 = 0x5402;
 pub(crate) const TCSETSW: u64 = 0x5403;
@@ -129,7 +131,7 @@ impl FileSystem for TtyFileSystem {
 #[allow(unused_imports)]
 pub(crate) use tty::{
     acquire_session, attributes, drain_output, flush_input, flush_output,
-    foreground_process_group, flow, input_ready, is_standard_terminal_descriptor, output_ready,
+    foreground_process_group, flow, input_ready, ioctl_console, is_standard_terminal_descriptor, output_ready,
     read_console, session_owns_console, set_attributes, set_foreground_process_group,
     set_window_size, window_size, write_console,
 };

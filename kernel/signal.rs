@@ -8,7 +8,7 @@
 use crate::kernel::error::Error;
 use crate::kernel::lib::lookup::LookupTable;
 
-pub(crate) const MAX_SIGNAL_NUMBER: u8 = 63;
+pub(crate) const MAX_SIGNAL_NUMBER: u8 = 64;
 pub(crate) const REALTIME_SIGNAL_MIN: u8 = 34;
 pub(crate) const SIGINT: u8 = 2;
 pub(crate) const SIGQUIT: u8 = 3;
@@ -32,7 +32,7 @@ pub(crate) const CLD_STOPPED: i32 = 5;
 pub(crate) const CLD_CONTINUED: i32 = 6;
 pub(crate) const SIGNAL_QUEUE_CAPACITY: usize = 32;
 
-const VALID_SIGNAL_MASK: u64 = u64::MAX >> 1;
+const VALID_SIGNAL_MASK: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SignalSet(u64);
@@ -251,7 +251,9 @@ impl SignalState {
         state.stopped_by_signal = None;
         for signal_number in 1..=MAX_SIGNAL_NUMBER {
             if default_signals.contains(signal_number) {
-                state.actions[signal_number as usize] = SignalAction::DEFAULT;
+                if let Some(action) = state.actions.get_mut(signal_number as usize) {
+                    *action = SignalAction::DEFAULT;
+                }
             }
         }
         state

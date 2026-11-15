@@ -153,11 +153,61 @@ pub(crate) mod syscall {
         const EXIT: u64;
         const EXIT_GROUP: u64;
         const GET_PID: u64;
+        const GET_PPID: u64;
         const GET_TID: u64;
+        const GET_UID: u64;
+        const GET_EUID: u64;
+        const GET_GID: u64;
+        const GET_EGID: u64;
+        const GET_CWD: u64;
+        const GET_GROUPS: u64;
+        const LSEEK: u64;
+        const GETRESUID: u64;
+        const GETRESGID: u64;
+        const SETUID: u64;
+        const SETGID: u64;
+        const SETREUID: u64;
+        const SETREGID: u64;
+        const SETRESUID: u64;
+        const SETRESGID: u64;
+        const SET_GROUPS: u64;
+        const UMASK: u64;
+        const GETPGID: u64;
+        const GETSID: u64;
+        const SETPGID: u64;
+        const SETSID: u64;
+        const KILL: u64;
+        const READLINKAT: u64;
+        const UNLINKAT: u64;
+        const GETRANDOM: u64;
+        const NANOSLEEP: u64;
+        const UNAME: u64;
+        const GETRUSAGE: u64;
+        const LINKAT: u64;
+        const SYMLINKAT: u64;
+        const DUP: u64;
+        const GETRLIMIT: u64;
+        const SETRLIMIT: u64;
+        const GETPRIORITY: u64;
+        const SETPRIORITY: u64;
+        const CHDIR: u64;
+        const SYNC: u64;
+        const RT_SIGPROCMASK: u64;
+        const RT_SIGPENDING: u64;
+        const RT_SIGACTION: u64;
+        const CHMOD: u64;
+        const FCHMOD: u64;
+        const CHOWN: u64;
+        const FCHOWN: u64;
         const SCHED_YIELD: u64;
         const READ: u64;
         const WRITE: u64;
+        const WRITEV: u64;
         const CLOSE: u64;
+        const IOCTL: u64;
+        const GETDENTS64: u64;
+        const FSTAT: u64;
+        const NEWFSTATAT: u64;
         const OPENAT: u64;
         const CLOCK_GET_TIME: u64;
         const MMAP: u64;
@@ -174,7 +224,97 @@ pub(crate) mod syscall {
     #[allow(non_upper_case_globals)]
     pub(crate) const GetPid: u64 = <Syscall as SyscallNumbers>::GET_PID;
     #[allow(non_upper_case_globals)]
+    pub(crate) const GetPpid: u64 = <Syscall as SyscallNumbers>::GET_PPID;
+    #[allow(non_upper_case_globals)]
     pub(crate) const GetTid: u64 = <Syscall as SyscallNumbers>::GET_TID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const GetUid: u64 = <Syscall as SyscallNumbers>::GET_UID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const GetEuid: u64 = <Syscall as SyscallNumbers>::GET_EUID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const GetGid: u64 = <Syscall as SyscallNumbers>::GET_GID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const GetEgid: u64 = <Syscall as SyscallNumbers>::GET_EGID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const GetCwd: u64 = <Syscall as SyscallNumbers>::GET_CWD;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const GetGroups: u64 = <Syscall as SyscallNumbers>::GET_GROUPS;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Lseek: u64 = <Syscall as SyscallNumbers>::LSEEK;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Getresuid: u64 = <Syscall as SyscallNumbers>::GETRESUID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Getresgid: u64 = <Syscall as SyscallNumbers>::GETRESGID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setuid: u64 = <Syscall as SyscallNumbers>::SETUID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setgid: u64 = <Syscall as SyscallNumbers>::SETGID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setreuid: u64 = <Syscall as SyscallNumbers>::SETREUID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setregid: u64 = <Syscall as SyscallNumbers>::SETREGID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setresuid: u64 = <Syscall as SyscallNumbers>::SETRESUID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setresgid: u64 = <Syscall as SyscallNumbers>::SETRESGID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const SetGroups: u64 = <Syscall as SyscallNumbers>::SET_GROUPS;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Umask: u64 = <Syscall as SyscallNumbers>::UMASK;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Getpgid: u64 = <Syscall as SyscallNumbers>::GETPGID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Getsid: u64 = <Syscall as SyscallNumbers>::GETSID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setpgid: u64 = <Syscall as SyscallNumbers>::SETPGID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setsid: u64 = <Syscall as SyscallNumbers>::SETSID;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Kill: u64 = <Syscall as SyscallNumbers>::KILL;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Readlinkat: u64 = <Syscall as SyscallNumbers>::READLINKAT;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Unlinkat: u64 = <Syscall as SyscallNumbers>::UNLINKAT;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Getrandom: u64 = <Syscall as SyscallNumbers>::GETRANDOM;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Nanosleep: u64 = <Syscall as SyscallNumbers>::NANOSLEEP;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Uname: u64 = <Syscall as SyscallNumbers>::UNAME;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Getrusage: u64 = <Syscall as SyscallNumbers>::GETRUSAGE;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Linkat: u64 = <Syscall as SyscallNumbers>::LINKAT;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Symlinkat: u64 = <Syscall as SyscallNumbers>::SYMLINKAT;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Dup: u64 = <Syscall as SyscallNumbers>::DUP;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Getrlimit: u64 = <Syscall as SyscallNumbers>::GETRLIMIT;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setrlimit: u64 = <Syscall as SyscallNumbers>::SETRLIMIT;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Getpriority: u64 = <Syscall as SyscallNumbers>::GETPRIORITY;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Setpriority: u64 = <Syscall as SyscallNumbers>::SETPRIORITY;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Chdir: u64 = <Syscall as SyscallNumbers>::CHDIR;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Sync: u64 = <Syscall as SyscallNumbers>::SYNC;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const RtSigprocmask: u64 = <Syscall as SyscallNumbers>::RT_SIGPROCMASK;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const RtSigpending: u64 = <Syscall as SyscallNumbers>::RT_SIGPENDING;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const RtSigaction: u64 = <Syscall as SyscallNumbers>::RT_SIGACTION;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Chmod: u64 = <Syscall as SyscallNumbers>::CHMOD;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Fchmod: u64 = <Syscall as SyscallNumbers>::FCHMOD;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Chown: u64 = <Syscall as SyscallNumbers>::CHOWN;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Fchown: u64 = <Syscall as SyscallNumbers>::FCHOWN;
     #[allow(non_upper_case_globals)]
     pub(crate) const SchedYield: u64 = <Syscall as SyscallNumbers>::SCHED_YIELD;
     #[allow(non_upper_case_globals)]
@@ -182,9 +322,28 @@ pub(crate) mod syscall {
     #[allow(non_upper_case_globals)]
     pub(crate) const Write: u64 = <Syscall as SyscallNumbers>::WRITE;
     #[allow(non_upper_case_globals)]
+    pub(crate) const Writev: u64 = <Syscall as SyscallNumbers>::WRITEV;
+    #[allow(non_upper_case_globals)]
     pub(crate) const Close: u64 = <Syscall as SyscallNumbers>::CLOSE;
     #[allow(non_upper_case_globals)]
+    pub(crate) const Ioctl: u64 = <Syscall as SyscallNumbers>::IOCTL;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const GetDents64: u64 = <Syscall as SyscallNumbers>::GETDENTS64;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Fstat: u64 = <Syscall as SyscallNumbers>::FSTAT;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Newfstatat: u64 = <Syscall as SyscallNumbers>::NEWFSTATAT;
+    #[allow(non_upper_case_globals)]
     pub(crate) const OpenAt: u64 = <Syscall as SyscallNumbers>::OPENAT;
+    #[cfg(target_arch = "x86_64")]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Open: u64 = 2;
+    #[cfg(target_arch = "x86_64")]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Stat: u64 = 4;
+    #[cfg(target_arch = "x86_64")]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Lstat: u64 = 6;
     #[allow(non_upper_case_globals)]
     pub(crate) const ClockGetTime: u64 = <Syscall as SyscallNumbers>::CLOCK_GET_TIME;
     #[allow(non_upper_case_globals)]
@@ -193,6 +352,10 @@ pub(crate) mod syscall {
     pub(crate) const Munmap: u64 = <Syscall as SyscallNumbers>::MUNMAP;
     #[allow(non_upper_case_globals)]
     pub(crate) const Mprotect: u64 = <Syscall as SyscallNumbers>::MPROTECT;
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const ArchPrctl: u64 = 158;
 }
 
 pub(crate) mod traits {

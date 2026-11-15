@@ -8,6 +8,7 @@
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::ptr::{addr_of, copy_nonoverlapping, write_bytes};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
@@ -19,11 +20,14 @@ const FPU_CONTEXT_SIZE: usize = 512;
 const FPU_CONTEXT_SIZE: usize = 512;
 #[cfg(feature = "fpu-avx")]
 const FPU_CONTEXT_SIZE: usize = 832;
+const IA32_FS_BASE: u32 = 0xc000_0100;
+const MAX_CPU_SLOTS: usize = 256;
 
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub(crate) struct FpuContext {
     _image: [u8; FPU_CONTEXT_SIZE],
+    fs_base: u64,
 }
 
 impl FpuContext {
@@ -40,11 +44,13 @@ impl FpuContext {
             image[24] = 0x80;
             image[25] = 0x1f;
         }
-        Self { _image: image }
+        Self { _image: image, fs_base: 0 }
     };
 }
 
 const TLS_BLOCK_SIZE: usize = 4096;
+static KERNEL_FS_BASES: [AtomicU64; MAX_CPU_SLOTS] =
+    [const { AtomicU64::new(0) }; MAX_CPU_SLOTS];
 
 //@FIXME: INDEXTYPE(TLS_BLOCKS); CPU-ID-indexed TLS block table; Vec access is O(1), keep Vec.
 static TLS_BLOCKS: IrqSpinLock<Vec<Option<alloc::boxed::Box<[u8]>>>> =
@@ -110,6 +116,9 @@ unsafe extern "C" {
 }
 
 pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
+    if cpu_id >= MAX_CPU_SLOTS {
+        return false;
+    }
     let Some(tls_block) = tls_block(cpu_id) else {
         return false;
     };
@@ -137,11 +146,12 @@ pub(crate) fn initialize_thread_local_storage(cpu_id: usize) -> bool {
         let thread_pointer = thread_pointer as u64;
         core::arch::asm!(
             "wrmsr",
-            in("ecx") 0xc000_0100u32,
+            in("ecx") IA32_FS_BASE,
             in("eax") thread_pointer as u32,
             in("edx") (thread_pointer >> 32) as u32,
             options(nostack, preserves_flags),
         );
+        KERNEL_FS_BASES[cpu_id].store(thread_pointer, Ordering::Release);
     }
     true
 }
@@ -180,5 +190,42 @@ pub(crate) unsafe fn switch(
     old_fpu_context: &mut FpuContext,
     new_fpu_context: &FpuContext,
 ) {
+    old_fpu_context.fs_base = read_fs_base();
+    let new_fs_base = if new_fpu_context.fs_base == 0 {
+        let cpu_slot = super::smp::current_cpu_slot().unwrap_or(0);
+        KERNEL_FS_BASES
+            .get(cpu_slot)
+            .map_or(0, |base| base.load(Ordering::Acquire))
+    } else {
+        new_fpu_context.fs_base
+    };
+    write_fs_base(new_fs_base);
     unsafe { kz_x86_64_context_switch(old_stack, new_stack, old_fpu_context, new_fpu_context) }
+}
+
+fn read_fs_base() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") IA32_FS_BASE,
+            out("eax") low,
+            out("edx") high,
+            options(nostack, preserves_flags),
+        );
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+fn write_fs_base(value: u64) {
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_FS_BASE,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
 }

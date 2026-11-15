@@ -6069,16 +6069,20 @@ fn copy_xattr_value(value: &[u8], output: *mut c_void, size: usize) -> Result<us
     Ok(value.len())
 }
 
-fn copy_xattr_names(names: &[Vec<u8>], output: *mut c_char, size: usize) -> Result<usize, i32> {
+fn copy_xattr_names(
+    names: &[Arc<crate::kernel::lib::immutable_byte_buffer::ImmutableByteBuffer>],
+    output: *mut c_char,
+    size: usize,
+) -> Result<usize, i32> {
     let length = names.iter().try_fold(0usize, |length, name| {
         length
-            .checked_add(name.len())
+            .checked_add(name.as_bytes().len())
             .and_then(|length| length.checked_add(1))
-                .ok_or(E2BIG)
+            .ok_or(E2BIG)
     })?;
-            if length > XATTR_SIZE_MAX {
-            return Err(E2BIG);
-            }
+    if length > XATTR_SIZE_MAX {
+        return Err(E2BIG);
+    }
     if size == 0 {
         return Ok(length);
     }
@@ -6090,7 +6094,7 @@ fn copy_xattr_names(names: &[Vec<u8>], output: *mut c_char, size: usize) -> Resu
     }
     let mut offset = 0;
     for name in names {
-        for byte in name {
+        for byte in name.as_bytes() {
             unsafe { write_volatile(output.cast::<u8>().add(offset), *byte) };
             offset += 1;
         }
@@ -6129,7 +6133,7 @@ fn get_xattr_path(
     let metadata = metadata_for_path(path)?;
     let name = unsafe { xattr_name(name) }?;
     let value = metadata.get_xattr(&name).map_err(metadata_errno)?;
-    copy_xattr_value(&value, output, size)
+    copy_xattr_value(value.as_bytes(), output, size)
 }
 
 fn get_xattr_fd(
@@ -6141,7 +6145,7 @@ fn get_xattr_fd(
     let metadata = metadata_for_fd(file_descriptor)?;
     let name = unsafe { xattr_name(name) }?;
     let value = metadata.get_xattr(&name).map_err(metadata_errno)?;
-    copy_xattr_value(&value, output, size)
+    copy_xattr_value(value.as_bytes(), output, size)
 }
 
 fn list_xattrs_path(path: *const c_char, output: *mut c_char, size: usize) -> Result<usize, i32> {

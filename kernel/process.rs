@@ -7,7 +7,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::kernel::error::Error;
 pub(crate) use crate::kernel::credentials::{GroupId, UserId};
@@ -31,9 +31,13 @@ use crate::kernel::signal::{
 const INITIAL_CAPABILITY_SLOTS: usize = 32;
 const FIRST_FILE_DESCRIPTOR: u32 = 3;
 const CHILD_EVENT_CAPACITY: usize = 8;
-pub(crate) const MAX_SUPPLEMENTARY_GROUPS: usize = 64;
+pub(crate) const MAX_SUPPLEMENTARY_GROUPS: usize = 65_536;
 static NEXT_PROCESS_ID: AtomicU32 = AtomicU32::new(1);
 static PROCESS_REGISTRY: IrqSpinLock<Vec<ProcessRegistryEntry>> = IrqSpinLock::new(Vec::new());
+
+fn is_kill_all_target(process_id: i32, caller_pid: i32) -> bool {
+    process_id > 1 && process_id != caller_pid
+}
 
 struct ProcessRegistryEntry {
     pid: i32,
@@ -782,7 +786,12 @@ impl KernelObjectTable {
 }
 
 struct FileDescriptorTable {
-    entries: Vec<Option<KernelObjectRef>>,
+    entries: Vec<Option<FileDescriptorEntry>>,
+}
+
+struct FileDescriptorEntry {
+    object: KernelObjectRef,
+    close_on_exec: bool,
 }
 
 impl FileDescriptorTable {
@@ -798,16 +807,28 @@ impl FileDescriptorTable {
     }
 
     fn insert(&mut self, object: KernelObjectRef) -> Result<u32, Error> {
+        self.insert_with_flags(object, false)
+    }
+
+    fn insert_with_flags(
+        &mut self,
+        object: KernelObjectRef,
+        close_on_exec: bool,
+    ) -> Result<u32, Error> {
+        let entry = FileDescriptorEntry {
+            object,
+            close_on_exec,
+        };
         if let Some(index) = self.entries.iter().position(Option::is_none) {
             let descriptor = Self::descriptor(index)?;
-            self.entries[index] = Some(object);
+            self.entries[index] = Some(entry);
             return Ok(descriptor);
         }
 
         let index = self.entries.len();
         let descriptor = Self::descriptor(index)?;
         self.entries.try_reserve(1).map_err(|_| Error::NoMem)?;
-        self.entries.push(Some(object));
+        self.entries.push(Some(entry));
         Ok(descriptor)
     }
 
@@ -817,13 +838,25 @@ impl FileDescriptorTable {
             .ok_or(Error::Badf)? as usize;
         self.entries
             .get(index)
-            .copied()
-            .flatten()
+            .and_then(Option::as_ref)
+            .map(|entry| entry.object)
             .ok_or(Error::Badf)
     }
 
     fn contains_object(&self, object: KernelObjectRef) -> bool {
-        self.entries.iter().any(|entry| *entry == Some(object))
+        self.entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.object == object)
+    }
+
+    fn remove_next_close_on_exec(&mut self) -> Option<KernelObjectRef> {
+        for entry in &mut self.entries {
+            if entry.as_ref().is_some_and(|entry| entry.close_on_exec) {
+                return entry.take().map(|entry| entry.object);
+            }
+        }
+        None
     }
 
     fn remove(&mut self, descriptor: u32) -> Result<KernelObjectRef, Error> {
@@ -833,12 +866,14 @@ impl FileDescriptorTable {
         self.entries
             .get_mut(index)
             .and_then(Option::take)
+            .map(|entry| entry.object)
             .ok_or(Error::Badf)
     }
 }
 
 pub(crate) struct Process {
     pid: i32,
+    syscall_abi: AtomicU8,
     active_threads: AtomicUsize,
     resource_usage: ProcessResourceUsage,
     exit_notified: AtomicBool,
@@ -853,6 +888,13 @@ pub(crate) struct Process {
     file_descriptors: IrqSpinLock<FileDescriptorTable>,
     children: IrqSpinLock<Vec<ChildProcessRecord>>,
     filesystem: IrqSpinLock<FilesystemContext>,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SyscallAbi {
+    Linux,
+    WindowsNt,
 }
 
 impl Process {
@@ -890,6 +932,7 @@ impl Process {
             pty_terminal,
             None,
         )?;
+        child.set_syscall_abi(parent.syscall_abi());
         parent.register_child(&child)?;
         Ok(child)
     }
@@ -914,6 +957,7 @@ impl Process {
             pty_terminal,
             Some(address_space),
         )?;
+        child.set_syscall_abi(parent.syscall_abi());
         parent.register_child(&child)?;
         Ok(child)
     }
@@ -947,6 +991,7 @@ impl Process {
         };
         let process = Arc::new(Self {
             pid,
+            syscall_abi: AtomicU8::new(SyscallAbi::Linux as u8),
             active_threads: AtomicUsize::new(0),
             resource_usage: ProcessResourceUsage::new(),
             exit_notified: AtomicBool::new(false),
@@ -1062,6 +1107,17 @@ impl Process {
 
     pub(crate) const fn pid(&self) -> i32 {
         self.pid
+    }
+
+    pub(crate) fn syscall_abi(&self) -> SyscallAbi {
+        match self.syscall_abi.load(Ordering::Acquire) {
+            value if value == SyscallAbi::WindowsNt as u8 => SyscallAbi::WindowsNt,
+            _ => SyscallAbi::Linux,
+        }
+    }
+
+    pub(crate) fn set_syscall_abi(&self, abi: SyscallAbi) {
+        self.syscall_abi.store(abi as u8, Ordering::Release);
     }
 
     pub(crate) fn add_cpu_time_ns(&self, elapsed_ns: u64) {
@@ -1617,7 +1673,7 @@ impl Process {
                 };
                 let selected = match target {
                     value if value > 0 => process.pid == value,
-                    -1 => process.pid != self.pid,
+                    -1 => is_kill_all_target(process.pid, self.pid),
                     _ => {
                         let control = process.control.lock();
                         control.process_group_id == target_group.unwrap_or_default()
@@ -2133,8 +2189,19 @@ impl Process {
     }
 
     pub(crate) fn insert_file_descriptor(&self, file: FileHandle) -> Result<u32, Error> {
+        self.insert_file_descriptor_with_flags(file, false)
+    }
+
+    pub(crate) fn insert_file_descriptor_with_flags(
+        &self,
+        file: FileHandle,
+        close_on_exec: bool,
+    ) -> Result<u32, Error> {
         let object_ref = self.insert_file_object(file)?;
-        let descriptor = self.file_descriptors.lock().insert(object_ref);
+        let descriptor = self
+            .file_descriptors
+            .lock()
+            .insert_with_flags(object_ref, close_on_exec);
         match descriptor {
             Ok(descriptor) => Ok(descriptor),
             Err(error) => {
@@ -2159,6 +2226,17 @@ impl Process {
             object_ref
         };
         self.close_kernel_object(object_ref)
+    }
+
+    pub(crate) fn close_on_exec_file_descriptors(&self) {
+        loop {
+            let Some(object_ref) = self.file_descriptors.lock().remove_next_close_on_exec() else {
+                break;
+            };
+            if !self.file_descriptors.lock().contains_object(object_ref) {
+                let _ = self.close_kernel_object(object_ref);
+            }
+        }
     }
 
     pub(crate) fn duplicate_file_descriptor_to_process(

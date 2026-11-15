@@ -484,6 +484,128 @@ pub(crate) fn set_window_size(size: WindowSize) {
     CONSOLE_TTY.lock().window_size = size;
 }
 
+pub(crate) fn ioctl_console(request: u64, argument: &mut [u8]) -> Result<i64, Error> {
+    match request {
+        super::TIOCGWINSZ => {
+            if argument.len() < 8 {
+                return Err(Error::Inval);
+            }
+            let size = window_size();
+            for (index, value) in [size.rows, size.columns, size.x_pixels, size.y_pixels]
+                .into_iter()
+                .enumerate()
+            {
+                let offset = index * 2;
+                argument[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
+            }
+            Ok(0)
+        }
+        super::TIOCSWINSZ => {
+            if argument.len() < 8 {
+                return Err(Error::Inval);
+            }
+            let read_field = |index: usize| {
+                let offset = index * 2;
+                u16::from_ne_bytes([argument[offset], argument[offset + 1]])
+            };
+            set_window_size(WindowSize {
+                rows: read_field(0),
+                columns: read_field(1),
+                x_pixels: read_field(2),
+                y_pixels: read_field(3),
+            });
+            Ok(0)
+        }
+        super::TIOCGPGRP => {
+            if argument.len() < 4 {
+                return Err(Error::Inval);
+            }
+            let process = ThreadManager::current_process()?;
+            let process_group = process.terminal_foreground_process_group()?;
+            argument[..4].copy_from_slice(&process_group.to_ne_bytes());
+            Ok(0)
+        }
+        super::TIOCSPGRP => {
+            if argument.len() < 4 {
+                return Err(Error::Inval);
+            }
+            let process_group = i32::from_ne_bytes(
+                argument[..4].try_into().map_err(|_| Error::Inval)?,
+            );
+            ThreadManager::current_process()?.set_terminal_foreground_process_group(process_group)?;
+            Ok(0)
+        }
+        super::TCGETS => {
+            if argument.len() < 36 {
+                return Err(Error::Inval);
+            }
+            let attributes = attributes();
+            for (index, value) in [
+                attributes.input_flags,
+                attributes.output_flags,
+                attributes.control_flags,
+                attributes.local_flags,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                write_native_u32(argument, index * 4, value);
+            }
+            argument[16] = 0;
+            argument[17..36].copy_from_slice(&attributes.control_characters[..19]);
+            Ok(0)
+        }
+        super::TCSETS | super::TCSETSW | super::TCSETSF => {
+            if argument.len() < 36 {
+                return Err(Error::Inval);
+            }
+            let mut attributes = attributes();
+            attributes.input_flags = read_native_u32(argument, 0);
+            attributes.output_flags = read_native_u32(argument, 4);
+            attributes.control_flags = read_native_u32(argument, 8);
+            attributes.local_flags = read_native_u32(argument, 12);
+            attributes.control_characters[..19].copy_from_slice(&argument[17..36]);
+            if request == super::TCSETSW {
+                drain_output()?;
+            } else if request == super::TCSETSF {
+                flush_input();
+            }
+            set_attributes(attributes)?;
+            Ok(0)
+        }
+        super::TCXONC => {
+            if argument.len() < 4 {
+                return Err(Error::Inval);
+            }
+            flow(read_native_i32(argument, 0))?;
+            Ok(0)
+        }
+        super::TCFLSH => {
+            if argument.len() < 4 {
+                return Err(Error::Inval);
+            }
+            match read_native_i32(argument, 0) {
+                0 => flush_input(),
+                1 => flush_output(),
+                2 => {
+                    flush_input();
+                    flush_output();
+                }
+                _ => return Err(Error::Inval),
+            }
+            Ok(0)
+        }
+        super::TCSBRK => {
+            if argument.len() < 4 {
+                return Err(Error::Inval);
+            }
+            drain_output()?;
+            Ok(0)
+        }
+        _ => Err(Error::NoSys),
+    }
+}
+
 pub(crate) fn flush_input() {
     {
         let mut terminal = CONSOLE_TTY.lock();

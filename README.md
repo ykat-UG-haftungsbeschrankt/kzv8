@@ -61,6 +61,30 @@ make run-x86_64
 make run-aarch64
 ```
 
+To expose a host directory through VirtIO-FS, start `virtiofsd` in one
+terminal, then launch the optional x86_64 target in another:
+
+```sh
+mkdir -p build/virtiofs-root
+/usr/libexec/virtiofsd --socket-path="$PWD/build/virtiofs.sock" --shared-dir="$PWD/build/virtiofs-root" --sandbox=none
+make RUNTIME_V8=0 run-x86_64-virtiofs
+```
+
+The guest's interactive virtconsole is attached to the terminal running Make,
+so keyboard input and TTY echo appear there. The guest exposes the shared
+directory at `/fs`. For custom paths, pass the same
+`VIRTIOFS_SOCKET` and `VIRTIOFS_ROOT` values to `virtiofsd` and Make, and pass
+`VIRTIOFS_TAG` to Make if changing the tag. The target stages
+`libraries/linux/x86_64/busybox-pie` as `/fs/busybox`; the kernel mounts the
+share and enters its `sh` applet on boot. This static musl PIE self-relocates
+into the per-process user address range, unlike the fixed-address static
+BusyBox at `libraries/linux/x86_64/busybox`. The target enables RDRAND for the
+Linux `AT_RANDOM` startup bytes. Override `VIRTIOFS_BUSYBOX` to stage a
+compatible static PIE executable. Ash standalone mode runs applets such as
+`ls` in-process, so basic commands do not require Linux `execve`. The target
+uses shared memfd-backed guest RAM, which the vhost-user filesystem backend
+requires.
+
 To build an image without starting QEMU, use
 `make build/x86_64/kernel.elf` or `make build/aarch64/kernel.bin`.
 
@@ -79,6 +103,7 @@ to use the interpreter when running through the JIT-preferred entry point.
 ## Scope
 
 This is a kernel lab, not a general-purpose OS. It has user-mode, ELF, syscall,
-and optional guest-virtualization foundations, but not a general process manager
-or program-launch workflow. JavaScript runs inside the kernel's V8 embedder, and
-the QEMU smoke tests are the current way to exercise the system end to end.
+and optional guest-virtualization foundations, but not a general process manager;
+the BusyBox shell is a boot-time demonstration rather than a general program
+launcher. JavaScript runs inside the kernel's V8 embedder, and the QEMU smoke
+tests are the current way to exercise the system end to end.

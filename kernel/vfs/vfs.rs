@@ -810,6 +810,10 @@ impl NodeApi for Node {
         }
     }
 
+    fn size_blocking(&self) -> VfsResult<u64> {
+        run_vfs_future(self.size())
+    }
+
     fn write_at<'a>(
         &'a self,
         offset: u64,
@@ -854,6 +858,14 @@ impl NodeApi for Node {
 }
 
 impl FileHandleApi for FileHandle {
+    fn is_directory(&self) -> bool {
+        matches!(&self.node, Node::Directory { .. })
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+
     fn metadata(&self) -> NodeMetadata {
         self.node.metadata()
     }
@@ -899,6 +911,13 @@ impl FileHandleApi for FileHandle {
 
     fn read_blocking(&mut self, buffer: &mut [u8]) -> VfsResult<usize> {
         run_vfs_future(self.read(buffer))
+    }
+
+    fn read_directory_blocking(&mut self) -> VfsResult<Vec<DirectoryEntry>> {
+        if !self.mode.allows_read() {
+            return Err(Error::Badf);
+        }
+        run_vfs_future(self.node.read_dir())
     }
 
     fn read<'a>(&'a mut self, buffer: &'a mut [u8]) -> VfsFuture<'a, VfsResult<usize>> {
@@ -1024,19 +1043,26 @@ impl VfsApi for Vfs {
         credentials: Credentials,
     ) -> VfsFuture<'a, VfsResult<FileHandle>> {
         Box::pin(async move {
-            let node = self.resolve(path, &credentials).await?;
+            let (node, path) = self.resolve_internal(path, &credentials, true).await?;
             let opened_plugin = match &node {
                 Node::File { plugin, .. } => {
                     node.check_access(&credentials, mode.access_mask())?;
                     plugin.open(mode).await?
                 }
-                Node::Directory { .. } => return Err(Error::IsDir),
+                Node::Directory { .. } => {
+                    if mode != OpenMode::ReadOnly {
+                        return Err(Error::IsDir);
+                    }
+                    node.check_access(&credentials, mode.access_mask())?;
+                    None
+                }
                 Node::Symlink { .. } => return Err(Error::Inval),
             };
             Ok(FileHandle {
                 node,
                 opened_plugin,
                 mode,
+                path,
                 offset: 0,
             })
         })
@@ -1061,6 +1087,26 @@ impl VfsApi for Vfs {
                 .await
                 .map(|(node, _path)| node)
         })
+    }
+
+    fn resolve_with_path_blocking(
+        &self,
+        path: &str,
+        credentials: &Credentials,
+    ) -> VfsResult<(Node, String)> {
+        run_vfs_future(Box::pin(async move {
+            self.resolve_internal(path, credentials, true).await
+        }))
+    }
+
+    fn resolve_with_path_no_follow_blocking(
+        &self,
+        path: &str,
+        credentials: &Credentials,
+    ) -> VfsResult<(Node, String)> {
+        run_vfs_future(Box::pin(async move {
+            self.resolve_internal(path, credentials, false).await
+        }))
     }
 
     fn hard_link<'a>(
@@ -1098,6 +1144,15 @@ impl VfsApi for Vfs {
         })
     }
 
+    fn hard_link_blocking(
+        &self,
+        source_path: &str,
+        link_path: &str,
+        credentials: &Credentials,
+    ) -> VfsResult<()> {
+        run_vfs_future(self.hard_link(source_path, link_path, credentials))
+    }
+
     fn symlink<'a>(
         &'a self,
         target: &'a str,
@@ -1130,6 +1185,15 @@ impl VfsApi for Vfs {
         })
     }
 
+    fn symlink_blocking(
+        &self,
+        target: &str,
+        link_path: &str,
+        credentials: &Credentials,
+    ) -> VfsResult<()> {
+        run_vfs_future(self.symlink(target, link_path, credentials))
+    }
+
     fn read_link<'a>(
         &'a self,
         path: &'a str,
@@ -1142,6 +1206,10 @@ impl VfsApi for Vfs {
                 _ => Err(Error::Inval),
             }
         })
+    }
+
+    fn read_link_blocking(&self, path: &str, credentials: &Credentials) -> VfsResult<String> {
+        run_vfs_future(self.read_link(path, credentials))
     }
 
     fn unlink<'a>(
@@ -1166,6 +1234,10 @@ impl VfsApi for Vfs {
             let node = parent.remove_file_entry(name)?;
             node.metadata().remove_link()
         })
+    }
+
+    fn unlink_blocking(&self, path: &str, credentials: &Credentials) -> VfsResult<()> {
+        run_vfs_future(self.unlink(path, credentials))
     }
 
     fn mount<'a>(
@@ -1280,6 +1352,10 @@ impl VfsApi for Vfs {
             }
             Ok(())
         })
+    }
+
+    fn sync_filesystems_blocking(&self) -> VfsResult<()> {
+        run_vfs_future(self.sync_filesystems())
     }
 
     fn read_dir<'a>(

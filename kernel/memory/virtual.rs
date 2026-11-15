@@ -10,7 +10,6 @@ use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use crate::kernel::arch::traits::{DebugArchitecture as _, MemoryArchitecture as _};
 use crate::kernel::arch::MemoryArchitecture;
-use crate::kernel::lib::interval::IntervalTree;
 use crate::kernel::memory::physical::PhysicalAllocator;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
@@ -36,10 +35,141 @@ enum PageRangeError {
     OutOfBounds,
 }
 
+const MAX_VM_AREAS: usize = 16384;
+
+#[derive(Clone, Copy)]
+struct VirtualArea {
+    start: usize,
+    end: usize,
+}
+
+impl VirtualArea {
+    const EMPTY: Self = Self { start: 0, end: 0 };
+}
+
+struct VirtualAreaIndex {
+    areas: [VirtualArea; MAX_VM_AREAS],
+    length: usize,
+}
+
+impl VirtualAreaIndex {
+    const fn new() -> Self {
+        Self {
+            areas: [VirtualArea::EMPTY; MAX_VM_AREAS],
+            length: 0,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.length == MAX_VM_AREAS
+    }
+
+    fn contains_range(&self, range: &Range<usize>) -> bool {
+        self.areas[..self.length]
+            .iter()
+            .any(|area| area.start == range.start && area.end == range.end)
+    }
+
+    fn find_point(&self, point: usize) -> Option<&VirtualArea> {
+        self.areas[..self.length]
+            .iter()
+            .find(|area| area.start <= point && point < area.end)
+    }
+
+    fn find_overlap(&self, query: Range<usize>) -> Option<&VirtualArea> {
+        if query.start >= query.end {
+            return None;
+        }
+        self.areas[..self.length].iter().find(|area| {
+            area.start < query.end && query.start < area.end
+        })
+    }
+
+    fn first_fit(
+        &self,
+        bounds: Range<usize>,
+        length: usize,
+        alignment: usize,
+    ) -> Option<Range<usize>> {
+        if bounds.start >= bounds.end
+            || length == 0
+            || alignment == 0
+            || !alignment.is_power_of_two()
+        {
+            return None;
+        }
+
+        let mut cursor = bounds.start;
+        for area in &self.areas[..self.length] {
+            if area.end <= bounds.start {
+                continue;
+            }
+            if area.start >= bounds.end {
+                break;
+            }
+            let occupied_start = area.start.max(bounds.start);
+            let occupied_end = area.end.min(bounds.end);
+            if occupied_start > cursor {
+                if let Some(fit) = Self::fit_in_gap(cursor, occupied_start, length, alignment) {
+                    return Some(fit);
+                }
+            }
+            cursor = cursor.max(occupied_end);
+        }
+        Self::fit_in_gap(cursor, bounds.end, length, alignment)
+    }
+
+    fn insert(&mut self, range: Range<usize>) -> Result<Option<()>, ()> {
+        if range.start >= range.end {
+            return Err(());
+        }
+        if self.contains_range(&range) {
+            return Ok(Some(()));
+        }
+        if self.is_full() {
+            return Err(());
+        }
+
+        let index = self.areas[..self.length].partition_point(|area| area.start < range.start);
+        for slot in (index..self.length).rev() {
+            self.areas[slot + 1] = self.areas[slot];
+        }
+        self.areas[index] = VirtualArea {
+            start: range.start,
+            end: range.end,
+        };
+        self.length += 1;
+        Ok(None)
+    }
+
+    fn remove(&mut self, range: &Range<usize>) -> Option<()> {
+        let index = self.areas[..self.length]
+            .iter()
+            .position(|area| area.start == range.start && area.end == range.end)?;
+        for slot in index..self.length - 1 {
+            self.areas[slot] = self.areas[slot + 1];
+        }
+        self.length -= 1;
+        self.areas[self.length] = VirtualArea::EMPTY;
+        Some(())
+    }
+
+    fn fit_in_gap(
+        start: usize,
+        end: usize,
+        length: usize,
+        alignment: usize,
+    ) -> Option<Range<usize>> {
+        let aligned_start = start.checked_add(alignment - 1)? & !(alignment - 1);
+        let allocation_end = aligned_start.checked_add(length)?;
+        (allocation_end <= end).then_some(aligned_start..allocation_end)
+    }
+}
+
 pub(crate) struct VirtualAreas {
     page_state: [AtomicU16; VirtualAreas::MAX_VM_PAGES],
     mmu_ready: AtomicBool,
-    area_index: IntervalTree<(), { VirtualAreas::MAX_VM_AREAS }>,
+    area_index: VirtualAreaIndex,
 }
 
 impl VirtualAreas {
@@ -48,7 +178,6 @@ impl VirtualAreas {
     const VM_ARENA_SIZE: usize =
         <MemoryArchitecture as crate::kernel::arch::traits::MemoryArchitecture>::VM_ARENA_SIZE;
     const MAX_VM_PAGES: usize = Self::VM_ARENA_SIZE / Self::PAGE_SIZE;
-    const MAX_VM_AREAS: usize = 16384;
     const VM_RESERVED: u16 = 1 << 7;
     const VM_OWNED: u16 = 1 << 8;
     const VM_BORROWED: u16 = 1 << 9;
@@ -59,7 +188,7 @@ impl VirtualAreas {
     const EMPTY: Self = Self {
         page_state: [const { AtomicU16::new(0) }; Self::MAX_VM_PAGES],
         mmu_ready: AtomicBool::new(false),
-        area_index: IntervalTree::new(),
+        area_index: VirtualAreaIndex::new(),
     };
 
     fn initialize(&mut self) {
@@ -136,18 +265,18 @@ impl VirtualAreas {
         let Some(address_range) = Self::address_range(range) else {
             return false;
         };
-        self.area_index.get(&address_range).is_some()
+        self.area_index.contains_range(&address_range)
     }
 
     fn containing_area(&self, range: PageRange) -> Option<PageRange> {
         let address_range = Self::address_range(range)?;
-        let (area_range, _) = self.area_index.find_point(address_range.start)?;
-        if address_range.end > area_range.end {
+        let area = self.area_index.find_point(address_range.start)?;
+        if address_range.end > area.end {
             return None;
         }
         Some(PageRange {
-            start_page: Self::page_start(area_range.start).ok()?,
-            end_page: Self::page_start(area_range.end).ok()?,
+            start_page: Self::page_start(area.start).ok()?,
+            end_page: Self::page_start(area.end).ok()?,
         })
     }
 
@@ -199,7 +328,7 @@ impl VirtualAreas {
         let start_page = range.start_page;
         let end_page = range.end_page;
         let address = address_range.start;
-        if self.area_index.insert(address_range, ()).is_err() {
+        if self.area_index.insert(address_range).is_err() {
             return None;
         }
 
@@ -279,7 +408,7 @@ impl VirtualAreas {
                     end_page: area_end,
                 };
                 let address_range = Self::address_range(suffix).expect("valid VM suffix range");
-                let inserted = self.area_index.insert(address_range, ());
+                let inserted = self.area_index.insert(address_range);
                 debug_assert!(matches!(inserted, Ok(None)));
             }
             (_, 0) => {
@@ -288,7 +417,7 @@ impl VirtualAreas {
                     end_page: range.start_page,
                 };
                 let address_range = Self::address_range(prefix).expect("valid VM prefix range");
-                let inserted = self.area_index.insert(address_range, ());
+                let inserted = self.area_index.insert(address_range);
                 debug_assert!(matches!(inserted, Ok(None)));
             }
             (_, _) => {
@@ -298,7 +427,7 @@ impl VirtualAreas {
                 };
                 let prefix_address_range =
                     Self::address_range(prefix).expect("valid VM prefix range");
-                let prefix_inserted = self.area_index.insert(prefix_address_range, ());
+                let prefix_inserted = self.area_index.insert(prefix_address_range);
                 debug_assert!(matches!(prefix_inserted, Ok(None)));
 
                 let suffix = PageRange {
@@ -307,7 +436,7 @@ impl VirtualAreas {
                 };
                 let suffix_address_range =
                     Self::address_range(suffix).expect("valid VM suffix range");
-                let suffix_inserted = self.area_index.insert(suffix_address_range, ());
+                let suffix_inserted = self.area_index.insert(suffix_address_range);
                 debug_assert!(matches!(suffix_inserted, Ok(None)));
             }
         }
@@ -439,7 +568,7 @@ impl VirtualAreas {
                 end_page: release_start,
             };
             let shortened_range = Self::address_range(shortened).expect("valid shortened range");
-            let inserted = self.area_index.insert(shortened_range, ());
+            let inserted = self.area_index.insert(shortened_range);
             debug_assert!(matches!(inserted, Ok(None)));
         }
 
@@ -729,6 +858,10 @@ pub(crate) fn resolve_page_fault(address: usize, access: FaultAccess) -> bool {
     }
     resolved
 }
+
+#[cfg(test)]
+#[path = "../../tests/kernel/memory/virtual.rs"]
+mod tests;
 
 #[allow(dead_code)]
 pub(crate) fn is_identity_mapped(address: usize) -> bool {

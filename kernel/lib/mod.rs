@@ -26,6 +26,7 @@ pub(crate) mod immutable_byte_buffer;
 pub(crate) mod interval;
 #[allow(dead_code)]
 pub(crate) mod list;
+#[allow(dead_code)]
 pub(crate) mod lookup;
 #[allow(dead_code)]
 pub(crate) mod queue;

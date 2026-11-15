@@ -384,7 +384,7 @@ impl UserAddressSpace {
 			}
 			areas
 		};
-		let child = Self::new()?;
+		let mut child = Self::new()?;
 		let mut page_contents = alloc::boxed::Box::new([0; USER_VM_PAGE_SIZE]);
 		for (range, page_states) in areas {
 			let length = range.end.checked_sub(range.start).ok_or(Error::Overflow)?;
@@ -910,6 +910,16 @@ impl UserAddressSpace {
 		{
 			crate::kernel::arch::CpuArchitecture::halt();
 		}
+		let syscall_abi = if object.is_pe() {
+			crate::kernel::process::SyscallAbi::WindowsNt
+		} else {
+			crate::kernel::process::SyscallAbi::Linux
+		};
+		let process = match crate::kernel::scheduler::thread::ThreadManager::current_process() {
+			Ok(process) => process,
+			Err(_) => crate::kernel::arch::CpuArchitecture::halt(),
+		};
+		process.set_syscall_abi(syscall_abi);
 		unsafe { crate::kernel::arch::ThreadArchitecture::enter_user(entry, stack_pointer) }
 	}
 }

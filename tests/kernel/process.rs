@@ -11,7 +11,7 @@
 
     use super::{
         Capability, CapabilityTable, Credentials, DEFAULT_RESOURCE_LIMITS, FileDescriptorTable,
-        FilesystemContext, GroupId, KernelObjectRef, KernelObjectTable, NamespaceSet, Process,
+        is_kill_all_target, FilesystemContext, GroupId, KernelObjectRef, KernelObjectTable, NamespaceSet, Process,
         ProcessControlState, ProcessResourceUsage, SchedulingParameters, SignalState,
         UserAddressSpace, UserId,
     };
@@ -106,6 +106,7 @@ impl Process {
     fn process_identity_is_its_arc_allocation_address() {
         let process = Arc::new(Process {
             pid: 1,
+            syscall_abi: core::sync::atomic::AtomicU8::new(super::SyscallAbi::Linux as u8),
             active_threads: AtomicUsize::new(0),
             resource_usage: ProcessResourceUsage::new(),
             exit_notified: AtomicBool::new(false),
@@ -146,6 +147,29 @@ impl Process {
         assert_eq!(descriptors.insert(third).unwrap(), 3);
         assert_eq!(descriptors.get(3).unwrap(), third);
         assert!(descriptors.get(0).is_err());
+    }
+
+    #[test]
+    fn close_on_exec_removes_only_marked_descriptors() {
+        let mut descriptors = FileDescriptorTable::new();
+        let inherited = KernelObjectRef::from_raw(0x1000);
+        let close_on_exec = KernelObjectRef::from_raw(0x2000);
+        let inherited_descriptor = descriptors.insert(inherited).unwrap();
+        let close_descriptor = descriptors
+            .insert_with_flags(close_on_exec, true)
+            .unwrap();
+
+        assert_eq!(descriptors.remove_next_close_on_exec(), Some(close_on_exec));
+        assert_eq!(descriptors.get(inherited_descriptor).unwrap(), inherited);
+        assert!(descriptors.get(close_descriptor).is_err());
+        assert_eq!(descriptors.remove_next_close_on_exec(), None);
+    }
+
+    #[test]
+    fn kill_all_excludes_init_and_the_caller() {
+        assert!(!is_kill_all_target(1, 10));
+        assert!(!is_kill_all_target(10, 10));
+        assert!(is_kill_all_target(2, 10));
     }
 
     #[test]

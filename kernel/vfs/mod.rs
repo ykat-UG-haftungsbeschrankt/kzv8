@@ -249,6 +249,7 @@ pub(crate) trait NodeApi: Sized {
         buffer: &'a mut [u8],
     ) -> VfsFuture<'a, VfsResult<usize>>;
     fn size(&self) -> VfsFuture<'_, VfsResult<u64>>;
+    fn size_blocking(&self) -> VfsResult<u64>;
     fn write_at<'a>(
         &'a self,
         offset: u64,
@@ -265,6 +266,7 @@ pub(crate) struct FileHandle {
     node: Node,
     opened_plugin: Option<Arc<dyn FilePlugin>>,
     mode: OpenMode,
+    path: String,
     offset: u64,
 }
 
@@ -282,9 +284,12 @@ pub(crate) trait FileHandleApi: Sized {
         credentials: &Credentials,
     ) -> VfsResult<i64>;
     fn is_terminal(&self) -> bool;
+    fn is_directory(&self) -> bool;
+    fn path(&self) -> &str;
     fn metadata(&self) -> NodeMetadata;
     fn size_blocking(&self) -> VfsResult<u64>;
     fn read_blocking(&mut self, buffer: &mut [u8]) -> VfsResult<usize>;
+    fn read_directory_blocking(&mut self) -> VfsResult<Vec<DirectoryEntry>>;
     fn read<'a>(&'a mut self, buffer: &'a mut [u8]) -> VfsFuture<'a, VfsResult<usize>>;
     fn write_blocking(&mut self, buffer: &[u8]) -> VfsResult<usize>;
     fn write<'a>(&'a mut self, buffer: &'a [u8]) -> VfsFuture<'a, VfsResult<usize>>;
@@ -318,28 +323,52 @@ pub(crate) trait VfsApi: Sized {
         path: &'a str,
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<Node>>;
+    fn resolve_with_path_blocking(
+        &self,
+        path: &str,
+        credentials: &Credentials,
+    ) -> VfsResult<(Node, String)>;
+    fn resolve_with_path_no_follow_blocking(
+        &self,
+        path: &str,
+        credentials: &Credentials,
+    ) -> VfsResult<(Node, String)>;
     fn hard_link<'a>(
         &'a self,
         source_path: &'a str,
         link_path: &'a str,
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<()>>;
+    fn hard_link_blocking(
+        &self,
+        source_path: &str,
+        link_path: &str,
+        credentials: &Credentials,
+    ) -> VfsResult<()>;
     fn symlink<'a>(
         &'a self,
         target: &'a str,
         link_path: &'a str,
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<()>>;
+    fn symlink_blocking(
+        &self,
+        target: &str,
+        link_path: &str,
+        credentials: &Credentials,
+    ) -> VfsResult<()>;
     fn read_link<'a>(
         &'a self,
         path: &'a str,
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<String>>;
+    fn read_link_blocking(&self, path: &str, credentials: &Credentials) -> VfsResult<String>;
     fn unlink<'a>(
         &'a self,
         path: &'a str,
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<()>>;
+    fn unlink_blocking(&self, path: &str, credentials: &Credentials) -> VfsResult<()>;
     fn mount<'a>(
         &'a self,
         path: &'a str,
@@ -353,6 +382,7 @@ pub(crate) trait VfsApi: Sized {
         credentials: &'a Credentials,
     ) -> VfsFuture<'a, VfsResult<()>>;
     fn sync_filesystems(&self) -> VfsFuture<'_, VfsResult<()>>;
+    fn sync_filesystems_blocking(&self) -> VfsResult<()>;
     fn umount<'a>(
         &'a self,
         path: &'a str,

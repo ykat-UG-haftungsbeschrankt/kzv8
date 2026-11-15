@@ -373,6 +373,11 @@ fn online_cpu_count() -> usize {
         .count()
 }
 
+pub(crate) fn current_cpu_slot() -> Option<usize> {
+    let apic_id = crate::kernel::arch::interrupts::current_apic_id();
+    CPU_SLOTS.lock().iter().position(|cpu| cpu.apic_id == apic_id)
+}
+
 #[no_mangle]
 pub extern "C" fn kz_secondary_main(cpu_id: usize) -> ! {
     trace(b'A');
