@@ -11,7 +11,6 @@ use core::mem::{size_of, MaybeUninit};
 use crate::kernel::types::Ptr;
 
 const PAGE_SIZE: usize = crate::kernel::memory::r#virtual::PAGE_SIZE;
-const NO_PAGE: usize = 0;
 
 #[repr(C)]
 struct Page {
@@ -29,16 +28,16 @@ impl Page {
 }
 
 pub(crate) struct Queue {
-	head: usize,
-	tail: usize,
+	head: Ptr<Page>,
+	tail: Ptr<Page>,
 	length: usize,
 }
 
 impl Queue {
 	pub(crate) const fn new() -> Self {
 		Self {
-			head: NO_PAGE,
-			tail: NO_PAGE,
+			head: core::ptr::null_mut(),
+			tail: core::ptr::null_mut(),
 			length: 0,
 		}
 	}
@@ -57,22 +56,22 @@ impl Queue {
 			.filter(|capacity| *capacity != 0)
 	}
 
-	fn data_ptr(page_address: usize) -> *mut u8 {
-		(page_address + size_of::<Page>()) as *mut u8
+	fn data_ptr(page: Ptr<Page>) -> *mut u8 {
+		page.cast::<u8>().wrapping_add(size_of::<Page>())
 	}
 
-	fn allocate_page() -> Option<usize> {
+	fn allocate_page() -> Option<Ptr<Page>> {
 		Self::page_capacity()?;
 		let address = crate::kernel::memory::r#virtual::reserve(PAGE_SIZE, PAGE_SIZE, 2)?;
-		let page = address as *mut Page;
+		let page = address as Ptr<Page>;
 		// SAFETY: reserve returns an aligned writable page that is exclusively owned by this queue.
 		unsafe { page.write(Page::EMPTY) };
-		Some(address)
+		Some(page)
 	}
 
 	fn ensure_tail_room(&mut self, page_capacity: usize) -> bool {
-		if self.tail != NO_PAGE {
-			let tail = self.tail as *mut Page;
+		if !self.tail.is_null() {
+			let tail = self.tail;
 			// SAFETY: tail points to a live page owned by this queue.
 			if unsafe { (*tail).end < page_capacity } {
 				return true;
@@ -82,12 +81,12 @@ impl Queue {
 		let Some(new_page) = Self::allocate_page() else {
 			return false;
 		};
-		if self.tail == NO_PAGE {
+		if self.tail.is_null() {
 			self.head = new_page;
 		} else {
-			let tail = self.tail as *mut Page;
+			let tail = self.tail;
 			// SAFETY: tail belongs to this queue and new_page is a live allocated page.
-			unsafe { (*tail).next = new_page as Ptr<Page> };
+			unsafe { (*tail).next = new_page };
 		}
 		self.tail = new_page;
 		true
@@ -103,8 +102,7 @@ impl Queue {
 				break;
 			}
 
-			let tail_address = self.tail;
-			let tail = tail_address as *mut Page;
+			let tail = self.tail;
 			// SAFETY: tail points to a live page owned by this queue.
 			let end = unsafe { (*tail).end };
 			let count = (bytes.len() - written)
@@ -115,7 +113,7 @@ impl Queue {
 			unsafe {
 				core::ptr::copy_nonoverlapping(
 					bytes.as_ptr().add(written),
-					Self::data_ptr(tail_address).add(end),
+					Self::data_ptr(tail).add(end),
 					count,
 				);
 				(*tail).end = end + count;
@@ -124,6 +122,11 @@ impl Queue {
 			written += count;
 		}
 		written
+	}
+
+	pub(crate) fn write_exact(&mut self, bytes: &[u8]) -> bool {
+		// SAFETY: the input slice is valid for byte copying and cannot alias this queue's pages.
+		unsafe { self.write_exact_raw(bytes.as_ptr(), bytes.len()) }
 	}
 
 	pub(crate) fn peek(&self, output: &mut [u8]) -> usize {
@@ -142,11 +145,10 @@ impl Queue {
 
 	unsafe fn copy_out(&self, output: *mut u8, byte_count: usize) {
 		debug_assert!(byte_count <= self.length);
-		let mut page_address = self.head;
+		let mut page = self.head;
 		let mut copied = 0;
 		while copied < byte_count {
-			debug_assert_ne!(page_address, NO_PAGE);
-			let page = page_address as *const Page;
+			debug_assert!(!page.is_null());
 			// SAFETY: page_address identifies a live page in this queue's chain.
 			let (start, end, next) = unsafe { ((*page).start, (*page).end, (*page).next) };
 			let count = (end - start).min(byte_count - copied);
@@ -154,13 +156,13 @@ impl Queue {
 			// SAFETY: the caller provides a writable, non-overlapping output range.
 			unsafe {
 				core::ptr::copy_nonoverlapping(
-					Self::data_ptr(page_address).add(start),
+					Self::data_ptr(page).add(start),
 					output.add(copied),
 					count,
 				);
 			}
 			copied += count;
-			page_address = next as usize;
+			page = next;
 		}
 	}
 
@@ -169,7 +171,7 @@ impl Queue {
 		let mut remaining = byte_count;
 		while remaining != 0 {
 			let page_address = self.head;
-			let page = page_address as *mut Page;
+			let page = page_address;
 			// SAFETY: head identifies a live page containing queued bytes.
 			let (start, end, next) = unsafe { ((*page).start, (*page).end, (*page).next) };
 			let count = (end - start).min(remaining);
@@ -181,13 +183,13 @@ impl Queue {
 
 			if next_start == end {
 				if next.is_null() {
-					self.head = NO_PAGE;
-					self.tail = NO_PAGE;
+					self.head = core::ptr::null_mut();
+					self.tail = core::ptr::null_mut();
 				} else {
-					self.head = next as usize;
+					self.head = next;
 				}
 				let _released =
-					crate::kernel::memory::r#virtual::release(page_address, PAGE_SIZE);
+					crate::kernel::memory::r#virtual::release(page_address as usize, PAGE_SIZE);
 			}
 		}
 	}
@@ -211,59 +213,59 @@ impl Queue {
 		};
 
 		let previous_tail = self.tail;
-		let tail_available = if previous_tail == NO_PAGE {
+		let tail_available = if previous_tail.is_null() {
 			0
 		} else {
-			let tail = previous_tail as *const Page;
+			let tail = previous_tail;
 			// SAFETY: previous_tail points to the live tail page owned by this queue.
 			page_capacity - unsafe { (*tail).end }
 		};
 		let bytes_after_tail = byte_count.saturating_sub(tail_available);
 		let pages_needed = bytes_after_tail / page_capacity
 			+ usize::from(bytes_after_tail % page_capacity != 0);
-		let mut new_head = NO_PAGE;
-		let mut new_tail = NO_PAGE;
+		let mut new_head = core::ptr::null_mut();
+		let mut new_tail = core::ptr::null_mut();
 		for _ in 0..pages_needed {
 			let Some(new_page) = Self::allocate_page() else {
 				Self::release_chain(new_head);
 				return false;
 			};
-			if new_tail == NO_PAGE {
+			if new_tail.is_null() {
 				new_head = new_page;
 			} else {
-				let tail = new_tail as *mut Page;
+				let tail = new_tail;
 				// SAFETY: new_tail belongs to the temporary chain and new_page is newly allocated.
-				unsafe { (*tail).next = new_page as Ptr<Page> };
+				unsafe { (*tail).next = new_page };
 			}
 			new_tail = new_page;
 		}
 
-		if new_head != NO_PAGE {
-			if previous_tail == NO_PAGE {
+		if !new_head.is_null() {
+			if previous_tail.is_null() {
 				self.head = new_head;
 			} else {
-				let tail = previous_tail as *mut Page;
+				let tail = previous_tail;
 				// SAFETY: tail belongs to this queue and new_head begins a live allocated chain.
-				unsafe { (*tail).next = new_head as Ptr<Page> };
+				unsafe { (*tail).next = new_head };
 			}
 			self.tail = new_tail;
 		}
 
-		let mut page_address = if previous_tail == NO_PAGE {
+		let mut page_address = if previous_tail.is_null() {
 			new_head
 		} else {
 			previous_tail
 		};
-		let mut page_offset = if previous_tail == NO_PAGE {
+		let mut page_offset = if previous_tail.is_null() {
 			0
 		} else {
-			let page = previous_tail as *const Page;
+			let page = previous_tail;
 			// SAFETY: previous_tail points to a live page owned by this queue.
 			unsafe { (*page).end }
 		};
 		let mut copied = 0;
 		while copied < byte_count {
-			let page = page_address as *mut Page;
+			let page = page_address;
 			let count = (page_capacity - page_offset).min(byte_count - copied);
 			// SAFETY: the caller guarantees readable, non-overlapping input; reserved pages provide
 			// enough writable space for the complete fixed-size record.
@@ -278,7 +280,7 @@ impl Queue {
 			copied += count;
 			if copied < byte_count {
 				// SAFETY: page_address is in the now-linked chain and another reserved page follows.
-				page_address = unsafe { (*page).next as usize };
+				page_address = unsafe { (*page).next };
 				page_offset = 0;
 			}
 		}
@@ -286,25 +288,19 @@ impl Queue {
 		true
 	}
 
-	fn release_chain(mut page_address: usize) {
-		while page_address != NO_PAGE {
-			let page = page_address as *mut Page;
+	fn release_chain(mut page: Ptr<Page>) {
+		while !page.is_null() {
 			// SAFETY: every page address in the chain refers to an allocated page.
 			let next = unsafe { (*page).next };
-			let next_address = if next.is_null() {
-				NO_PAGE
-			} else {
-				next as usize
-			};
-			let _released = crate::kernel::memory::r#virtual::release(page_address, PAGE_SIZE);
-			page_address = next_address;
+			let _released = crate::kernel::memory::r#virtual::release(page as usize, PAGE_SIZE);
+			page = next;
 	}
 	}
 
 	pub(crate) fn clear(&mut self) {
 		Self::release_chain(self.head);
-		self.head = NO_PAGE;
-		self.tail = NO_PAGE;
+		self.head = core::ptr::null_mut();
+		self.tail = core::ptr::null_mut();
 		self.length = 0;
 	}
 }

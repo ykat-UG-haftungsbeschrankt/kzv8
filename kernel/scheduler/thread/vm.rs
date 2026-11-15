@@ -154,6 +154,10 @@ const VM_RESERVED: u16 = 1 << 7;
 const VM_OWNED: u16 = 1 << 8;
 const VM_BORROWED: u16 = 1 << 9;
 
+fn fork_page_needs_temporary_access(page_is_mapped: bool, page_has_backing: bool) -> bool {
+	!page_is_mapped && page_has_backing
+}
+
 struct UserArea {
 	range: Range<usize>,
 	page_states: Vec<AtomicU16>,
@@ -368,16 +372,6 @@ impl UserAddressSpace {
 
 		let areas = {
 			let source_areas = self.inner.areas.lock();
-			let page_count = source_areas
-				.areas
-				.iter()
-				.map(|area| area.page_states.len())
-				.sum::<usize>();
-			crate::kernel::debug::debug_fmt(format_args!(
-				"kz: fork snapshot areas={} reserved_pages={}\n",
-				source_areas.areas.len(),
-				page_count
-			));
 			let mut areas = Vec::new();
 			areas
 				.try_reserve_exact(source_areas.areas.len())
@@ -396,47 +390,49 @@ impl UserAddressSpace {
 			}
 			areas
 		};
-		crate::kernel::debug::debug("kz: fork snapshot copied\n");
-		crate::kernel::debug::debug("kz: fork creating child address space\n");
 		let mut child = Self::new()?;
-		crate::kernel::debug::debug("kz: fork child address space created\n");
 		child.set_program_break_state(self.program_break_state());
 		let mut page_contents = alloc::boxed::Box::new([0; USER_VM_PAGE_SIZE]);
-		crate::kernel::debug::debug("kz: fork scratch page allocated\n");
-		for (area_index, (range, page_states)) in areas.into_iter().enumerate() {
+		for (range, page_states) in areas {
 			let length = range.end.checked_sub(range.start).ok_or(Error::Overflow)?;
-			crate::kernel::debug::debug_fmt(format_args!(
-				"kz: fork reserving area {} pages={}\n",
-				area_index,
-				page_states.len()
-			));
 			child
 				.reserve_user_mapping(Some(range.start), length, 0, true)
 				.ok_or(Error::NoMem)?;
-			crate::kernel::debug::debug("kz: fork child area reserved\n");
 			for (page_index, state) in page_states.into_iter().enumerate() {
-				if page_index % 64 == 0 {
-					crate::kernel::debug::debug_fmt(format_args!(
-						"kz: fork page progress area={} page={}\n",
-						area_index, page_index
-					));
-				}
 				let address = range
 					.start
 					.checked_add(page_index.checked_mul(USER_VM_PAGE_SIZE).ok_or(Error::Overflow)?)
 					.ok_or(Error::Overflow)?;
 				let permissions = (state & VM_PERMISSION_MASK) as i32;
-				if state & (VM_OWNED | VM_BORROWED) == 0 {
+				let page_has_backing = if state & (VM_OWNED | VM_BORROWED) != 0 {
+					self.activate(|| {
+						crate::kernel::arch::MemoryArchitecture::page_has_backing(address)
+					})
+					.ok_or(Error::NoMem)?
+				} else {
+					false
+				};
+				if !page_has_backing {
 					if !child.protect_user_mapping(address, USER_VM_PAGE_SIZE, permissions) {
 						return Err(Error::NoMem);
 					}
 					continue;
 				}
 				let copied = self.activate(|| {
-					if !crate::kernel::arch::MemoryArchitecture::page_is_mapped(address) {
+					let needs_temporary_access = fork_page_needs_temporary_access(
+						crate::kernel::arch::MemoryArchitecture::page_is_mapped(address),
+						page_has_backing,
+					);
+					if needs_temporary_access
+						&& !crate::kernel::arch::MemoryArchitecture::set_user_page_permissions(
+							address,
+							USER_VM_PAGE_SIZE,
+							1,
+						)
+					{
 						return false;
 					}
-					// The page is mapped in this address space; kernel-mode reads bypass its user permissions.
+					// The source page may be PROT_NONE; temporarily make backed pages readable for the copy.
 					unsafe {
 						core::ptr::copy_nonoverlapping(
 							address as *const u8,
@@ -444,22 +440,37 @@ impl UserAddressSpace {
 							USER_VM_PAGE_SIZE,
 						)
 					};
+					if needs_temporary_access
+						&& !crate::kernel::arch::MemoryArchitecture::set_user_page_permissions(
+							address,
+							USER_VM_PAGE_SIZE,
+							permissions,
+						)
+					{
+						crate::kernel::arch::CpuArchitecture::halt();
+					}
 					true
 				});
-				if copied != Some(true)
-					|| !child.protect_user_mapping(address, USER_VM_PAGE_SIZE, 2)
-					|| !child.resolve_page_fault(
-						address,
-						crate::kernel::memory::r#virtual::FaultAccess::Write,
-					)
-					|| child.write(address, page_contents.as_slice()).is_err()
-					|| !child.protect_user_mapping(address, USER_VM_PAGE_SIZE, permissions)
-				{
+				if copied != Some(true) {
+					return Err(Error::NoMem);
+				}
+				if !child.protect_user_mapping(address, USER_VM_PAGE_SIZE, 2) {
+					return Err(Error::NoMem);
+				}
+				if !child.resolve_page_fault(
+					address,
+					crate::kernel::memory::r#virtual::FaultAccess::Write,
+				) {
+					return Err(Error::NoMem);
+				}
+				if child.write(address, page_contents.as_slice()).is_err() {
+					return Err(Error::NoMem);
+				}
+				if !child.protect_user_mapping(address, USER_VM_PAGE_SIZE, permissions) {
 					return Err(Error::NoMem);
 				}
 			}
 		}
-		crate::kernel::debug::debug("kz: fork address-space clone complete\n");
 		Ok(child)
 	}
 

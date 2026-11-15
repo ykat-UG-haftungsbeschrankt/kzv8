@@ -12,6 +12,9 @@ pub(crate) fn handle() -> Result<i64, Error> {
 }
 
 pub(crate) fn handle_syscall(_number: u64) -> Result<i64, Error> {
+    if _number == 435 {
+        crate::kernel::debug::debug("kz: unsupported clone3 syscall\n");
+    }
     handle()
 }
 

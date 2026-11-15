@@ -8,7 +8,16 @@
 use alloc::sync::Arc;
 
 use crate::kernel::scheduler::sync::IrqSpinLock;
-use super::{UserAddressSpace, UserAddressSpaceInner, UserAreas};
+use super::{
+    fork_page_needs_temporary_access, UserAddressSpace, UserAddressSpaceInner, UserAreas,
+};
+
+#[test]
+fn fork_temporarily_accesses_backed_nonpresent_pages() {
+    assert!(fork_page_needs_temporary_access(false, true));
+    assert!(!fork_page_needs_temporary_access(true, true));
+    assert!(!fork_page_needs_temporary_access(false, false));
+}
 
 impl UserAddressSpace {
     pub(crate) fn new_test_stub() -> Self {

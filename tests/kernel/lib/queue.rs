@@ -33,7 +33,7 @@ fn byte_writes_can_be_peeked_and_read() {
 }
 
 #[test]
-fn byte_queue_spans_pages_and_can_be_reused() {
+fn queue_bytes_span_pages_and_can_be_reused() {
     let page_capacity = Queue::page_capacity().unwrap();
     let bytes = (0..page_capacity + 3)
         .map(|index| (index % 251) as u8)
@@ -53,6 +53,21 @@ fn byte_queue_spans_pages_and_can_be_reused() {
     let mut reused = [0; 5];
     assert_eq!(queue.read(&mut reused), 5);
     assert_eq!(&reused, b"reuse");
+}
+
+#[test]
+fn exact_writes_span_page_boundaries() {
+    let page_capacity = Queue::page_capacity().unwrap();
+    let mut queue = Queue::new();
+    let prefix = vec![0x5a; page_capacity - 1];
+
+    assert_eq!(queue.write(&prefix), prefix.len());
+    assert!(queue.write_exact(&[1, 2, 3]));
+
+    let mut output = vec![0; prefix.len() + 3];
+    assert_eq!(queue.read(&mut output), output.len());
+    assert_eq!(&output[..prefix.len()], prefix);
+    assert_eq!(&output[prefix.len()..], &[1, 2, 3]);
 }
 
 #[test]

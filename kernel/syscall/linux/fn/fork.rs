@@ -53,51 +53,16 @@ fn validate_clone_arguments(arguments: [u64; 6]) -> Result<(), Error> {
 }
 
 fn fork_process(mut registers: UserRegisterState) -> Result<i64, Error> {
-    crate::kernel::debug::debug("kz: fork syscall entered\n");
     let parent = ThreadManager::current_process()?;
     let (_, signal_mask) = ThreadManager::current_signal_context()?;
-    let free_frames_before = crate::kernel::memory::physical::PhysicalAllocator::free_frames();
-    crate::kernel::debug::debug_fmt(format_args!(
-        "kz: fork clone starting, free frames={}\n",
-        free_frames_before
-    ));
-    let address_space = match parent.address_space().fork_clone() {
-        Ok(address_space) => address_space,
-        Err(error) => {
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: fork address-space clone failed {:?}, free frames {} -> {}\n",
-                error,
-                free_frames_before,
-                crate::kernel::memory::physical::PhysicalAllocator::free_frames()
-            ));
-            return Err(error);
-        }
-    };
-    crate::kernel::debug::debug("kz: fork address-space clone complete\n");
-    let child = match Process::new_fork_child(&parent, address_space) {
-        Ok(child) => child,
-        Err(error) => {
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: fork process creation failed {:?}, free frames {}\n",
-                error,
-                crate::kernel::memory::physical::PhysicalAllocator::free_frames()
-            ));
-            return Err(error);
-        }
-    };
-    crate::kernel::debug::debug("kz: fork child process registered\n");
+    let address_space = parent.address_space().fork_clone()?;
+    let child = Process::new_fork_child(&parent, address_space)?;
     let child_pid = child.pid();
     registers.rax = 0;
     if let Err(error) = ThreadManager::create_fork_child(child, registers, signal_mask) {
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: fork child-thread creation failed {:?}, free frames {}\n",
-            error,
-            crate::kernel::memory::physical::PhysicalAllocator::free_frames()
-        ));
         parent.discard_unstarted_child(child_pid);
         return Err(error);
     }
-    crate::kernel::debug::debug("kz: fork child thread enqueued\n");
     Ok(i64::from(child_pid))
 }
 

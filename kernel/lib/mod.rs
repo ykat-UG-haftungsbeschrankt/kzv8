@@ -13,7 +13,6 @@
 
 pub(crate) mod address;
 pub(crate) mod alignment;
-pub(crate) mod byte_queue;
 pub(crate) mod bitfield;
 pub(crate) mod endian;
 #[allow(dead_code)]

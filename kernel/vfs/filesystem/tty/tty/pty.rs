@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 
 use crate::kernel::arch::traits::CpuArchitecture as _;
 use crate::kernel::error::Error;
-use crate::kernel::lib::byte_queue::ByteQueue;
+use crate::kernel::lib::queue::Queue;
 use crate::kernel::scheduler::sync::IrqSpinLock;
 use crate::kernel::signal::{SIGINT, SIGQUIT, SIGTSTP, SIGWINCH};
 
@@ -27,9 +27,9 @@ struct PtyState {
     foreground_process_group_id: Option<i32>,
     attributes: super::TerminalAttributes,
     window_size: super::WindowSize,
-    to_slave: ByteQueue,
-    to_master: ByteQueue,
-    canonical_line: [u8; super::CANONICAL_LINE_CAPACITY],
+    to_slave: Queue,
+    to_master: Queue,
+    canonical_line: [u8; super::CANONICAL_LINE_CAPACITY + 1],
     canonical_length: usize,
     eof_pending: bool,
     output_stopped: bool,
@@ -37,7 +37,7 @@ struct PtyState {
 }
 
 impl PtyState {
-    fn new(to_slave: ByteQueue, to_master: ByteQueue) -> Self {
+    fn new(to_slave: Queue, to_master: Queue) -> Self {
         Self {
             master_open: true,
             slave_locked: true,
@@ -53,7 +53,7 @@ impl PtyState {
             },
             to_slave,
             to_master,
-            canonical_line: [0; super::CANONICAL_LINE_CAPACITY],
+            canonical_line: [0; super::CANONICAL_LINE_CAPACITY + 1],
             canonical_length: 0,
             eof_pending: false,
             output_stopped: false,
@@ -90,8 +90,8 @@ impl InputAction {
 
 impl Pty {
     pub(crate) fn new() -> Result<Arc<Self>, Error> {
-        let to_slave = ByteQueue::new(PTY_BUFFER_CAPACITY)?;
-        let to_master = ByteQueue::new(PTY_BUFFER_CAPACITY)?;
+        let to_slave = Queue::new();
+        let to_master = Queue::new();
         Ok(Arc::new(Self {
             state: IrqSpinLock::new(PtyState::new(to_slave, to_master)),
         }))
@@ -135,7 +135,7 @@ impl Pty {
             return Ok(0);
         }
         let mut state = self.state.lock();
-        let count = state.to_master.pop_into(output);
+        let count = state.to_master.read(output);
         if count != 0 {
             return Ok(count);
         }
@@ -188,7 +188,7 @@ impl Pty {
             return Ok(0);
         }
         let mut state = self.state.lock();
-        let count = state.to_slave.pop_into(output);
+        let count = state.to_slave.read(output);
         if count != 0 {
             return Ok(count);
         }
@@ -236,7 +236,7 @@ impl Pty {
         if events & POLLOUT != 0
             && state.master_open
             && state.slave_open_count != 0
-            && state.to_slave.available() != 0
+            && queue_available(&state.to_slave) != 0
         {
             readiness |= POLLOUT;
         }
@@ -260,7 +260,7 @@ impl Pty {
         if events & POLLOUT != 0
             && state.master_open
             && !state.output_stopped
-            && state.to_master.available() != 0
+            && queue_available(&state.to_master) != 0
         {
             readiness |= POLLOUT;
         }
@@ -347,7 +347,7 @@ impl Pty {
             2 | 3 => {
                 let index = if action == 2 { super::VSTOP } else { super::VSTART };
                 let control = state.attributes.control_characters[index];
-                if control != 0 && !state.to_slave.push(control) {
+                if control != 0 && !queue_write(&mut state.to_slave, &[control]) {
                     return Err(Error::Again);
                 }
             }
@@ -466,7 +466,7 @@ fn process_master_input_byte(state: &mut PtyState, input: u8) -> InputAction {
     }
 
     if attributes.local_flags & super::ICANON == 0 {
-        if !state.to_slave.push(byte) {
+        if !queue_write(&mut state.to_slave, &[byte]) {
             return InputAction::rejected();
         }
         if attributes.local_flags & super::ECHO != 0 {
@@ -525,7 +525,7 @@ fn process_master_input_byte(state: &mut PtyState, input: u8) -> InputAction {
         return InputAction::accepted(None);
     }
 
-    if state.canonical_length == state.canonical_line.len() {
+    if state.canonical_length == super::CANONICAL_LINE_CAPACITY {
         if attributes.local_flags & super::ECHO != 0 {
             echo_bytes(state, &[7]);
         }
@@ -541,21 +541,24 @@ fn process_master_input_byte(state: &mut PtyState, input: u8) -> InputAction {
 }
 
 fn push_canonical_line(state: &mut PtyState, ending: Option<u8>) -> bool {
-    let required = state.canonical_length + usize::from(ending.is_some());
-    if required > state.to_slave.available() {
-        return false;
-    }
-    if !state
-        .to_slave
-        .push_slice(&state.canonical_line[..state.canonical_length])
-    {
-        return false;
-    }
+    let canonical_length = state.canonical_length;
+    let required = canonical_length + usize::from(ending.is_some());
     if let Some(byte) = ending {
-        let _ = state.to_slave.push(byte);
+        state.canonical_line[canonical_length] = byte;
+    }
+    if !queue_write(&mut state.to_slave, &state.canonical_line[..required]) {
+        return false;
     }
     state.canonical_length = 0;
     true
+}
+
+fn queue_available(queue: &Queue) -> usize {
+    PTY_BUFFER_CAPACITY.saturating_sub(queue.len())
+}
+
+fn queue_write(queue: &mut Queue, bytes: &[u8]) -> bool {
+    bytes.len() <= queue_available(queue) && queue.write_exact(bytes)
 }
 
 fn echo_bytes(state: &mut PtyState, bytes: &[u8]) {
@@ -592,7 +595,7 @@ fn queue_output_byte(state: &mut PtyState, byte: u8) -> bool {
         output[0] = byte;
         1
     };
-    if !state.to_master.push_slice(&output[..length]) {
+    if !queue_write(&mut state.to_master, &output[..length]) {
         return false;
     }
     match byte {
