@@ -287,6 +287,7 @@ struct UserAddressSpaceInner {
 	base: usize,
 	length: usize,
 	areas: IrqSpinLock<UserAreas>,
+	program_break: IrqSpinLock<(usize, usize, usize)>,
 	#[cfg(test)]
 	test_stub: bool,
 }
@@ -352,6 +353,7 @@ impl UserAddressSpace {
 				base,
 				length,
 				areas: IrqSpinLock::new(UserAreas::new()),
+				program_break: IrqSpinLock::new((0, 0, 0)),
 				#[cfg(test)]
 				test_stub: false,
 			}),
@@ -366,6 +368,16 @@ impl UserAddressSpace {
 
 		let areas = {
 			let source_areas = self.inner.areas.lock();
+			let page_count = source_areas
+				.areas
+				.iter()
+				.map(|area| area.page_states.len())
+				.sum::<usize>();
+			crate::kernel::debug::debug_fmt(format_args!(
+				"kz: fork snapshot areas={} reserved_pages={}\n",
+				source_areas.areas.len(),
+				page_count
+			));
 			let mut areas = Vec::new();
 			areas
 				.try_reserve_exact(source_areas.areas.len())
@@ -384,14 +396,31 @@ impl UserAddressSpace {
 			}
 			areas
 		};
+		crate::kernel::debug::debug("kz: fork snapshot copied\n");
+		crate::kernel::debug::debug("kz: fork creating child address space\n");
 		let mut child = Self::new()?;
+		crate::kernel::debug::debug("kz: fork child address space created\n");
+		child.set_program_break_state(self.program_break_state());
 		let mut page_contents = alloc::boxed::Box::new([0; USER_VM_PAGE_SIZE]);
-		for (range, page_states) in areas {
+		crate::kernel::debug::debug("kz: fork scratch page allocated\n");
+		for (area_index, (range, page_states)) in areas.into_iter().enumerate() {
 			let length = range.end.checked_sub(range.start).ok_or(Error::Overflow)?;
+			crate::kernel::debug::debug_fmt(format_args!(
+				"kz: fork reserving area {} pages={}\n",
+				area_index,
+				page_states.len()
+			));
 			child
 				.reserve_user_mapping(Some(range.start), length, 0, true)
 				.ok_or(Error::NoMem)?;
+			crate::kernel::debug::debug("kz: fork child area reserved\n");
 			for (page_index, state) in page_states.into_iter().enumerate() {
+				if page_index % 64 == 0 {
+					crate::kernel::debug::debug_fmt(format_args!(
+						"kz: fork page progress area={} page={}\n",
+						area_index, page_index
+					));
+				}
 				let address = range
 					.start
 					.checked_add(page_index.checked_mul(USER_VM_PAGE_SIZE).ok_or(Error::Overflow)?)
@@ -430,11 +459,24 @@ impl UserAddressSpace {
 				}
 			}
 		}
+		crate::kernel::debug::debug("kz: fork address-space clone complete\n");
 		Ok(child)
 	}
 
 	pub(crate) fn root(&self) -> usize {
 		self.inner.root
+	}
+
+	pub(crate) fn set_program_break_base(&self, base: usize) {
+		*self.inner.program_break.lock() = (base, base, base);
+	}
+
+	pub(crate) fn program_break_state(&self) -> (usize, usize, usize) {
+		*self.inner.program_break.lock()
+	}
+
+	pub(crate) fn set_program_break_state(&self, state: (usize, usize, usize)) {
+		*self.inner.program_break.lock() = state;
 	}
 
 	fn bounds(&self) -> Option<Range<usize>> {
@@ -520,6 +562,19 @@ impl UserAddressSpace {
 			return None;
 		}
 		self.reserve_user(None, length, USER_VM_PAGE_SIZE, permissions)
+	}
+
+	pub(crate) fn reserve_user_stack(&self, length: usize, permissions: i32) -> Option<usize> {
+		if length == 0 || !(0..=4).contains(&permissions) {
+			return None;
+		}
+		let length = align_up(length, USER_VM_PAGE_SIZE)?;
+		let stack_base = self
+			.bounds()?
+			.end
+			.checked_sub(length)?
+			& !(USER_VM_PAGE_SIZE - 1);
+		self.reserve_user_mapping(Some(stack_base), length, permissions, true)
 	}
 
 	pub(crate) fn reserve_user_mapping_limited(
@@ -912,6 +967,8 @@ impl UserAddressSpace {
 		}
 		let syscall_abi = if object.is_pe() {
 			crate::kernel::process::SyscallAbi::WindowsNt
+		} else if object.is_mach_o() {
+			crate::kernel::process::SyscallAbi::Darwin
 		} else {
 			crate::kernel::process::SyscallAbi::Linux
 		};
@@ -920,7 +977,12 @@ impl UserAddressSpace {
 			Err(_) => crate::kernel::arch::CpuArchitecture::halt(),
 		};
 		process.set_syscall_abi(syscall_abi);
-		unsafe { crate::kernel::arch::ThreadArchitecture::enter_user(entry, stack_pointer) }
+		unsafe {
+			crate::kernel::arch::ThreadArchitecture::enter_user_with_configured_kernel_stack(
+				entry,
+				stack_pointer,
+			)
+		}
 	}
 }
 

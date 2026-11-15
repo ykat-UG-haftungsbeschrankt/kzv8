@@ -19,6 +19,8 @@ pub(crate) struct Context {
 	kernel_stack_pointer: usize,
 	entry: usize,
 	stack_pointer: usize,
+	#[cfg(target_arch = "x86_64")]
+	fork_registers: Option<crate::kernel::arch::UserRegisterState>,
 }
 
 impl Context {
@@ -46,7 +48,30 @@ impl Context {
 			kernel_stack_pointer,
 			entry,
 			stack_pointer,
+			#[cfg(target_arch = "x86_64")]
+			fork_registers: None,
 		})
+	}
+
+	#[cfg(target_arch = "x86_64")]
+	pub(crate) fn load_forked(
+		kernel_stack: &mut [u8],
+		kernel_entry: extern "C" fn() -> !,
+		address_space: UserAddressSpace,
+		registers: crate::kernel::arch::UserRegisterState,
+	) -> Result<Self, Error> {
+		let entry = usize::try_from(registers.user_return_frame[0]).map_err(|_| Error::Fault)?;
+		let stack_pointer = usize::try_from(registers.user_return_frame[2]).map_err(|_| Error::Fault)?;
+		let mut context = Self::load(
+			kernel_stack,
+			kernel_entry,
+			address_space,
+			entry,
+			stack_pointer,
+		)?;
+		context.kernel.fpu_context = registers.fpu_context;
+		context.fork_registers = Some(registers);
+		Ok(context)
 	}
 
 	pub(crate) const fn kernel_stack_pointer(&self) -> usize {
@@ -69,6 +94,10 @@ impl Context {
 		self.address_space = address_space;
 		self.entry = entry;
 		self.stack_pointer = stack_pointer;
+		#[cfg(target_arch = "x86_64")]
+		{
+			self.fork_registers = None;
+		}
 		Ok(())
 	}
 
@@ -94,6 +123,16 @@ impl Context {
 				!= self.address_space.root()
 		{
 			crate::kernel::arch::CpuArchitecture::halt();
+		}
+		#[cfg(target_arch = "x86_64")]
+		if let Some(registers) = self.fork_registers {
+			if !crate::kernel::arch::ThreadArchitecture::set_user_kernel_stack(
+				self.kernel_stack_pointer,
+			) {
+				crate::kernel::arch::CpuArchitecture::halt();
+			}
+			// SAFETY: the saved return addresses were validated against this active address space.
+			unsafe { crate::kernel::arch::restore_user_registers(registers) }
 		}
 		unsafe {
 			crate::kernel::arch::ThreadArchitecture::enter_user(self.entry, self.stack_pointer)

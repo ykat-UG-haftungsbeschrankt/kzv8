@@ -22,6 +22,7 @@ const IA32_STAR: u32 = 0xc000_0081;
 const IA32_LSTAR: u32 = 0xc000_0082;
 const IA32_FMASK: u32 = 0xc000_0084;
 const IA32_FS_BASE: u32 = 0xc000_0100;
+const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
 const EFER_SCE: u64 = 1;
 const RFLAGS_CARRY: u64 = 1;
 const STAR_VALUE: u64 = (0x23u64 << 48) | (0x08u64 << 32);
@@ -74,6 +75,7 @@ core::arch::global_asm!(
     "xsave64 [rsp]",
     ".endif",
     "mov rdi, r12",
+    "mov rsi, r13",
     "call x86_syscall_dispatch",
     ".if {fpu_mode} == 0",
     "frstor [r13]",
@@ -112,6 +114,7 @@ core::arch::global_asm!(
 );
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct SavedRegisters {
     r15: u64,
     r14: u64,
@@ -132,8 +135,64 @@ struct SavedRegisters {
     user_return_frame: [u64; 3],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct UserRegisterState {
+    pub(crate) r15: u64,
+    pub(crate) r14: u64,
+    pub(crate) r13: u64,
+    pub(crate) r12: u64,
+    pub(crate) r11: u64,
+    pub(crate) r10: u64,
+    pub(crate) r9: u64,
+    pub(crate) r8: u64,
+    pub(crate) rdi: u64,
+    pub(crate) rsi: u64,
+    pub(crate) rbp: u64,
+    pub(crate) rdx: u64,
+    pub(crate) rcx: u64,
+    pub(crate) rbx: u64,
+    pub(crate) rax: u64,
+    pub(crate) user_return_frame: [u64; 3],
+    user_gs_base: u64,
+    pub(crate) fpu_context: crate::kernel::arch::FpuContext,
+}
+
+impl UserRegisterState {
+    /// # Safety
+    /// `fpu_state` must point to the save area written by `x86_syscall_entry`.
+    unsafe fn from_saved(registers: &SavedRegisters, fpu_state: *const u8) -> Self {
+        let fpu_image = unsafe {
+            core::slice::from_raw_parts(fpu_state, crate::kernel::arch::FPU_CONTEXT_SIZE)
+        };
+        Self {
+            r15: registers.r15,
+            r14: registers.r14,
+            r13: registers.r13,
+            r12: registers.r12,
+            r11: registers.r11,
+            r10: registers.r10,
+            r9: registers.r9,
+            r8: registers.r8,
+            rdi: registers.rdi,
+            rsi: registers.rsi,
+            rbp: registers.rbp,
+            rdx: registers.rdx,
+            rcx: registers.rcx,
+            rbx: registers.rbx,
+            rax: registers.rax,
+            user_return_frame: registers.user_return_frame,
+            user_gs_base: read_msr(IA32_KERNEL_GS_BASE),
+            fpu_context: crate::kernel::arch::fork_fpu_context(
+                fpu_image,
+                read_msr(IA32_FS_BASE),
+            ),
+        }
+    }
+}
+
 #[no_mangle]
-extern "C" fn x86_syscall_dispatch(registers: *mut SavedRegisters) {
+extern "C" fn x86_syscall_dispatch(registers: *mut SavedRegisters, fpu_state: *const u8) {
     let registers = unsafe { &mut *registers };
     let mut frame = SyscallFrame {
         number: registers.rax,
@@ -149,7 +208,19 @@ extern "C" fn x86_syscall_dispatch(registers: *mut SavedRegisters) {
         result: 0,
         errno: 0,
     };
-    crate::kernel::syscall::dispatch(&mut frame);
+    if frame.number == <Syscall as SyscallNumbers>::FORK
+        || frame.number == <Syscall as SyscallNumbers>::CLONE
+        || frame.number == <Syscall as SyscallNumbers>::VFORK
+    {
+        // SAFETY: the entry stub passes its aligned FPU save area with the register frame.
+        let user_registers = unsafe { UserRegisterState::from_saved(registers, fpu_state) };
+        crate::kernel::syscall::dispatch_with_user_registers(&mut frame, user_registers);
+    } else {
+        crate::kernel::syscall::dispatch_with_user_stack_pointer(
+            &mut frame,
+            registers.user_return_frame[2] as usize,
+        );
+    }
     if crate::kernel::syscall::darwin::has_syscall_class(frame.number) {
         let user_flags = &mut registers.user_return_frame[1];
         if frame.errno != 0 {
@@ -159,6 +230,45 @@ extern "C" fn x86_syscall_dispatch(registers: *mut SavedRegisters) {
         }
     }
     registers.rax = frame.result as u64;
+}
+
+/// # Safety
+/// The saved RIP and RSP must be valid in the active address space, its kernel stack must be
+/// installed, and interrupts must be disabled until `iretq` enters userspace.
+pub(crate) unsafe fn restore_user_registers(registers: UserRegisterState) -> ! {
+    write_msr(IA32_KERNEL_GS_BASE, registers.user_gs_base);
+    let register_pointer = &registers as *const UserRegisterState;
+    unsafe {
+        core::arch::asm!(
+            "mov ax, 0x2b",
+            "mov ds, ax",
+            "mov es, ax",
+            "push 0x2b",
+            "push qword ptr [rdi + 136]",
+            "push qword ptr [rdi + 128]",
+            "push 0x33",
+            "push qword ptr [rdi + 120]",
+            "mov r15, qword ptr [rdi + 0]",
+            "mov r14, qword ptr [rdi + 8]",
+            "mov r13, qword ptr [rdi + 16]",
+            "mov r12, qword ptr [rdi + 24]",
+            "mov r11, qword ptr [rdi + 32]",
+            "mov r10, qword ptr [rdi + 40]",
+            "mov r9, qword ptr [rdi + 48]",
+            "mov r8, qword ptr [rdi + 56]",
+            "mov rsi, qword ptr [rdi + 72]",
+            "mov rbp, qword ptr [rdi + 80]",
+            "mov rdx, qword ptr [rdi + 88]",
+            "mov rcx, qword ptr [rdi + 96]",
+            "mov rbx, qword ptr [rdi + 104]",
+            "mov rax, qword ptr [rdi + 112]",
+            "mov rdi, qword ptr [rdi + 64]",
+            "swapgs",
+            "iretq",
+            in("rdi") register_pointer,
+            options(noreturn),
+        );
+    }
 }
 
 pub(crate) fn initialize() -> bool {
@@ -176,19 +286,39 @@ pub(crate) fn initialize() -> bool {
 }
 
 pub(crate) unsafe fn enter_user(entry: usize, stack_pointer: usize) -> ! {
+    unsafe { enter_user_impl(entry, stack_pointer, true) }
+}
+
+/// # Safety
+/// The entry mapping and user stack must be valid, and `set_user_kernel_stack` must have
+/// configured a valid kernel stack for the current thread.
+pub(crate) unsafe fn enter_user_with_configured_kernel_stack(
+    entry: usize,
+    stack_pointer: usize,
+) -> ! {
+    unsafe { enter_user_impl(entry, stack_pointer, false) }
+}
+
+unsafe fn enter_user_impl(
+    entry: usize,
+    stack_pointer: usize,
+    configure_kernel_stack: bool,
+) -> ! {
     if !initialize() || stack_pointer % 16 != 0 {
         crate::kernel::arch::CpuArchitecture::halt();
     }
-    let kernel_stack_pointer: usize;
-    unsafe {
-        core::arch::asm!(
-            "mov {stack}, rsp",
-            stack = out(reg) kernel_stack_pointer,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    if !super::segments::set_kernel_stack(kernel_stack_pointer) {
-        crate::kernel::arch::CpuArchitecture::halt();
+    if configure_kernel_stack {
+        let kernel_stack_pointer: usize;
+        unsafe {
+            core::arch::asm!(
+                "mov {stack}, rsp",
+                stack = out(reg) kernel_stack_pointer,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        if !super::segments::set_kernel_stack(kernel_stack_pointer) {
+            crate::kernel::arch::CpuArchitecture::halt();
+        }
     }
     unsafe {
         core::arch::asm!(
@@ -249,6 +379,9 @@ unsafe extern "C" {
 }
 
 impl SyscallNumbers for Syscall {
+    const FORK: u64 = 57;
+    const CLONE: u64 = 56;
+    const VFORK: u64 = 58;
     const EXIT: u64 = 60;
     const EXIT_GROUP: u64 = 231;
     const GET_PID: u64 = 39;
@@ -282,6 +415,8 @@ impl SyscallNumbers for Syscall {
     const NANOSLEEP: u64 = 35;
     const UNAME: u64 = 63;
     const GETRUSAGE: u64 = 98;
+    const WAIT4: u64 = 61;
+    const EXECVE: u64 = 59;
     const LINKAT: u64 = 265;
     const SYMLINKAT: u64 = 266;
     const DUP: u64 = 32;
@@ -300,6 +435,10 @@ impl SyscallNumbers for Syscall {
     const FCHOWN: u64 = 93;
     const SCHED_YIELD: u64 = 24;
     const READ: u64 = 0;
+    const POLL: u64 = 7;
+    const PREAD64: u64 = 17;
+    const FUTEX: u64 = 202;
+    const BRK: u64 = 12;
     const WRITE: u64 = 1;
     const WRITEV: u64 = 20;
     const CLOSE: u64 = 3;

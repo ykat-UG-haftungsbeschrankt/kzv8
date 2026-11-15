@@ -42,13 +42,15 @@ pub(crate) mod ipc;
 #[path = "lib/mod.rs"]
 pub(crate) mod kernel_lib;
 pub(crate) use kernel_lib as lib;
+pub(crate) use lib::random;
 pub(crate) mod memory;
 pub(crate) mod net;
 pub(crate) mod namespace;
 pub(crate) mod process;
-pub(crate) mod random;
 pub(crate) mod signal;
 pub(crate) mod syscall;
+#[allow(dead_code)]
+pub(crate) mod types;
 pub(crate) use vfs::filesystem::tty as tty;
 #[cfg(not(test))]
 #[path = "../runtime/run.rs"]
@@ -66,7 +68,7 @@ pub(crate) mod vfs;
 // Preserve existing internal paths while modules move to the crate root.
 pub(crate) mod kernel {
     #[allow(unused_imports)]
-    pub(crate) use crate::{arch, beam, block, credentials, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, namespace, process, runtime, scheduler, script, signal, syscall, tty, vfs};
+    pub(crate) use crate::{arch, beam, block, credentials, debug, dl, driver, ebpf, error, event, ipc, lib, memory, net, namespace, process, runtime, scheduler, script, signal, syscall, tty, types, vfs};
     #[cfg(feature = "virtualization")]
     #[allow(unused_imports)]
     pub(crate) use crate::vm;

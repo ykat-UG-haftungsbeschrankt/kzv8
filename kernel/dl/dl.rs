@@ -57,6 +57,29 @@ impl LoadedObject {
         Ok(Self { state })
     }
 
+    pub(crate) fn load_for_dynamic_exec<F: FileSource, A: AddressSpace>(
+        source: &F,
+        address_space: &mut A,
+        kind: ObjectKind,
+    ) -> Result<Self, Error> {
+        if source.len() < 4 {
+            return Err(Error::NoExec);
+        }
+        let mut magic = [0u8; 4];
+        read_exact(source, 0, &mut magic)?;
+        if !super::elf::matches(&magic) {
+            return Err(Error::NoExec);
+        }
+        let object = super::elf::ElfLoadedObject::load_for_dynamic_exec(
+            source,
+            address_space,
+            kind,
+        )?;
+        Ok(Self {
+            state: LoadedObjectState::Elf(object),
+        })
+    }
+
     pub(crate) const fn kind(&self) -> ObjectKind {
         match &self.state {
             LoadedObjectState::Elf(object) => object.kind(),
@@ -67,6 +90,10 @@ impl LoadedObject {
 
     pub(crate) fn is_pe(&self) -> bool {
         matches!(&self.state, LoadedObjectState::Pe(_))
+    }
+
+    pub(crate) fn is_mach_o(&self) -> bool {
+        matches!(&self.state, LoadedObjectState::MachO(_))
     }
 
     pub(crate) const fn mapping_base(&self) -> usize {
@@ -193,6 +220,16 @@ impl LoadedObject {
             LoadedObjectState::Elf(object) => object.seal(address_space),
             LoadedObjectState::Pe(object) => object.seal(address_space),
             LoadedObjectState::MachO(object) => object.seal(address_space),
+        }
+    }
+
+    pub(crate) fn seal_for_dynamic_exec<A: AddressSpace>(
+        &mut self,
+        address_space: &mut A,
+    ) -> Result<(), Error> {
+        match &mut self.state {
+            LoadedObjectState::Elf(object) => object.seal_for_dynamic_exec(address_space),
+            LoadedObjectState::Pe(_) | LoadedObjectState::MachO(_) => Err(Error::OpNotSupp),
         }
     }
 

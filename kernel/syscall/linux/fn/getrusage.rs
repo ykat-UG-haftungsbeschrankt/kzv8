@@ -77,7 +77,7 @@ fn combine_usage(mut usage: ResourceUsageSnapshot, children: ResourceUsageSnapsh
     usage
 }
 
-fn encode_usage(usage: ResourceUsageSnapshot) -> Result<[u8; RUSAGE_LENGTH], Error> {
+pub(crate) fn encode_usage(usage: ResourceUsageSnapshot) -> Result<[u8; RUSAGE_LENGTH], Error> {
     let (user_seconds, user_microseconds) = timeval(usage.user_cpu_time_ns)?;
     let (system_seconds, system_microseconds) = timeval(usage.system_cpu_time_ns)?;
     let values = [

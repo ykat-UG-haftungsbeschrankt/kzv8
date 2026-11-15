@@ -104,6 +104,14 @@ pub(crate) enum SeekFrom {
 pub(crate) trait DirectoryPlugin: Send + Sync {
     fn lookup<'a>(&'a self, name: &'a str) -> VfsFuture<'a, VfsResult<Node>>;
 
+    fn create_file<'a>(
+        &'a self,
+        _name: &'a str,
+        _mode: u16,
+    ) -> VfsFuture<'a, VfsResult<()>> {
+        Box::pin(async { Err(Error::Rofs) })
+    }
+
     fn insert_entry(&self, _name: &str, _node: Node) -> VfsResult<()> {
         Err(Error::Rofs)
     }
@@ -318,6 +326,18 @@ pub(crate) trait VfsApi: Sized {
         mode: OpenMode,
         credentials: Credentials,
     ) -> VfsResult<FileHandle>;
+    fn create_file<'a>(
+        &'a self,
+        path: &'a str,
+        mode: u16,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>>;
+    fn create_file_blocking(
+        &self,
+        path: &str,
+        mode: u16,
+        credentials: &Credentials,
+    ) -> VfsResult<()>;
     fn resolve<'a>(
         &'a self,
         path: &'a str,

@@ -33,7 +33,8 @@ mod virtio;
 #[cfg(all(feature = "fpu-x87", feature = "fpu-sse"))]
 compile_error!("select exactly one of fpu-x87, fpu-sse, or fpu-avx");
 
-pub(crate) use threads::FpuContext;
+pub(crate) use syscall::{restore_user_registers, UserRegisterState};
+pub(crate) use threads::{fork_fpu_context, FpuContext, FPU_CONTEXT_SIZE};
 
 #[allow(dead_code)]
 pub(crate) const VM_ARENA_SIZE: usize =
@@ -346,6 +347,13 @@ impl crate::kernel::arch::traits::ThreadArchitecture for super::ThreadArchitectu
 
     unsafe fn enter_user(entry: usize, stack_pointer: usize) -> ! {
         unsafe { self::enter_user(entry, stack_pointer) }
+    }
+
+    unsafe fn enter_user_with_configured_kernel_stack(
+        entry: usize,
+        stack_pointer: usize,
+    ) -> ! {
+        unsafe { self::syscall::enter_user_with_configured_kernel_stack(entry, stack_pointer) }
     }
 
     fn switch_thread(

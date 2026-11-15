@@ -28,6 +28,8 @@ pub(crate) fn dispatch_call(frame: SyscallFrame) -> Result<i64, Error> {
         r#fn::arch_prctl::ArchPrctl::ID => r#fn::arch_prctl::ArchPrctl::handle(frame),
         r#fn::exit::Exit::ID => r#fn::exit::Exit::handle(frame),
         r#fn::exit_group::ExitGroup::ID => r#fn::exit_group::ExitGroup::handle(frame),
+        #[cfg(target_arch = "x86_64")]
+        r#fn::execve::Execve::ID => r#fn::execve::Execve::handle(frame),
         r#fn::getpid::GetPid::ID => r#fn::getpid::GetPid::handle(frame),
         r#fn::process_group::GetPgid::ID => r#fn::process_group::GetPgid::handle(frame),
         r#fn::process_group::GetSid::ID => r#fn::process_group::GetSid::handle(frame),
@@ -43,7 +45,12 @@ pub(crate) fn dispatch_call(frame: SyscallFrame) -> Result<i64, Error> {
         r#fn::signal_mask::RtSigprocmask::ID => r#fn::signal_mask::RtSigprocmask::handle(frame),
         r#fn::signal_pending::RtSigpending::ID => r#fn::signal_pending::RtSigpending::handle(frame),
         r#fn::signal_action::RtSigaction::ID => r#fn::signal_action::RtSigaction::handle(frame),
+           r#fn::pread64::Pread64::ID => r#fn::pread64::Pread64::handle(frame),
         r#fn::read::Read::ID => r#fn::read::Read::handle(frame),
+        #[cfg(target_arch = "x86_64")]
+        r#fn::poll::Poll::ID => r#fn::poll::Poll::handle(frame),
+        r#fn::pread64::Pread64::ID => r#fn::pread64::Pread64::handle(frame),
+        r#fn::futex::Futex::ID => r#fn::futex::Futex::handle(frame),
         r#fn::readlinkat::ReadlinkAt::ID => r#fn::readlinkat::ReadlinkAt::handle(frame),
         r#fn::unlinkat::UnlinkAt::ID => r#fn::unlinkat::UnlinkAt::handle(frame),
         r#fn::write::Write::ID => r#fn::write::Write::handle(frame),
@@ -70,6 +77,7 @@ pub(crate) fn dispatch_call(frame: SyscallFrame) -> Result<i64, Error> {
         r#fn::getgroups::GetGroups::ID => r#fn::getgroups::GetGroups::handle(frame),
         r#fn::getrandom::Getrandom::ID => r#fn::getrandom::Getrandom::handle(frame),
         r#fn::getrusage::Getrusage::ID => r#fn::getrusage::Getrusage::handle(frame),
+        r#fn::wait4::Wait4::ID => r#fn::wait4::Wait4::handle(frame),
         r#fn::rlimit::Getrlimit::ID => r#fn::rlimit::Getrlimit::handle(frame),
         r#fn::rlimit::Setrlimit::ID => r#fn::rlimit::Setrlimit::handle(frame),
         r#fn::priority::Getpriority::ID => r#fn::priority::Getpriority::handle(frame),
@@ -92,12 +100,13 @@ pub(crate) fn dispatch_call(frame: SyscallFrame) -> Result<i64, Error> {
             r#fn::clock_gettime::ClockGetTime::handle(frame)
         }
         r#fn::chdir::Chdir::ID => r#fn::chdir::Chdir::handle(frame),
+        r#fn::brk::Brk::ID => r#fn::brk::Brk::handle(frame),
         r#fn::mmap::Mmap::ID => r#fn::mmap::Mmap::handle(frame),
         r#fn::munmap::Munmap::ID => r#fn::munmap::Munmap::handle(frame),
         r#fn::mprotect::Mprotect::ID => r#fn::mprotect::Mprotect::handle(frame),
         r#fn::nanosleep::Nanosleep::ID => r#fn::nanosleep::Nanosleep::handle(frame),
         r#fn::uname::Uname::ID => r#fn::uname::Uname::handle(frame),
-        _ => r#fn::unsupported::handle(),
+        _ => r#fn::unsupported::handle_syscall(frame.number),
     }
 }
 
@@ -106,6 +115,20 @@ pub(crate) fn dispatch(frame: &mut SyscallFrame) {
     frame.errno = 0;
     let result = dispatch_call(*frame);
     frame.result = match result {
+        Ok(value) => value,
+        Err(error) => error::to_syscall_result(error),
+    };
+    ThreadManager::end_syscall_accounting();
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn dispatch_with_user_registers(
+    frame: &mut SyscallFrame,
+    registers: crate::kernel::arch::UserRegisterState,
+) {
+    ThreadManager::begin_syscall_accounting();
+    frame.errno = 0;
+    frame.result = match r#fn::fork::dispatch(*frame, registers) {
         Ok(value) => value,
         Err(error) => error::to_syscall_result(error),
     };

@@ -17,6 +17,7 @@ impl SyscallNumbers for Syscall {
     const WRITE: u64 = 64;
     const CLOSE: u64 = 57;
     const GETDENTS64: u64 = 61;
+    const WAIT4: u64 = 260;
     const OPENAT: u64 = 56;
     const CLOCK_GET_TIME: u64 = 113;
     const MMAP: u64 = 222;

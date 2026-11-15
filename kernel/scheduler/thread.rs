@@ -992,6 +992,26 @@ impl ThreadManager {
         Self::enqueue_thread(thread)
     }
 
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn create_fork_child(
+        process: Arc<Process>,
+        registers: crate::kernel::arch::UserRegisterState,
+        signal_mask: SignalSet,
+    ) -> Result<usize, Error> {
+        let mut stack = ThreadStack::try_new(ThreadStack::DEFAULT_SIZE)?;
+        let context = userspace::Context::load_forked(
+            stack.as_mut_slice(),
+            Self::thread_trampoline,
+            process.address_space(),
+            registers,
+        )?;
+        let mut thread = Box::new(ListNode::new(Thread::new_userspace(
+            stack, context, process, true,
+        )));
+        thread.signal_mask = signal_mask;
+        Self::enqueue_thread(thread)
+    }
+
     pub(crate) fn exec_current(
         address_space: vm::UserAddressSpace,
         entry: usize,

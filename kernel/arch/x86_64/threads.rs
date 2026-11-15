@@ -13,13 +13,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::kernel::scheduler::sync::IrqSpinLock;
 
 #[cfg(feature = "fpu-x87")]
-const FPU_CONTEXT_SIZE: usize = 108;
+pub(crate) const FPU_CONTEXT_SIZE: usize = 108;
 #[cfg(all(feature = "fpu-sse", not(feature = "fpu-avx")))]
-const FPU_CONTEXT_SIZE: usize = 512;
+pub(crate) const FPU_CONTEXT_SIZE: usize = 512;
 #[cfg(not(any(feature = "fpu-x87", feature = "fpu-sse", feature = "fpu-avx")))]
-const FPU_CONTEXT_SIZE: usize = 512;
+pub(crate) const FPU_CONTEXT_SIZE: usize = 512;
 #[cfg(feature = "fpu-avx")]
-const FPU_CONTEXT_SIZE: usize = 832;
+pub(crate) const FPU_CONTEXT_SIZE: usize = 832;
 const IA32_FS_BASE: u32 = 0xc000_0100;
 const MAX_CPU_SLOTS: usize = 256;
 
@@ -46,6 +46,14 @@ impl FpuContext {
         }
         Self { _image: image, fs_base: 0 }
     };
+}
+
+pub(crate) fn fork_fpu_context(image: &[u8], fs_base: u64) -> FpuContext {
+    let mut context = FpuContext::INITIAL;
+    let copied_length = image.len().min(FPU_CONTEXT_SIZE);
+    context._image[..copied_length].copy_from_slice(&image[..copied_length]);
+    context.fs_base = fs_base;
+    context
 }
 
 const TLS_BLOCK_SIZE: usize = 4096;

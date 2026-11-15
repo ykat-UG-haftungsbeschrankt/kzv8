@@ -48,6 +48,7 @@ pub(crate) struct VirtioFs {
     request_state: IrqSpinLock<RequestState>,
     node_metadata: IrqSpinLock<BTreeMap<u64, NodeMetadata>>,
     write_locks: IrqSpinLock<BTreeMap<u64, Weak<AtomicBool>>>,
+    request_lock: AtomicBool,
     next_unique: AtomicU64,
     tag: String,
     max_write: usize,
@@ -66,7 +67,7 @@ struct InFlightRequest<'a> {
     completed: bool,
 }
 
-struct FileWriteGuard<'a>(&'a AtomicBool);
+struct AtomicLockGuard<'a>(&'a AtomicBool);
 
 struct InitializationWake;
 
@@ -74,20 +75,20 @@ impl Wake for InitializationWake {
     fn wake(self: Arc<Self>) {}
 }
 
-impl Drop for FileWriteGuard<'_> {
+impl Drop for AtomicLockGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
 }
 
-async fn acquire_file_write_lock(lock: &AtomicBool) -> FileWriteGuard<'_> {
+async fn acquire_atomic_lock(lock: &AtomicBool) -> AtomicLockGuard<'_> {
     while lock
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         crate::kernel::scheduler::future::yield_now().await;
     }
-    FileWriteGuard(lock)
+    AtomicLockGuard(lock)
 }
 
 impl Drop for InFlightRequest<'_> {
@@ -119,6 +120,7 @@ impl VirtioFs {
     const FUSE_KERNEL_MINOR: u32 = 41;
     const FUSE_INIT: u32 = 26;
     const FUSE_LOOKUP: u32 = 1;
+    const FUSE_MKNOD: u32 = 8;
     const FUSE_GETATTR: u32 = 3;
     const FUSE_OPEN: u32 = 14;
     const FUSE_READ: u32 = 15;
@@ -190,6 +192,7 @@ impl VirtioFs {
             }),
             node_metadata: IrqSpinLock::new(BTreeMap::new()),
             write_locks: IrqSpinLock::new(BTreeMap::new()),
+            request_lock: AtomicBool::new(false),
             next_unique: AtomicU64::new(1),
             tag,
             max_write: Self::MAX_REQUEST_SIZE - Self::FUSE_IN_HEADER_SIZE,
@@ -324,6 +327,41 @@ impl VirtioFs {
         self.node_from_type(node_id, mode, owner, group)
     }
 
+    async fn create_file(&self, parent: u64, name: &str, mode: u16) -> VfsResult<()> {
+        if name.is_empty() || name.contains('/') || name.as_bytes().contains(&0) {
+            return Err(Error::Inval);
+        }
+        let payload_length = 16usize
+            .checked_add(name.len())
+            .and_then(|length| length.checked_add(1))
+            .ok_or(Error::MsgSize)?;
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(payload_length)
+            .map_err(|_| Error::NoMem)?;
+        payload.resize(16, 0);
+        Self::write_u32(
+            &mut payload,
+            0,
+            Self::MODE_REGULAR_FILE | u32::from(mode & 0o777),
+        );
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+
+        let mut response = [0; Self::FUSE_ENTRY_OUT_SIZE];
+        let length = self
+            .transact(Self::FUSE_MKNOD, parent, &payload, &mut response)
+            .await?;
+        if length < Self::FUSE_ENTRY_OUT_SIZE {
+            return Err(Error::Proto);
+        }
+        let node_type = Self::read_u32(&response, Self::FUSE_ENTRY_MODE_OFFSET)?;
+        if node_type & Self::MODE_TYPE_MASK != Self::MODE_REGULAR_FILE {
+            return Err(Error::Proto);
+        }
+        Ok(())
+    }
+
     async fn read_dir(self: &Arc<Self>, node_id: u64) -> VfsResult<Vec<DirectoryEntry>> {
         let handle = self.open(node_id, Self::FUSE_OPENDIR, 0).await?;
         let result = self.read_dir_handle(node_id, handle).await;
@@ -445,13 +483,13 @@ impl VirtioFs {
 
     async fn write_at(&self, node_id: u64, offset: u64, buffer: &[u8]) -> VfsResult<usize> {
         let lock = self.write_lock(node_id);
-        let _guard = acquire_file_write_lock(&lock).await;
+        let _guard = acquire_atomic_lock(&lock).await;
         self.write_at_unlocked(node_id, offset, buffer).await
     }
 
     async fn append(&self, node_id: u64, buffer: &[u8]) -> VfsResult<AppendResult> {
         let lock = self.write_lock(node_id);
-        let _guard = acquire_file_write_lock(&lock).await;
+        let _guard = acquire_atomic_lock(&lock).await;
         let offset = self.file_size(node_id).await?;
         let requested = u64::try_from(buffer.len()).map_err(|_| Error::Fbig)?;
         offset.checked_add(requested).ok_or(Error::Fbig)?;
@@ -543,6 +581,7 @@ impl VirtioFs {
             return Err(Error::MsgSize);
         }
 
+        let _request_guard = acquire_atomic_lock(&self.request_lock).await;
         let unique = self.next_unique.fetch_add(1, Ordering::Relaxed);
         let head = {
             let mut state = self.request_state.lock();
@@ -578,7 +617,9 @@ impl VirtioFs {
                     true,
                 ),
             ];
-            let head = state.queue.submit(&descriptors).ok_or(Error::Busy)?;
+            let Some(head) = state.queue.submit(&descriptors) else {
+                return Err(Error::Busy);
+            };
             state.in_flight_head = Some(head);
             state.orphaned = false;
             head
@@ -648,6 +689,7 @@ impl VirtioFs {
         match error {
             -1 => Error::Acces,
             -2 => Error::NoEnt,
+            -17 => Error::Exist,
             -5 => Error::Io,
             -12 => Error::NoMem,
             -13 => Error::Acces,
@@ -749,6 +791,17 @@ impl DirectoryPlugin for FuseDirectory {
         let parent = self.node_id;
         let name = String::from(name);
         Box::pin(async move { filesystem.lookup_node(parent, &name).await })
+    }
+
+    fn create_file<'a>(
+        &'a self,
+        name: &'a str,
+        mode: u16,
+    ) -> VfsFuture<'a, VfsResult<()>> {
+        let filesystem = self.filesystem.clone();
+        let parent = self.node_id;
+        let name = String::from(name);
+        Box::pin(async move { filesystem.create_file(parent, &name, mode).await })
     }
 
     fn read_dir(&self) -> VfsFuture<'_, VfsResult<Vec<DirectoryEntry>>> {

@@ -18,6 +18,7 @@ impl UserAddressSpace {
                 base: 0,
                 length: 0,
                 areas: IrqSpinLock::new(UserAreas::new()),
+                program_break: IrqSpinLock::new((0, 0, 0)),
                 test_stub: true,
             }),
         }

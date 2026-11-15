@@ -150,6 +150,24 @@ impl Process {
     }
 
     #[test]
+    fn fork_file_descriptor_table_preserves_slots_and_close_on_exec() {
+        let mut descriptors = FileDescriptorTable::new();
+        let removed = KernelObjectRef::from_raw(0x1000);
+        let close_on_exec = KernelObjectRef::from_raw(0x2000);
+        let replacement = KernelObjectRef::from_raw(0x3000);
+        let removed_descriptor = descriptors.insert(removed).unwrap();
+        let inherited_descriptor = descriptors
+            .insert_with_flags(close_on_exec, true)
+            .unwrap();
+        assert_eq!(descriptors.remove(removed_descriptor).unwrap(), removed);
+
+        let mut forked = descriptors.try_clone().unwrap();
+        assert_eq!(forked.insert(replacement).unwrap(), removed_descriptor);
+        assert_eq!(forked.remove_next_close_on_exec(), Some(close_on_exec));
+        assert_eq!(descriptors.get(inherited_descriptor).unwrap(), close_on_exec);
+    }
+
+    #[test]
     fn close_on_exec_removes_only_marked_descriptors() {
         let mut descriptors = FileDescriptorTable::new();
         let inherited = KernelObjectRef::from_raw(0x1000);

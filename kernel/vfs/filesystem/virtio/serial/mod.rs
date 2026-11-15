@@ -166,6 +166,7 @@ impl VirtioSerial {
         }
 
         let mut input = serial.input.lock();
+        serial.collect_received(&mut input);
         let length = output.len().min(input.length);
         let first_length = length.min(Self::INPUT_CAPACITY - input.head);
         output[..first_length].copy_from_slice(&input.bytes[input.head..input.head + first_length]);
@@ -243,20 +244,7 @@ impl VirtioSerial {
         }
 
         let mut input = serial.input.lock();
-        if let (Some(expected), Some(used)) =
-            (input.active_head, serial.receive_queue.lock().poll_used())
-        {
-            input.active_head = None;
-            if used.id == u32::from(expected) {
-                let length = (used.length as usize).min(Self::MAX_CHUNK_SIZE);
-                if length != 0 {
-                    let mut receive_buffer = serial.receive_buffer.lock();
-                    if let Some(buffer) = receive_buffer.as_mut() {
-                        Self::append_input(&mut input, &buffer.as_mut_slice()[..length]);
-                    }
-                }
-            }
-        }
+        serial.collect_received(&mut input);
         let receive_notify = serial.submit_receive(&mut input);
         drop(input);
 
@@ -283,6 +271,28 @@ impl VirtioSerial {
                     transport.notify(1);
                 }
             }
+        }
+    }
+
+    fn collect_received(&self, input: &mut InputQueue) {
+        let Some(expected) = input.active_head else {
+            return;
+        };
+        let Some(used) = self.receive_queue.lock().poll_used() else {
+            return;
+        };
+        input.active_head = None;
+        if used.id != u32::from(expected) {
+            return;
+        }
+
+        let length = (used.length as usize).min(Self::MAX_CHUNK_SIZE);
+        if length == 0 {
+            return;
+        }
+        let mut receive_buffer = self.receive_buffer.lock();
+        if let Some(buffer) = receive_buffer.as_mut() {
+            Self::append_input(input, &buffer.as_mut_slice()[..length]);
         }
     }
 

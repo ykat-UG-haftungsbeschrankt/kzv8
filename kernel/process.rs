@@ -282,6 +282,12 @@ pub(crate) struct ChildExitStatus {
     resource_usage: ResourceUsageSnapshot,
 }
 
+impl ChildExitStatus {
+    pub(crate) const fn resource_usage_snapshot(self) -> ResourceUsageSnapshot {
+        self.resource_usage
+    }
+}
+
 struct ChildProcessRecord {
     process_id: i32,
     process_group_id: i32,
@@ -789,6 +795,7 @@ struct FileDescriptorTable {
     entries: Vec<Option<FileDescriptorEntry>>,
 }
 
+#[derive(Clone, Copy)]
 struct FileDescriptorEntry {
     object: KernelObjectRef,
     close_on_exec: bool,
@@ -869,6 +876,15 @@ impl FileDescriptorTable {
             .map(|entry| entry.object)
             .ok_or(Error::Badf)
     }
+
+    fn try_clone(&self) -> Result<Self, Error> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| Error::NoMem)?;
+        entries.extend(self.entries.iter().copied());
+        Ok(Self { entries })
+    }
 }
 
 pub(crate) struct Process {
@@ -894,6 +910,7 @@ pub(crate) struct Process {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SyscallAbi {
     Linux,
+    Darwin,
     WindowsNt,
 }
 
@@ -959,6 +976,23 @@ impl Process {
         )?;
         child.set_syscall_abi(parent.syscall_abi());
         parent.register_child(&child)?;
+        Ok(child)
+    }
+
+    pub(crate) fn new_fork_child(
+        parent: &Arc<Self>,
+        address_space: UserAddressSpace,
+    ) -> Result<Arc<Self>, Error> {
+        let child = Self::new_child_with_address_space(
+            parent,
+            parent.namespace_set(),
+            parent.credentials()?,
+            address_space,
+        )?;
+        if let Err(error) = parent.inherit_fork_state(&child) {
+            parent.discard_unstarted_child(child.pid);
+            return Err(error);
+        }
         Ok(child)
     }
 
@@ -1111,6 +1145,7 @@ impl Process {
 
     pub(crate) fn syscall_abi(&self) -> SyscallAbi {
         match self.syscall_abi.load(Ordering::Acquire) {
+            value if value == SyscallAbi::Darwin as u8 => SyscallAbi::Darwin,
             value if value == SyscallAbi::WindowsNt as u8 => SyscallAbi::WindowsNt,
             _ => SyscallAbi::Linux,
         }
@@ -2031,6 +2066,34 @@ impl Process {
             .lock()
             .retain(|child| child.process_id != process_id);
         PROCESS_REGISTRY.lock().retain(|entry| entry.pid != process_id);
+    }
+
+    fn inherit_fork_state(&self, child: &Process) -> Result<(), Error> {
+        let signals = self.signals.lock().for_spawn(SignalSet::EMPTY);
+        *child.signals.lock() = signals;
+
+        let (file_descriptors, objects) = {
+            let descriptors = self.file_descriptors.lock();
+            let file_descriptors = descriptors.try_clone()?;
+            let mut objects = Vec::new();
+            objects
+                .try_reserve_exact(descriptors.entries.iter().flatten().count())
+                .map_err(|_| Error::NoMem)?;
+            let kernel_objects = self.kernel_objects.lock();
+            for entry in descriptors.entries.iter().flatten() {
+                objects.push(kernel_objects.get(entry.object)?);
+            }
+            (file_descriptors, objects)
+        };
+
+        {
+            let mut kernel_objects = child.kernel_objects.lock();
+            for object in objects {
+                kernel_objects.insert_shared(object)?;
+            }
+        }
+        *child.file_descriptors.lock() = file_descriptors;
+        Ok(())
     }
 
     pub(crate) fn current_directory(&self) -> Result<Vec<u8>, Error> {

@@ -174,7 +174,26 @@ impl ElfLoadedObject {
         kind: ObjectKind,
         preferred_address: Option<usize>,
     ) -> Result<Self, Error> {
-        let parsed = ParsedElf::parse(source, kind)?;
+        Self::load_with_options(source, address_space, kind, preferred_address, false, true)
+    }
+
+    pub(crate) fn load_for_dynamic_exec<F: FileSource, A: AddressSpace>(
+        source: &F,
+        address_space: &mut A,
+        kind: ObjectKind,
+    ) -> Result<Self, Error> {
+        Self::load_with_options(source, address_space, kind, None, true, false)
+    }
+
+    fn load_with_options<F: FileSource, A: AddressSpace>(
+        source: &F,
+        address_space: &mut A,
+        kind: ObjectKind,
+        preferred_address: Option<usize>,
+        allow_interpreter: bool,
+        parse_dynamic: bool,
+    ) -> Result<Self, Error> {
+        let parsed = ParsedElf::parse(source, kind, allow_interpreter)?;
         let fixed = parsed.fixed_address;
         let preferred_address = if fixed {
             if preferred_address.is_some_and(|address| address != parsed.minimum_page) {
@@ -203,7 +222,13 @@ impl ElfLoadedObject {
             return Err(Error::NoMem);
         }
 
-        let result = Self::load_reserved(&parsed, address_space, mapping_base, load_bias);
+        let result = Self::load_reserved(
+            &parsed,
+            address_space,
+            mapping_base,
+            load_bias,
+            parse_dynamic,
+        );
         if result.is_err() {
             address_space.release(mapping_base, parsed.mapping_length);
         }
@@ -350,6 +375,21 @@ impl ElfLoadedObject {
         &mut self,
         address_space: &mut A,
     ) -> Result<(), Error> {
+        self.seal_with_relro(address_space, true)
+    }
+
+    pub(crate) fn seal_for_dynamic_exec<A: AddressSpace>(
+        &mut self,
+        address_space: &mut A,
+    ) -> Result<(), Error> {
+        self.seal_with_relro(address_space, false)
+    }
+
+    fn seal_with_relro<A: AddressSpace>(
+        &mut self,
+        address_space: &mut A,
+        apply_relro: bool,
+    ) -> Result<(), Error> {
         if self.state != ObjectState::ReadyToSeal {
             return Err(Error::Inval);
         }
@@ -384,20 +424,22 @@ impl ElfLoadedObject {
             }
         }
 
-        for segment in &self.relro_segments {
-            let segment_end = segment
-                .virtual_address
-                .checked_add(segment.memory_size)
-                .ok_or(Error::Overflow)?;
-            let first_page = segment.virtual_address & !((PAGE_SIZE as u64) - 1);
-            let end_page = segment_end & !((PAGE_SIZE as u64) - 1);
-            if end_page <= first_page {
-                continue;
-            }
-            let start_index = self.page_index(first_page)?;
-            let end_index = self.page_index(end_page)?;
-            for page in &mut page_permissions[start_index..end_index] {
-                *page &= !Permissions::WRITE.bits();
+        if apply_relro {
+            for segment in &self.relro_segments {
+                let segment_end = segment
+                    .virtual_address
+                    .checked_add(segment.memory_size)
+                    .ok_or(Error::Overflow)?;
+                let first_page = segment.virtual_address & !((PAGE_SIZE as u64) - 1);
+                let end_page = segment_end & !((PAGE_SIZE as u64) - 1);
+                if end_page <= first_page {
+                    continue;
+                }
+                let start_index = self.page_index(first_page)?;
+                let end_index = self.page_index(end_page)?;
+                for page in &mut page_permissions[start_index..end_index] {
+                    *page &= !Permissions::WRITE.bits();
+                }
             }
         }
         if self.self_relocation_prepared {
@@ -565,6 +607,7 @@ impl ElfLoadedObject {
         address_space: &mut A,
         mapping_base: usize,
         load_bias: usize,
+        parse_dynamic: bool,
     ) -> Result<Self, Error> {
         address_space.zero(mapping_base, parsed.mapping_length)?;
         let mut relro_segments = Vec::new();
@@ -595,7 +638,11 @@ impl ElfLoadedObject {
             }
         }
 
-        let (needed, symbols, relocations) = parsed.load_dynamic(load_bias)?;
+        let (needed, symbols, relocations) = if parse_dynamic {
+            parsed.load_dynamic(load_bias)?
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         let mut load_ranges = Vec::new();
         load_ranges
             .try_reserve_exact(parsed.load_ranges.len())
@@ -635,7 +682,11 @@ impl ElfLoadedObject {
 }
 
 impl<'a, F: FileSource> ParsedElf<'a, F> {
-    fn parse(source: &'a F, requested_kind: ObjectKind) -> Result<Self, Error> {
+    fn parse(
+        source: &'a F,
+        requested_kind: ObjectKind,
+        allow_interpreter: bool,
+    ) -> Result<Self, Error> {
         if source.len() < ELF_HEADER_SIZE as u64 {
             return Err(Error::NoExec);
         }
@@ -770,7 +821,7 @@ impl<'a, F: FileSource> ParsedElf<'a, F> {
                     has_executable_entry = true;
                 }
             }
-            if header.kind == PT_INTERP {
+            if header.kind == PT_INTERP && !allow_interpreter {
                 return Err(Error::OpNotSupp);
             }
             program_headers.push(header);

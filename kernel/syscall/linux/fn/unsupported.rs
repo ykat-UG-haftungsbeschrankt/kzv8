@@ -11,6 +11,10 @@ pub(crate) fn handle() -> Result<i64, Error> {
     Err(Error::NoSys)
 }
 
+pub(crate) fn handle_syscall(_number: u64) -> Result<i64, Error> {
+    handle()
+}
+
 #[cfg(test)]
 #[path = "../../../../tests/kernel/syscall/linux/fn/unsupported.rs"]
 mod tests;

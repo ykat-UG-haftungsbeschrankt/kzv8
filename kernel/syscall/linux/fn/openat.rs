@@ -12,11 +12,11 @@ use crate::kernel::scheduler::thread::ThreadManager;
 use crate::kernel::vfs::{FileHandleApi as _, OpenMode, VfsApi as _};
 
 const OPEN_ACCESS_MODE_MASK: u64 = 0x3;
+const OPEN_CREATE: u64 = 0o100;
 const OPEN_DIRECTORY: u64 = 0x1_0000;
 const OPEN_CLOEXEC: u64 = 0x8_0000;
 const OPEN_IGNORED_FLAGS: u64 = 0o400 | 0o100000;
-const OPEN_UNSUPPORTED_FLAGS: u64 = 0o100
-    | 0o200
+const OPEN_UNSUPPORTED_FLAGS: u64 = 0o200
     | 0o1000
     | 0o2000
     | 0o4000
@@ -29,6 +29,7 @@ const OPEN_UNSUPPORTED_FLAGS: u64 = 0o100
     | 0o10000000
     | 0o20000000;
 const OPEN_KNOWN_FLAGS: u64 = OPEN_ACCESS_MODE_MASK
+    | OPEN_CREATE
     | OPEN_DIRECTORY
     | OPEN_CLOEXEC
     | OPEN_IGNORED_FLAGS
@@ -65,7 +66,19 @@ impl OpenAt {
             &process,
         )?;
         let vfs = crate::kernel::vfs::mounted().ok_or(Error::NoDev)?;
-        let file = vfs.open_blocking(&path, open_mode, process.credentials()?)?;
+        let file = match vfs.open_blocking(&path, open_mode, process.credentials()?) {
+            Ok(file) => file,
+            Err(Error::NoEnt) if arguments.flags & OPEN_CREATE != 0 => {
+                let mode = ((arguments.mode as u32 & 0o777) & !process.umask()) as u16;
+                let credentials = process.credentials()?;
+                match vfs.create_file_blocking(&path, mode, &credentials) {
+                    Ok(()) | Err(Error::Exist) => {}
+                    Err(error) => return Err(error),
+                }
+                vfs.open_blocking(&path, open_mode, process.credentials()?)?
+            }
+            Err(error) => return Err(error),
+        };
         if arguments.flags & OPEN_DIRECTORY != 0 && !file.is_directory() {
             return Err(Error::NotDir);
         }
@@ -78,7 +91,6 @@ impl OpenAt {
             process.close_file_descriptor(descriptor)?;
             return Err(Error::Mfile);
         }
-        let _ = arguments.mode;
         Ok(i64::from(descriptor))
     }
 

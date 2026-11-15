@@ -6,6 +6,7 @@
  */
 
 pub(crate) mod block;
+pub(crate) mod ramdisk;
 pub(crate) mod tty;
 pub(crate) mod virtio;
 #[cfg(feature = "virtualization")]

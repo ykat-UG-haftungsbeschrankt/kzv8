@@ -965,7 +965,7 @@ impl<'a, F: FileSource> ParsedPe<'a, F> {
                 let target_rva = first_thunk
                     .checked_add(thunk_offset)
                     .ok_or(Error::Overflow)?;
-                if !self.is_writable_rva(target_rva, 8) {
+                if !self.is_import_target_rva(target_rva, 8) {
                     return Err(Error::Libbad);
                 }
                 if self.imports.len() >= MAX_IMPORTS {
@@ -1046,9 +1046,9 @@ impl<'a, F: FileSource> ParsedPe<'a, F> {
         Ok(())
     }
 
-    fn is_writable_rva(&self, rva: u32, length: usize) -> bool {
+    fn is_import_target_rva(&self, rva: u32, length: usize) -> bool {
         self.sections.iter().any(|section| {
-            section.characteristics & IMAGE_SCN_MEM_WRITE != 0
+            section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0
                 && section_contains(section, rva, length)
         })
     }

@@ -41,6 +41,7 @@ impl SyscallNumbers for Syscall {
     const NANOSLEEP: u64 = 101;
     const UNAME: u64 = 160;
     const GETRUSAGE: u64 = 165;
+    const EXECVE: u64 = 221;
     const LINKAT: u64 = 37;
     const SYMLINKAT: u64 = 36;
     const DUP: u64 = 23;
@@ -59,6 +60,9 @@ impl SyscallNumbers for Syscall {
     const FCHOWN: u64 = 55;
     const SCHED_YIELD: u64 = 124;
     const READ: u64 = 63;
+    const PREAD64: u64 = 67;
+    const FUTEX: u64 = 98;
+    const BRK: u64 = 214;
     const WRITE: u64 = 64;
     const WRITEV: u64 = 66;
     const CLOSE: u64 = 57;

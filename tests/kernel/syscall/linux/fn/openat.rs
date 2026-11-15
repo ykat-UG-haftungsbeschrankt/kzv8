@@ -21,7 +21,8 @@ fn syscall_id_matches_linux_architecture_abi() {
 #[test]
 fn openat_distinguishes_unsupported_known_flags_from_unknown_bits() {
     assert_eq!(validate_flags(0), Ok(()));
-    assert_eq!(validate_flags(0o100), Err(Error::NoSys));
+    assert_eq!(validate_flags(0o100), Ok(()));
+    assert_eq!(validate_flags(0o200), Err(Error::NoSys));
     assert_eq!(validate_flags(0o4010000), Err(Error::NoSys));
     assert_eq!(validate_flags(0o20200000), Err(Error::NoSys));
     assert_eq!(validate_flags(1 << 30), Err(Error::Inval));

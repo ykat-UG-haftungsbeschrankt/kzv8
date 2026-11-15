@@ -82,8 +82,15 @@ BusyBox at `libraries/linux/x86_64/busybox`. The target enables RDRAND for the
 Linux `AT_RANDOM` startup bytes. Override `VIRTIOFS_BUSYBOX` to stage a
 compatible static PIE executable. Ash standalone mode runs applets such as
 `ls` in-process, so basic commands do not require Linux `execve`. The target
-uses shared memfd-backed guest RAM, which the vhost-user filesystem backend
-requires.
+also stages `libraries/linux/x86_64/mc` and the Debian runtime under
+`libraries/linux/x86_64/mc-runtime/root`; the original `.deb` archives are
+kept in `mc-runtime/packages`. BusyBox receives an `LD_LIBRARY_PATH` for the
+staged libraries. VirtIO-FS in this kernel does not follow symlinks, so the
+target materializes the runtime's SONAME symlinks as regular files in the
+guest root. The kernel maps ELF interpreters and file-backed private mappings
+so the guest dynamic linker can load them. At the ash prompt, run `mc` or
+`mc --version`. The target uses shared memfd-backed guest RAM, which the
+vhost-user filesystem backend requires.
 
 To build an image without starting QEMU, use
 `make build/x86_64/kernel.elf` or `make build/aarch64/kernel.bin`.

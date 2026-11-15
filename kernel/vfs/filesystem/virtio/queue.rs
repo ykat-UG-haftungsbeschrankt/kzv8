@@ -203,11 +203,11 @@ impl<const N: usize> VirtQueue<N> {
         if queue_size == 0 {
             return None;
         }
+        DmaArena::sync_for_cpu();
         let used_index = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.used.index)) };
         if self.last_used == used_index {
             return None;
         }
-        DmaArena::sync_for_cpu();
         let slot = usize::from(self.last_used) % queue_size;
         let element =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!(self.used.ring[slot])) };

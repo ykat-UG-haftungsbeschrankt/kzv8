@@ -1077,6 +1077,34 @@ impl VfsApi for Vfs {
         run_vfs_future(self.open(path, mode, credentials))
     }
 
+    fn create_file<'a>(
+        &'a self,
+        path: &'a str,
+        mode: u16,
+        credentials: &'a Credentials,
+    ) -> VfsFuture<'a, VfsResult<()>> {
+        Box::pin(async move {
+            let (parent_path, name) = split_parent_path(path)?;
+            let (parent, _) = self
+                .resolve_internal(parent_path, credentials, true)
+                .await?;
+            check_directory_mutation(&parent, credentials, false)?;
+            match &parent {
+                Node::Directory { plugin, .. } => plugin.create_file(name, mode).await,
+                Node::File { .. } | Node::Symlink { .. } => Err(Error::NotDir),
+            }
+        })
+    }
+
+    fn create_file_blocking(
+        &self,
+        path: &str,
+        mode: u16,
+        credentials: &Credentials,
+    ) -> VfsResult<()> {
+        run_vfs_future(self.create_file(path, mode, credentials))
+    }
+
     fn resolve<'a>(
         &'a self,
         path: &'a str,

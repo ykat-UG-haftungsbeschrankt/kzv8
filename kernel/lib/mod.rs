@@ -30,6 +30,7 @@ pub(crate) mod list;
 pub(crate) mod lookup;
 #[allow(dead_code)]
 pub(crate) mod queue;
+pub(crate) mod random;
 pub(crate) mod stack;
 pub(crate) mod sorted_vector;
 #[allow(dead_code)]

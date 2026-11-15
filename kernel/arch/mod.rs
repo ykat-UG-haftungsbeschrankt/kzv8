@@ -183,6 +183,14 @@ pub(crate) mod syscall {
         const NANOSLEEP: u64;
         const UNAME: u64;
         const GETRUSAGE: u64;
+        const WAIT4: u64;
+        const EXECVE: u64;
+        #[cfg(target_arch = "x86_64")]
+        const FORK: u64;
+        #[cfg(target_arch = "x86_64")]
+        const CLONE: u64;
+        #[cfg(target_arch = "x86_64")]
+        const VFORK: u64;
         const LINKAT: u64;
         const SYMLINKAT: u64;
         const DUP: u64;
@@ -201,6 +209,11 @@ pub(crate) mod syscall {
         const FCHOWN: u64;
         const SCHED_YIELD: u64;
         const READ: u64;
+        #[cfg(target_arch = "x86_64")]
+        const POLL: u64;
+        const PREAD64: u64;
+        const FUTEX: u64;
+        const BRK: u64;
         const WRITE: u64;
         const WRITEV: u64;
         const CLOSE: u64;
@@ -284,6 +297,19 @@ pub(crate) mod syscall {
     #[allow(non_upper_case_globals)]
     pub(crate) const Getrusage: u64 = <Syscall as SyscallNumbers>::GETRUSAGE;
     #[allow(non_upper_case_globals)]
+    pub(crate) const Wait4: u64 = <Syscall as SyscallNumbers>::WAIT4;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Execve: u64 = <Syscall as SyscallNumbers>::EXECVE;
+    #[cfg(target_arch = "x86_64")]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Fork: u64 = <Syscall as SyscallNumbers>::FORK;
+    #[cfg(target_arch = "x86_64")]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Clone: u64 = <Syscall as SyscallNumbers>::CLONE;
+    #[cfg(target_arch = "x86_64")]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Vfork: u64 = <Syscall as SyscallNumbers>::VFORK;
+    #[allow(non_upper_case_globals)]
     pub(crate) const Linkat: u64 = <Syscall as SyscallNumbers>::LINKAT;
     #[allow(non_upper_case_globals)]
     pub(crate) const Symlinkat: u64 = <Syscall as SyscallNumbers>::SYMLINKAT;
@@ -319,6 +345,15 @@ pub(crate) mod syscall {
     pub(crate) const SchedYield: u64 = <Syscall as SyscallNumbers>::SCHED_YIELD;
     #[allow(non_upper_case_globals)]
     pub(crate) const Read: u64 = <Syscall as SyscallNumbers>::READ;
+    #[cfg(target_arch = "x86_64")]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Poll: u64 = <Syscall as SyscallNumbers>::POLL;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Pread64: u64 = <Syscall as SyscallNumbers>::PREAD64;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Futex: u64 = <Syscall as SyscallNumbers>::FUTEX;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Brk: u64 = <Syscall as SyscallNumbers>::BRK;
     #[allow(non_upper_case_globals)]
     pub(crate) const Write: u64 = <Syscall as SyscallNumbers>::WRITE;
     #[allow(non_upper_case_globals)]
@@ -393,6 +428,17 @@ pub(crate) mod traits {
         /// # Safety
         /// `entry` and `stack_pointer` must refer to executable and writable user mappings.
         unsafe fn enter_user(entry: usize, stack_pointer: usize) -> !;
+        /// Enter after `set_user_kernel_stack` has selected the privilege-transition stack.
+        ///
+        /// # Safety
+        /// `entry` and `stack_pointer` must refer to executable and writable user mappings,
+        /// and the configured kernel stack must remain valid for the userspace thread.
+        unsafe fn enter_user_with_configured_kernel_stack(
+            entry: usize,
+            stack_pointer: usize,
+        ) -> ! {
+            unsafe { Self::enter_user(entry, stack_pointer) }
+        }
         fn switch_thread(
             old_stack: &mut usize,
             new_stack: usize,
