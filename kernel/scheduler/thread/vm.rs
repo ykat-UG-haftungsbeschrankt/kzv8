@@ -390,21 +390,6 @@ impl UserAddressSpace {
 			}
 			areas
 		};
-		crate::kernel::debug::debug_fmt(format_args!(
-			"kz: fork VM source root={:#x} base={:#x} length={:#x} areas={}\n",
-			self.inner.root,
-			self.inner.base,
-			self.inner.length,
-			areas.len()
-		));
-		for (range, page_states) in &areas {
-			crate::kernel::debug::debug_fmt(format_args!(
-				"kz: fork VM area={:#x}..{:#x} pages={}\n",
-				range.start,
-				range.end,
-				page_states.len()
-			));
-		}
 		let mut child = Self::new()?;
 		child.set_program_break_state(self.program_break_state());
 		let mut page_contents = alloc::boxed::Box::new([0; USER_VM_PAGE_SIZE]);
@@ -485,56 +470,6 @@ impl UserAddressSpace {
 					return Err(Error::NoMem);
 				}
 			}
-		}
-		#[cfg(target_arch = "x86_64")]
-		{
-			let kernel_page = 0x10_0000_4000usize;
-			let stack_page = 0x8ff_ffff_000usize;
-			let parent_frames = self
-				.activate(|| {
-					(
-						crate::kernel::arch::MemoryArchitecture::debug_page_frame(kernel_page),
-						crate::kernel::arch::MemoryArchitecture::debug_page_frame(stack_page),
-					)
-				})
-				.unwrap_or((None, None));
-			let child_frames = child
-				.activate(|| {
-					(
-						crate::kernel::arch::MemoryArchitecture::debug_page_frame(kernel_page),
-						crate::kernel::arch::MemoryArchitecture::debug_page_frame(stack_page),
-					)
-				})
-				.unwrap_or((None, None));
-			let parent_transient_kernel_frame = self
-				.activate(|| {
-					crate::kernel::arch::MemoryArchitecture::debug_page_frame(0x10_0014_e000)
-				})
-				.flatten();
-			let child_transient_kernel_frame = child
-				.activate(|| {
-					crate::kernel::arch::MemoryArchitecture::debug_page_frame(0x10_0014_e000)
-				})
-				.flatten();
-			let parent_kernel_entries = self
-				.activate(|| {
-					crate::kernel::arch::MemoryArchitecture::debug_page_table_entries(kernel_page)
-				})
-				.flatten();
-			let child_kernel_entries = child
-				.activate(|| {
-					crate::kernel::arch::MemoryArchitecture::debug_page_table_entries(kernel_page)
-				})
-				.flatten();
-			crate::kernel::debug::debug_fmt(format_args!(
-				"kz: fork page frames kernel={:?} stack={:?} transient={:?}/{:?} kernel entries={:?}/{:?}\n",
-				parent_frames,
-				child_frames,
-				parent_transient_kernel_frame,
-				child_transient_kernel_frame,
-				parent_kernel_entries,
-				child_kernel_entries
-			));
 		}
 		Ok(child)
 	}

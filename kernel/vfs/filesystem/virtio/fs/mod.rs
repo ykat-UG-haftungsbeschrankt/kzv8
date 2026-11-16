@@ -78,10 +78,6 @@ impl Wake for InitializationWake {
 impl Drop for AtomicLockGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: FUSE atomic lock released address={:p}\n",
-            self.0
-        ));
     }
 }
 
@@ -585,26 +581,7 @@ impl VirtioFs {
             return Err(Error::MsgSize);
         }
 
-        let (in_flight_head, orphaned) = {
-            let state = self.request_state.lock();
-            (state.in_flight_head, state.orphaned)
-        };
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: FUSE transact waiting opcode={} node={} request={} lock={:p} held={} in_flight={:?} orphaned={}\n",
-            opcode,
-            node_id,
-            request_length,
-            &self.request_lock,
-            self.request_lock.load(Ordering::Acquire),
-            in_flight_head,
-            orphaned
-        ));
         let _request_guard = acquire_atomic_lock(&self.request_lock).await;
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: FUSE transact locked opcode={} node={}
-",
-            opcode, node_id
-        ));
         let unique = self.next_unique.fetch_add(1, Ordering::Relaxed);
         let head = {
             let mut state = self.request_state.lock();
@@ -647,11 +624,6 @@ impl VirtioFs {
             state.orphaned = false;
             head
         };
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: FUSE transact submitted opcode={} node={} head={} unique={}
-",
-            opcode, node_id, head, unique
-        ));
         DmaArena::sync_for_device();
         self.transport.notify(Self::REQUEST_QUEUE);
 
@@ -669,11 +641,6 @@ impl VirtioFs {
                 crate::kernel::scheduler::future::yield_now().await;
                 continue;
             };
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: FUSE transact completed opcode={} node={} head={} length={}
-",
-                opcode, node_id, head, used.length
-            ));
             let body_length = {
                 let mut state = self.request_state.lock();
                 if state.in_flight_head != Some(head) || used.id != u32::from(head) {
@@ -697,10 +664,6 @@ impl VirtioFs {
                     return Err(Error::Proto);
                 }
                 if error != 0 {
-                    crate::kernel::debug::debug_fmt(format_args!(
-                        "kz: FUSE opcode={} node={} errno={}\n",
-                        opcode, node_id, error,
-                    ));
                     return Err(Self::map_fuse_error(error));
                 }
                 let body_length = response_length - Self::FUSE_OUT_HEADER_SIZE;
@@ -715,11 +678,6 @@ impl VirtioFs {
             };
             return Ok(body_length);
         }
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: FUSE transact spin limit opcode={} node={}
-",
-            opcode, node_id
-        ));
         Err(Error::Io)
     }
 

@@ -111,12 +111,6 @@ pub(crate) fn dispatch_call(frame: SyscallFrame) -> Result<i64, Error> {
 }
 
 pub(crate) fn dispatch(frame: &mut SyscallFrame) {
-    if ThreadManager::current_process().is_ok_and(|process| process.pid() == 2) {
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: child syscall number={} arguments={:x?}\n",
-            frame.number, frame.arguments
-        ));
-    }
     ThreadManager::begin_syscall_accounting();
     frame.errno = 0;
     let result = dispatch_call(*frame);

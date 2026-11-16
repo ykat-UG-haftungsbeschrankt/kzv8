@@ -166,12 +166,6 @@ impl<T> LinkedList<T> {
         self.head.is_none()
     }
 
-    pub(crate) fn debug_head_address(&self) -> Option<usize> {
-        self.head
-            .as_deref()
-            .map(|node| node as *const ListNode<T> as usize)
-    }
-
     pub(crate) fn try_push_front(&mut self, value: T) -> Result<(), T> {
         let layout = Layout::new::<ListNode<T>>();
         // SAFETY: Layout is valid and nonzero for the sized ListNode<T>.

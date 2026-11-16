@@ -7,13 +7,7 @@
 
 use core::mem::size_of;
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::kernel::arch::traits::MemoryArchitecture as _;
-
-static PAGE_FAULT_DIAGNOSTIC: AtomicBool = AtomicBool::new(false);
-static KERNEL_PAGE_FAULT_DIAGNOSTIC: AtomicBool = AtomicBool::new(false);
-static CHILD_KERNEL_PAGE_FAULT_DIAGNOSTIC: AtomicUsize = AtomicUsize::new(0);
 const FPU_MODE: usize = if cfg!(feature = "fpu-x87") {
     0
 } else if cfg!(feature = "fpu-avx") {
@@ -559,26 +553,6 @@ pub(crate) fn enabled() -> bool {
 extern "C" fn x86_page_fault_dispatch(address: usize, error_code: u64) -> u64 {
     const REJECTED_FAULT_BITS: u64 = (1 << 0) | (1 << 3) | (1 << 5) | (1 << 6);
     let user_fault = error_code & (1 << 2) != 0;
-    let child_kernel_fault = !user_fault
-        && crate::kernel::scheduler::thread::ThreadManager::current_process()
-            .is_ok_and(|process| process.pid() == 2)
-        && CHILD_KERNEL_PAGE_FAULT_DIAGNOSTIC.fetch_add(1, Ordering::AcqRel) < 16;
-    if child_kernel_fault {
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: child kernel page fault address={:#x} error={:#x} root={:#x}\n",
-            address,
-            error_code,
-            crate::kernel::arch::MemoryArchitecture::current_address_space()
-        ));
-    }
-    if !user_fault && !KERNEL_PAGE_FAULT_DIAGNOSTIC.swap(true, Ordering::AcqRel) {
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: first kernel page fault address={:#x} error={:#x} root={:#x}\n",
-            address,
-            error_code,
-            crate::kernel::arch::MemoryArchitecture::current_address_space()
-        ));
-    }
     if error_code & REJECTED_FAULT_BITS != 0 {
         if user_fault {
             crate::kernel::scheduler::thread::ThreadManager::exit_current(core::ptr::null_mut());
@@ -593,22 +567,8 @@ extern "C" fn x86_page_fault_dispatch(address: usize, error_code: u64) -> u64 {
         crate::kernel::memory::r#virtual::FaultAccess::Read
     };
     let resolved = crate::kernel::memory::r#virtual::resolve_page_fault(address, access);
-    if child_kernel_fault {
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: child kernel page fault resolved={} address={:#x}\n",
-            resolved, address
-        ));
-    }
     if user_fault && !resolved {
         crate::kernel::scheduler::thread::ThreadManager::exit_current(core::ptr::null_mut());
-    }
-    if !PAGE_FAULT_DIAGNOSTIC.swap(true, Ordering::AcqRel) {
-        let message = if resolved {
-            b"kz: first lazy page fault resolved\n" as &[u8]
-        } else {
-            b"kz: first lazy page fault rejected\n" as &[u8]
-        };
-        let _written = crate::kernel::vfs::filesystem::virtio::console::Console::write(message);
     }
     resolved as u64
 }

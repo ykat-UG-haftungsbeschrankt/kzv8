@@ -11,7 +11,6 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::kernel::arch::traits::MemoryArchitecture as _;
 use crate::kernel::vfs::filesystem::virtio::transport::{self, VirtioDeviceInfo, VirtioTransport};
 use crate::kernel::error::Error;
 use crate::kernel::lib::hashmap::HashMap;
@@ -29,36 +28,10 @@ struct Directory {
 
 impl DirectoryPlugin for Directory {
     fn lookup<'a>(&'a self, name: &'a str) -> VfsFuture<'a, VfsResult<Node>> {
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: directory lookup start directory={:p} name={} root={:#x}\n",
-            self,
-            name,
-            crate::kernel::arch::MemoryArchitecture::current_address_space()
-        ));
         let result = {
             let entries = self.entries.lock();
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: directory lookup locked directory={:p} name={}\n",
-                self, name
-            ));
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: directory map get start directory={:p} len={} name={}\n",
-                self,
-                entries.len(),
-                name
-            ));
-            let result = entries.get(name).cloned().ok_or(Error::NoEnt);
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: directory map get complete directory={:p} found={}\n",
-                self,
-                result.is_ok()
-            ));
-            result
+            entries.get(name).cloned().ok_or(Error::NoEnt)
         };
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: directory lookup released directory={:p} name={}\n",
-            self, name
-        ));
         Box::pin(async move { result })
     }
 

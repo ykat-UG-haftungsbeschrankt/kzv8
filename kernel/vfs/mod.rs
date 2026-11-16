@@ -104,6 +104,10 @@ pub(crate) enum SeekFrom {
 pub(crate) trait DirectoryPlugin: Send + Sync {
     fn lookup<'a>(&'a self, name: &'a str) -> VfsFuture<'a, VfsResult<Node>>;
 
+    fn debug_hash_map_state(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
+
     fn create_file<'a>(
         &'a self,
         _name: &'a str,

@@ -39,19 +39,10 @@ impl Wait4 {
         let options = parse_options(frame.arguments[2])?;
         let usage_address = usize::try_from(frame.arguments[3]).map_err(|_| Error::Fault)?;
         let process = ThreadManager::current_process()?;
-        let parent_pid = process.pid();
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: wait4 enter pid={} target={}\n",
-            parent_pid, process_id
-        ));
         let mut address_space = process.address_space();
 
         if status_address != 0
-            && !address_space.user_range_accessible(
-                status_address,
-                WAIT_STATUS_LENGTH,
-                true,
-            )
+            && !address_space.user_range_accessible(status_address, WAIT_STATUS_LENGTH, true)
         {
             return Err(Error::Fault);
         }
@@ -70,10 +61,6 @@ impl Wait4 {
                 false,
             )?;
             if let Some(status) = status {
-                crate::kernel::debug::debug_fmt(format_args!(
-                    "kz: wait4 return pid={} child={} status={:#x}\n",
-                    parent_pid, status.process_id, status.status
-                ));
                 write_status(&mut address_space, status_address, status)?;
                 write_usage(&mut address_space, usage_address, status)?;
                 return Ok(i64::from(status.process_id));
@@ -91,24 +78,11 @@ impl Wait4 {
                 ThreadManager::take_current_signal_wake();
                 return Err(Error::Intr);
             }
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: wait4 block pid={} target={}\n",
-                parent_pid, process_id
-            ));
             if !ThreadManager::switch_current_for_signal() {
                 if ThreadManager::take_current_signal_wake() {
-                    crate::kernel::debug::debug_fmt(format_args!(
-                        "kz: wait4 wake pending pid={}\n",
-                        parent_pid
-                    ));
                     continue;
                 }
                 crate::kernel::arch::CpuArchitecture::wait_for_interrupt();
-            } else {
-                crate::kernel::debug::debug_fmt(format_args!(
-                    "kz: wait4 resumed pid={}\n",
-                    parent_pid
-                ));
             }
         }
     }

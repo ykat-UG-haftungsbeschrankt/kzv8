@@ -165,6 +165,7 @@ impl UserRegisterState {
         let fpu_image = unsafe {
             core::slice::from_raw_parts(fpu_state, crate::kernel::arch::FPU_CONTEXT_SIZE)
         };
+        let user_gs_base = read_msr(IA32_KERNEL_GS_BASE);
         Self {
             r15: registers.r15,
             r14: registers.r14,
@@ -182,7 +183,7 @@ impl UserRegisterState {
             rbx: registers.rbx,
             rax: registers.rax,
             user_return_frame: registers.user_return_frame,
-            user_gs_base: read_msr(IA32_KERNEL_GS_BASE),
+            user_gs_base,
             fpu_context: crate::kernel::arch::fork_fpu_context(
                 fpu_image,
                 read_msr(IA32_FS_BASE),

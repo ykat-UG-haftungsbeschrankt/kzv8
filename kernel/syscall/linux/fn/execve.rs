@@ -25,20 +25,11 @@ impl Execve {
 
     pub(crate) fn handle(frame: SyscallFrame) -> Result<i64, Error> {
         let process = ThreadManager::current_process()?;
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: execve entered pid={}\n",
-            process.pid()
-        ));
         let address_space = process.address_space();
         let path_address = usize::try_from(frame.arguments[0]).map_err(|_| Error::Fault)?;
-        let path = resolve_at_current_directory(
-            copy_user_path(&address_space, path_address)?,
-            &process.current_directory()?,
-        )?;
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: execve resolved pid={} path={}\n",
-            process.pid(), path
-        ));
+        let copied_path = copy_user_path(&address_space, path_address)?;
+        let current_directory = process.current_directory()?;
+        let path = resolve_at_current_directory(copied_path, &current_directory)?;
         let mut argument_bytes = 0;
         let arguments = copy_user_strings(
             &address_space,
@@ -53,10 +44,6 @@ impl Execve {
         let argument_slices = string_slices(&arguments)?;
         let environment_slices = string_slices(&environment)?;
 
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: execve loading pid={} path={}\n",
-            process.pid(), path
-        ));
         boot::exec_image(
             &path,
             argument_slices.as_slice(),

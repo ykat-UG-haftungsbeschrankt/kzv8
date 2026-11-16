@@ -168,7 +168,7 @@ pub(crate) fn set_kernel_stack(stack_pointer: usize) -> bool {
     let Some(slot) = slots.iter_mut().find(|slot| slot.apic_id == apic_id) else {
         return false;
     };
-    let slot_address = addr_of!(*slot) as u64;
+    let slot_address = addr_of!(**slot) as u64;
     slot.kernel_rsp = stack_pointer as u64;
     let tss_stack = unsafe { addr_of_mut!(slot.tss).cast::<u8>().add(4).cast::<u32>() };
     let stack_pointer = stack_pointer as u64;

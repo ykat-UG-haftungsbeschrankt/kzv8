@@ -196,14 +196,6 @@ impl Vfs {
             return Err(Error::Inval);
         }
         let mut pending_path = copy_string(path)?;
-        crate::kernel::debug::debug_fmt(format_args!(
-            "kz: VFS pending path copy input={:p} output={:p} input_len={} output_len={} output={:?}\n",
-            path.as_ptr(),
-            pending_path.as_ptr(),
-            path.len(),
-            pending_path.len(),
-            pending_path.as_bytes()
-        ));
         let mut followed_symlinks = 0;
         loop {
             let step = {
@@ -212,10 +204,6 @@ impl Vfs {
                     .try_reserve_exact(pending_path.split('/').count())
                     .map_err(|_| Error::NoMem)?;
                 components.extend(pending_path.split('/').filter(|part| !part.is_empty()));
-                crate::kernel::debug::debug_fmt(format_args!(
-                    "kz: VFS pending path components={} path={:?}\n",
-                    components.len(), pending_path.as_bytes()
-                ));
 
                 let mut node_stack = Vec::new();
                 node_stack
@@ -252,27 +240,11 @@ impl Vfs {
                         return Err(Error::NotDir);
                     }
                     parent.check_access(credentials, ACCESS_EXECUTE)?;
-                    crate::kernel::debug::debug_fmt(format_args!(
-                        "kz: VFS resolve lookup start component={} path={}\n",
-                        component, pending_path
-                    ));
                     let mut child = parent.lookup(component).await?;
-                    crate::kernel::debug::debug_fmt(format_args!(
-                        "kz: VFS resolve lookup complete component={} path={}\n",
-                        component, pending_path
-                    ));
                     let child_path = absolute_path_with(&path_stack, component)?;
-                    crate::kernel::debug::debug_fmt(format_args!(
-                        "kz: VFS resolve mount check path={}\n",
-                        child_path
-                    ));
                     if let Some(mounted_root) = self.mount_root_at(&child_path)? {
                         child = mounted_root;
                     }
-                    crate::kernel::debug::debug_fmt(format_args!(
-                        "kz: VFS resolve mount checked path={}\n",
-                        child_path
-                    ));
 
                     let is_final = index + 1 == components.len();
                     if let Node::Symlink { target, .. } = &child {
@@ -1070,26 +1042,12 @@ impl VfsApi for Vfs {
         mode: OpenMode,
         credentials: Credentials,
     ) -> VfsFuture<'a, VfsResult<FileHandle>> {
-        Box::pin(async move {
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: VFS open resolve start path={}\n",
-                path
-            ));
+        let future = Box::pin(async move {
             let resolved = self.resolve_internal(path, &credentials, true).await;
             let (node, path) = match resolved {
                 Ok(resolved) => resolved,
-                Err(error) => {
-                    crate::kernel::debug::debug_fmt(format_args!(
-                        "kz: VFS open resolve failed path={} error={:?}\n",
-                        path, error
-                    ));
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: VFS open resolve complete path={}\n",
-                path
-            ));
             let opened_plugin = match &node {
                 Node::File { plugin, .. } => {
                     node.check_access(&credentials, mode.access_mask())?;
@@ -1111,7 +1069,8 @@ impl VfsApi for Vfs {
                 path,
                 offset: 0,
             })
-        })
+        });
+        future
     }
 
     fn open_blocking(

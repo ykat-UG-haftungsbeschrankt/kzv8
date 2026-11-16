@@ -80,15 +80,7 @@ pub(crate) fn exec_image(
 ) -> Result<(), Error> {
     let process = crate::kernel::scheduler::thread::ThreadManager::current_process()?;
     let credentials = process.credentials()?;
-    crate::kernel::debug::debug_fmt(format_args!(
-        "kz: exec image start pid={} path={}\n",
-        process.pid(), executable
-    ));
     let image = read_image(executable, &process)?;
-    crate::kernel::debug::debug_fmt(format_args!(
-        "kz: exec image read pid={} bytes={}\n",
-        process.pid(), image.len()
-    ));
     let is_elf = image.starts_with(b"\x7fELF");
     if is_elf {
         if let Some(interpreter) = program_interpreter(&image)? {
@@ -393,33 +385,15 @@ fn read_image(
     process: &alloc::sync::Arc<crate::kernel::process::Process>,
 ) -> Result<Vec<u8>, Error> {
     let vfs = crate::kernel::vfs::mounted().ok_or(Error::NoDev)?;
-    crate::kernel::debug::debug_fmt(format_args!(
-        "kz: image open start pid={} path={}\n",
-        process.pid(), executable
-    ));
     let mut image_file = match vfs.open_blocking(
         executable,
         OpenMode::ReadOnly,
         process.credentials()?,
     ) {
         Ok(image_file) => image_file,
-        Err(error) => {
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: image open failed pid={} path={} error={:?}\n",
-                process.pid(), executable, error
-            ));
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
-    crate::kernel::debug::debug_fmt(format_args!(
-        "kz: image opened pid={} path={}\n",
-        process.pid(), executable
-    ));
     let image_length = usize::try_from(image_file.size_blocking()?).map_err(|_| Error::Fbig)?;
-    crate::kernel::debug::debug_fmt(format_args!(
-        "kz: image sized pid={} bytes={}\n",
-        process.pid(), image_length
-    ));
     if image_length == 0 || image_length > MAX_EXECUTABLE_SIZE {
         return Err(Error::NoExec);
     }
@@ -430,29 +404,13 @@ fn read_image(
     image.resize(image_length, 0);
     let mut image_offset = 0;
     while image_offset < image_length {
-        if image_offset == 0 {
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: image first read start pid={} bytes={}\n",
-                process.pid(), image_length
-            ));
-        }
         let count = image_file.read_blocking(&mut image[image_offset..])?;
-        if image_offset == 0 {
-            crate::kernel::debug::debug_fmt(format_args!(
-                "kz: image first read complete pid={} count={}\n",
-                process.pid(), count
-            ));
-        }
         if count == 0 || count > image_length - image_offset {
             return Err(Error::Io);
         }
         image_offset += count;
     }
     drop(image_file);
-    crate::kernel::debug::debug_fmt(format_args!(
-        "kz: image read complete pid={} bytes={}\n",
-        process.pid(), image_length
-    ));
     Ok(image)
 }
 
