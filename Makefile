@@ -15,6 +15,8 @@ V8_PLATFORM_OUT ?= runtime/v8/src/out.gn/x64.platform
 V8_AARCH64_PLATFORM_OUT ?= runtime/v8/src/out.gn/arm64.platform
 V8_CXX ?= runtime/v8/src/third_party/llvm-build/Release+Asserts/bin/clang++
 QEMU_GDB_PORT ?= 1234
+VIRTIOFS_DISPLAY ?= none
+VIRTIOFS_CONSOLE_CHRDEV ?= stdio,id=console,signal=off
 VIRTIOFS_SOCKET ?= $(CURDIR)/build/virtiofs.sock
 VIRTIOFS_ROOT ?= $(CURDIR)/build/virtiofs-root
 VIRTIOFS_BUSYBOX ?= libraries/linux/x86_64/busybox-pie
@@ -23,6 +25,7 @@ VIRTIOFS_MC_RUNTIME_ROOT ?= libraries/linux/x86_64/mc-runtime/root
 HELLO_LIBRARY_DIR ?= build/hello-library
 HELLO_LIBRARY ?= $(HELLO_LIBRARY_DIR)/libhello.so
 HELLO_PROGRAM ?= $(HELLO_LIBRARY_DIR)/hello
+HELLO_STATIC ?= libraries/linux/x86_64/hello_static
 PLATFORM_HELLO_DIR ?= build/platform-hello
 DARWIN_HELLO_DIR ?= $(PLATFORM_HELLO_DIR)/darwin
 WINDOWS_HELLO_DIR ?= $(PLATFORM_HELLO_DIR)/windows
@@ -69,7 +72,7 @@ else
 $(error AARCH64_FPU_STATE must be on or off)
 endif
 
-.PHONY: all test app-build doc hello-library hello-library-test hello-platform stage-platform-hello run-x86_64-virtiofs-darwin run-x86_64-virtiofs-windows run-x86_64 run-x86_64-virtiofs run-aarch64 debug-x86_64 debug-aarch64 v8-host-test v8-platform-test clean force
+.PHONY: all test app-build doc hello-library hello-library-test hello-static hello-platform stage-platform-hello run-x86_64-virtiofs-darwin run-x86_64-virtiofs-windows run-x86_64 run-x86_64-virtiofs run-x86_64-virtiofs-gtk run-aarch64 debug-x86_64 debug-aarch64 v8-host-test v8-platform-test clean force
 all: $(RUNTIME_V8_BUILD_DEPENDENCY) build/x86_64/kernel.elf build/aarch64/kernel.bin
 
 force:
@@ -216,6 +219,11 @@ $(HELLO_LIBRARY): tests/qemu/hello-library/library.c | $(HELLO_LIBRARY_DIR)
 $(HELLO_PROGRAM): tests/qemu/hello-library/main.c $(HELLO_LIBRARY) | $(HELLO_LIBRARY_DIR)
 	$(CC) -O2 -fPIE -ffreestanding -fno-stack-protector -nostdlib -pie -Wl,-e,_start -Wl,-z,now -Wl,--no-as-needed -Wl,--dynamic-linker=/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 -Wl,-rpath,'$$ORIGIN' -L"$(HELLO_LIBRARY_DIR)" -o "$@" "$<" -lhello
 
+hello-static: $(HELLO_STATIC)
+
+$(HELLO_STATIC): tests/qemu/hello-library/static_main.c
+	$(CLANG) --target=x86_64-linux-gnu -O2 -ffreestanding -fno-stack-protector -fno-pie -nostdlib -static -Wl,-no-pie -Wl,-e,_start -o "$@" "$<"
+
 run-x86_64: build/x86_64/kernel.elf
 	qemu-system-x86_64 -machine microvm,acpi=off -accel tcg -m 5G -smp 2 -display none -serial file:build/x86_64/early-debug.log -monitor none -no-reboot -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev stdio,id=console,signal=off -device virtconsole,chardev=console
 
@@ -228,7 +236,11 @@ run-x86_64-virtiofs: build/x86_64/kernel.elf
 	cp -a "$(VIRTIOFS_MC_RUNTIME_ROOT)/." "$(VIRTIOFS_ROOT)/"
 	find "$(VIRTIOFS_ROOT)/usr/lib/x86_64-linux-gnu" -maxdepth 1 -type l -name '*.so*' -exec sh -c 'for link do target=$$(readlink -f "$$link") || exit 1; cp --remove-destination "$$target" "$$link" || exit 1; done' sh {} +
 	install -m 0755 "$(VIRTIOFS_MC)" "$(VIRTIOFS_ROOT)/mc"
-	qemu-system-x86_64 -object memory-backend-memfd,id=mem,size=$(VIRTIOFS_RAM),share=on -machine microvm,acpi=off,memory-backend=mem -accel tcg -cpu qemu64,+rdrand -smp 2 -display none -serial file:build/x86_64/early-debug.log -monitor none -no-reboot -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev stdio,id=console,signal=off -device virtconsole,chardev=console -chardev socket,id=virtiofs,path=$(VIRTIOFS_SOCKET) -device vhost-user-fs-device,chardev=virtiofs,tag=$(VIRTIOFS_TAG)
+	qemu-system-x86_64 -object memory-backend-memfd,id=mem,size=$(VIRTIOFS_RAM),share=on -machine microvm,acpi=off,memory-backend=mem -accel tcg -cpu qemu64,+rdrand -smp 2 -display $(VIRTIOFS_DISPLAY) -serial file:build/x86_64/early-debug.log -monitor none -no-reboot -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev $(VIRTIOFS_CONSOLE_CHRDEV) -device virtconsole,chardev=console -chardev socket,id=virtiofs,path=$(VIRTIOFS_SOCKET) -device vhost-user-fs-device,chardev=virtiofs,tag=$(VIRTIOFS_TAG)
+
+run-x86_64-virtiofs-gtk: VIRTIOFS_DISPLAY := gtk
+run-x86_64-virtiofs-gtk: VIRTIOFS_CONSOLE_CHRDEV := vc,id=console
+run-x86_64-virtiofs-gtk: run-x86_64-virtiofs
 
 run-aarch64: build/aarch64/kernel.bin
 	qemu-system-aarch64 -machine virt,gic-version=2 -cpu cortex-a72 -accel tcg -m 128M -smp 2 -display none -serial file:build/aarch64/early-debug.log -monitor none -no-reboot -global virtio-mmio.force-legacy=false -kernel $< -device virtio-serial-device -chardev stdio,id=console,signal=off -device virtconsole,chardev=console

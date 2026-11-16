@@ -8,13 +8,11 @@
 use core::marker::PhantomData;
 use core::mem::{size_of, MaybeUninit};
 
-use crate::kernel::types::Ptr;
-
 const PAGE_SIZE: usize = crate::kernel::memory::r#virtual::PAGE_SIZE;
 
 #[repr(C)]
 struct Page {
-	next: Ptr<Page>,
+	next: *mut Page,
 	start: usize,
 	end: usize,
 }
@@ -28,10 +26,13 @@ impl Page {
 }
 
 pub(crate) struct Queue {
-	head: Ptr<Page>,
-	tail: Ptr<Page>,
+	head: *mut Page,
+	tail: *mut Page,
 	length: usize,
 }
+
+// SAFETY: Queue exclusively owns its pages, and moving it transfers that ownership.
+unsafe impl Send for Queue {}
 
 impl Queue {
 	pub(crate) const fn new() -> Self {
@@ -56,14 +57,14 @@ impl Queue {
 			.filter(|capacity| *capacity != 0)
 	}
 
-	fn data_ptr(page: Ptr<Page>) -> *mut u8 {
+	fn data_ptr(page: *mut Page) -> *mut u8 {
 		page.cast::<u8>().wrapping_add(size_of::<Page>())
 	}
 
-	fn allocate_page() -> Option<Ptr<Page>> {
+	fn allocate_page() -> Option<*mut Page> {
 		Self::page_capacity()?;
 		let address = crate::kernel::memory::r#virtual::reserve(PAGE_SIZE, PAGE_SIZE, 2)?;
-		let page = address as Ptr<Page>;
+		let page = address as *mut Page;
 		// SAFETY: reserve returns an aligned writable page that is exclusively owned by this queue.
 		unsafe { page.write(Page::EMPTY) };
 		Some(page)
@@ -223,8 +224,8 @@ impl Queue {
 		let bytes_after_tail = byte_count.saturating_sub(tail_available);
 		let pages_needed = bytes_after_tail / page_capacity
 			+ usize::from(bytes_after_tail % page_capacity != 0);
-		let mut new_head = core::ptr::null_mut();
-		let mut new_tail = core::ptr::null_mut();
+		let mut new_head: *mut Page = core::ptr::null_mut();
+		let mut new_tail: *mut Page = core::ptr::null_mut();
 		for _ in 0..pages_needed {
 			let Some(new_page) = Self::allocate_page() else {
 				Self::release_chain(new_head);
@@ -288,7 +289,7 @@ impl Queue {
 		true
 	}
 
-	fn release_chain(mut page: Ptr<Page>) {
+	fn release_chain(mut page: *mut Page) {
 		while !page.is_null() {
 			// SAFETY: every page address in the chain refers to an allocated page.
 			let next = unsafe { (*page).next };

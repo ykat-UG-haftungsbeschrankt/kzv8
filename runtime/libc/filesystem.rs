@@ -4933,9 +4933,17 @@ pub(crate) fn install_open_descriptor_for_process(
 }
 
 pub(crate) fn cleanup_process_descriptors_for_process(process_id: i32) {
+    crate::kernel::debug::debug_fmt(format_args!(
+        "kz: descriptor cleanup start pid={}\n",
+        process_id
+    ));
     let aliases = crate::kernel::runtime::runtime_libc::fd_alias::remove_all_for_process(
         process_id,
     );
+    crate::kernel::debug::debug_fmt(format_args!(
+        "kz: descriptor cleanup aliases removed pid={}\n",
+        process_id
+    ));
     match aliases {
         Ok(aliases) => {
             for alias in aliases {
@@ -4959,12 +4967,36 @@ pub(crate) fn cleanup_process_descriptors_for_process(process_id: i32) {
         }
     }
     for file_descriptor in 0..=415 {
+        if file_descriptor <= 2 {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: descriptor cleanup close pid={} fd={}\n",
+                process_id, file_descriptor
+            ));
+        }
         let _ = close_descriptor_for_process(process_id, file_descriptor);
+        if file_descriptor <= 2 {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: descriptor cleanup closed pid={} fd={}\n",
+                process_id, file_descriptor
+            ));
+        }
     }
+    crate::kernel::debug::debug_fmt(format_args!(
+        "kz: descriptor cleanup descriptors closed pid={}\n",
+        process_id
+    ));
     remove_standard_descriptors_for_process(process_id);
+    crate::kernel::debug::debug_fmt(format_args!(
+        "kz: descriptor cleanup standard descriptors removed pid={}\n",
+        process_id
+    ));
     crate::kernel::runtime::runtime_libc::fd_alias::release_reserved_targets_for_process(
         process_id,
     );
+    crate::kernel::debug::debug_fmt(format_args!(
+        "kz: descriptor cleanup complete pid={}\n",
+        process_id
+    ));
 }
 
 fn standard_descriptor_is_open(file_descriptor: i32) -> Result<bool, i32> {

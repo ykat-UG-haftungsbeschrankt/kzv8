@@ -292,6 +292,14 @@ impl crate::kernel::arch::traits::MemoryArchitecture for super::MemoryArchitectu
         paging::page_has_backing(virtual_address)
     }
 
+    fn debug_page_frame(virtual_address: usize) -> Option<usize> {
+        paging::debug_page_frame(virtual_address)
+    }
+
+    fn debug_page_table_entries(virtual_address: usize) -> Option<[u64; 4]> {
+        paging::debug_page_table_entries(virtual_address)
+    }
+
     fn user_range_accessible(address: usize, length: usize, write: bool) -> bool {
         paging::user_range_accessible(address, length, write)
     }

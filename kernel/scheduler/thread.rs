@@ -25,6 +25,7 @@ use crate::kernel::process::{
 };
 use crate::kernel::namespace::NamespaceSet;
 use crate::kernel::signal::{SignalInfo, SignalQueue, SignalSet};
+use crate::kernel::vfs::{OpenMode, VfsApi};
 
 use super::sync::IrqSpinLock;
 
@@ -1062,7 +1063,16 @@ impl ThreadManager {
             current.cleanup_handlers.clear();
             current.tls.fill(0);
         }
+        let new_address_space_root = address_space.root();
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: exec replace address space pid={} root={:#x}\n",
+            process.pid(), new_address_space_root
+        ));
         process.replace_address_space(address_space);
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: exec installed address space pid={} root={:#x}\n",
+            process.pid(), process.address_space().root()
+        ));
         process.reset_caught_signal_actions_for_exec();
         let mut terminated_siblings = 0usize;
         loop {
@@ -1285,21 +1295,56 @@ impl ThreadManager {
         };
 
         if let Some(kernel_stack_pointer) = context.new_user_kernel_stack {
+            if check_signal_wake {
+                crate::kernel::debug::debug_fmt(format_args!(
+                    "kz: signal switch set stack={:#x}\n",
+                    kernel_stack_pointer
+                ));
+            }
             if !crate::kernel::arch::ThreadArchitecture::set_user_kernel_stack(
                 kernel_stack_pointer,
             ) {
+                crate::kernel::debug::debug_fmt(format_args!(
+                    "kz: signal switch stack setup failed\n"
+                ));
                 crate::kernel::arch::CpuArchitecture::halt();
             }
+        }
+        if check_signal_wake {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: signal switch activate root={:#x}\n",
+                context.new_address_space_root
+            ));
         }
         if !crate::kernel::arch::MemoryArchitecture::activate_address_space(
             context.new_address_space_root,
         ) {
+            if check_signal_wake {
+                crate::kernel::debug::debug_fmt(format_args!(
+                    "kz: signal switch address-space activation failed\n"
+                ));
+            }
             crate::kernel::arch::CpuArchitecture::halt();
         }
 
         // SAFETY: both thread boxes remain owned by the queues while their contexts are switched.
+        if check_signal_wake {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: signal switch enter context switch\n"
+            ));
+        }
         unsafe { Self::switch_threads(context) };
+        if check_signal_wake {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: signal switch returned from context switch\n"
+            ));
+        }
         Self::reap_pending();
+        if check_signal_wake {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: signal switch reaped pending threads\n"
+            ));
+        }
         crate::kernel::arch::InterruptArchitecture::restore_interrupts(interrupt_state);
         Self::cancel_current_if_async_requested();
         Self::exit_if_process_terminated();
@@ -2188,7 +2233,12 @@ impl ThreadManager {
     pub(crate) fn exit_current(result: *mut c_void) -> ! {
         let _interrupt_state =
             crate::kernel::arch::InterruptArchitecture::disable_interrupts();
-        let (context, exited_process, exit_status) = {
+        let exiting_pid = Self::current_process().map_or(-1, |process| process.pid());
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: thread exit pid={} result={:#x}\n",
+            exiting_pid, result as usize
+        ));
+        let (old_context, exited_process, exit_status) = {
             let mut manager = THREAD_MANAGER.lock();
             let now_ns = scheduler_time_ns();
             manager.account_current_cpu_time(now_ns);
@@ -2209,50 +2259,108 @@ impl ThreadManager {
                 } else {
                     manager.busy.push_back(current);
                 }
-
-                if let Some(mut next) = manager.pop_next_ready() {
-                    next.state = ThreadState::Running;
-                    next.running_since_ns = Some(now_ns);
-                    let context = SwitchContext {
-                        old_context,
-                        new_context: next.context.kernel() as *const kernel::Context,
-                        new_user_kernel_stack: next.context.user_kernel_stack_pointer(),
-                        new_address_space_root: next.process.address_space().root(),
-                    };
-                    manager.busy.push_front(next);
-                    (Some(context), Some(exited_process), exit_status)
-                } else {
-                    (None, Some(exited_process), exit_status)
-                }
+                (Some(old_context), Some(exited_process), exit_status)
             } else {
                 (None, None, 0)
             }
         };
         if let Some(process) = exited_process {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: thread notify parent pid={} status={:#x}\n",
+                process.pid(), exit_status
+            ));
             process.thread_exited(exit_status);
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: thread notified parent pid={}\n",
+                process.pid()
+            ));
         }
-        let Some(context) = context else {
+        let context = old_context.and_then(|old_context| {
+            let mut manager = THREAD_MANAGER.lock();
+            let mut next = manager.pop_next_ready()?;
+            let next_pid = next.process.pid();
+            let now_ns = scheduler_time_ns();
+            next.state = ThreadState::Running;
+            next.running_since_ns = Some(now_ns);
+            let context = SwitchContext {
+                old_context,
+                new_context: next.context.kernel() as *const kernel::Context,
+                new_user_kernel_stack: next.context.user_kernel_stack_pointer(),
+                new_address_space_root: next.process.address_space().root(),
+            };
+            manager.busy.push_front(next);
+            Some((context, next_pid))
+        });
+        let Some((context, next_pid)) = context else {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: no ready thread after exit pid={}\n",
+                exiting_pid
+            ));
             crate::kernel::arch::CpuArchitecture::halt();
         };
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: thread exit switch pid={} next={}\n",
+            exiting_pid, next_pid
+        ));
         if let Some(kernel_stack_pointer) = context.new_user_kernel_stack {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: exit set stack={:#x}\n",
+                kernel_stack_pointer
+            ));
             if !crate::kernel::arch::ThreadArchitecture::set_user_kernel_stack(
                 kernel_stack_pointer,
             ) {
+                crate::kernel::debug::debug_fmt(format_args!(
+                    "kz: exit stack setup failed\n"
+                ));
                 crate::kernel::arch::CpuArchitecture::halt();
             }
         }
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: exit activate root={:#x}\n",
+            context.new_address_space_root
+        ));
         if !crate::kernel::arch::MemoryArchitecture::activate_address_space(
             context.new_address_space_root,
         ) {
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: exit address-space activation failed\n"
+            ));
             crate::kernel::arch::CpuArchitecture::halt();
         }
         // SAFETY: the exiting node is retained until another thread has switched onto its stack.
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: exit enter context switch\n"
+        ));
         unsafe { Self::switch_threads(context) };
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: exit context switch returned\n"
+        ));
         crate::kernel::arch::CpuArchitecture::halt()
     }
 
     pub(crate) extern "C" fn thread_trampoline() -> ! {
         let interrupt_state = crate::kernel::arch::InterruptArchitecture::disable_interrupts();
+        let starting_pid = Self::current_process().map_or(-1, |process| process.pid());
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: thread trampoline pid={}\n",
+            starting_pid
+        ));
+        if starting_pid == 2 {
+            let success = match (Self::current_process(), crate::kernel::vfs::mounted()) {
+                (Ok(process), Some(vfs)) => process
+                    .credentials()
+                    .is_ok_and(|credentials| {
+                        vfs.open_blocking("/fs", OpenMode::ReadOnly, credentials)
+                            .is_ok()
+                    }),
+                _ => false,
+            };
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: child trampoline VFS probe success={}\n",
+                success
+            ));
+        }
         Self::reap_pending();
         #[derive(Clone, Copy)]
         enum Start {

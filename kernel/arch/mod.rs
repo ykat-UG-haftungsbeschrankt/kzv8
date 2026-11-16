@@ -569,6 +569,12 @@ pub(crate) mod traits {
         fn unmap_page(virtual_address: usize) -> Option<usize>;
         fn page_is_mapped(virtual_address: usize) -> bool;
         fn page_has_backing(virtual_address: usize) -> bool;
+        fn debug_page_frame(_virtual_address: usize) -> Option<usize> {
+            None
+        }
+        fn debug_page_table_entries(_virtual_address: usize) -> Option<[u64; 4]> {
+            None
+        }
         fn user_range_accessible(address: usize, length: usize, write: bool) -> bool;
         fn user_range_executable(address: usize, length: usize) -> bool;
         fn high_memory_smoke() -> bool;

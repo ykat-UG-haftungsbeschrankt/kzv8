@@ -564,6 +564,37 @@ pub(crate) fn page_has_backing(virtual_address: usize) -> bool {
     page_table_value(virtual_address).is_some_and(|entry| entry & PAGE_ADDRESS_MASK != 0)
 }
 
+pub(crate) fn debug_page_frame(virtual_address: usize) -> Option<usize> {
+    let _guard = PAGE_TABLE_LOCK.lock();
+    let entry = page_table_value(virtual_address)?;
+    (entry & (PRESENT | HUGE_PAGE) == PRESENT)
+        .then_some((entry & PAGE_ADDRESS_MASK) as usize)
+}
+
+pub(crate) fn debug_page_table_entries(virtual_address: usize) -> Option<[u64; 4]> {
+    let _guard = PAGE_TABLE_LOCK.lock();
+    let root = current_address_space() as *mut u64;
+    let pml4_entry = unsafe { read_volatile(root.add((virtual_address >> 39) & 0x1ff)) };
+    if pml4_entry & PRESENT == 0 {
+        return Some([pml4_entry, 0, 0, 0]);
+    }
+    let pdpt = (pml4_entry & PAGE_ADDRESS_MASK) as *mut u64;
+    let pdpt_entry = unsafe { read_volatile(pdpt.add((virtual_address >> 30) & 0x1ff)) };
+    if pdpt_entry & (PRESENT | HUGE_PAGE) != PRESENT {
+        return Some([pml4_entry, pdpt_entry, 0, 0]);
+    }
+    let directory = (pdpt_entry & PAGE_ADDRESS_MASK) as *mut u64;
+    let directory_entry = unsafe {
+        read_volatile(directory.add((virtual_address >> 21) & 0x1ff))
+    };
+    if directory_entry & (PRESENT | HUGE_PAGE) != PRESENT {
+        return Some([pml4_entry, pdpt_entry, directory_entry, 0]);
+    }
+    let table = (directory_entry & PAGE_ADDRESS_MASK) as *mut u64;
+    let page_entry = unsafe { read_volatile(table.add((virtual_address >> 12) & 0x1ff)) };
+    Some([pml4_entry, pdpt_entry, directory_entry, page_entry])
+}
+
 pub(crate) fn user_range_accessible(address: usize, length: usize, write: bool) -> bool {
     const USER_ADDRESS_LIMIT: usize = 1 << 47;
     if length == 0 {

@@ -1532,6 +1532,10 @@ impl Process {
     }
 
     fn record_child_event(&self, status: ChildExitStatus) {
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: child event record start parent={} child={}\n",
+            self.pid, status.process_id
+        ));
         let mut children = self.children.lock();
         if let Some(child) = children
             .iter_mut()
@@ -1547,7 +1551,15 @@ impl Process {
             }
         }
         drop(children);
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: child event recorded parent={} child={}\n",
+            self.pid, status.process_id
+        ));
         ThreadManager::wake_process_threads(self.pid);
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: child event wake returned parent={} child={}\n",
+            self.pid, status.process_id
+        ));
     }
 
     fn update_child_process_group(&self, process_id: i32, process_group_id: i32) {
@@ -1622,10 +1634,18 @@ impl Process {
         if parent_pid <= 0 {
             return;
         }
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: parent lookup start child={} parent={}\n",
+            self.pid, parent_pid
+        ));
         let parent = {
             let registry = PROCESS_REGISTRY.lock();
             Self::lookup_registered(&registry, parent_pid)
         };
+        crate::kernel::debug::debug_fmt(format_args!(
+            "kz: parent lookup complete child={} parent={} found={}\n",
+            self.pid, parent_pid, parent.is_some()
+        ));
         if let Some(parent) = parent {
             parent.record_child_event(ChildExitStatus {
                 process_id: self.pid,
@@ -1634,6 +1654,10 @@ impl Process {
                 status,
                 resource_usage: self.resource_usage.snapshot(),
             });
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: parent event returned child={} parent={}\n",
+                self.pid, parent_pid
+            ));
             if code == CLD_STOPPED
                 && parent
                     .signal_action(SIGCHLD)
@@ -1648,6 +1672,10 @@ impl Process {
                 self.user_ids()[1],
                 0,
                 status,
+            ));
+            crate::kernel::debug::debug_fmt(format_args!(
+                "kz: parent signal queued child={} parent={}\n",
+                self.pid, parent_pid
             ));
         }
     }

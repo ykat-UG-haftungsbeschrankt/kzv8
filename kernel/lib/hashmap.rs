@@ -257,11 +257,48 @@ impl<K: Eq + Hash, V, const INITIAL_CAPACITY: usize> HashMap<K, V, INITIAL_CAPAC
 		K: Borrow<Q>,
 		Q: Eq + Hash,
 	{
-		if self.capacity == 0 {
+		crate::kernel::debug::debug_fmt(format_args!(
+			"kz: HashMap get entry map={:p} key={:p}\n",
+			self,
+			key as *const Q as *const ()
+		));
+		let capacity = self.capacity;
+		crate::kernel::debug::debug_fmt(format_args!(
+			"kz: HashMap get capacity map={:p} capacity={}\n",
+			self, capacity
+		));
+		if capacity == 0 {
 			return None;
 		}
-		let index = Self::bucket_index(key, self.capacity);
-		for entry in self.bucket(index).iter() {
+		crate::kernel::debug::debug_fmt(format_args!(
+			"kz: HashMap get hash start map={:p} key={:p} capacity={} length={}\n",
+			self,
+			key as *const Q as *const (),
+			capacity,
+			self.length
+		));
+		let index = Self::bucket_index(key, capacity);
+		crate::kernel::debug::debug_fmt(format_args!(
+			"kz: HashMap get hash done map={:p} bucket={}\n",
+			self, index
+		));
+		crate::kernel::debug::debug_fmt(format_args!(
+			"kz: HashMap get map={:p} key={:?} capacity={} length={} bucket={} head={:?}\n",
+			self,
+			core::any::type_name::<Q>(),
+			self.capacity,
+			self.length,
+			index,
+			self.bucket(index).debug_head_address()
+		));
+		for (visited, entry) in self.bucket(index).iter().enumerate() {
+			if visited >= self.length {
+				crate::kernel::debug::debug_fmt(format_args!(
+					"kz: hashmap bucket cycle address={:#x} capacity={} length={} bucket={}\n",
+					self.address, self.capacity, self.length, index
+				));
+				return None;
+			}
 			if <K as Borrow<Q>>::borrow(&entry.key) == key {
 				return Some(&entry.value);
 			}
